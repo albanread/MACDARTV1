@@ -125,5 +125,5 @@ this build disables TLS, uses the system zlib via a shim, and extracts only the
 command-line VM subset.
 
 The MACDART port itself — the scripts, the CMake build, and
-`patches/macdart-port.patch` in this repository — is offered under the same
-BSD-3-Clause terms.
+`patches/macdart-port.patch` in this repository — is offered under the
+BSD-3-Clause terms in [`LICENSE`](LICENSE).

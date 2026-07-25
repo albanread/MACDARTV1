@@ -12,6 +12,20 @@ import 'dart:mirrors' show MirrorSystem;
 /// The process id — a POSIX FFI smoke test (getpid()).
 int processId() native "Cocoa_getpid";
 
+/// Evaluate [src] as a Dart expression against the workspace's live library and
+/// return its `toString()`, or an `"ERR: ..."` string on failure. The heart of
+/// the live workspace's Do-it/Print-it (see WORKSPACE_PLAN.md §5). `src` must be
+/// a single expression; wrap statements as an immediately-invoked closure
+/// `(){ ... }()`. (Temporary home in dart:cocoa; moves to dart:workspace.)
+String wsEval(String src) native "Workspace_eval";
+
+/// Hot-reload the workspace's sources after rewriting its scratch file: changed
+/// method bodies go live on existing instances, and structural class changes
+/// MORPH live instances (same-named fields preserved, new fields initialized).
+/// Returns `""` on success or `"ERR: ..."` if the reload was cancelled (an
+/// unsafe change → restart the isolate). See WORKSPACE_PLAN.md §5.
+String wsReload() native "Workspace_reload";
+
 // --- Low-level natives ------------------------------------------------------
 int _nsStringFromCString(String s) native "Cocoa_nsStringFromCString";
 int _nsStringLength(int handle) native "Cocoa_nsStringLength";
@@ -42,6 +56,41 @@ void autoreleasePool(void body()) {
   } finally {
     _poolPop(token);
   }
+}
+
+// --- Reverse callbacks (target-action) --------------------------------------
+// AppKit controls call back into Dart. A ticket keys the Dart handler; the
+// native side stores only the ticket (never a Dart handle). See cocoa_callbacks.mm.
+
+/// A control-action handler; [sender] is the control that fired.
+typedef void CocoaAction(Cocoa sender);
+
+int _cbNext = 1;
+final Map<int, CocoaAction> _cbHandlers = <int, CocoaAction>{};
+bool _cbDispatchRegistered = false;
+
+void _registerCallbackDispatch(Function f) native "Cocoa_registerCallbackDispatch";
+int _makeActionTarget(int ticket) native "Cocoa_makeActionTarget";
+void _wireAction(int control, int target) native "Cocoa_wireAction";
+
+// The single entry every native callback funnels through (see cocoa_callbacks.mm).
+void _cocoaDispatch(int ticket, int sender) {
+  var fn = _cbHandlers[ticket];
+  if (fn != null) fn(new Cocoa._adopt(sender));
+}
+
+/// Wire [control]'s action to [fn] (e.g. an `NSButton`'s click). Returns the
+/// target object; AppKit holds targets weakly, so keep a reference to it alive.
+Cocoa onAction(Cocoa control, CocoaAction fn) {
+  if (!_cbDispatchRegistered) {
+    _registerCallbackDispatch(_cocoaDispatch);
+    _cbDispatchRegistered = true;
+  }
+  var ticket = _cbNext++;
+  _cbHandlers[ticket] = fn;
+  var target = new Cocoa._adopt(_makeActionTarget(ticket));
+  _wireAction(control.handle, target.handle);
+  return target;
 }
 
 /// A minimal typed NSString wrapper (Phase 1; still handy for strings).

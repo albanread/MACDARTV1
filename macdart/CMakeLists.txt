@@ -230,10 +230,12 @@ dart_gen_builtin(io_gen.cc dart::bin::Builtin::io_source_paths_ dart:io ${IO_DAR
 dart_gen_builtin(cocoa_gen.cc dart::bin::Builtin::cocoa_source_paths_ dart:cocoa ${COCOA}/cocoa.dart)
 add_library(dart_cocoa STATIC
   ${COCOA}/cocoa_natives.mm    # resolver + natives (incl. the general _send)
+  ${COCOA}/cocoa_callbacks.mm  # reverse callbacks (target-action, class pairs)
   ${COCOA}/objc_shim.m         # fixed-shape AAPCS64 dispatch shim
   ${COCOA}/cocoa_abi.cc        # @encode -> ABI-token classifier
+  ${COCOA}/workspace_natives.cc # live-workspace eval primitives (Dart_EvaluateExpr)
   ${GEN}/cocoa_gen.cc)         # dart:cocoa library source array
-set_source_files_properties(${COCOA}/cocoa_natives.mm ${COCOA}/objc_shim.m
+set_source_files_properties(${COCOA}/cocoa_natives.mm ${COCOA}/cocoa_callbacks.mm ${COCOA}/objc_shim.m
   PROPERTIES COMPILE_FLAGS "-fno-objc-arc -fobjc-exceptions")
 target_link_libraries(dart_cocoa PUBLIC "-framework Foundation" "-framework AppKit")
 
@@ -333,6 +335,22 @@ add_executable(dart
   ${GEN}/snapshot_gen.cc ${GEN}/resources_gen.cc)
 target_link_libraries(dart PRIVATE dart_io dart_builtin dart_cocoa dart_engine_snap z ${MACOS_FRAMEWORKS})
 target_link_options(dart PRIVATE -rdynamic)
+
+# --- dartui: the Cocoa GUI host (dart + a thread-0 UI host) ------------------
+# Identical to `dart` plus cocoa_host.mm, built with DART_UI_HOST so main.cc runs
+# the UI isolate's main() on OS thread 0 (AppKit's only legal thread). The Dart
+# workspace UI itself is written in Dart via dart:cocoa. See WORKSPACE_PLAN.md.
+add_executable(dartui
+  ${RT}/bin/builtin_nolib.cc ${RT}/bin/builtin_natives.cc ${RT}/bin/error_exit.cc
+  ${RT}/bin/main.cc ${RT}/bin/loader.cc ${RT}/bin/snapshot_utils.cc
+  ${RT}/bin/observatory_assets_empty.cc ${RT}/bin/vmservice_impl.cc
+  ${GEN}/snapshot_gen.cc ${GEN}/resources_gen.cc
+  ${COCOA}/cocoa_host.mm)
+target_compile_definitions(dartui PRIVATE DART_UI_HOST)
+set_source_files_properties(${COCOA}/cocoa_host.mm
+  PROPERTIES COMPILE_FLAGS "-fno-objc-arc -fobjc-exceptions")
+target_link_libraries(dartui PRIVATE dart_io dart_builtin dart_cocoa dart_engine_snap z ${MACOS_FRAMEWORKS})
+target_link_options(dartui PRIVATE -rdynamic)
 
 # Report the compile set size at configure time.
 list(LENGTH VM_CC _n_vm)

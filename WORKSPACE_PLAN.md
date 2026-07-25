@@ -249,8 +249,18 @@ stale generation / re-entrancy. Trampoline: `Dart_EnterIsolate(ui)` +
     string/number all colour correctly. Also added: physical-interaction fixes
     (redraw flush + immediate feedback) and an app menu (Quit ⌘Q, Workspace Do It
     ⌘D / Print It ⌘P). Optional later: true floating `NSPanel` transcript.
-- **M6 — shell**: toolbar-as-tab-bar + tabless `NSTabView`.
-- **M7+ — Browser (mirrors+analyzer), Docs (markdown), Find** — grown tab by tab.
+- **M6 — tabbed shell** ✅ DONE: a toolbar of view-switcher buttons over a tabless
+  `NSTabView` (`setTabViewType: 6`), a right-anchored live metrics label
+  (`cocoaStats` wraps/frees), and the transcript docked below (shared). Three
+  tabs, each a container view: **Workspace** (the M5 highlighted editor + Do It /
+  Print It / Clear), **Browser** (Refresh → the language isolate's live classes
+  via `dart:mirrors` — classes, fields, methods, constructors, top-level vars),
+  and **Docs**. Toolbar buttons call `selectTabViewItemAtIndex:`; socket `tab <n>`
+  drives it. No new native — all via the existing bridge. Demonstrated +
+  snapshotted all three tabs. (Deferred: window-resize reflow / autoresizing.)
+- **M7+ — a richer Browser** (NSTableView panes via table data-source delegates
+  vs the current text dump), Docs via markdown, Find/senders, the watchdog, and
+  smoothing the debug reload assert — grown as needed.
 
 ### Repo layout (new)
 - `macdart/cocoa/cocoa_host.mm` — the thread-0 GUI host (M1/M2). Linked only into

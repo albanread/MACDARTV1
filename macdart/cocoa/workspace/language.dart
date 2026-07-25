@@ -5,6 +5,7 @@
 import 'dart:cocoa';       // wsEval / wsReload
 import 'dart:isolate';
 import 'dart:io';
+import 'dart:mirrors';      // live class browser
 
 // ===BEGIN USER===
 // ===END USER===
@@ -30,6 +31,8 @@ main(List args, SendPort uiPort) {
         out = _doit(arg);
       } else if (cmd == 'accept') {
         out = _accept(arg);
+      } else if (cmd == 'browse') {
+        out = _browse();
       } else if (cmd == 'ping') {
         out = 'lang-pong';
       } else {
@@ -74,4 +77,59 @@ String _declName(String d) {
   m = new RegExp(r'(\w+)\s*[=(]').firstMatch(d);
   if (m != null) return m.group(1);
   return 'anon' + _decls.length.toString();
+}
+
+// A live class browser over this isolate's root library (the user's accepted
+// declarations), via dart:mirrors. Hides harness internals (underscore, main).
+String _browse() {
+  var sb = new StringBuffer();
+  var root = currentMirrorSystem().isolate.rootLibrary;
+  var classes = <String>[], vars = <String>[], funcs = <String>[];
+  root.declarations.forEach((sym, decl) {
+    var name = MirrorSystem.getName(sym);
+    if (name.startsWith('_') || name == 'main') return;
+    if (decl is ClassMirror) {
+      ClassMirror cm = decl;
+      var b = new StringBuffer();
+      b.writeln('class ' + name + ' {');
+      cm.declarations.forEach((s2, d2) {
+        var n2 = MirrorSystem.getName(s2);
+        if (d2 is VariableMirror) {
+          VariableMirror vm = d2;
+          b.writeln('    ' + _typeName(vm.type) + ' ' + n2 + ';');
+        } else if (d2 is MethodMirror) {
+          MethodMirror mm = d2;
+          if (mm.isConstructor) b.writeln('    ' + n2 + '(...)');  // n2 already includes the class name
+          else if (mm.isGetter) b.writeln('    get ' + n2);
+          else if (mm.isSetter) {} // paired with the getter
+          else b.writeln('    ' + n2 + '(...)');
+        }
+      });
+      b.writeln('}');
+      classes.add(b.toString());
+    } else if (decl is MethodMirror && !decl.isGetter && !decl.isSetter) {
+      funcs.add(name + '(...)');
+    } else if (decl is VariableMirror) {
+      VariableMirror vm = decl;
+      vars.add(_typeName(vm.type) + ' ' + name);
+    }
+  });
+  if (classes.isEmpty && vars.isEmpty && funcs.isEmpty) {
+    return '(no declarations yet — Accept some code in the Workspace tab)';
+  }
+  for (var c in classes) sb.writeln(c);
+  if (vars.isNotEmpty) {
+    sb.writeln('— top-level variables —');
+    for (var v in vars) sb.writeln('  ' + v);
+    sb.writeln('');
+  }
+  if (funcs.isNotEmpty) {
+    sb.writeln('— top-level functions —');
+    for (var f in funcs) sb.writeln('  ' + f);
+  }
+  return sb.toString();
+}
+
+String _typeName(TypeMirror t) {
+  try { return MirrorSystem.getName(t.simpleName); } catch (e) { return 'var'; }
 }

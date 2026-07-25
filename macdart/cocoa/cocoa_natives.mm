@@ -24,6 +24,10 @@ extern "C" int macdart_objc_send(void* target, void* sel, int ret_kind,
                                  double out_fpr[4], char* err, int errcap);
 enum { SH_VOID = 0, SH_GPR, SH_FPR, SH_F32, SH_HFA2, SH_HFA4, SH_INTPAIR };
 
+// ObjC autorelease pool primitives (libobjc).
+extern "C" void* objc_autoreleasePoolPush(void);
+extern "C" void objc_autoreleasePoolPop(void*);
+
 namespace dart {
 namespace bin {
 
@@ -44,6 +48,12 @@ static void EnsureFrameworks() {
          RTLD_LAZY | RTLD_GLOBAL);
   dlopen("/System/Library/Frameworks/AppKit.framework/AppKit",
          RTLD_LAZY | RTLD_GLOBAL);
+  // A bottom autorelease pool for this (non-main) thread, so autoreleased
+  // temporaries always have a home (no "autoreleased with no pool" leak). It is
+  // deliberately never popped — scoped drainage is via autoreleasePool()/the
+  // per-event pool once there is a run loop. (When AppKit owns the main thread
+  // we will NOT push here — CF owns main's pool stack.)
+  objc_autoreleasePoolPush();
 }
 
 // Coerce a Dart value to a 64-bit GPR word for a 'g' argument: int -> as-is,
@@ -172,6 +182,15 @@ static void Cocoa_getClass(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, Dart_NewInteger((int64_t)objc_getClass(name)));
 }
 
+// Autorelease pool push/pop (scoped drainage via autoreleasePool()).
+static void Cocoa_poolPush(Dart_NativeArguments args) {
+  EnsureFrameworks();
+  Dart_SetReturnValue(args, Dart_NewInteger((int64_t)objc_autoreleasePoolPush()));
+}
+static void Cocoa_poolPop(Dart_NativeArguments args) {
+  objc_autoreleasePoolPop((void*)IntArg(args, 0));
+}
+
 // objc_retain / objc_release on a handle (memory management for wrappers).
 static void Cocoa_retain(Dart_NativeArguments args) {
   id o = (id)IntArg(args, 0);
@@ -223,6 +242,8 @@ static void Cocoa_nsStringUtf8(Dart_NativeArguments args) {
   V(Cocoa_nsStringUtf8, 1)                                                     \
   V(Cocoa_send, 3)                                                             \
   V(Cocoa_getClass, 1)                                                         \
+  V(Cocoa_poolPush, 0)                                                         \
+  V(Cocoa_poolPop, 1)                                                          \
   V(Cocoa_retain, 1)                                                           \
   V(Cocoa_release, 1)
 

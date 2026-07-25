@@ -24,6 +24,20 @@ int _getClass(String name) native "Cocoa_getClass";
 dynamic _send(int target, String selector, List args) native "Cocoa_send";
 int _retain(int handle) native "Cocoa_retain";
 void _release(int handle) native "Cocoa_release";
+int _poolPush() native "Cocoa_poolPush";
+void _poolPop(int token) native "Cocoa_poolPop";
+
+/// Run [body] inside an Objective-C autorelease pool. Any autoreleased
+/// temporaries created while it runs (bridged NSStrings, `+0` method results)
+/// are released when it returns — the scoped equivalent of MACVM's `poolDo:`.
+void autoreleasePool(void body()) {
+  var token = _poolPush();
+  try {
+    body();
+  } finally {
+    _poolPop(token);
+  }
+}
 
 /// A minimal typed NSString wrapper (Phase 1; still handy for strings).
 class NSString {
@@ -65,21 +79,18 @@ class Cocoa {
     String selector;
     var args = <dynamic>[];
 
-    if (inv.isGetter) {
-      selector = name;                                   // e.g. `obj.frame`
-    } else if (name.contains('_') && named.isEmpty) {
-      // Underscore convention for multi-keyword selectors (reliable — positional
-      // args are ordered, unlike Dart's named args):
-      //   colorWithRed_green_blue_alpha(r,g,b,a)
-      //     -> [x colorWithRed:r green:g blue:b alpha:a]
-      selector = name.replaceAll('_', ':') + ':';
-      args.addAll(pos);
-    } else if (pos.isEmpty && named.isEmpty) {
-      selector = name;                                   // 0-arg, e.g. `alloc()`
+    if (inv.isGetter || (pos.isEmpty && named.isEmpty)) {
+      // A getter or a 0-argument method: bare selector, no colon.
+      //   obj.frame     -> [obj frame]
+      //   obj.alloc()   -> [obj alloc]
+      selector = name;
     } else {
-      // Single keyword (+ optionally ONE named arg — order is then irrelevant):
-      //   stringWithUTF8String(s) -> stringWithUTF8String:
-      //   insertObject(x, atIndex: 0) -> insertObject:atIndex:
+      // A keyword message. The first positional arg belongs to the leading
+      // keyword; each named argument (now in source order — see the VM's
+      // invocation_mirror_patch.dart) adds another `label:` keyword:
+      //   obj.stringWithUTF8String(s)                  -> [obj stringWithUTF8String:s]
+      //   NSColor.colorWithRed(r, green:g, blue:b, alpha:a)
+      //     -> [NSColor colorWithRed:r green:g blue:b alpha:a]
       selector = name + ':';
       args.addAll(pos);
       named.forEach((label, value) {

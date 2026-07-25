@@ -110,7 +110,20 @@ test runner. The full plan and the reasoning behind it are in
 
 ## Licensing
 
-Dart is © the Dart project authors under a BSD-3-Clause license; the extracted
-sources and the built VM remain under that license (`extract.sh` copies it to
-`macdart/LICENSE.dart`). The MACDART port scripts and patches in this repository
-are provided under the same terms.
+The Dart VM and core libraries this project ports are **BSD-3-Clause**:
+*"Copyright 2012, the Dart project authors. All rights reserved."* (the
+no-endorsement clause names Google Inc.). They also carry an **additional patent
+grant** (Dart's `PATENTS` file — a perpetual, royalty-free, irrevocable patent
+license). `extract.sh` preserves both as `macdart/LICENSE.dart` and
+`macdart/PATENTS.dart`.
+
+The one third-party library actually vendored, **double-conversion**, is under
+its own BSD-3-Clause license (*"Copyright 2006-2011, the V8 project authors"*),
+kept in its source directory. The other, more encumbered externals listed in
+Dart's license preamble (NSS, SQLite, 7-Zip, zlib, …) are **not** included:
+this build disables TLS, uses the system zlib via a shim, and extracts only the
+command-line VM subset.
+
+The MACDART port itself — the scripts, the CMake build, and
+`patches/macdart-port.patch` in this repository — is offered under the same
+BSD-3-Clause terms.

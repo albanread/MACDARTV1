@@ -12,6 +12,7 @@
 /macdart/sdk/
 /macdart/tools/
 /macdart/LICENSE.dart
+/macdart/PATENTS.dart
 
 # --- Build outputs ------------------------------------------------------------
 /macdart/build/

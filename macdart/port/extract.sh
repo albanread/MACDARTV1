@@ -69,7 +69,10 @@ cp "$SRC/runtime/dart-runtime.gyp" "$DEST/runtime/dart-runtime.gyp"
 # --- VERSION + license provenance ---
 mkdir -p "$DEST/tools"
 cp "$SRC/tools/VERSION" "$DEST/tools/VERSION"
+# Preserve Dart's license and the accompanying patent grant (BSD-3-Clause +
+# PATENTS). double-conversion carries its own LICENSE inside its copied dir.
 cp "$SRC/LICENSE" "$DEST/LICENSE.dart" 2>/dev/null || true
+cp "$SRC/PATENTS" "$DEST/PATENTS.dart" 2>/dev/null || true
 
 # --- MACDART-owned files that live inside the extracted tree -----------------
 # zlib shim: dart:io's filter.cc includes "zlib/zlib.h" (a vendored path absent

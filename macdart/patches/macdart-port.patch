@@ -63,3 +63,121 @@
  
      entry->set_offset(assembler()->CodeSize());
      BeginCodeSourceRange();
+--- a/runtime/bin/builtin.h	2026-07-25 09:31:56.867549821 +0100
++++ b/runtime/bin/builtin.h	2026-07-25 14:48:03.174245861 +0100
+@@ -29,7 +29,8 @@
+   enum BuiltinLibraryId {
+     kInvalidLibrary = -1,
+     kBuiltinLibrary = 0,
+-    kIOLibrary
++    kIOLibrary,
++    kCocoaLibrary  // MACDART: dart:cocoa native bridge
+   };
+ 
+   // Get source corresponding to built in library specified in 'id'.
+@@ -70,6 +71,7 @@
+   static const char* _builtin_source_paths_[];
+   static const char* io_source_paths_[];
+   static const char* io_patch_paths_[];
++  static const char* cocoa_source_paths_[];  // MACDART: dart:cocoa
+   static const char* html_source_paths_[];
+   static const char* html_common_source_paths_[];
+   static const char* js_source_paths_[];
+--- a/runtime/bin/builtin.cc	2026-07-25 09:31:56.867385154 +0100
++++ b/runtime/bin/builtin.cc	2026-07-25 14:48:15.855560756 +0100
+@@ -18,6 +18,8 @@
+     {DartUtils::kBuiltinLibURL, _builtin_source_paths_, NULL, NULL, true},
+     {DartUtils::kIOLibURL, io_source_paths_, DartUtils::kIOLibPatchURL,
+      io_patch_paths_, true},
++    // MACDART: dart:cocoa — native macOS bridge (always available).
++    {DartUtils::kCocoaLibURL, cocoa_source_paths_, NULL, NULL, true},
+ 
+ #if defined(DART_NO_SNAPSHOT)
+     // Only include these libraries in the dart_bootstrap case for now.
+--- a/runtime/bin/builtin_natives.cc	2026-07-25 09:31:56.867819239 +0100
++++ b/runtime/bin/builtin_natives.cc	2026-07-25 14:54:00.040394390 +0100
+@@ -16,6 +16,7 @@
+ #include "bin/embedded_dart_io.h"
+ #include "bin/file.h"
+ #include "bin/io_natives.h"
++#include "cocoa_natives.h"  // MACDART: dart:cocoa native resolver
+ #include "bin/platform.h"
+ 
+ namespace dart {
+@@ -67,6 +68,10 @@
+   Dart_NativeFunction result =
+       IONativeLookup(name, argument_count, auto_setup_scope);
+   if (result == NULL) {
++    // MACDART: fall through to the dart:cocoa natives.
++    result = CocoaNativeLookup(name, argument_count, auto_setup_scope);
++  }
++  if (result == NULL) {
+     result = Builtin_DummyNative;
+   }
+   return result;
+@@ -81,7 +86,9 @@
+       return reinterpret_cast<const uint8_t*>(entry->name_);
+     }
+   }
+-  return IONativeSymbol(nf);
++  const uint8_t* io_sym = IONativeSymbol(nf);
++  if (io_sym != NULL) return io_sym;
++  return CocoaNativeSymbol(nf);  // MACDART
+ }
+ 
+ 
+--- a/runtime/bin/builtin_nolib.cc	2026-07-25 09:31:56.867876114 +0100
++++ b/runtime/bin/builtin_nolib.cc	2026-07-25 15:02:19.800491023 +0100
+@@ -17,6 +17,8 @@
+     /* { url_, source_, patch_url_, patch_source_, has_natives_ } */
+     {DartUtils::kBuiltinLibURL, NULL, NULL, NULL, true},
+     {DartUtils::kIOLibURL, NULL, NULL, NULL, true},
++    // MACDART: dart:cocoa (source comes from the snapshot; natives resolved here).
++    {DartUtils::kCocoaLibURL, NULL, NULL, NULL, true},
+ 
+     // End marker.
+     {NULL, NULL, NULL, NULL, false}};
+--- a/runtime/bin/dartutils.h	2026-07-25 09:31:56.870498458 +0100
++++ b/runtime/bin/dartutils.h	2026-07-25 14:48:25.581050563 +0100
+@@ -245,6 +245,7 @@
+   static const char* const kIsolateLibURL;
+   static const char* const kIOLibURL;
+   static const char* const kIOLibPatchURL;
++  static const char* const kCocoaLibURL;  // MACDART: dart:cocoa
+   static const char* const kUriLibURL;
+   static const char* const kHttpScheme;
+   static const char* const kVMServiceLibURL;
+--- a/runtime/bin/dartutils.cc	2026-07-25 09:31:56.868629742 +0100
++++ b/runtime/bin/dartutils.cc	2026-07-25 14:48:50.902927052 +0100
+@@ -43,6 +43,7 @@
+ const char* const DartUtils::kIsolateLibURL = "dart:isolate";
+ const char* const DartUtils::kIOLibURL = "dart:io";
+ const char* const DartUtils::kIOLibPatchURL = "dart:io-patch";
++const char* const DartUtils::kCocoaLibURL = "dart:cocoa";  // MACDART
+ const char* const DartUtils::kUriLibURL = "dart:uri";
+ const char* const DartUtils::kHttpScheme = "http:";
+ const char* const DartUtils::kVMServiceLibURL = "dart:vmservice";
+@@ -694,6 +695,10 @@
+   Dart_Handle io_lib = Builtin::LoadAndCheckLibrary(Builtin::kIOLibrary);
+   RETURN_IF_ERROR(io_lib);
+   Builtin::SetNativeResolver(Builtin::kIOLibrary);
++  // MACDART: dart:cocoa — load + wire its native resolver alongside dart:io.
++  Dart_Handle cocoa_lib = Builtin::LoadAndCheckLibrary(Builtin::kCocoaLibrary);
++  RETURN_IF_ERROR(cocoa_lib);
++  Builtin::SetNativeResolver(Builtin::kCocoaLibrary);
+ 
+   // Setup the builtin library in a persistent handle attached the isolate
+   // specific data as we seem to lookup and use builtin lib a lot.
+--- a/runtime/bin/gen_snapshot.cc	2026-07-25 09:31:56.875208476 +0100
++++ b/runtime/bin/gen_snapshot.cc	2026-07-25 15:04:41.684058236 +0100
+@@ -1367,6 +1367,10 @@
+ 
+   Dart_Handle library = LoadGenericSnapshotCreationScript(Builtin::kIOLibrary);
+   CHECK_RESULT(library);
++  // MACDART: load dart:cocoa into the snapshot isolate so it is captured too.
++  Dart_Handle cocoa_lib =
++      LoadGenericSnapshotCreationScript(Builtin::kCocoaLibrary);
++  CHECK_RESULT(cocoa_lib);
+   Dart_Handle result = Dart_FinalizeLoading(false);
+   if (Dart_IsError(result)) {
+     const char* err_msg = Dart_GetError(library);

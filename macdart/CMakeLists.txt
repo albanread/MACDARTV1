@@ -32,6 +32,7 @@ set(RT   ${MACDART_ROOT}/runtime)
 set(SDKLIB ${MACDART_ROOT}/sdk/lib)
 set(PORT ${MACDART_ROOT}/port)
 set(DC   ${RT}/third_party/double-conversion/src)
+set(COCOA ${MACDART_ROOT}/cocoa)   # MACDART-owned dart:cocoa bridge (tracked)
 set(GEN  ${CMAKE_CURRENT_BINARY_DIR}/gen)
 file(MAKE_DIRECTORY ${GEN})
 
@@ -58,7 +59,7 @@ add_compile_definitions(
   $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
 )
 
-include_directories(${RT} ${RT}/include ${DC} ${RT}/third_party)
+include_directories(${RT} ${RT}/include ${DC} ${RT}/third_party ${COCOA})
 
 # Warnings visible but non-fatal. Optimization is build-type driven so a
 # separate Release build dir gives a fast dart (NDEBUG compiles out Dart's
@@ -221,6 +222,17 @@ dart_gen_builtin(builtin_gen.cc dart::bin::Builtin::_builtin_source_paths_ dart:
 dart_sources(IO_DART dart ${SDKLIB}/io/io_sources.gypi)
 dart_gen_builtin(io_gen.cc dart::bin::Builtin::io_source_paths_ dart:io ${IO_DART})
 
+# --- dart:cocoa bridge (MACDART) -------------------------------------------
+# The dart:cocoa library source (cocoa_source_paths_) + its native resolver,
+# packaged as one static lib linked into every executable (the shared bin files
+# builtin.cc / builtin_natives.cc now reference these symbols). Objective-C++
+# natives are compiled MRC (-fno-objc-arc) — the VM owns the ObjC refcount.
+dart_gen_builtin(cocoa_gen.cc dart::bin::Builtin::cocoa_source_paths_ dart:cocoa ${COCOA}/cocoa.dart)
+add_library(dart_cocoa STATIC ${COCOA}/cocoa_natives.mm ${GEN}/cocoa_gen.cc)
+set_source_files_properties(${COCOA}/cocoa_natives.mm PROPERTIES
+  COMPILE_FLAGS "-fno-objc-arc -fobjc-exceptions")
+target_link_libraries(dart_cocoa PUBLIC "-framework Foundation" "-framework AppKit")
+
 dart_sources(IO_PATCH_DART dart ${RT}/bin/io_sources.gypi)
 dart_gen_builtin(io_patch_gen.cc dart::bin::Builtin::io_patch_paths_ dart:io ${IO_PATCH_DART})
 
@@ -274,7 +286,7 @@ add_executable(dart_bootstrap
   ${RT}/bin/vmservice_impl.cc ${PORT}/macdart_browser_stubs.cc
   ${GEN}/builtin_gen.cc ${GEN}/io_gen.cc ${GEN}/io_patch_gen.cc ${GEN}/resources_gen.cc)
 target_compile_definitions(dart_bootstrap PRIVATE DART_NO_SNAPSHOT)
-target_link_libraries(dart_bootstrap PRIVATE dart_io dart_builtin dart_engine_nosnap z ${MACOS_FRAMEWORKS})
+target_link_libraries(dart_bootstrap PRIVATE dart_io dart_builtin dart_cocoa dart_engine_nosnap z ${MACOS_FRAMEWORKS})
 target_link_options(dart_bootstrap PRIVATE -rdynamic)
 
 # --- gen_snapshot: emits the core VM + isolate snapshots --------------------
@@ -286,7 +298,7 @@ add_executable(gen_snapshot
   ${PORT}/macdart_browser_stubs.cc
   ${GEN}/builtin_gen.cc ${GEN}/io_gen.cc ${GEN}/io_patch_gen.cc ${GEN}/resources_gen.cc)
 target_compile_definitions(gen_snapshot PRIVATE DART_NO_SNAPSHOT PLATFORM_DISABLE_SOCKET)
-target_link_libraries(gen_snapshot PRIVATE dart_io dart_builtin dart_engine_nosnap z ${MACOS_FRAMEWORKS})
+target_link_libraries(gen_snapshot PRIVATE dart_io dart_builtin dart_cocoa dart_engine_nosnap z ${MACOS_FRAMEWORKS})
 
 # --- Snapshot pipeline: gen_snapshot -> .bin -> snapshot_gen.cc -------------
 add_custom_command(
@@ -315,7 +327,7 @@ add_executable(dart
   ${RT}/bin/main.cc ${RT}/bin/loader.cc ${RT}/bin/snapshot_utils.cc
   ${RT}/bin/observatory_assets_empty.cc ${RT}/bin/vmservice_impl.cc
   ${GEN}/snapshot_gen.cc ${GEN}/resources_gen.cc)
-target_link_libraries(dart PRIVATE dart_io dart_builtin dart_engine_snap z ${MACOS_FRAMEWORKS})
+target_link_libraries(dart PRIVATE dart_io dart_builtin dart_cocoa dart_engine_snap z ${MACOS_FRAMEWORKS})
 target_link_options(dart PRIVATE -rdynamic)
 
 # Report the compile set size at configure time.

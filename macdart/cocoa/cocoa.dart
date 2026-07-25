@@ -58,15 +58,25 @@ void autoreleasePool(void body()) {
   }
 }
 
-// --- Reverse callbacks (target-action) --------------------------------------
+// --- Reverse callbacks (target-action, delegates, table sources) ------------
 // AppKit controls call back into Dart. A ticket keys the Dart handler; the
 // native side stores only the ticket (never a Dart handle). See cocoa_callbacks.mm.
 
 /// A control-action handler; [sender] is the control that fired.
 typedef void CocoaAction(Cocoa sender);
+typedef int RowCountFn();
+typedef String CellFn(int row);
+typedef void SelectFn(int row);
+
+class _TableSource {
+  final RowCountFn rowCount;
+  final CellFn cellAt;
+  final SelectFn onSelect;
+  _TableSource(this.rowCount, this.cellAt, this.onSelect);
+}
 
 int _cbNext = 1;
-final Map<int, CocoaAction> _cbHandlers = <int, CocoaAction>{};
+final Map<int, dynamic> _cbHandlers = <int, dynamic>{};   // CocoaAction | _TableSource
 bool _cbDispatchRegistered = false;
 
 void _registerCallbackDispatch(Function f) native "Cocoa_registerCallbackDispatch";
@@ -74,18 +84,31 @@ int _makeActionTarget(int ticket) native "Cocoa_makeActionTarget";
 void _wireAction(int control, int target) native "Cocoa_wireAction";
 
 // The single entry every native callback funnels through (see cocoa_callbacks.mm).
-void _cocoaDispatch(int ticket, int sender) {
-  var fn = _cbHandlers[ticket];
-  if (fn != null) fn(new Cocoa._adopt(sender));
+// kind: 0 action, 1 textDidChange, 2 tableRowCount, 3 tableValue(arg=row),
+// 4 tableSelect(arg=row). Returns void for 0/1/4, an int for 2, a String for 3.
+dynamic _cocoaDispatch(int ticket, int kind, int arg) {
+  var h = _cbHandlers[ticket];
+  if (h == null) return null;
+  if (kind <= 1) { if (h is CocoaAction) h(new Cocoa._adopt(arg)); return null; }
+  if (h is _TableSource) {
+    if (kind == 2) return h.rowCount();
+    if (kind == 3) return h.cellAt(arg);
+    if (kind == 4) { h.onSelect(arg); return null; }
+  }
+  return null;
+}
+
+void _ensureDispatch() {
+  if (!_cbDispatchRegistered) {
+    _registerCallbackDispatch(_cocoaDispatch);
+    _cbDispatchRegistered = true;
+  }
 }
 
 /// Wire [control]'s action to [fn] (e.g. an `NSButton`'s click). Returns the
 /// target object; AppKit holds targets weakly, so keep a reference to it alive.
 Cocoa onAction(Cocoa control, CocoaAction fn) {
-  if (!_cbDispatchRegistered) {
-    _registerCallbackDispatch(_cocoaDispatch);
-    _cbDispatchRegistered = true;
-  }
+  _ensureDispatch();
   var ticket = _cbNext++;
   _cbHandlers[ticket] = fn;
   var target = new Cocoa._adopt(_makeActionTarget(ticket));
@@ -94,17 +117,26 @@ Cocoa onAction(Cocoa control, CocoaAction fn) {
 }
 
 /// Wire [textView]'s text-change notification (`textDidChange:`) to [fn] — e.g.
-/// to re-highlight as the user types. Returns the delegate; AppKit holds it
-/// weakly, so keep a reference alive.
+/// to re-highlight as the user types. Keep the returned delegate alive.
 Cocoa onTextChange(Cocoa textView, CocoaAction fn) {
-  if (!_cbDispatchRegistered) {
-    _registerCallbackDispatch(_cocoaDispatch);
-    _cbDispatchRegistered = true;
-  }
+  _ensureDispatch();
   var ticket = _cbNext++;
   _cbHandlers[ticket] = fn;
   var target = new Cocoa._adopt(_makeActionTarget(ticket));
   textView.setDelegate(target);
+  return target;
+}
+
+/// Make [tableView] data-driven: [rowCount] rows, [cellAt] gives a row's text,
+/// [onSelect] fires when the selection changes. Returns the source object — keep
+/// it alive. Call `tableView.reloadData()` after the underlying data changes.
+Cocoa onTable(Cocoa tableView, RowCountFn rowCount, CellFn cellAt, SelectFn onSelect) {
+  _ensureDispatch();
+  var ticket = _cbNext++;
+  _cbHandlers[ticket] = new _TableSource(rowCount, cellAt, onSelect);
+  var target = new Cocoa._adopt(_makeActionTarget(ticket));
+  tableView.setDataSource(target);
+  tableView.setDelegate(target);
   return target;
 }
 
@@ -116,6 +148,26 @@ void _applySpans(int textStorage, List spans) native "Cocoa_applySpans";
 /// indices), which is exactly what `NSRange` wants.
 void applySpans(Cocoa textView, List spans) {
   _applySpans(textView.textStorage().handle, spans);
+}
+
+// --- SQLite image store (macOS libsqlite3) ----------------------------------
+int _sqlOpen(String path) native "Sqlite_open";
+void _sqlClose(int db) native "Sqlite_close";
+String _sqlExec(int db, String sql, List params) native "Sqlite_exec";
+List _sqlQuery(int db, String sql, List params) native "Sqlite_query";
+
+/// A minimal SQLite handle. Parameterised (`?`) queries only — never
+/// string-concatenate SQL. The workspace's "image" (user-app source) lives here.
+class Db {
+  final int _h;
+  const Db._(this._h);
+  factory Db.open(String path) => new Db._(_sqlOpen(path));
+  bool get isOpen => _h != 0;
+  /// A non-SELECT statement (CREATE/INSERT/UPDATE/DELETE). "" ok, else "ERR: …".
+  String exec(String sql, [List params = const []]) => _sqlExec(_h, sql, params);
+  /// A SELECT — rows as a `List<List<String>>` (null on prepare error).
+  List query(String sql, [List params = const []]) => _sqlQuery(_h, sql, params);
+  void close() => _sqlClose(_h);
 }
 
 /// A minimal typed NSString wrapper (Phase 1; still handy for strings).

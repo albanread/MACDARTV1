@@ -349,6 +349,12 @@ void Cocoa_makeActionTarget(Dart_NativeArguments args);
 void Cocoa_wireAction(Dart_NativeArguments args);
 void Cocoa_applySpans(Dart_NativeArguments args);
 
+// SQLite image store (defined in sqlite_natives.cc).
+void Sqlite_open(Dart_NativeArguments args);
+void Sqlite_close(Dart_NativeArguments args);
+void Sqlite_exec(Dart_NativeArguments args);
+void Sqlite_query(Dart_NativeArguments args);
+
 #define COCOA_NATIVE_LIST(V)                                                   \
   V(Cocoa_getpid, 0)                                                           \
   V(Cocoa_nsStringFromCString, 1)                                              \
@@ -366,7 +372,11 @@ void Cocoa_applySpans(Dart_NativeArguments args);
   V(Cocoa_registerCallbackDispatch, 1)                                         \
   V(Cocoa_makeActionTarget, 1)                                                 \
   V(Cocoa_wireAction, 2)                                                       \
-  V(Cocoa_applySpans, 2)
+  V(Cocoa_applySpans, 2)                                                       \
+  V(Sqlite_open, 1)                                                            \
+  V(Sqlite_close, 1)                                                           \
+  V(Sqlite_exec, 3)                                                            \
+  V(Sqlite_query, 3)
 
 static struct CocoaEntry {
   const char* name_;

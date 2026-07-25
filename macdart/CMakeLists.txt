@@ -234,10 +234,11 @@ add_library(dart_cocoa STATIC
   ${COCOA}/objc_shim.m         # fixed-shape AAPCS64 dispatch shim
   ${COCOA}/cocoa_abi.cc        # @encode -> ABI-token classifier
   ${COCOA}/workspace_natives.cc # live-workspace eval primitives (Dart_EvaluateExpr)
+  ${COCOA}/sqlite_natives.cc   # SQLite image store (libsqlite3)
   ${GEN}/cocoa_gen.cc)         # dart:cocoa library source array
 set_source_files_properties(${COCOA}/cocoa_natives.mm ${COCOA}/cocoa_callbacks.mm ${COCOA}/objc_shim.m
   PROPERTIES COMPILE_FLAGS "-fno-objc-arc -fobjc-exceptions")
-target_link_libraries(dart_cocoa PUBLIC "-framework Foundation" "-framework AppKit")
+target_link_libraries(dart_cocoa PUBLIC "-framework Foundation" "-framework AppKit" sqlite3)
 
 dart_sources(IO_PATCH_DART dart ${RT}/bin/io_sources.gypi)
 dart_gen_builtin(io_patch_gen.cc dart::bin::Builtin::io_patch_paths_ dart:io ${IO_PATCH_DART})

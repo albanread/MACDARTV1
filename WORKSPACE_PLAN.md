@@ -276,12 +276,28 @@ stale generation / re-entrancy. Trampoline: `Dart_EnterIsolate(ui)` +
   `dart:mirrors` caches class metadata, so the reflection-based Browser shows a
   class as first reflected — fields added by a later reload don't appear (the
   class IS updated; do-its see it). → the Smalltalk browser below is source-based.
-- **M7 — Smalltalk-style class browser** (in progress): replace the Browser text
-  dump with a multi-pane browser (Libraries │ Classes │ members-by-kind │ members)
-  + a source pane with Accept/Cancel, driven from the accepted SOURCE (`_decls`,
-  always current — sidesteps the mirrors staleness). Needs a new native: NSTableView
-  data-source support (return-value delegate IMPs) — the C6 role from MACVM's
-  objc_delegate.rs. Then Docs via markdown, Find/senders, debug reload assert.
+- **M7 — Smalltalk-style class browser** (in progress). Architecture (locked with
+  the user): **world = the VM snapshot** (dart:core etc.); **user app = source in a
+  SQLite "image" loaded on top**. Browser = World (read-only via mirrors — base
+  libs never reload, so no staleness) + User App (editable, from SQLite) → class →
+  members → source; Accept commits to the image + hot-reloads.
+  - **Foundations ✅ DONE & tested:**
+    - **SQLite image store** — `sqlite_natives.cc` (libsqlite3, linked) + a `Db`
+      wrapper in cocoa.dart (`open`/`exec`/`query`, parameterised binding). Verified:
+      create/insert/query; source with embedded quotes stored intact; real .sqlite
+      on disk.
+    - **Table data-source callbacks** (the C6 return-value role) — `cocoa_callbacks.mm`
+      now has one unified 3-arg dispatch (`_cocoaDispatch(ticket, kind, arg)`) that
+      can RETURN values, plus `numberOfRowsInTableView:`,
+      `tableView:objectValueForTableColumn:row:`, `tableViewSelectionDidChange:`.
+      Dart API `onTable(table, rowCount, cellAt, onSelect)`. Verified: a cell-based
+      NSTableView renders a Dart list.
+  - **Remaining:** (a) wire the language isolate to the SQLite image — boot loads
+    user decls from the DB over the snapshot, Accept UPSERTs + reloads, watchdog
+    respawn re-reads the DB (drops the in-memory gAccepted replay); (b) the
+    multi-pane browser UI (categories/World+UserApp │ classes │ members │ source +
+    Accept) on `onTable`; (c) member parsing + per-member source. Then Docs
+    (markdown), Find/senders, the debug reload assert.
 
 ### Repo layout (new)
 - `macdart/cocoa/cocoa_host.mm` — the thread-0 GUI host (M1/M2). Linked only into

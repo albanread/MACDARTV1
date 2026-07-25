@@ -1,0 +1,65 @@
+--- a/runtime/vm/cpu_arm64.cc	2026-07-25 09:31:56.964145986 +0100
++++ b/runtime/vm/cpu_arm64.cc	2026-07-25 10:21:17.749227387 +0100
+@@ -16,6 +16,13 @@
+ #include <unistd.h>      /* NOLINT */
+ #endif
+ 
++// MACDART: on Apple silicon the JIT patches code at runtime, so the I-cache
++// must be flushed via Darwin's sys_icache_invalidate. (Upstream iOS is AOT and
++// never reaches FlushICache; macOS JIT does.) Mirrors Dart 2.14.4.
++#if defined(HOST_OS_MACOS)
++#include <libkern/OSCacheControl.h>
++#endif
++
+ namespace dart {
+ 
+ void CPU::FlushICache(uword start, uword size) {
+@@ -38,8 +45,11 @@
+   char* beg = reinterpret_cast<char*>(start);
+   char* end = reinterpret_cast<char*>(start + size);
+   ::__clear_cache(beg, end);
++#elif defined(HOST_OS_MACOS)
++  // MACDART: Darwin split I/D cache flush for JIT-emitted arm64 code.
++  sys_icache_invalidate(reinterpret_cast<void*>(start), size);
+ #else
+-#error FlushICache only tested/supported on Android, Fuchsia, and Linux
++#error FlushICache only tested/supported on Android, Fuchsia, Linux, and macOS
+ #endif
+ 
+ #endif
+--- a/runtime/vm/stub_code_arm64.cc	2026-07-25 09:31:57.000588919 +0100
++++ b/runtime/vm/stub_code_arm64.cc	2026-07-25 11:21:15.932638215 +0100
+@@ -488,6 +488,15 @@
+       COMPILE_ASSERT(R25 > CODE_REG);
+       __ ldr(R25, Address(FP, 2 * kWordSize));
+       __ str(R25, Address(SP, -1 * kWordSize, Address::PreIndex));
++    } else if (r == SP) {
++      // MACDART: SP (R15 in Dart code) as both source and base with writeback,
++      // i.e. `str SP, [SP, #-8]!`, is Rt==Rn — ARM CONSTRAINED UNPREDICTABLE.
++      // Apple Silicon traps it as an illegal instruction (other ARM cores
++      // execute it). R25 was already pushed above (R25 > SP), so use it as a
++      // scratch holding SP's value.
++      COMPILE_ASSERT(R25 > SP);
++      __ mov(R25, SP);
++      __ str(R25, Address(SP, -1 * kWordSize, Address::PreIndex));
+     } else {
+       __ str(r, Address(SP, -1 * kWordSize, Address::PreIndex));
+     }
+--- a/runtime/vm/flow_graph_compiler.cc	2026-07-25 09:31:56.970509094 +0100
++++ b/runtime/vm/flow_graph_compiler.cc	2026-07-25 13:11:54.898057654 +0100
+@@ -537,7 +537,14 @@
+     }
+ #endif
+ 
+-    LoopInfoComment(assembler(), *entry, *loop_headers);
++    // MACDART: loop_headers is only non-NULL when EmittingComments() (see top
++    // of VisitBlocks). The original unconditionally formed `*loop_headers`,
++    // which is undefined behavior on the NULL (comments-off) path; clang 17's
++    // optimizer exploits it and drops LoopInfoComment's internal guard, causing
++    // a NULL deref. Guard the call so the reference is never formed on NULL.
++    if (Assembler::EmittingComments()) {
++      LoopInfoComment(assembler(), *entry, *loop_headers);
++    }
+ 
+     entry->set_offset(assembler()->CodeSize());
+     BeginCodeSourceRange();

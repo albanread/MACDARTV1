@@ -1,32 +1,104 @@
-// dart:cocoa — MACDART's native macOS bridge (Phase 1).
+// dart:cocoa — MACDART's native macOS bridge.
 //
-// A bootstrap library (wired like dart:io) whose `native` functions call into
-// the ObjC runtime via the VM. Phase 1 proves the pipeline end-to-end: a POSIX
-// call and a real NSString round-trip. The general dynamic send + noSuchMethod
-// ergonomic layer arrives in later phases (see MACDART/COCOA_PLAN.md).
+// A bootstrap library (wired like dart:io). Phase 1 proved the pipeline with a
+// POSIX call and a typed NSString round-trip; Phase 2/3 adds the GENERAL
+// dynamic send: `noSuchMethod` forwards any Dart method call to objc_msgSend,
+// with the method's AAPCS64 argument/return marshaling driven by the runtime
+// @encode. See MACDART/COCOA_PLAN.md.
 library dart.cocoa;
+
+import 'dart:mirrors' show MirrorSystem;
 
 /// The process id — a POSIX FFI smoke test (getpid()).
 int processId() native "Cocoa_getpid";
 
-// --- Phase-1 NSString round-trip (typed sends; validates class/sel/msgSend) --
+// --- Low-level natives ------------------------------------------------------
 int _nsStringFromCString(String s) native "Cocoa_nsStringFromCString";
 int _nsStringLength(int handle) native "Cocoa_nsStringLength";
 String _nsStringUtf8(int handle) native "Cocoa_nsStringUtf8";
 
-/// A minimal NSString wrapper over a retained ObjC id (held as an int handle).
-/// Phase 1 keeps this hand-written; later phases replace it with a noSuchMethod
-/// proxy so any selector works without a per-method binding.
+int _getClass(String name) native "Cocoa_getClass";
+/// The general dynamic send: [target] id, [selector] like "colorWithRed:...:",
+/// [args] the ordered arguments. Returns int (id/integer), double, a List of
+/// numbers (struct), or null (void), per the method's return type.
+dynamic _send(int target, String selector, List args) native "Cocoa_send";
+int _retain(int handle) native "Cocoa_retain";
+void _release(int handle) native "Cocoa_release";
+
+/// A minimal typed NSString wrapper (Phase 1; still handy for strings).
 class NSString {
   final int handle;
   const NSString.fromHandle(this.handle);
   factory NSString(String s) => new NSString.fromHandle(_nsStringFromCString(s));
-
-  /// -[NSString length]
   int get length => _nsStringLength(handle);
-
-  /// -[NSString UTF8String] back to a Dart string.
   String toUtf8() => _nsStringUtf8(handle);
-
   String toString() => toUtf8();
+}
+
+/// A dynamically-dispatched Objective-C object.
+///
+/// Any method you call is forwarded to `objc_msgSend` via [noSuchMethod]. Dart
+/// named arguments become the ObjC keyword-selector parts, so this:
+///
+///     final c = NSColor.colorWithRed(1.0, green: 0.0, blue: 0.0, alpha: 1.0);
+///
+/// sends `[NSColor colorWithRed:1.0 green:0.0 blue:0.0 alpha:1.0]`. Object
+/// results come back as raw id handles (ints) — wrap them in a [Cocoa] to keep
+/// sending; struct results (NSRect/NSRange) come back as a `List` of numbers.
+class Cocoa {
+  final int handle;
+  Cocoa(this.handle);
+
+  /// Look up a class by name — the receiver for class methods.
+  static Cocoa cls(String name) => new Cocoa(_getClass(name));
+
+  bool get isNil => handle == 0;
+
+  /// Send [selector] with [args] explicitly (bypassing noSuchMethod).
+  dynamic send(String selector, [List args = const []]) =>
+      _send(handle, selector, _unwrap(args));
+
+  dynamic noSuchMethod(Invocation inv) {
+    var name = MirrorSystem.getName(inv.memberName);
+    var pos = inv.positionalArguments;
+    var named = inv.namedArguments;
+    String selector;
+    var args = <dynamic>[];
+
+    if (inv.isGetter) {
+      selector = name;                                   // e.g. `obj.frame`
+    } else if (name.contains('_') && named.isEmpty) {
+      // Underscore convention for multi-keyword selectors (reliable — positional
+      // args are ordered, unlike Dart's named args):
+      //   colorWithRed_green_blue_alpha(r,g,b,a)
+      //     -> [x colorWithRed:r green:g blue:b alpha:a]
+      selector = name.replaceAll('_', ':') + ':';
+      args.addAll(pos);
+    } else if (pos.isEmpty && named.isEmpty) {
+      selector = name;                                   // 0-arg, e.g. `alloc()`
+    } else {
+      // Single keyword (+ optionally ONE named arg — order is then irrelevant):
+      //   stringWithUTF8String(s) -> stringWithUTF8String:
+      //   insertObject(x, atIndex: 0) -> insertObject:atIndex:
+      selector = name + ':';
+      args.addAll(pos);
+      named.forEach((label, value) {
+        selector += MirrorSystem.getName(label) + ':';
+        args.add(value);
+      });
+    }
+    return _send(handle, selector, _unwrap(args));
+  }
+
+  static List _unwrap(List args) {
+    // Let callers pass Cocoa objects as arguments; send their id handles.
+    var out = new List(args.length);
+    for (var i = 0; i < args.length; i++) {
+      var a = args[i];
+      out[i] = (a is Cocoa) ? a.handle : a;
+    }
+    return out;
+  }
+
+  String toString() => 'Cocoa(0x${handle.toRadixString(16)})';
 }

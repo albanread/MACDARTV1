@@ -48,6 +48,12 @@ int macdart_objc_send(void* target, void* sel, int ret_kind,
         out_fpr[0] = fn(t,c, g[0],g[1],g[2],g[3],g[4],g[5],
            f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7], s[0],s[1],s[2],s[3]);
         break; }
+      case RET_HFA2: {  // NSPoint / NSSize: {double x2} comes back in d0..d1
+        Hfa2 (*fn)(SHAPE) = (Hfa2(*)(SHAPE))objc_msgSend;
+        Hfa2 r = fn(t,c, g[0],g[1],g[2],g[3],g[4],g[5],
+           f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7], s[0],s[1],s[2],s[3]);
+        out_fpr[0]=r.d0; out_fpr[1]=r.d1;
+        break; }
       case RET_HFA4: {  // NSRect etc.: {double x4} comes back in d0..d3
         Hfa4 (*fn)(SHAPE) = (Hfa4(*)(SHAPE))objc_msgSend;
         Hfa4 r = fn(t,c, g[0],g[1],g[2],g[3],g[4],g[5],

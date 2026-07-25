@@ -228,9 +228,13 @@ dart_gen_builtin(io_gen.cc dart::bin::Builtin::io_source_paths_ dart:io ${IO_DAR
 # builtin.cc / builtin_natives.cc now reference these symbols). Objective-C++
 # natives are compiled MRC (-fno-objc-arc) — the VM owns the ObjC refcount.
 dart_gen_builtin(cocoa_gen.cc dart::bin::Builtin::cocoa_source_paths_ dart:cocoa ${COCOA}/cocoa.dart)
-add_library(dart_cocoa STATIC ${COCOA}/cocoa_natives.mm ${GEN}/cocoa_gen.cc)
-set_source_files_properties(${COCOA}/cocoa_natives.mm PROPERTIES
-  COMPILE_FLAGS "-fno-objc-arc -fobjc-exceptions")
+add_library(dart_cocoa STATIC
+  ${COCOA}/cocoa_natives.mm    # resolver + natives (incl. the general _send)
+  ${COCOA}/objc_shim.m         # fixed-shape AAPCS64 dispatch shim
+  ${COCOA}/cocoa_abi.cc        # @encode -> ABI-token classifier
+  ${GEN}/cocoa_gen.cc)         # dart:cocoa library source array
+set_source_files_properties(${COCOA}/cocoa_natives.mm ${COCOA}/objc_shim.m
+  PROPERTIES COMPILE_FLAGS "-fno-objc-arc -fobjc-exceptions")
 target_link_libraries(dart_cocoa PUBLIC "-framework Foundation" "-framework AppKit")
 
 dart_sources(IO_PATCH_DART dart ${RT}/bin/io_sources.gypi)

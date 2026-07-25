@@ -31,6 +31,8 @@ main(List args, SendPort uiPort) {
         out = _doit(arg);
       } else if (cmd == 'accept') {
         out = _accept(arg);
+      } else if (cmd == 'reset') {
+        out = _reset(arg);   // arg is a List<String> of declarations (replay)
       } else if (cmd == 'browse') {
         out = _browse();
       } else if (cmd == 'ping') {
@@ -60,14 +62,31 @@ String _doit(String code) {
 String _accept(String decl) {
   var name = _declName(decl);
   _decls[name] = decl.trim();
+  var err = _rebuildAndReload();
+  return err.isEmpty ? ('accepted ' + name) : err;
+}
+
+// Replace the whole declaration set at once (used by the UI's watchdog to
+// replay the accepted declarations into a freshly respawned isolate).
+String _reset(List decls) {
+  _decls.clear();
+  for (var d in decls) {
+    var s = d.toString();
+    _decls[_declName(s)] = s.trim();
+  }
+  var err = _rebuildAndReload();
+  return err.isEmpty ? ('reset (' + _decls.length.toString() + ' decls)') : err;
+}
+
+// Regenerate the USER region from _decls and hot-reload. Returns "" or "ERR:…".
+String _rebuildAndReload() {
   var region = _decls.values.join('\n\n');
   var text = new File(_scratch).readAsStringSync();
   var s = text.indexOf(_begin) + _begin.length;
   var e = text.indexOf(_end);
-  var updated = text.substring(0, s) + '\n' + region + '\n' + text.substring(e);
-  new File(_scratch).writeAsStringSync(updated);
-  var err = wsReload();
-  return err.isEmpty ? ('accepted ' + name) : err;
+  new File(_scratch).writeAsStringSync(
+      text.substring(0, s) + '\n' + region + '\n' + text.substring(e));
+  return wsReload();
 }
 
 String _declName(String d) {

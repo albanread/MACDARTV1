@@ -258,9 +258,17 @@ stale generation / re-entrancy. Trampoline: `Dart_EnterIsolate(ui)` +
   and **Docs**. Toolbar buttons call `selectTabViewItemAtIndex:`; socket `tab <n>`
   drives it. No new native — all via the existing bridge. Demonstrated +
   snapshotted all three tabs. (Deferred: window-resize reflow / autoresizing.)
+- **Watchdog** ✅ DONE: the UI isolate time-boxes every request to the language
+  isolate (`ask` + `Future.timeout`); on a timeout — a runaway do-it like
+  `while(true){}` — it `Isolate.kill(IMMEDIATE)`s and respawns from the scratch
+  file, then replays the accepted declarations via a batched `reset` command
+  (respawn-from-source, MACVM's supervisor). Also monitors `onExit`/`onError`.
+  Proven: `while(true){}` → killed after 6s, isolate restarted, `Counter` (an
+  accepted class) survived, next do-it works, no leaked process. Live object
+  state is an honest clean loss.
 - **M7+ — a richer Browser** (NSTableView panes via table data-source delegates
-  vs the current text dump), Docs via markdown, Find/senders, the watchdog, and
-  smoothing the debug reload assert — grown as needed.
+  vs the current text dump), Docs via markdown, Find/senders, and smoothing the
+  debug reload assert — grown as needed.
 
 ### Repo layout (new)
 - `macdart/cocoa/cocoa_host.mm` — the thread-0 GUI host (M1/M2). Linked only into

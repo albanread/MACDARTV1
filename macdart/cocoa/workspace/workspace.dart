@@ -16,6 +16,15 @@ List<String> gLog = <String>[];
 Map<String, Cocoa> gButtons = <String, Cocoa>{};
 List<Cocoa> gTargets = <Cocoa>[];      // keep action targets/delegates alive
 
+// Language-isolate watchdog state.
+Isolate gLangIsolate;
+String gScratch;                       // the language isolate's scratch root file
+List<String> gAccepted = <String>[];   // declarations to replay after a respawn
+bool gRespawning = false;
+int gLangGen = 0;                      // generation, to ignore stale exit events
+final Object _kTimeout = new Object();
+const Duration _kDoitTimeout = const Duration(seconds: 6);
+
 Cocoa _mono(double sz) => Cocoa.cls("NSFont").userFixedPitchFontOfSize(sz);
 
 Cocoa button(Cocoa parent, String title, List frame, CocoaAction fn) {
@@ -277,12 +286,65 @@ void buildMenu() {
   app.setMainMenu(mainMenu);
 }
 
+// Time-boxed request to the language isolate. If it doesn't reply in time the
+// isolate is presumed hung (a runaway do-it), and the watchdog kills + respawns
+// it so the workspace can never wedge.
 Future<String> ask(String cmd, String arg) async {
+  if (gLang == null) return "ERR: language isolate restarting…";
   var rp = new ReceivePort();
   gLang.send([cmd, arg, rp.sendPort]);
-  var result = await rp.first;
+  var result = await rp.first.timeout(_kDoitTimeout, onTimeout: () => _kTimeout);
   rp.close();
+  if (identical(result, _kTimeout)) {
+    await respawnLanguage("'" + cmd + "' timed out — killed runaway code");
+    return "ERR: " + cmd + " timed out (isolate restarted)";
+  }
   return result;
+}
+
+// Spawn the language isolate from the scratch file, with error/exit monitoring.
+Future spawnLanguage() async {
+  var gen = ++gLangGen;
+  var fromLang = new ReceivePort();
+  var errPort = new ReceivePort();
+  var exitPort = new ReceivePort();
+  gLangIsolate = await Isolate.spawnUri(
+      Uri.parse('file://' + gScratch), <String>[gScratch], fromLang.sendPort,
+      onError: errPort.sendPort, onExit: exitPort.sendPort, errorsAreFatal: false);
+  gLang = await fromLang.first;
+  fromLang.close();
+  errPort.listen((e) {
+    var m = (e is List && e.length > 0) ? e[0].toString() : e.toString();
+    log("⚠ language error: " + m);
+  });
+  exitPort.listen((_) {
+    exitPort.close();
+    if (gen == gLangGen && !gRespawning) {
+      respawnLanguage("language isolate exited unexpectedly");
+    }
+  });
+}
+
+// Kill the (possibly hung) language isolate and start a fresh one, replaying the
+// accepted declarations from source — MACVM's supervisor pattern. Live object
+// state is an honest clean loss; declarations come back.
+Future respawnLanguage(String why) async {
+  if (gRespawning) return;
+  gRespawning = true;
+  log("⚠ " + why + " — restarting language isolate…");
+  gLang = null;
+  try { if (gLangIsolate != null) gLangIsolate.kill(priority: Isolate.IMMEDIATE); } catch (e) {}
+  await spawnLanguage();
+  if (gAccepted.length > 0) {
+    var rp = new ReceivePort();
+    gLang.send(['reset', gAccepted, rp.sendPort]);
+    await rp.first.timeout(_kDoitTimeout, onTimeout: () => null);
+    rp.close();
+  }
+  gRespawning = false;
+  log("language isolate restarted" +
+      (gAccepted.length > 0 ? " (" + gAccepted.length.toString() + " declarations reloaded)" : ""));
+  updateMetrics();
 }
 
 Future<String> snapshot(String path) async {
@@ -316,7 +378,12 @@ Future<String> handle(String line) async {
       b.performClick(null);
       return "clicked " + arg;
     case 'doit': return await ask('doit', arg);
-    case 'accept': return await ask('accept', arg);
+    case 'accept': {
+      var r = await ask('accept', arg);
+      if (r.startsWith('accepted')) gAccepted.add(arg);   // remember for respawn replay
+      return r;
+    }
+    case 'kill': await respawnLanguage("manual kill"); return "ok";
     case 'quit':
       Cocoa.cls("NSApplication").sharedApplication().terminate(null); return "ok";
     default: return "ERR: unknown " + cmd;
@@ -354,14 +421,9 @@ main() async {
   // The language isolate hot-reloads (rewrites) its own root file, so spawn it
   // from a MUTABLE COPY of the tracked language.dart template, never the source.
   var templatePath = Platform.script.resolve('language.dart').toFilePath();
-  var scratch = Directory.systemTemp.path + '/macdart_ws_lang.dart';
-  new File(scratch).writeAsStringSync(new File(templatePath).readAsStringSync());
-
-  var fromLang = new ReceivePort();
-  await Isolate.spawnUri(
-      Uri.parse('file://' + scratch), <String>[scratch], fromLang.sendPort);
-  gLang = await fromLang.first;
-  fromLang.close();
+  gScratch = Directory.systemTemp.path + '/macdart_ws_lang.dart';
+  new File(gScratch).writeAsStringSync(new File(templatePath).readAsStringSync());
+  await spawnLanguage();
   log("language isolate ready");
 
   var server = await ServerSocket.bind(InternetAddress.LOOPBACK_IP_V4, 7644);

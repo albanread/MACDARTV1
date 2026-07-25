@@ -177,7 +177,9 @@ Cocoa tableIn(Cocoa parent, List frame) {
 }
 
 void buildBrowserTab(Cocoa br) {
-  // instance/class toggle (over the member panes).
+  // create buttons (left) + instance/class toggle (over the member panes).
+  button(br, "+ Class", [8.0, 394.0, 78.0, 22.0], (s) => newClass());
+  button(br, "+ Method", [90.0, 394.0, 90.0, 22.0], (s) => newMethod());
   button(br, "instance", [372.0, 394.0, 84.0, 22.0], (s) => setSide('i'));
   button(br, "class", [460.0, 394.0, 66.0, 22.0], (s) => setSide('c'));
 
@@ -290,18 +292,24 @@ void browserAccept() {
     ask('setcomment', [name, text]).then((r) { gBrClassComment = text; log("✓ comment saved — " + name); });
     return;
   }
-  if (gBrMode == 'source' && gSelMemberSrc != null && gSelMemberSrc.length > 0 && gBrClassSrc != null) {
-    var newClass = _replaceOnce(gBrClassSrc, gSelMemberSrc, text);   // edit one member
+  // Source mode + a selected class: edit an existing member (replace) or add a
+  // new one (insert before the class's closing brace).
+  if (gBrMode == 'source' && gBrSelClass != null && gBrClassSrc != null) {
+    var newClass = (gSelMemberSrc != null && gSelMemberSrc.length > 0)
+        ? _replaceOnce(gBrClassSrc, gSelMemberSrc, text)
+        : _insertMember(gBrClassSrc, text);
+    gSelMemberSrc = text;
     ask('acceptMany', [newClass]).then((r) {
       log("✓ Accept — " + r);
-      gBrClassSrc = newClass; gSelMemberSrc = text;
+      gBrClassSrc = newClass;
       _reloadBrowserClass();
     });
     return;
   }
-  var decls = splitTopLevel(text);                                   // whole class
+  // Definition mode / a brand-new class: accept the whole source.
+  var decls = splitTopLevel(text);
   if (decls.isEmpty) { log("(nothing to accept)"); return; }
-  ask('acceptMany', decls).then((r) { log("✓ Accept — " + r); _reloadBrowserClass(); });
+  ask('acceptMany', decls).then((r) { log("✓ Accept — " + r); _reloadClassList(); });
 }
 
 void _reloadBrowserClass() {
@@ -309,6 +317,47 @@ void _reloadBrowserClass() {
   if (gBrSelClass == null || !gBrUserApp) return;
   ask('classmembers', gBrSelClass).then((r) { gClassMembers = _dl(r); filterMembers(); gWindow.display(); });
   ask('classsrc', gBrSelClass).then((r) { gBrClassSrc = r.toString(); gWindow.display(); });
+}
+
+void _reloadClassList() {
+  updateMetrics();
+  if (gBrSelCat == null) return;
+  ask(gBrUserApp ? 'classes' : 'worldclasses', gBrUserApp ? '' : gBrSelCat).then((r) {
+    gBrClasses = _dl(r); gClassTable.reloadData(); gWindow.display();
+  });
+}
+
+// Insert a new member just before the class's closing brace.
+String _insertMember(String classSrc, String member) {
+  var i = classSrc.lastIndexOf('}');
+  if (i < 0) return classSrc + "\n" + member.trim();
+  return classSrc.substring(0, i) + "  " + member.trim() + "\n" + classSrc.substring(i);
+}
+
+// + New Class: drop a class template into the Definition pane; edit + Accept creates it.
+void newClass() {
+  gBrUserApp = true;
+  gBrSelClass = null; gSelMemberSrc = null;
+  gClassMembers = <dynamic>[]; gVarRecs = <dynamic>[]; gMethodRecs = <dynamic>[];
+  gVarTable.reloadData(); gMethodTable.reloadData();
+  gBrMode = 'definition';
+  gBrClassSrc = "class NewClass {\n  \n}";
+  gBrowserSrc.setString(gBrClassSrc);
+  highlightView(gBrowserSrc);
+  gWindow.display();
+  log("+ New Class — rename it, add members, then Accept");
+}
+
+// + New Method: drop a method template into the Source pane; edit + Accept adds it.
+void newMethod() {
+  if (!gBrUserApp || gBrSelClass == null) { log("select a user class first"); return; }
+  gSelMemberSrc = null;   // new member — nothing to replace
+  gBrMode = 'source';
+  var tmpl = (gBrSide == 'c') ? "static newMethod() {\n  \n}" : "newMethod() {\n  \n}";
+  gBrowserSrc.setString(tmpl);
+  highlightView(gBrowserSrc);
+  gWindow.display();
+  log("+ New Method in " + gBrSelClass + " — edit and Accept");
 }
 
 void browserRemove() {
@@ -610,6 +659,10 @@ Future<String> handle(String line) async {
     case 'brmethod': selectMemberRec(gMethodRecs, int.parse(arg)); return "ok";
     case 'brside': setSide(arg); return "ok";
     case 'brmode': setMode(arg); return "ok";
+    case 'brnewclass': newClass(); return "ok";
+    case 'brnewmethod': newMethod(); return "ok";
+    case 'brsettext': gBrowserSrc.setString(arg.replaceAll('\\n', '\n')); highlightView(gBrowserSrc); return "ok";
+    case 'braccept': browserAccept(); return "ok";
     case 'settext':
       gEditor.setString(arg.replaceAll('\\n', '\n'));
       highlight();

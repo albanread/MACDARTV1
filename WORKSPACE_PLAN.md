@@ -315,9 +315,15 @@ stale generation / re-entrancy. Trampoline: `Dart_EnterIsolate(ui)` +
     the class comment stored in the image (`comment` column). Verified: instance vs
     class members, User App (Account: balance/owner/deposit/…) and World (dart:cocoa:
     Cocoa/Db/NSString) both browse; highlighted source.
-  - **Remaining polish:** protocols pane + New Class/New Method buttons (MACVM has
-    them); Docs as markdown; Find/senders; the debug reload assert; window-resize
-    reflow; image path → `~/.macdart/` for cross-session persistence.
+  - **+ New Class / + New Method ✅ DONE**: `+ Class` drops a `class NewClass {}`
+    template into the Definition pane (edit + Accept creates it); `+ Method` drops
+    a method template into the Source pane (instance or `static` per the toggle) —
+    Accept inserts it before the class's closing brace and reloads. Verified from
+    the browser: created `Widget` then added `area()` → `new Widget().area()` = 50,
+    both persisted to the image and live.
+  - **Remaining polish:** protocols pane; a Cancel button + "edit Class>>member"
+    status line; Docs as markdown; Find/senders; the debug reload assert;
+    window-resize reflow; image path → `~/.macdart/` for cross-session persistence.
 
 ### Repo layout (new)
 - `macdart/cocoa/cocoa_host.mm` — the thread-0 GUI host (M1/M2). Linked only into

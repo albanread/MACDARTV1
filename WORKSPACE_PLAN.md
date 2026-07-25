@@ -321,9 +321,16 @@ stale generation / re-entrancy. Trampoline: `Dart_EnterIsolate(ui)` +
     Accept inserts it before the class's closing brace and reloads. Verified from
     the browser: created `Widget` then added `area()` → `new Widget().area()` = 50,
     both persisted to the image and live.
-  - **Remaining polish:** protocols pane; a Cancel button + "edit Class>>member"
-    status line; Docs as markdown; Find/senders; the debug reload assert;
-    window-resize reflow; image path → `~/.macdart/` for cross-session persistence.
+  - **Cancel + status line ✅ DONE**: a **Cancel** button reverts the source pane to
+    the committed version (member/class/comment); the status line shows
+    `Class >> member  ·  Accept: live + saved` (or `(read-only)` for world) — every
+    Accept both hot-reloads live AND UPSERTs the image, so it persists for the next
+    run (proven: edit a method in the browser → live `42`, and `42` again after a
+    full relaunch). Member-level edits replace in-source; Definition shows the whole
+    class (Dart methods are inline).
+  - **Remaining polish:** protocols pane; Docs as markdown; Find/senders; the debug
+    reload assert; window-resize reflow; image path → `~/.macdart/` for
+    cross-session persistence.
 
 ### Repo layout (new)
 - `macdart/cocoa/cocoa_host.mm` — the thread-0 GUI host (M1/M2). Linked only into

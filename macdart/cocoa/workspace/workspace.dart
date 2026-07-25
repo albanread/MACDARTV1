@@ -26,7 +26,8 @@ final Object _kTimeout = new Object();
 const Duration _kDoitTimeout = const Duration(seconds: 6);
 
 // Browser (Smalltalk-style, 4-pane) state.
-Cocoa gCatTable, gClassTable, gVarTable, gMethodTable, gBrowserSrc;
+Cocoa gCatTable, gClassTable, gVarTable, gMethodTable, gBrowserSrc, gStatus;
+String gSelMemberSig;              // signature of the selected member (status line)
 List gBrCats = <dynamic>[];        // Categories: "User App" + world libraries
 List gBrClasses = <dynamic>[];     // classes in the selected category
 List gClassMembers = <dynamic>[];  // all member records of the selected class
@@ -190,11 +191,13 @@ void buildBrowserTab(Cocoa br) {
   gMethodTable = tableIn(br, [604.0, 196.0, 256.0, 190.0]);
 
   // Source pane modes + actions (over the source view).
-  button(br, "Comment", [8.0, 168.0, 92.0, 22.0], (s) => setMode('comment'));
-  button(br, "Definition", [104.0, 168.0, 98.0, 22.0], (s) => setMode('definition'));
-  button(br, "Source", [206.0, 168.0, 78.0, 22.0], (s) => setMode('source'));
-  button(br, "Accept", [604.0, 168.0, 84.0, 22.0], (s) => browserAccept());
-  button(br, "Remove", [694.0, 168.0, 90.0, 22.0], (s) => browserRemove());
+  button(br, "Comment", [8.0, 168.0, 84.0, 22.0], (s) => setMode('comment'));
+  button(br, "Definition", [94.0, 168.0, 92.0, 22.0], (s) => setMode('definition'));
+  button(br, "Source", [190.0, 168.0, 72.0, 22.0], (s) => setMode('source'));
+  gStatus = label(br, [270.0, 170.0, 320.0, 18.0]);
+  button(br, "Accept", [594.0, 168.0, 68.0, 22.0], (s) => browserAccept());
+  button(br, "Cancel", [666.0, 168.0, 64.0, 22.0], (s) => browserCancel());
+  button(br, "Remove", [734.0, 168.0, 90.0, 22.0], (s) => browserRemove());
 
   gBrowserSrc = scrolledTextView(br, [8.0, 8.0, 852.0, 152.0], true);
   var mf = _mono(13.0);
@@ -232,7 +235,7 @@ void selectCategory(int row) {
 void selectClass(int row) {
   if (row < 0 || row >= gBrClasses.length) return;
   gBrSelClass = gBrClasses[row].toString();
-  gSelMemberSrc = null;
+  gSelMemberSrc = null; gSelMemberSig = null;
   var membersCmd = gBrUserApp ? 'classmembers' : 'worldclassmembers';
   var membersArg = gBrUserApp ? gBrSelClass : (gBrSelCat + '|' + gBrSelClass);
   ask(membersCmd, membersArg).then((r) { gClassMembers = _dl(r); filterMembers(); gWindow.display(); });
@@ -261,7 +264,8 @@ void setSide(String side) { gBrSide = side; filterMembers(); gWindow.display(); 
 void selectMemberRec(List recs, int row) {
   if (row < 0 || row >= recs.length) return;
   var src = recs[row][3].toString();
-  gSelMemberSrc = src.length > 0 ? src : recs[row][2].toString();
+  gSelMemberSig = recs[row][2].toString();
+  gSelMemberSrc = src.length > 0 ? src : gSelMemberSig;
   gBrMode = 'source';
   updateSourcePane();
 }
@@ -275,7 +279,35 @@ void updateSourcePane() {
   else text = (gSelMemberSrc != null && gSelMemberSrc.length > 0) ? gSelMemberSrc : (gBrClassSrc != null ? gBrClassSrc : "");
   gBrowserSrc.setString(text);
   highlightView(gBrowserSrc);
+  updateStatus();
   gWindow.display();
+}
+
+// The "edit Class>>member" status line. Accept both hot-reloads live AND writes
+// the SQLite image, so it persists for the next run — hence "live + saved".
+void updateStatus() {
+  if (gStatus == null) return;
+  var t = "";
+  var tag = gBrUserApp ? "   ·   Accept: live + saved" : "   (read-only)";
+  if (gBrSelClass == null) {
+    t = (gBrMode == 'definition') ? "new class" + tag : "";
+  } else if (gBrMode == 'comment') {
+    t = "comment: " + gBrSelClass + tag;
+  } else if (gBrMode == 'definition') {
+    t = "definition: " + gBrSelClass + tag;
+  } else if (gSelMemberSig != null && gSelMemberSig.length > 0) {
+    t = gBrSelClass + " >> " + gSelMemberSig + tag;
+  } else {
+    t = "new method in " + gBrSelClass + tag;
+  }
+  gStatus.setStringValue(t);
+}
+
+// Cancel: discard edits in the source pane, restoring the committed version of
+// whatever is selected (member / class / comment).
+void browserCancel() {
+  updateSourcePane();
+  log("cancelled — reverted");
 }
 
 String _replaceOnce(String s, String find, String repl) {
@@ -337,13 +369,14 @@ String _insertMember(String classSrc, String member) {
 // + New Class: drop a class template into the Definition pane; edit + Accept creates it.
 void newClass() {
   gBrUserApp = true;
-  gBrSelClass = null; gSelMemberSrc = null;
+  gBrSelClass = null; gSelMemberSrc = null; gSelMemberSig = null;
   gClassMembers = <dynamic>[]; gVarRecs = <dynamic>[]; gMethodRecs = <dynamic>[];
   gVarTable.reloadData(); gMethodTable.reloadData();
   gBrMode = 'definition';
   gBrClassSrc = "class NewClass {\n  \n}";
   gBrowserSrc.setString(gBrClassSrc);
   highlightView(gBrowserSrc);
+  updateStatus();
   gWindow.display();
   log("+ New Class — rename it, add members, then Accept");
 }
@@ -351,11 +384,12 @@ void newClass() {
 // + New Method: drop a method template into the Source pane; edit + Accept adds it.
 void newMethod() {
   if (!gBrUserApp || gBrSelClass == null) { log("select a user class first"); return; }
-  gSelMemberSrc = null;   // new member — nothing to replace
+  gSelMemberSrc = null; gSelMemberSig = null;   // new member — nothing to replace
   gBrMode = 'source';
   var tmpl = (gBrSide == 'c') ? "static newMethod() {\n  \n}" : "newMethod() {\n  \n}";
   gBrowserSrc.setString(tmpl);
   highlightView(gBrowserSrc);
+  updateStatus();
   gWindow.display();
   log("+ New Method in " + gBrSelClass + " — edit and Accept");
 }
@@ -663,6 +697,7 @@ Future<String> handle(String line) async {
     case 'brnewmethod': newMethod(); return "ok";
     case 'brsettext': gBrowserSrc.setString(arg.replaceAll('\\n', '\n')); highlightView(gBrowserSrc); return "ok";
     case 'braccept': browserAccept(); return "ok";
+    case 'brcancel': browserCancel(); return "ok";
     case 'settext':
       gEditor.setString(arg.replaceAll('\\n', '\n'));
       highlight();

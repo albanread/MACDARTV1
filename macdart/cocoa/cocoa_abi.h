@@ -28,6 +28,8 @@ enum {
   TOK_G = 'g', TOK_F = 'f', TOK_V = 'v', TOK_B = 'b', TOK_S = 's', TOK_Q = '?',
   TOK_CSTR = '*',    // char* — a GPR like 'g', but a Dart String marshals as a
                      // C string (not an NSString), and a char* return -> String.
+  TOK_OBJ = '@',     // id / Class — a GPR like 'g' for args, but an OBJECT return
+                     // is wrapped in a retained Cocoa (with a release finalizer).
   TOK_HFA = 0x100,   // | k  (k = 1..4 V-regs)
   TOK_INT = 0x200,   // | n  (n = 1..2 GPRs)
 };

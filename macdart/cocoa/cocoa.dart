@@ -18,14 +18,19 @@ int _nsStringLength(int handle) native "Cocoa_nsStringLength";
 String _nsStringUtf8(int handle) native "Cocoa_nsStringUtf8";
 
 int _getClass(String name) native "Cocoa_getClass";
-/// The general dynamic send: [target] id, [selector] like "colorWithRed:...:",
-/// [args] the ordered arguments. Returns int (id/integer), double, a List of
-/// numbers (struct), or null (void), per the method's return type.
-dynamic _send(int target, String selector, List args) native "Cocoa_send";
+/// The general dynamic send: [receiver] a Cocoa, [selector] like
+/// "colorWithRed:...:", [args] the ordered arguments. Returns a Cocoa (for an
+/// object result — retained, released on GC), a String (char*), an int
+/// (integer id), a double, a List of numbers (struct), or null (void).
+dynamic _send(Cocoa receiver, String selector, List args) native "Cocoa_send";
 int _retain(int handle) native "Cocoa_retain";
 void _release(int handle) native "Cocoa_release";
 int _poolPush() native "Cocoa_poolPush";
 void _poolPop(int token) native "Cocoa_poolPop";
+
+/// `[wraps, releases]` — retain-on-wrap vs release-on-GC counts. A gap that
+/// never settles across GCs indicates a leak.
+List cocoaStats() native "Cocoa_stats";
 
 /// Run [body] inside an Objective-C autorelease pool. Any autoreleased
 /// temporaries created while it runs (bridged NSStrings, `+0` method results)
@@ -60,17 +65,25 @@ class NSString {
 /// results come back as raw id handles (ints) — wrap them in a [Cocoa] to keep
 /// sending; struct results (NSRect/NSRange) come back as a `List` of numbers.
 class Cocoa {
-  final int handle;
-  Cocoa(this.handle);
+  int _handle;      // the ObjC id; 0 once poisoned (consumed by init) or nil
+  int _wph = 0;     // native weak-persistent-handle (release finalizer); 0 = none
 
-  /// Look up a class by name — the receiver for class methods.
-  static Cocoa cls(String name) => new Cocoa(_getClass(name));
+  // Only the runtime constructs Cocoa objects: the native _send wraps object
+  // results here (adding retain + a release finalizer for non-class objects),
+  // and Cocoa.cls wraps a class (no finalizer). `_adopt` never retains — the
+  // native owns that policy.
+  Cocoa._adopt(this._handle);
 
-  bool get isNil => handle == 0;
+  /// Look up a class by name — the receiver for class methods (not finalized).
+  static Cocoa cls(String name) => new Cocoa._adopt(_getClass(name));
+
+  /// The raw ObjC id (0 if nil / released).
+  int get handle => _handle;
+  bool get isNil => _handle == 0;
 
   /// Send [selector] with [args] explicitly (bypassing noSuchMethod).
   dynamic send(String selector, [List args = const []]) =>
-      _send(handle, selector, _unwrap(args));
+      _send(this, selector, _unwrap(args));
 
   dynamic noSuchMethod(Invocation inv) {
     var name = MirrorSystem.getName(inv.memberName);
@@ -98,7 +111,7 @@ class Cocoa {
         args.add(value);
       });
     }
-    return _send(handle, selector, _unwrap(args));
+    return _send(this, selector, _unwrap(args));
   }
 
   static List _unwrap(List args) {

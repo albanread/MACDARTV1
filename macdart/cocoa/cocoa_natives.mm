@@ -8,6 +8,7 @@
 #import <Foundation/Foundation.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
+#include <atomic>
 #include <dlfcn.h>
 #include <string.h>
 #include <unistd.h>
@@ -77,12 +78,101 @@ static double DoubleFromDart(Dart_Handle h) {
   return 0.0;
 }
 
-// The general dynamic send: _send(int target, String selector, List args).
+// --- object wrapping: retain-on-wrap + release-on-GC finalizer -------------
+
+// The dart:cocoa `Cocoa` type, cached across calls.
+static Dart_PersistentHandle g_cocoa_type = NULL;
+static Dart_Handle CocoaType() {
+  if (g_cocoa_type == NULL) {
+    Dart_Handle lib = Dart_LookupLibrary(Dart_NewStringFromCString("dart:cocoa"));
+    Dart_Handle type = Dart_GetType(lib, Dart_NewStringFromCString("Cocoa"), 0, NULL);
+    if (Dart_IsError(type)) return type;
+    g_cocoa_type = Dart_NewPersistentHandle(type);
+  }
+  return Dart_HandleFromPersistent(g_cocoa_type);
+}
+
+// Observability: balance of retain-on-wrap vs release-on-finalize (a growing
+// gap that never settles indicates a leak). Finalizers may run off the mutator
+// thread, so these are atomic.
+static std::atomic<int64_t> g_wraps{0};
+static std::atomic<int64_t> g_releases{0};
+
+// Called when a Cocoa Dart object is GC'd: drop the strong ref it owned.
+static void ReleaseFinalizer(void*, Dart_WeakPersistentHandle, void* peer) {
+  if (peer) {
+    [(id)peer release];
+    g_releases.fetch_add(1);
+  }
+}
+
+// ARC ownership families: a selector returns +1 if it begins (after any leading
+// underscores) with alloc/new/copy/mutableCopy/init followed by a non-lowercase.
+static bool StartsFamily(const char* s, const char* fam) {
+  size_t n = strlen(fam);
+  if (strncmp(s, fam, n) != 0) return false;
+  char c = s[n];
+  return !(c >= 'a' && c <= 'z');
+}
+static bool IsPlusOneFamily(const char* sel) {
+  while (*sel == '_') sel++;
+  return StartsFamily(sel, "alloc") || StartsFamily(sel, "new") ||
+         StartsFamily(sel, "mutableCopy") || StartsFamily(sel, "copy") ||
+         StartsFamily(sel, "init");
+}
+static bool IsInitFamily(const char* sel) {
+  while (*sel == '_') sel++;
+  return StartsFamily(sel, "init");
+}
+
+static Dart_Handle MakeCocoa(int64_t handle) {
+  Dart_Handle argv[1] = {Dart_NewInteger(handle)};
+  return Dart_New(CocoaType(), Dart_NewStringFromCString("_adopt"), 1, argv);
+}
+
+// Wrap an object return in a Cocoa. Non-+1-family results are retained so the
+// wrapper owns exactly one strong ref, released by ReleaseFinalizer on GC.
+// Classes and nil are wrapped plainly (never retained/released).
+static Dart_Handle WrapObject(id obj, const char* sel) {
+  if (obj == nil) return MakeCocoa(0);
+  bool is_class = class_isMetaClass(object_getClass(obj));
+  Dart_Handle cocoa = MakeCocoa((int64_t)obj);
+  if (Dart_IsError(cocoa) || is_class) return cocoa;
+  if (!IsPlusOneFamily(sel)) [obj retain];
+  Dart_WeakPersistentHandle wph =
+      Dart_NewWeakPersistentHandle(cocoa, (void*)obj, 0, ReleaseFinalizer);
+  Dart_SetField(cocoa, Dart_NewStringFromCString("_wph"),
+                Dart_NewInteger((int64_t)wph));
+  g_wraps.fetch_add(1);
+  return cocoa;
+}
+
+// init consumed the receiver's object and returned a (possibly different) one:
+// disown the receiver (cancel its finalizer, zero its handle) so it won't
+// double-release. Called on the receiver after any init-family send.
+static void PoisonReceiver(Dart_Handle receiver) {
+  Dart_Handle f = Dart_GetField(receiver, Dart_NewStringFromCString("_wph"));
+  int64_t wph = 0;
+  if (!Dart_IsError(f)) Dart_IntegerToInt64(f, &wph);
+  if (wph != 0) {
+    Dart_DeleteWeakPersistentHandle(Dart_CurrentIsolate(),
+                                    (Dart_WeakPersistentHandle)wph);
+    Dart_SetField(receiver, Dart_NewStringFromCString("_wph"), Dart_NewInteger(0));
+    g_wraps.fetch_sub(1);  // this wrap's release is transferred to init's result
+  }
+  Dart_SetField(receiver, Dart_NewStringFromCString("_handle"), Dart_NewInteger(0));
+}
+
+// The general dynamic send: _send(Cocoa receiver, String selector, List args).
 // Resolves the method's @encode, classifies it (AAPCS64 tokens), marshals each
 // Dart arg into the flat GPR/FPR buffers per its token, dispatches through the
 // fixed-shape shim, and returns the result as the matching Dart value.
 static void Cocoa_send(Dart_NativeArguments args) {
-  id target = (id)IntArg(args, 0);
+  Dart_Handle receiver = Dart_GetNativeArgument(args, 0);
+  Dart_Handle hf = Dart_GetField(receiver, Dart_NewStringFromCString("_handle"));
+  int64_t h = 0;
+  if (!Dart_IsError(hf)) Dart_IntegerToInt64(hf, &h);
+  id target = (id)h;
   const char* sel_name = NULL;
   Dart_StringToCString(Dart_GetNativeArgument(args, 1), &sel_name);
   SEL sel = sel_registerName(sel_name);
@@ -152,7 +242,11 @@ static void Cocoa_send(Dart_NativeArguments args) {
   }
 
   // Deliver the result as the matching Dart value.
-  if (ret_tok == TOK_CSTR) {               // char* -> Dart String
+  if (ret_tok == TOK_OBJ) {                // id/Class -> retained Cocoa wrapper
+    Dart_Handle wrapped = WrapObject((id)out_gpr[0], sel_name);
+    if (IsInitFamily(sel_name)) PoisonReceiver(receiver);
+    Dart_SetReturnValue(args, wrapped);
+  } else if (ret_tok == TOK_CSTR) {        // char* -> Dart String
     const char* c = (const char*)out_gpr[0];
     Dart_SetReturnValue(args, Dart_NewStringFromCString(c ? c : ""));
   } else if (rk == SH_VOID) {
@@ -180,6 +274,14 @@ static void Cocoa_getClass(Dart_NativeArguments args) {
   const char* name = NULL;
   Dart_StringToCString(Dart_GetNativeArgument(args, 0), &name);
   Dart_SetReturnValue(args, Dart_NewInteger((int64_t)objc_getClass(name)));
+}
+
+// [wraps, releases] — for leak observability. A gap that never settles = leak.
+static void Cocoa_stats(Dart_NativeArguments args) {
+  Dart_Handle l = Dart_NewList(2);
+  Dart_ListSetAt(l, 0, Dart_NewInteger(g_wraps.load()));
+  Dart_ListSetAt(l, 1, Dart_NewInteger(g_releases.load()));
+  Dart_SetReturnValue(args, l);
 }
 
 // Autorelease pool push/pop (scoped drainage via autoreleasePool()).
@@ -242,6 +344,7 @@ static void Cocoa_nsStringUtf8(Dart_NativeArguments args) {
   V(Cocoa_nsStringUtf8, 1)                                                     \
   V(Cocoa_send, 3)                                                             \
   V(Cocoa_getClass, 1)                                                         \
+  V(Cocoa_stats, 0)                                                            \
   V(Cocoa_poolPush, 0)                                                         \
   V(Cocoa_poolPop, 1)                                                          \
   V(Cocoa_retain, 1)                                                           \

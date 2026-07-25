@@ -10,7 +10,7 @@ import 'dart:isolate';
 import 'dart:convert';
 import 'dart:async';
 
-Cocoa gWindow, gContent, gTabView, gEditor, gTranscript, gBrowser, gMetrics;
+Cocoa gWindow, gContent, gTabView, gEditor, gTranscript, gMetrics;
 SendPort gLang;
 List<String> gLog = <String>[];
 Map<String, Cocoa> gButtons = <String, Cocoa>{};
@@ -19,11 +19,19 @@ List<Cocoa> gTargets = <Cocoa>[];      // keep action targets/delegates alive
 // Language-isolate watchdog state.
 Isolate gLangIsolate;
 String gScratch;                       // the language isolate's scratch root file
-List<String> gAccepted = <String>[];   // declarations to replay after a respawn
+String gDbPath;                        // the SQLite image (source of truth)
 bool gRespawning = false;
 int gLangGen = 0;                      // generation, to ignore stale exit events
 final Object _kTimeout = new Object();
 const Duration _kDoitTimeout = const Duration(seconds: 6);
+
+// Browser (Smalltalk-style) state.
+Cocoa gClassTable, gMemberTable, gBrowserSrc;
+int gBrowserCat = 0;                   // 0 = User App, 1 = World
+List gBrClasses = <dynamic>[];         // pane 1 rows (classes, or world libraries)
+List gBrMembers = <dynamic>[];         // pane 2 rows (members, or world classes)
+String gBrSelClass, gBrSelWorldLib;
+List<String> _asList(dynamic r) => r is List ? new List<String>.from(r.map((e) => e.toString())) : <String>[];
 
 Cocoa _mono(double sz) => Cocoa.cls("NSFont").userFixedPitchFontOfSize(sz);
 
@@ -74,7 +82,7 @@ Cocoa addTab(Cocoa tabView, String ident, double w, double h) {
 
 void switchTab(int i) {
   gTabView.selectTabViewItemAtIndex(i);
-  if (i == 1) refreshBrowser();
+  if (i == 1) browserCategory(gBrowserCat);
   updateMetrics();
   gWindow.display();
 }
@@ -109,11 +117,8 @@ void buildWindow() {
   gEditor = scrolledTextView(ws, [8.0, 8.0, 852.0, 372.0], true);
   gTargets.add(onTextChange(gEditor, (s) => highlight()));
 
-  // Browser tab: reflect the language isolate's classes (dart:mirrors).
-  var br = addTab(gTabView, "browser", 868.0, 420.0);
-  button(br, "Refresh", [8.0, 388.0, 90.0, 28.0], (s) => refreshBrowser());
-  label(br, [110.0, 392.0, 500.0, 18.0]).setStringValue("live classes in the language isolate");
-  gBrowser = scrolledTextView(br, [8.0, 8.0, 852.0, 372.0], false);
+  // Browser tab: a Smalltalk-style class browser (World / User App).
+  buildBrowserTab(addTab(gTabView, "browser", 868.0, 420.0));
 
   // Docs tab.
   var dc = addTab(gTabView, "docs", 868.0, 420.0);
@@ -146,9 +151,105 @@ void log(String line) {
   gWindow.display();   // async/callback updates run outside AppKit's event flush
 }
 
-void refreshBrowser() {
-  ask('browse', '').then((r) {
-    if (gBrowser != null) { gBrowser.setString(r); gWindow.display(); }
+// --- Smalltalk-style class browser ------------------------------------------
+// An NSTableView (single text column, no header) inside a scroll view.
+Cocoa tableIn(Cocoa parent, List frame) {
+  var scroll = Cocoa.cls("NSScrollView").alloc().initWithFrame(frame);
+  scroll.setHasVerticalScroller(true);
+  scroll.setBorderType(2);
+  var table = Cocoa.cls("NSTableView").alloc().initWithFrame([0.0, 0.0, frame[2], frame[3]]);
+  var col = Cocoa.cls("NSTableColumn").alloc().initWithIdentifier("c");
+  col.setWidth(frame[2] - 4.0);
+  var cell = col.dataCell();
+  var f = _mono(12.0);
+  if (!cell.isNil && !f.isNil) cell.setFont(f);
+  table.addTableColumn(col);
+  table.setHeaderView(null);
+  table.setUsesAlternatingRowBackgroundColors(true);
+  scroll.setDocumentView(table);
+  parent.addSubview(scroll);
+  return table;
+}
+
+void buildBrowserTab(Cocoa br) {
+  button(br, "User App", [8.0, 388.0, 92.0, 26.0], (s) => browserCategory(0));
+  button(br, "World", [106.0, 388.0, 74.0, 26.0], (s) => browserCategory(1));
+  button(br, "Accept", [604.0, 388.0, 84.0, 26.0], (s) => browserAccept());
+  button(br, "Remove", [694.0, 388.0, 90.0, 26.0], (s) => browserRemove());
+
+  gClassTable = tableIn(br, [8.0, 192.0, 300.0, 190.0]);
+  gMemberTable = tableIn(br, [316.0, 192.0, 544.0, 190.0]);
+  gBrowserSrc = scrolledTextView(br, [8.0, 8.0, 852.0, 176.0], true);
+  var mf = _mono(13.0);
+  if (!mf.isNil) gBrowserSrc.setFont(mf);
+
+  gTargets.add(onTable(gClassTable, () => gBrClasses.length, (r) => gBrClasses[r].toString(), (r) => selectClass(r)));
+  gTargets.add(onTable(gMemberTable, () => gBrMembers.length, (r) => gBrMembers[r].toString(), (r) => selectMember(r)));
+  gTargets.add(onTextChange(gBrowserSrc, (s) => highlightView(gBrowserSrc)));
+}
+
+void browserCategory(int cat) {
+  gBrowserCat = cat;
+  gBrSelClass = null;
+  gBrMembers = <dynamic>[];
+  if (gBrowserSrc != null) gBrowserSrc.setString("");
+  ask(cat == 0 ? 'classes' : 'worldlibs', '').then((r) {
+    gBrClasses = _asList(r);
+    gClassTable.reloadData();
+    gMemberTable.reloadData();
+    gWindow.display();
+  });
+}
+
+void selectClass(int row) {
+  if (row < 0 || row >= gBrClasses.length) return;
+  var name = gBrClasses[row].toString();
+  if (gBrowserCat == 0) {
+    gBrSelClass = name;
+    ask('members', name).then((r) { gBrMembers = _asList(r); gMemberTable.reloadData(); gWindow.display(); });
+    ask('classsrc', name).then((r) { gBrowserSrc.setString(r.toString()); highlightView(gBrowserSrc); gWindow.display(); });
+  } else {
+    gBrSelWorldLib = name;
+    ask('worldclasses', name).then((r) { gBrMembers = _asList(r); gMemberTable.reloadData(); gWindow.display(); });
+    gBrowserSrc.setString("// " + name + "  —  world library (read-only)");
+    gWindow.display();
+  }
+}
+
+void selectMember(int row) {
+  if (row < 0 || row >= gBrMembers.length) return;
+  if (gBrowserCat == 1) {          // world: pane 2 holds classes → show members
+    var cls = gBrMembers[row].toString();
+    ask('worldmembers', gBrSelWorldLib + '|' + cls).then((r) {
+      var ms = _asList(r);
+      gBrowserSrc.setString("// " + cls + "  (world, read-only)\nclass " + cls + " {\n  " +
+          ms.join(";\n  ") + (ms.length > 0 ? ";" : "") + "\n}");
+      highlightView(gBrowserSrc);
+      gWindow.display();
+    });
+  }
+  // user app: member selection is informational; the source stays the class.
+}
+
+void browserAccept() {
+  if (gBrowserCat != 0) { log("world classes are read-only"); return; }
+  var decls = splitTopLevel(gBrowserSrc.string().UTF8String());
+  if (decls.isEmpty) { log("(nothing to accept)"); return; }
+  ask('acceptMany', decls).then((r) {
+    log("✓ Browser Accept — " + r);
+    updateMetrics();
+    browserCategory(0);
+  });
+}
+
+void browserRemove() {
+  if (gBrowserCat != 0 || gBrSelClass == null) { log("nothing to remove"); return; }
+  var name = gBrSelClass;
+  ask('remove', name).then((r) {
+    log("Browser — " + r);
+    gBrSelClass = null;
+    gBrowserSrc.setString("");
+    browserCategory(0);
   });
 }
 
@@ -232,10 +333,12 @@ List<int> lexDart(String s) {
   return out;
 }
 
-void highlight() {
-  if (gEditor == null) return;
-  applySpans(gEditor, lexDart(gEditor.string().UTF8String()));
+void highlightView(Cocoa tv) {
+  if (tv == null) return;
+  applySpans(tv, lexDart(tv.string().UTF8String()));
 }
+
+void highlight() => highlightView(gEditor);
 
 // The selected text, or the whole buffer if there's no selection. Dart strings
 // and NSString ranges are both UTF-16, so the offsets line up directly.
@@ -257,16 +360,15 @@ void run(bool printIt) {
 }
 
 // Accept: commit the editor's top-level declarations to the language isolate.
-// They go LIVE via hot reload (existing instances morph) and persist — unlike
-// Do It, which evaluates transiently. Tracked for the watchdog to replay.
+// They go LIVE via hot reload (existing instances morph) and are written to the
+// SQLite image, so they persist and survive a watchdog respawn — unlike Do It,
+// which evaluates transiently.
 void acceptEditor() {
   var decls = splitTopLevel(gEditor.string().UTF8String());
   if (decls.isEmpty) { log("(nothing to accept)"); return; }
   ask('acceptMany', decls).then((r) {
     if (r.startsWith('accepted')) {
-      gAccepted.addAll(decls);   // watchdog replay (reset dedups by name)
       log("✓ Accept — " + r);
-      refreshBrowser();
     } else {
       log("Accept failed — " + r);
     }
@@ -361,7 +463,7 @@ void buildMenu() {
 // Time-boxed request to the language isolate. If it doesn't reply in time the
 // isolate is presumed hung (a runaway do-it), and the watchdog kills + respawns
 // it so the workspace can never wedge.
-Future<String> ask(String cmd, var arg) async {   // arg is a String or a List
+Future ask(String cmd, var arg) async {   // arg/result may be a String or a List
   if (gLang == null) return "ERR: language isolate restarting…";
   var rp = new ReceivePort();
   gLang.send([cmd, arg, rp.sendPort]);
@@ -381,7 +483,7 @@ Future spawnLanguage() async {
   var errPort = new ReceivePort();
   var exitPort = new ReceivePort();
   gLangIsolate = await Isolate.spawnUri(
-      Uri.parse('file://' + gScratch), <String>[gScratch], fromLang.sendPort,
+      Uri.parse('file://' + gScratch), <String>[gScratch, gDbPath], fromLang.sendPort,
       onError: errPort.sendPort, onExit: exitPort.sendPort, errorsAreFatal: false);
   gLang = await fromLang.first;
   fromLang.close();
@@ -397,25 +499,19 @@ Future spawnLanguage() async {
   });
 }
 
-// Kill the (possibly hung) language isolate and start a fresh one, replaying the
-// accepted declarations from source — MACVM's supervisor pattern. Live object
-// state is an honest clean loss; declarations come back.
+// Kill the (possibly hung) language isolate and start a fresh one. The new
+// isolate boots from the SQLite image (the source of truth), so accepted
+// declarations come back automatically — MACVM's supervisor pattern. Live object
+// state is an honest clean loss.
 Future respawnLanguage(String why) async {
   if (gRespawning) return;
   gRespawning = true;
   log("⚠ " + why + " — restarting language isolate…");
   gLang = null;
   try { if (gLangIsolate != null) gLangIsolate.kill(priority: Isolate.IMMEDIATE); } catch (e) {}
-  await spawnLanguage();
-  if (gAccepted.length > 0) {
-    var rp = new ReceivePort();
-    gLang.send(['reset', gAccepted, rp.sendPort]);
-    await rp.first.timeout(_kDoitTimeout, onTimeout: () => null);
-    rp.close();
-  }
+  await spawnLanguage();   // boots from the image
   gRespawning = false;
-  log("language isolate restarted" +
-      (gAccepted.length > 0 ? " (" + gAccepted.length.toString() + " declarations reloaded)" : ""));
+  log("language isolate restarted (declarations reloaded from the image)");
   updateMetrics();
 }
 
@@ -440,6 +536,9 @@ Future<String> handle(String line) async {
     case 'ping': return "pong";
     case 'snap': return await snapshot(arg.isEmpty ? "/tmp/dartui.png" : arg);
     case 'tab': switchTab(int.parse(arg)); return "ok";
+    case 'brcat': browserCategory(int.parse(arg)); return "ok";
+    case 'brclass': selectClass(int.parse(arg)); return "ok";
+    case 'brmember': selectMember(int.parse(arg)); return "ok";
     case 'settext':
       gEditor.setString(arg.replaceAll('\\n', '\n'));
       highlight();
@@ -450,11 +549,8 @@ Future<String> handle(String line) async {
       b.performClick(null);
       return "clicked " + arg;
     case 'doit': return await ask('doit', arg);
-    case 'accept': {
-      var r = await ask('accept', arg);
-      if (r.startsWith('accepted')) gAccepted.add(arg);   // remember for respawn replay
-      return r;
-    }
+    case 'accept': return await ask('accept', arg);   // persisted in the image
+    case 'remove': return await ask('remove', arg);
     case 'kill': await respawnLanguage("manual kill"); return "ok";
     case 'quit':
       Cocoa.cls("NSApplication").sharedApplication().terminate(null); return "ok";
@@ -494,9 +590,10 @@ main() async {
   // from a MUTABLE COPY of the tracked language.dart template, never the source.
   var templatePath = Platform.script.resolve('language.dart').toFilePath();
   gScratch = Directory.systemTemp.path + '/macdart_ws_lang.dart';
+  gDbPath = Directory.systemTemp.path + '/macdart_workspace.sqlite';  // the image
   new File(gScratch).writeAsStringSync(new File(templatePath).readAsStringSync());
   await spawnLanguage();
-  log("language isolate ready");
+  log("language isolate ready — image: " + gDbPath);
 
   var server = await ServerSocket.bind(InternetAddress.LOOPBACK_IP_V4, 7644);
   stderr.writeln("dartui workspace control on 127.0.0.1:7644");

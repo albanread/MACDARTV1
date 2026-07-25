@@ -292,12 +292,21 @@ stale generation / re-entrancy. Trampoline: `Dart_EnterIsolate(ui)` +
       `tableView:objectValueForTableColumn:row:`, `tableViewSelectionDidChange:`.
       Dart API `onTable(table, rowCount, cellAt, onSelect)`. Verified: a cell-based
       NSTableView renders a Dart list.
-  - **Remaining:** (a) wire the language isolate to the SQLite image — boot loads
-    user decls from the DB over the snapshot, Accept UPSERTs + reloads, watchdog
-    respawn re-reads the DB (drops the in-memory gAccepted replay); (b) the
-    multi-pane browser UI (categories/World+UserApp │ classes │ members │ source +
-    Accept) on `onTable`; (c) member parsing + per-member source. Then Docs
-    (markdown), Find/senders, the debug reload assert.
+  - **Image wiring ✅ DONE**: the language isolate opens the SQLite image
+    (`decls(name,kind,category,source)`); boot loads user decls over the snapshot
+    and hot-reloads them live; `acceptMany`/`accept`/`remove` UPSERT/DELETE + reload;
+    the watchdog respawn re-reads the DB (in-memory `gAccepted` replay retired).
+    Verified: accept persists; relaunch reloads `Counter`/`Pt` from the image with
+    no re-accept (`new Counter().bump()`→1 after restart).
+  - **Multi-pane browser ✅ DONE**: Browser tab is now `[User App | World]` +
+    `[Accept | Remove]` over Classes │ Members `NSTableView`s + an editable,
+    highlighted Source pane. User App = image classes → members (parsed from
+    source) → class source (Accept commits to the image + reloads; Remove deletes).
+    World = base libraries → classes, read-only via mirrors (accurate — they never
+    reload). Demonstrated + snapshotted both categories.
+  - **Remaining polish:** per-member source (edit one method) vs whole-class; Docs
+    as markdown; Find/senders; the debug reload assert; window-resize reflow;
+    image path → `~/.macdart/` for cross-session persistence.
 
 ### Repo layout (new)
 - `macdart/cocoa/cocoa_host.mm` — the thread-0 GUI host (M1/M2). Linked only into

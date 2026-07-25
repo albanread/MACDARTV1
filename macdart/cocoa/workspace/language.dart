@@ -31,6 +31,8 @@ main(List args, SendPort uiPort) {
         out = _doit(arg);
       } else if (cmd == 'accept') {
         out = _accept(arg);
+      } else if (cmd == 'acceptMany') {
+        out = _acceptMany(arg);   // GUI Accept: the editor's top-level decls
       } else if (cmd == 'reset') {
         out = _reset(arg);   // arg is a List<String> of declarations (replay)
       } else if (cmd == 'browse') {
@@ -64,6 +66,21 @@ String _accept(String decl) {
   _decls[name] = decl.trim();
   var err = _rebuildAndReload();
   return err.isEmpty ? ('accepted ' + name) : err;
+}
+
+// Merge several declarations at once (the GUI's Accept — the editor buffer split
+// into top-level declarations), redefining by name, then reload ONCE (so live
+// instances of a changed class morph in a single pass).
+String _acceptMany(List decls) {
+  var names = <String>[];
+  for (var d in decls) {
+    var s = d.toString();
+    var name = _declName(s);
+    _decls[name] = s.trim();
+    names.add(name);
+  }
+  var err = _rebuildAndReload();
+  return err.isEmpty ? ('accepted ' + names.join(', ')) : err;
 }
 
 // Replace the whole declaration set at once (used by the UI's watchdog to

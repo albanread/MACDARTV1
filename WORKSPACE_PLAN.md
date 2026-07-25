@@ -266,9 +266,22 @@ stale generation / re-entrancy. Trampoline: `Dart_EnterIsolate(ui)` +
   Proven: `while(true){}` → killed after 6s, isolate restarted, `Counter` (an
   accepted class) survived, next do-it works, no leaked process. Live object
   state is an honest clean loss.
-- **M7+ — a richer Browser** (NSTableView panes via table data-source delegates
-  vs the current text dump), Docs via markdown, Find/senders, and smoothing the
-  debug reload assert — grown as needed.
+- **Accept button** ✅ DONE: the Workspace has Do It / Print It / **Accept** / Clear
+  (Accept = ⌘S). Accept splits the editor buffer into top-level declarations
+  (`splitTopLevel`, respecting strings/comments) and commits them to the language
+  isolate's `acceptMany` — they go live via hot reload, morphing existing
+  instances, and persist. Tracked in `gAccepted` for watchdog replay. Proven from
+  the GUI: define `Pt`+`p`, mutate, redefine `Pt` with a new field + Accept → the
+  live `p` morphs (kept `x=42`, gained `z`). **Known limitation surfaced:**
+  `dart:mirrors` caches class metadata, so the reflection-based Browser shows a
+  class as first reflected — fields added by a later reload don't appear (the
+  class IS updated; do-its see it). → the Smalltalk browser below is source-based.
+- **M7 — Smalltalk-style class browser** (in progress): replace the Browser text
+  dump with a multi-pane browser (Libraries │ Classes │ members-by-kind │ members)
+  + a source pane with Accept/Cancel, driven from the accepted SOURCE (`_decls`,
+  always current — sidesteps the mirrors staleness). Needs a new native: NSTableView
+  data-source support (return-value delegate IMPs) — the C6 role from MACVM's
+  objc_delegate.rs. Then Docs via markdown, Find/senders, debug reload assert.
 
 ### Repo layout (new)
 - `macdart/cocoa/cocoa_host.mm` — the thread-0 GUI host (M1/M2). Linked only into

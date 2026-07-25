@@ -100,9 +100,10 @@ void buildWindow() {
 
   // Workspace tab: Do It / Print It / Clear + a highlighted editor.
   var ws = addTab(gTabView, "workspace", 868.0, 420.0);
-  button(ws, "Do It", [8.0, 388.0, 90.0, 28.0], (s) => run(false));
-  button(ws, "Print It", [104.0, 388.0, 96.0, 28.0], (s) => run(true));
-  button(ws, "Clear", [206.0, 388.0, 80.0, 28.0], (s) {
+  button(ws, "Do It", [8.0, 388.0, 84.0, 28.0], (s) => run(false));
+  button(ws, "Print It", [98.0, 388.0, 90.0, 28.0], (s) => run(true));
+  button(ws, "Accept", [194.0, 388.0, 92.0, 28.0], (s) => acceptEditor());
+  button(ws, "Clear", [292.0, 388.0, 74.0, 28.0], (s) {
     gLog.clear(); gTranscript.setString(""); gWindow.display();
   });
   gEditor = scrolledTextView(ws, [8.0, 8.0, 852.0, 372.0], true);
@@ -255,6 +256,76 @@ void run(bool printIt) {
   ask('doit', code).then((r) { log("   ⟹   " + r); updateMetrics(); });
 }
 
+// Accept: commit the editor's top-level declarations to the language isolate.
+// They go LIVE via hot reload (existing instances morph) and persist — unlike
+// Do It, which evaluates transiently. Tracked for the watchdog to replay.
+void acceptEditor() {
+  var decls = splitTopLevel(gEditor.string().UTF8String());
+  if (decls.isEmpty) { log("(nothing to accept)"); return; }
+  ask('acceptMany', decls).then((r) {
+    if (r.startsWith('accepted')) {
+      gAccepted.addAll(decls);   // watchdog replay (reset dedups by name)
+      log("✓ Accept — " + r);
+      refreshBrowser();
+    } else {
+      log("Accept failed — " + r);
+    }
+    updateMetrics();
+  });
+}
+
+// Split source into top-level declarations (class / enum / typedef / var /
+// function), respecting strings and comments. A unit ends at a top-level '}'
+// (depth returns to 0) or a top-level ';'.
+List<String> splitTopLevel(String s) {
+  var out = <String>[];
+  var n = s.length, i = 0, start = 0, depth = 0;
+  while (i < n) {
+    var c = s.codeUnitAt(i);
+    if (c == 0x2F && i + 1 < n) {                       // comments
+      var d = s.codeUnitAt(i + 1);
+      if (d == 0x2F) { while (i < n && s.codeUnitAt(i) != 0x0A) i++; continue; }
+      if (d == 0x2A) {
+        i += 2;
+        while (i + 1 < n && !(s.codeUnitAt(i) == 0x2A && s.codeUnitAt(i + 1) == 0x2F)) i++;
+        i = (i + 1 < n) ? i + 2 : n; continue;
+      }
+    }
+    if (c == 0x27 || c == 0x22) {                       // strings
+      var q = c;
+      var triple = i + 2 < n && s.codeUnitAt(i + 1) == q && s.codeUnitAt(i + 2) == q;
+      if (triple) {
+        i += 3;
+        while (i + 2 < n && !(s.codeUnitAt(i) == q && s.codeUnitAt(i + 1) == q && s.codeUnitAt(i + 2) == q)) {
+          if (s.codeUnitAt(i) == 0x5C) i++; i++;
+        }
+        i = (i + 2 < n) ? i + 3 : n;
+      } else {
+        i++;
+        while (i < n && s.codeUnitAt(i) != q && s.codeUnitAt(i) != 0x0A) {
+          if (s.codeUnitAt(i) == 0x5C) i++; i++;
+        }
+        if (i < n && s.codeUnitAt(i) == q) i++;
+      }
+      continue;
+    }
+    if (c == 0x7B) { depth++; i++; continue; }           // {
+    if (c == 0x7D) {                                     // }
+      i++;
+      if (depth > 0) depth--;
+      if (depth == 0) { var d = s.substring(start, i).trim(); if (d.length > 0) out.add(d); start = i; }
+      continue;
+    }
+    if (c == 0x3B && depth == 0) {                       // ; at top level
+      i++; var d = s.substring(start, i).trim(); if (d.length > 0) out.add(d); start = i; continue;
+    }
+    i++;
+  }
+  var tail = s.substring(start).trim();
+  if (tail.length > 0) out.add(tail);
+  return out;
+}
+
 // --- Menu bar ---------------------------------------------------------------
 Cocoa menuItem(Cocoa menu, String title, String key, CocoaAction fn) {
   var it = Cocoa.cls("NSMenuItem").alloc().init();
@@ -282,6 +353,7 @@ void buildMenu() {
   wsItem.setSubmenu(wsMenu);
   menuItem(wsMenu, "Do It", "d", (s) => run(false));
   menuItem(wsMenu, "Print It", "p", (s) => run(true));
+  menuItem(wsMenu, "Accept", "s", (s) => acceptEditor());
 
   app.setMainMenu(mainMenu);
 }
@@ -289,7 +361,7 @@ void buildMenu() {
 // Time-boxed request to the language isolate. If it doesn't reply in time the
 // isolate is presumed hung (a runaway do-it), and the watchdog kills + respawns
 // it so the workspace can never wedge.
-Future<String> ask(String cmd, String arg) async {
+Future<String> ask(String cmd, var arg) async {   // arg is a String or a List
   if (gLang == null) return "ERR: language isolate restarting…";
   var rp = new ReceivePort();
   gLang.send([cmd, arg, rp.sendPort]);

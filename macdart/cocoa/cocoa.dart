@@ -93,6 +93,31 @@ Cocoa onAction(Cocoa control, CocoaAction fn) {
   return target;
 }
 
+/// Wire [textView]'s text-change notification (`textDidChange:`) to [fn] — e.g.
+/// to re-highlight as the user types. Returns the delegate; AppKit holds it
+/// weakly, so keep a reference alive.
+Cocoa onTextChange(Cocoa textView, CocoaAction fn) {
+  if (!_cbDispatchRegistered) {
+    _registerCallbackDispatch(_cocoaDispatch);
+    _cbDispatchRegistered = true;
+  }
+  var ticket = _cbNext++;
+  _cbHandlers[ticket] = fn;
+  var target = new Cocoa._adopt(_makeActionTarget(ticket));
+  textView.setDelegate(target);
+  return target;
+}
+
+void _applySpans(int textStorage, List spans) native "Cocoa_applySpans";
+
+/// Colour [textView] with syntax-highlight runs: a flat `[start, len, kind, …]`
+/// list (kind: 1 keyword, 2 string, 3 comment, 4 number, 5 type, else default).
+/// Attribute-only — the caret never moves. Offsets are UTF-16 units (Dart string
+/// indices), which is exactly what `NSRange` wants.
+void applySpans(Cocoa textView, List spans) {
+  _applySpans(textView.textStorage().handle, spans);
+}
+
 /// A minimal typed NSString wrapper (Phase 1; still handy for strings).
 class NSString {
   final int handle;

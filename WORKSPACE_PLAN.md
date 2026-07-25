@@ -240,10 +240,15 @@ stale generation / re-entrancy. Trampoline: `Dart_EnterIsolate(ui)` +
   - **Selection-aware**: `currentCode()` runs the selection (via `selectedRange`,
     an i2 return → `[loc,len]`, substring in Dart — offsets align since both are
     UTF-16) or the whole buffer.
-  - **Remaining**: syntax highlighting — a Dart lexer + a `textDidChange:` delegate
-    (extends the M4 callback mechanism to a delegate role) + a batched native
-    `applySpans(textStorage, runs)`; optionally a true floating `NSPanel`
-    transcript vs the current docked pane.
+  - **Syntax highlighting ✅ DONE**: a forgiving Dart lexer in the UI isolate
+    (`lexDart` → flat `[start,len,kind]` runs; UTF-16 offsets = `NSRange`), a
+    `textDidChange:` delegate (second method on the M4 callback class, wired via
+    `onTextChange`) re-highlighting on each edit, and a batched native
+    `Cocoa_applySpans` that recolours the `textStorage` attribute-only in one
+    begin/end pass (system colours, light+dark). Verified: comment/keyword/type/
+    string/number all colour correctly. Also added: physical-interaction fixes
+    (redraw flush + immediate feedback) and an app menu (Quit ⌘Q, Workspace Do It
+    ⌘D / Print It ⌘P). Optional later: true floating `NSPanel` transcript.
 - **M6 — shell**: toolbar-as-tab-bar + tabless `NSTabView`.
 - **M7+ — Browser (mirrors+analyzer), Docs (markdown), Find** — grown tab by tab.
 

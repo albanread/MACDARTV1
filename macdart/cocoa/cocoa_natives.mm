@@ -342,10 +342,12 @@ static void Cocoa_nsStringUtf8(Dart_NativeArguments args) {
 void Workspace_eval(Dart_NativeArguments args);
 void Workspace_reload(Dart_NativeArguments args);
 
-// Reverse-callback natives (defined in cocoa_callbacks.mm) — target-action.
+// Reverse-callback natives (defined in cocoa_callbacks.mm) — target-action,
+// delegates, and the syntax-highlight span applier.
 void Cocoa_registerCallbackDispatch(Dart_NativeArguments args);
 void Cocoa_makeActionTarget(Dart_NativeArguments args);
 void Cocoa_wireAction(Dart_NativeArguments args);
+void Cocoa_applySpans(Dart_NativeArguments args);
 
 #define COCOA_NATIVE_LIST(V)                                                   \
   V(Cocoa_getpid, 0)                                                           \
@@ -363,7 +365,8 @@ void Cocoa_wireAction(Dart_NativeArguments args);
   V(Workspace_reload, 0)                                                       \
   V(Cocoa_registerCallbackDispatch, 1)                                         \
   V(Cocoa_makeActionTarget, 1)                                                 \
-  V(Cocoa_wireAction, 2)
+  V(Cocoa_wireAction, 2)                                                       \
+  V(Cocoa_applySpans, 2)
 
 static struct CocoaEntry {
   const char* name_;

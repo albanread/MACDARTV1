@@ -61,6 +61,7 @@ void buildWindow() {
 
   // Code editor (fills the middle) and the transcript dock (bottom).
   gEditor = scrolledTextView([16.0, 188.0, 788.0, 344.0], true);
+  gTargets.add(onTextChange(gEditor, (s) => highlight()));   // live syntax colouring
   gTranscript = scrolledTextView([16.0, 12.0, 788.0, 164.0], false);
 
   log("workspace ready — type Dart above, then Do It / Print It");
@@ -134,6 +135,95 @@ void buildMenu() {
   app.setMainMenu(mainMenu);
 }
 
+// --- Syntax highlighting ----------------------------------------------------
+// A forgiving single-pass Dart lexer → flat [start, len, kind, ...] runs. kind:
+// 1 keyword, 2 string, 3 comment, 4 number, 5 type (Capitalized), else default.
+// Offsets are UTF-16 units (Dart string indices), matching NSRange. For live
+// paint, not a real parser.
+final Set<String> _dartKeywords = new Set<String>.from(<String>[
+  'abstract','as','assert','async','await','break','case','catch','class','const',
+  'continue','default','deferred','do','dynamic','else','enum','export','extends',
+  'external','factory','false','final','finally','for','get','if','implements',
+  'import','in','is','library','new','null','operator','part','rethrow','return',
+  'set','static','super','switch','sync','this','throw','true','try','typedef',
+  'var','void','while','with','yield','bool','int','double','num',
+]);
+
+bool _isDigit(int c) => c >= 0x30 && c <= 0x39;
+bool _isHex(int c) => _isDigit(c) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66);
+bool _isUpper(int c) => c >= 0x41 && c <= 0x5A;
+bool _isAlpha(int c) => _isUpper(c) || (c >= 0x61 && c <= 0x7A);
+bool _isIdentStart(int c) => _isAlpha(c) || c == 0x5F || c == 0x24;
+bool _isIdentPart(int c) => _isIdentStart(c) || _isDigit(c);
+
+List<int> lexDart(String s) {
+  var out = <int>[];
+  var n = s.length, i = 0;
+  while (i < n) {
+    var c = s.codeUnitAt(i);
+    if (c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D) { i++; continue; }
+    if (c == 0x2F && i + 1 < n) {                       // '/'
+      var d = s.codeUnitAt(i + 1);
+      if (d == 0x2F) {                                  // // line comment
+        var st = i; while (i < n && s.codeUnitAt(i) != 0x0A) i++;
+        out..add(st)..add(i - st)..add(3); continue;
+      }
+      if (d == 0x2A) {                                  // /* block comment */
+        var st = i; i += 2;
+        while (i + 1 < n && !(s.codeUnitAt(i) == 0x2A && s.codeUnitAt(i + 1) == 0x2F)) i++;
+        i = (i + 1 < n) ? i + 2 : n;
+        out..add(st)..add(i - st)..add(3); continue;
+      }
+    }
+    if (c == 0x27 || c == 0x22) {                       // ' or " string
+      var st = i, q = c;
+      var triple = i + 2 < n && s.codeUnitAt(i + 1) == q && s.codeUnitAt(i + 2) == q;
+      if (triple) {
+        i += 3;
+        while (i + 2 < n && !(s.codeUnitAt(i) == q && s.codeUnitAt(i + 1) == q && s.codeUnitAt(i + 2) == q)) {
+          if (s.codeUnitAt(i) == 0x5C) i++;
+          i++;
+        }
+        i = (i + 2 < n) ? i + 3 : n;
+      } else {
+        i++;
+        while (i < n && s.codeUnitAt(i) != q && s.codeUnitAt(i) != 0x0A) {
+          if (s.codeUnitAt(i) == 0x5C) i++;
+          i++;
+        }
+        if (i < n && s.codeUnitAt(i) == q) i++;
+      }
+      out..add(st)..add(i - st)..add(2); continue;
+    }
+    if (_isDigit(c)) {                                  // number
+      var st = i;
+      if (c == 0x30 && i + 1 < n && (s.codeUnitAt(i + 1) == 0x78 || s.codeUnitAt(i + 1) == 0x58)) {
+        i += 2; while (i < n && _isHex(s.codeUnitAt(i))) i++;
+      } else {
+        while (i < n) {
+          var d = s.codeUnitAt(i);
+          if (_isDigit(d) || d == 0x2E || d == 0x65 || d == 0x45 || d == 0x5F) i++; else break;
+        }
+      }
+      out..add(st)..add(i - st)..add(4); continue;
+    }
+    if (_isIdentStart(c)) {                             // identifier / keyword / type
+      var st = i; i++;
+      while (i < n && _isIdentPart(s.codeUnitAt(i))) i++;
+      var word = s.substring(st, i);
+      var kind = _dartKeywords.contains(word) ? 1 : (_isUpper(c) ? 5 : 0);
+      out..add(st)..add(i - st)..add(kind); continue;
+    }
+    i++;                                                // punctuation / other
+  }
+  return out;
+}
+
+void highlight() {
+  if (gEditor == null) return;
+  applySpans(gEditor, lexDart(gEditor.string().UTF8String()));
+}
+
 Future<String> ask(String cmd, String arg) async {
   var rp = new ReceivePort();
   gLang.send([cmd, arg, rp.sendPort]);
@@ -165,6 +255,7 @@ Future<String> handle(String line) async {
     case 'snap': return await snapshot(arg.isEmpty ? "/tmp/dartui.png" : arg);
     case 'settext':                        // "type" into the editor; \n -> newline
       gEditor.setString(arg.replaceAll('\\n', '\n'));
+      highlight();
       return "ok";
     case 'select':                         // "select loc len" for selection tests
       var p = arg.split(' ');

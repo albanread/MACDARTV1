@@ -304,9 +304,20 @@ stale generation / re-entrancy. Trampoline: `Dart_EnterIsolate(ui)` +
     source) → class source (Accept commits to the image + reloads; Remove deletes).
     World = base libraries → classes, read-only via mirrors (accurate — they never
     reload). Demonstrated + snapshotted both categories.
-  - **Remaining polish:** per-member source (edit one method) vs whole-class; Docs
-    as markdown; Find/senders; the debug reload assert; window-resize reflow;
-    image path → `~/.macdart/` for cross-session persistence.
+  - **Four-pane browser ✅ DONE** (MACVM Browser-V2 shape, adapted to Dart):
+    **Categories** (User App + world libraries) │ **Classes** │ **Variables** │
+    **Methods**, with an **instance/class** toggle and a **Comment / Definition /
+    Source** pane + Accept/Remove. Panes select (no name-editing); the source pane
+    edits. Members are records `[side(i/c), kind(var/method), signature, source]`
+    parsed from the class source (user app) or via mirrors (world). Source-pane
+    modes: Definition = full class source (whole-class Accept); Source = the
+    selected member's source (member-level Accept via in-source replace); Comment =
+    the class comment stored in the image (`comment` column). Verified: instance vs
+    class members, User App (Account: balance/owner/deposit/…) and World (dart:cocoa:
+    Cocoa/Db/NSString) both browse; highlighted source.
+  - **Remaining polish:** protocols pane + New Class/New Method buttons (MACVM has
+    them); Docs as markdown; Find/senders; the debug reload assert; window-resize
+    reflow; image path → `~/.macdart/` for cross-session persistence.
 
 ### Repo layout (new)
 - `macdart/cocoa/cocoa_host.mm` — the thread-0 GUI host (M1/M2). Linked only into

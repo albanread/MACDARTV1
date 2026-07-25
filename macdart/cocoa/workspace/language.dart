@@ -24,7 +24,8 @@ main(List args, SendPort uiPort) {
     _db = new Db.open(args[1]);
     if (_db.isOpen) {
       _db.exec('CREATE TABLE IF NOT EXISTS decls'
-          '(name TEXT PRIMARY KEY, kind TEXT, category TEXT, source TEXT)');
+          '(name TEXT PRIMARY KEY, kind TEXT, category TEXT, source TEXT, comment TEXT)');
+      _db.exec('ALTER TABLE decls ADD COLUMN comment TEXT');  // no-op if it exists
       _loadFromImage();
     }
   }
@@ -44,9 +45,12 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'classes') out = _classNames();
       else if (cmd == 'members') out = _memberList(arg);
       else if (cmd == 'classsrc') out = _decls.containsKey(arg) ? _decls[arg] : '';
-      else if (cmd == 'worldlibs') out = _worldLibs();
-      else if (cmd == 'worldclasses') out = _worldClasses(arg);
-      else if (cmd == 'worldmembers') out = _worldMembers(arg);
+      else if (cmd == 'classmembers') out = _classMembers2(arg);
+      else if (cmd == 'categories') out = _categories();
+      else if (cmd == 'classcomment') out = _classComment(arg);
+      else if (cmd == 'setcomment') out = _setComment(arg);
+      else if (cmd == 'worldclasses') out = _worldClasses(arg.length > 0 ? arg : 'dart:core');
+      else if (cmd == 'worldclassmembers') out = _worldClassMembers(arg);
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();
     } catch (e) {
@@ -222,6 +226,13 @@ String _memberSig(String m) {
 }
 
 // --- the world (read-only, via dart:mirrors) --------------------------------
+// Browser categories: the editable user app, then the world's libraries.
+List _categories() {
+  var out = <String>['User App'];
+  out.addAll(_worldLibs());
+  return out;
+}
+
 List _worldLibs() {
   var out = <String>[];
   currentMirrorSystem().libraries.forEach((uri, lib) { out.add(uri.toString()); });
@@ -242,10 +253,40 @@ List _worldClasses(String libUri) {
   return out;
 }
 
-List _worldMembers(String qualified) {   // "libUri|ClassName"
+// A member record: [side('i'|'c'), kind('var'|'method'), signature, source].
+// User-app members, parsed from the class source.
+List _classMembers2(String className) {
+  var src = _decls[className];
+  if (src == null) return const <List>[];
+  var out = <List>[];
+  for (var m in _splitMembers(src)) {
+    var t = m.trim();
+    if (t.length == 0) continue;
+    out.add([new RegExp(r'^static\b').hasMatch(t) ? 'c' : 'i',
+             _isMethod(t) ? 'method' : 'var', _memberSig(t), m]);
+  }
+  return out;
+}
+
+// A member is a method if a '(' precedes any '{' / ';' / plain '=' (field init).
+bool _isMethod(String m) {
+  for (var i = 0; i < m.length; i++) {
+    var c = m.codeUnitAt(i);
+    if (c == 0x28) return true;                 // '('
+    if (c == 0x7B || c == 0x3B) return false;   // '{' or ';'
+    if (c == 0x3D) {                            // '='
+      var nxt = (i + 1 < m.length) ? m.codeUnitAt(i + 1) : 0;
+      if (nxt != 0x3D && nxt != 0x3E) return false;
+    }
+  }
+  return false;
+}
+
+// World class members via mirrors, same record format (source = signature, r/o).
+List _worldClassMembers(String qualified) {   // "libUri|ClassName"
   var parts = qualified.split('|');
-  if (parts.length != 2) return const <String>[];
-  var out = <String>[];
+  if (parts.length != 2) return const <List>[];
+  var out = <List>[];
   currentMirrorSystem().libraries.forEach((uri, lib) {
     if (uri.toString() == parts[0]) {
       lib.declarations.forEach((sym, decl) {
@@ -253,12 +294,14 @@ List _worldMembers(String qualified) {   // "libUri|ClassName"
           ClassMirror cm = decl;
           cm.declarations.forEach((s2, d2) {
             var n2 = MirrorSystem.getName(s2);
-            if (d2 is VariableMirror) out.add(n2);
-            else if (d2 is MethodMirror) {
+            if (d2 is VariableMirror) {
+              VariableMirror vm = d2;
+              out.add([vm.isStatic ? 'c' : 'i', 'var', _typeName(vm.type) + ' ' + n2, '']);
+            } else if (d2 is MethodMirror) {
               MethodMirror mm = d2;
-              if (mm.isConstructor) out.add(n2 + '()');
-              else if (mm.isGetter) out.add('get ' + n2);
-              else if (!mm.isSetter) out.add(n2 + '()');
+              if (mm.isSetter) return;
+              var sig = mm.isConstructor ? (n2 + '()') : (mm.isGetter ? ('get ' + n2) : (n2 + '()'));
+              out.add([mm.isStatic ? 'c' : 'i', 'method', sig, '']);
             }
           });
         }
@@ -266,4 +309,23 @@ List _worldMembers(String qualified) {   // "libUri|ClassName"
     }
   });
   return out;
+}
+
+String _typeName(TypeMirror t) {
+  try { return MirrorSystem.getName(t.simpleName); } catch (e) { return 'var'; }
+}
+
+// The class comment, stored in the image alongside its source.
+String _classComment(String name) {
+  if (_db == null || !_db.isOpen) return '';
+  var r = _db.query('SELECT comment FROM decls WHERE name=?', [name]);
+  if (r != null && r.length > 0 && r[0].length > 0 && r[0][0] != null) return r[0][0];
+  return '';
+}
+
+String _setComment(List a) {
+  if (_db != null && _db.isOpen) {
+    _db.exec('UPDATE decls SET comment=? WHERE name=?', [a[1].toString(), a[0].toString()]);
+  }
+  return 'ok';
 }

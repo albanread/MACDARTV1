@@ -25,13 +25,18 @@ int gLangGen = 0;                      // generation, to ignore stale exit event
 final Object _kTimeout = new Object();
 const Duration _kDoitTimeout = const Duration(seconds: 6);
 
-// Browser (Smalltalk-style) state.
-Cocoa gClassTable, gMemberTable, gBrowserSrc;
-int gBrowserCat = 0;                   // 0 = User App, 1 = World
-List gBrClasses = <dynamic>[];         // pane 1 rows (classes, or world libraries)
-List gBrMembers = <dynamic>[];         // pane 2 rows (members, or world classes)
-String gBrSelClass, gBrSelWorldLib;
-List<String> _asList(dynamic r) => r is List ? new List<String>.from(r.map((e) => e.toString())) : <String>[];
+// Browser (Smalltalk-style, 4-pane) state.
+Cocoa gCatTable, gClassTable, gVarTable, gMethodTable, gBrowserSrc;
+List gBrCats = <dynamic>[];        // Categories: "User App" + world libraries
+List gBrClasses = <dynamic>[];     // classes in the selected category
+List gClassMembers = <dynamic>[];  // all member records of the selected class
+List gVarRecs = <dynamic>[];       // variables for the current side (i/c)
+List gMethodRecs = <dynamic>[];    // methods for the current side (i/c)
+String gBrSide = 'i';              // instance | class
+String gBrMode = 'source';         // comment | definition | source
+String gBrSelCat, gBrSelClass, gBrClassSrc, gBrClassComment, gSelMemberSrc;
+bool gBrUserApp = true;            // is the selected category editable (user app)?
+List _dl(dynamic r) => r is List ? r : <dynamic>[];   // reply -> list
 
 Cocoa _mono(double sz) => Cocoa.cls("NSFont").userFixedPitchFontOfSize(sz);
 
@@ -82,7 +87,7 @@ Cocoa addTab(Cocoa tabView, String ident, double w, double h) {
 
 void switchTab(int i) {
   gTabView.selectTabViewItemAtIndex(i);
-  if (i == 1) browserCategory(gBrowserCat);
+  if (i == 1) openBrowser();
   updateMetrics();
   gWindow.display();
 }
@@ -172,84 +177,147 @@ Cocoa tableIn(Cocoa parent, List frame) {
 }
 
 void buildBrowserTab(Cocoa br) {
-  button(br, "User App", [8.0, 388.0, 92.0, 26.0], (s) => browserCategory(0));
-  button(br, "World", [106.0, 388.0, 74.0, 26.0], (s) => browserCategory(1));
-  button(br, "Accept", [604.0, 388.0, 84.0, 26.0], (s) => browserAccept());
-  button(br, "Remove", [694.0, 388.0, 90.0, 26.0], (s) => browserRemove());
+  // instance/class toggle (over the member panes).
+  button(br, "instance", [372.0, 394.0, 84.0, 22.0], (s) => setSide('i'));
+  button(br, "class", [460.0, 394.0, 66.0, 22.0], (s) => setSide('c'));
 
-  gClassTable = tableIn(br, [8.0, 192.0, 300.0, 190.0]);
-  gMemberTable = tableIn(br, [316.0, 192.0, 544.0, 190.0]);
-  gBrowserSrc = scrolledTextView(br, [8.0, 8.0, 852.0, 176.0], true);
+  // Four panes: Categories | Classes | Variables | Methods.
+  gCatTable = tableIn(br, [8.0, 196.0, 158.0, 218.0]);
+  gClassTable = tableIn(br, [174.0, 196.0, 190.0, 218.0]);
+  gVarTable = tableIn(br, [372.0, 196.0, 224.0, 190.0]);
+  gMethodTable = tableIn(br, [604.0, 196.0, 256.0, 190.0]);
+
+  // Source pane modes + actions (over the source view).
+  button(br, "Comment", [8.0, 168.0, 92.0, 22.0], (s) => setMode('comment'));
+  button(br, "Definition", [104.0, 168.0, 98.0, 22.0], (s) => setMode('definition'));
+  button(br, "Source", [206.0, 168.0, 78.0, 22.0], (s) => setMode('source'));
+  button(br, "Accept", [604.0, 168.0, 84.0, 22.0], (s) => browserAccept());
+  button(br, "Remove", [694.0, 168.0, 90.0, 22.0], (s) => browserRemove());
+
+  gBrowserSrc = scrolledTextView(br, [8.0, 8.0, 852.0, 152.0], true);
   var mf = _mono(13.0);
   if (!mf.isNil) gBrowserSrc.setFont(mf);
 
+  gTargets.add(onTable(gCatTable, () => gBrCats.length, (r) => gBrCats[r].toString(), (r) => selectCategory(r)));
   gTargets.add(onTable(gClassTable, () => gBrClasses.length, (r) => gBrClasses[r].toString(), (r) => selectClass(r)));
-  gTargets.add(onTable(gMemberTable, () => gBrMembers.length, (r) => gBrMembers[r].toString(), (r) => selectMember(r)));
+  gTargets.add(onTable(gVarTable, () => gVarRecs.length, (r) => gVarRecs[r][2].toString(), (r) => selectMemberRec(gVarRecs, r)));
+  gTargets.add(onTable(gMethodTable, () => gMethodRecs.length, (r) => gMethodRecs[r][2].toString(), (r) => selectMemberRec(gMethodRecs, r)));
   gTargets.add(onTextChange(gBrowserSrc, (s) => highlightView(gBrowserSrc)));
 }
 
-void browserCategory(int cat) {
-  gBrowserCat = cat;
+void openBrowser() {
+  ask('categories', '').then((r) {
+    gBrCats = _dl(r);
+    gCatTable.reloadData();
+    gWindow.display();
+  });
+}
+
+void selectCategory(int row) {
+  if (row < 0 || row >= gBrCats.length) return;
+  gBrSelCat = gBrCats[row].toString();
+  gBrUserApp = (gBrSelCat == 'User App');
   gBrSelClass = null;
-  gBrMembers = <dynamic>[];
-  if (gBrowserSrc != null) gBrowserSrc.setString("");
-  ask(cat == 0 ? 'classes' : 'worldlibs', '').then((r) {
-    gBrClasses = _asList(r);
-    gClassTable.reloadData();
-    gMemberTable.reloadData();
+  gClassMembers = <dynamic>[]; gVarRecs = <dynamic>[]; gMethodRecs = <dynamic>[];
+  gBrowserSrc.setString("");
+  ask(gBrUserApp ? 'classes' : 'worldclasses', gBrUserApp ? '' : gBrSelCat).then((r) {
+    gBrClasses = _dl(r);
+    gClassTable.reloadData(); gVarTable.reloadData(); gMethodTable.reloadData();
     gWindow.display();
   });
 }
 
 void selectClass(int row) {
   if (row < 0 || row >= gBrClasses.length) return;
-  var name = gBrClasses[row].toString();
-  if (gBrowserCat == 0) {
-    gBrSelClass = name;
-    ask('members', name).then((r) { gBrMembers = _asList(r); gMemberTable.reloadData(); gWindow.display(); });
-    ask('classsrc', name).then((r) { gBrowserSrc.setString(r.toString()); highlightView(gBrowserSrc); gWindow.display(); });
+  gBrSelClass = gBrClasses[row].toString();
+  gSelMemberSrc = null;
+  var membersCmd = gBrUserApp ? 'classmembers' : 'worldclassmembers';
+  var membersArg = gBrUserApp ? gBrSelClass : (gBrSelCat + '|' + gBrSelClass);
+  ask(membersCmd, membersArg).then((r) { gClassMembers = _dl(r); filterMembers(); gWindow.display(); });
+  if (gBrUserApp) {
+    ask('classsrc', gBrSelClass).then((r) { gBrClassSrc = r.toString(); if (gBrMode == 'source') gBrMode = 'definition'; updateSourcePane(); });
+    ask('classcomment', gBrSelClass).then((r) { gBrClassComment = r.toString(); });
   } else {
-    gBrSelWorldLib = name;
-    ask('worldclasses', name).then((r) { gBrMembers = _asList(r); gMemberTable.reloadData(); gWindow.display(); });
-    gBrowserSrc.setString("// " + name + "  —  world library (read-only)");
-    gWindow.display();
+    gBrClassSrc = "// " + gBrSelClass + "  —  world class (read-only)";
+    gBrClassComment = "";
+    gBrMode = 'definition';
+    updateSourcePane();
   }
 }
 
-void selectMember(int row) {
-  if (row < 0 || row >= gBrMembers.length) return;
-  if (gBrowserCat == 1) {          // world: pane 2 holds classes → show members
-    var cls = gBrMembers[row].toString();
-    ask('worldmembers', gBrSelWorldLib + '|' + cls).then((r) {
-      var ms = _asList(r);
-      gBrowserSrc.setString("// " + cls + "  (world, read-only)\nclass " + cls + " {\n  " +
-          ms.join(";\n  ") + (ms.length > 0 ? ";" : "") + "\n}");
-      highlightView(gBrowserSrc);
-      gWindow.display();
-    });
+void filterMembers() {
+  gVarRecs = <dynamic>[]; gMethodRecs = <dynamic>[];
+  for (var rec in gClassMembers) {
+    if (rec[0] != gBrSide) continue;
+    if (rec[1] == 'var') gVarRecs.add(rec); else gMethodRecs.add(rec);
   }
-  // user app: member selection is informational; the source stays the class.
+  gVarTable.reloadData(); gMethodTable.reloadData();
+}
+
+void setSide(String side) { gBrSide = side; filterMembers(); gWindow.display(); }
+
+void selectMemberRec(List recs, int row) {
+  if (row < 0 || row >= recs.length) return;
+  var src = recs[row][3].toString();
+  gSelMemberSrc = src.length > 0 ? src : recs[row][2].toString();
+  gBrMode = 'source';
+  updateSourcePane();
+}
+
+void setMode(String mode) { gBrMode = mode; updateSourcePane(); }
+
+void updateSourcePane() {
+  var text;
+  if (gBrMode == 'comment') text = gBrClassComment != null ? gBrClassComment : "";
+  else if (gBrMode == 'definition') text = gBrClassSrc != null ? gBrClassSrc : "";
+  else text = (gSelMemberSrc != null && gSelMemberSrc.length > 0) ? gSelMemberSrc : (gBrClassSrc != null ? gBrClassSrc : "");
+  gBrowserSrc.setString(text);
+  highlightView(gBrowserSrc);
+  gWindow.display();
+}
+
+String _replaceOnce(String s, String find, String repl) {
+  var i = s.indexOf(find);
+  return i < 0 ? s : (s.substring(0, i) + repl + s.substring(i + find.length));
 }
 
 void browserAccept() {
-  if (gBrowserCat != 0) { log("world classes are read-only"); return; }
-  var decls = splitTopLevel(gBrowserSrc.string().UTF8String());
+  if (!gBrUserApp) { log("world classes are read-only"); return; }
+  var text = gBrowserSrc.string().UTF8String();
+  if (gBrMode == 'comment') {
+    if (gBrSelClass == null) return;
+    var name = gBrSelClass;
+    ask('setcomment', [name, text]).then((r) { gBrClassComment = text; log("✓ comment saved — " + name); });
+    return;
+  }
+  if (gBrMode == 'source' && gSelMemberSrc != null && gSelMemberSrc.length > 0 && gBrClassSrc != null) {
+    var newClass = _replaceOnce(gBrClassSrc, gSelMemberSrc, text);   // edit one member
+    ask('acceptMany', [newClass]).then((r) {
+      log("✓ Accept — " + r);
+      gBrClassSrc = newClass; gSelMemberSrc = text;
+      _reloadBrowserClass();
+    });
+    return;
+  }
+  var decls = splitTopLevel(text);                                   // whole class
   if (decls.isEmpty) { log("(nothing to accept)"); return; }
-  ask('acceptMany', decls).then((r) {
-    log("✓ Browser Accept — " + r);
-    updateMetrics();
-    browserCategory(0);
-  });
+  ask('acceptMany', decls).then((r) { log("✓ Accept — " + r); _reloadBrowserClass(); });
+}
+
+void _reloadBrowserClass() {
+  updateMetrics();
+  if (gBrSelClass == null || !gBrUserApp) return;
+  ask('classmembers', gBrSelClass).then((r) { gClassMembers = _dl(r); filterMembers(); gWindow.display(); });
+  ask('classsrc', gBrSelClass).then((r) { gBrClassSrc = r.toString(); gWindow.display(); });
 }
 
 void browserRemove() {
-  if (gBrowserCat != 0 || gBrSelClass == null) { log("nothing to remove"); return; }
+  if (!gBrUserApp || gBrSelClass == null) { log("nothing to remove"); return; }
   var name = gBrSelClass;
   ask('remove', name).then((r) {
     log("Browser — " + r);
-    gBrSelClass = null;
-    gBrowserSrc.setString("");
-    browserCategory(0);
+    gBrSelClass = null; gSelMemberSrc = null; gBrowserSrc.setString("");
+    selectCategory(0);
   });
 }
 
@@ -536,9 +604,12 @@ Future<String> handle(String line) async {
     case 'ping': return "pong";
     case 'snap': return await snapshot(arg.isEmpty ? "/tmp/dartui.png" : arg);
     case 'tab': switchTab(int.parse(arg)); return "ok";
-    case 'brcat': browserCategory(int.parse(arg)); return "ok";
+    case 'brcat': selectCategory(int.parse(arg)); return "ok";
     case 'brclass': selectClass(int.parse(arg)); return "ok";
-    case 'brmember': selectMember(int.parse(arg)); return "ok";
+    case 'brvar': selectMemberRec(gVarRecs, int.parse(arg)); return "ok";
+    case 'brmethod': selectMemberRec(gMethodRecs, int.parse(arg)); return "ok";
+    case 'brside': setSide(arg); return "ok";
+    case 'brmode': setMode(arg); return "ok";
     case 'settext':
       gEditor.setString(arg.replaceAll('\\n', '\n'));
       highlight();

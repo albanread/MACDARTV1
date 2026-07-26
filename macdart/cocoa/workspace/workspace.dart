@@ -323,10 +323,7 @@ void buildWindow() {
   button(ws, "Do It", [8.0, 388.0, 84.0, 28.0], (s) => run(false));
   button(ws, "Print It", [98.0, 388.0, 90.0, 28.0], (s) => run(true));
   alias("ws:Accept", button(ws, "Accept", [194.0, 388.0, 92.0, 28.0], (s) => acceptEditor()));
-  button(ws, "Clear", [292.0, 388.0, 74.0, 28.0], (s) {
-    gLog.clear(); gTranscript.setString(""); repaint();
-  });
-  pinTop(<String>["Do It", "Print It", "Accept", "Clear"]);
+  pinTop(<String>["Do It", "Print It", "Accept"]);
   gEditor = scrolledTextView(ws, [8.0, 8.0, 852.0, 372.0], true);
   anchorScroll(gEditor, kWidthSizable + kHeightSizable);
   gTargets.add(onTextChange(gEditor, (s) => highlight()));
@@ -348,8 +345,12 @@ void buildWindow() {
 
   // Transcript dock (shared across tabs): docked to the bottom at a fixed
   // height, widening with the window.
-  gTranscript = scrolledTextView(gContent, [16.0, 12.0, 868.0, 152.0], false);
+  gTranscript = scrolledTextView(gContent, [16.0, 12.0, 868.0, 140.0], false);
   anchorScroll(gTranscript, kWidthSizable);
+  // Clear sits with the transcript it clears, reachable from every tab.
+  button(gContent, "Clear", [824.0, 154.0, 60.0, 18.0], (s) {
+    gLog.clear(); gTranscript.setString(""); repaint();
+  }).setAutoresizingMask(kMinXMargin);
 
   // Below this the panes stop being usable, so don't let the window get there.
   gWindow.setContentMinSize([680.0, 480.0]);
@@ -476,50 +477,90 @@ Cocoa tableIn(Cocoa parent, List frame) {
   return table;
 }
 
+// A browser column. Each split pane is its OWN NSView holding the table plus any
+// buttons that belong to that column, which is how MACVM does it
+// (world/72_cocoabrowser2.mst buildClassListPane:): the scroll view is inset by
+// the button row's height and the buttons sit at the pane's bottom edge. Because
+// they are children of the pane, the splitter carries them — put them in the tab
+// instead, at fixed coordinates, and they drift out of alignment as soon as a
+// divider moves.
+const double kPaneBtnH = 26.0;
+
+Cocoa browserPane(Cocoa split, double w, double h) {
+  var v = Cocoa.cls("NSView").alloc().initWithFrame([0.0, 0.0, w, h]);
+  v.setAutoresizesSubviews(true);
+  v.setAutoresizingMask(kWidthSizable + kHeightSizable);
+  split.addSubview(v);
+  return v;
+}
+
+// A New/Remove pair across the bottom of a column. The Remove button gets the
+// larger share, since "Remove Method" is the longest label here and a truncated
+// button is worse than an uneven split.
+void paneButtons(Cocoa pane, double w, String leftTitle, CocoaAction leftFn,
+                 String rightTitle, CocoaAction rightFn) {
+  var lw = (w * 0.42) - 6.0, rw = (w * 0.58) - 6.0;
+  var l = button(pane, leftTitle, [4.0, 3.0, lw, 22.0], leftFn);
+  var r = button(pane, rightTitle, [(w * 0.42) + 2.0, 3.0, rw, 22.0], rightFn);
+  l.setAutoresizingMask(kWidthSizable);
+  r.setAutoresizingMask(kWidthSizable + kMinXMargin);
+}
+
 void buildBrowserTab(Cocoa br) {
-  // create buttons (left) + instance/class toggle (over the member panes).
-  button(br, "+ Class", [8.0, 394.0, 78.0, 22.0], (s) => newClass());
-  button(br, "+ Method", [90.0, 394.0, 90.0, 22.0], (s) => newMethod());
-  button(br, "instance", [372.0, 394.0, 84.0, 22.0], (s) => setSide('i'));
-  button(br, "class", [460.0, 394.0, 66.0, 22.0], (s) => setSide('c'));
   br.setAutoresizesSubviews(true);
-  pinTop(<String>["+ Class", "+ Method", "instance", "class"]);   // ride the top edge
 
-  // The browser proper is two nested split views, so every separator is a
-  // draggable splitter: the four panes side by side over the source area.
-  var vsplit = splitView([8.0, 8.0, 852.0, 380.0], false);
-  var hsplit = splitView([0.0, 0.0, 852.0, 220.0], true);
+  // Two nested split views, so every separator is a draggable splitter: the four
+  // columns side by side over the source area.
+  var vsplit = splitView([8.0, 8.0, 852.0, 404.0], false);
+  var hsplit = splitView([0.0, 0.0, 852.0, 250.0], true);
+  var cw = 213.0, ph = 250.0;
 
-  // Four panes: Categories | Classes | Variables | Methods. Each scroll view is
-  // a split pane, so the splitter resizes it directly.
-  var cw = 213.0;
-  gCatTable = tableIn(hsplit, [0.0, 0.0, cw, 220.0]);
-  gClassTable = tableIn(hsplit, [0.0, 0.0, cw, 220.0]);
-  gVarTable = tableIn(hsplit, [0.0, 0.0, cw, 220.0]);
-  gMethodTable = tableIn(hsplit, [0.0, 0.0, cw, 220.0]);
+  // Categories — just a list.
+  var catPane = browserPane(hsplit, cw, ph);
+  gCatTable = tableIn(catPane, [0.0, 0.0, cw, ph]);
 
-  // Lower half: the mode/action row pinned above the source view, both inside
-  // one container so the horizontal splitter moves them together.
-  var lower = Cocoa.cls("NSView").alloc().initWithFrame([0.0, 0.0, 852.0, 150.0]);
+  // Classes — list over its own New/Remove.
+  var classPane = browserPane(hsplit, cw, ph);
+  gClassTable = tableIn(classPane, [0.0, kPaneBtnH, cw, ph - kPaneBtnH]);
+  paneButtons(classPane, cw, "+ Class", (s) => newClass(),
+                             "Remove Class", (s) => browserRemove());
+
+  // Variables — the instance/class toggle governs this column and Methods, so it
+  // rides the top of this pane rather than floating in the tab.
+  var varPane = browserPane(hsplit, cw, ph);
+  gVarTable = tableIn(varPane, [0.0, 0.0, cw, ph - kPaneBtnH]);
+  var bi = button(varPane, "instance", [4.0, ph - 24.0, (cw / 2.0) - 6.0, 22.0], (s) => setSide('i'));
+  var bc = button(varPane, "class", [(cw / 2.0) + 2.0, ph - 24.0, (cw / 2.0) - 6.0, 22.0], (s) => setSide('c'));
+  bi.setAutoresizingMask(kWidthSizable + kMinYMargin);
+  bc.setAutoresizingMask(kWidthSizable + kMinXMargin + kMinYMargin);
+
+  // Methods — list over its own New/Remove.
+  var methPane = browserPane(hsplit, cw, ph);
+  gMethodTable = tableIn(methPane, [0.0, kPaneBtnH, cw, ph - kPaneBtnH]);
+  paneButtons(methPane, cw, "+ Method", (s) => newMethod(),
+                             "Remove Method", (s) => removeMethod());
+
+  // Lower half: the mode/action row pinned above the source view, both inside one
+  // container so the horizontal splitter moves them together.
+  var lower = Cocoa.cls("NSView").alloc().initWithFrame([0.0, 0.0, 852.0, 144.0]);
   lower.setAutoresizesSubviews(true);
-  button(lower, "Comment", [0.0, 126.0, 84.0, 22.0], (s) => setMode('comment'));
-  button(lower, "Definition", [86.0, 126.0, 92.0, 22.0], (s) => setMode('definition'));
-  button(lower, "Source", [182.0, 126.0, 72.0, 22.0], (s) => setMode('source'));
-  gStatus = label(lower, [262.0, 128.0, 320.0, 18.0]);
-  alias("br:Accept", button(lower, "Accept", [586.0, 126.0, 68.0, 22.0], (s) => browserAccept()));
-  button(lower, "Cancel", [658.0, 126.0, 64.0, 22.0], (s) => browserCancel());
-  button(lower, "Remove", [726.0, 126.0, 90.0, 22.0], (s) => browserRemove());
-  pinTop(<String>["Comment", "Definition", "Source"]);          // ride the top edge
-  pinTop(<String>["Accept", "Cancel", "Remove"], kMinXMargin);  // ...and the right edge
+  button(lower, "Comment", [0.0, 120.0, 84.0, 22.0], (s) => setMode('comment'));
+  button(lower, "Definition", [86.0, 120.0, 92.0, 22.0], (s) => setMode('definition'));
+  button(lower, "Source", [182.0, 120.0, 72.0, 22.0], (s) => setMode('source'));
+  gStatus = label(lower, [262.0, 122.0, 380.0, 18.0]);
+  alias("br:Accept", button(lower, "Accept", [650.0, 120.0, 68.0, 22.0], (s) => browserAccept()));
+  button(lower, "Cancel", [722.0, 120.0, 64.0, 22.0], (s) => browserCancel());
+  pinTop(<String>["Comment", "Definition", "Source"]);   // ride the top edge
+  pinTop(<String>["Accept", "Cancel"], kMinXMargin);     // ...and the right edge
   gStatus.setAutoresizingMask(kMinYMargin + kWidthSizable);
-  gBrowserSrc = scrolledTextView(lower, [0.0, 0.0, 852.0, 122.0], true);
+  gBrowserSrc = scrolledTextView(lower, [0.0, 0.0, 852.0, 116.0], true);
   anchorScroll(gBrowserSrc, kWidthSizable + kHeightSizable);
 
   vsplit.addSubview(hsplit);
   vsplit.addSubview(lower);
   vsplit.adjustSubviews();
   hsplit.adjustSubviews();
-  vsplit.setPosition(220.0, ofDividerAtIndex: 0);
+  vsplit.setPosition(ph, ofDividerAtIndex: 0);
   hsplit.setPosition(cw, ofDividerAtIndex: 0);
   hsplit.setPosition(cw * 2, ofDividerAtIndex: 1);
   hsplit.setPosition(cw * 3, ofDividerAtIndex: 2);
@@ -532,6 +573,28 @@ void buildBrowserTab(Cocoa br) {
   gTargets.add(onTable(gVarTable, () => gVarRecs.length, (r) => gVarRecs[r][2].toString(), sel((r) => selectMemberRec(gVarRecs, r))));
   gTargets.add(onTable(gMethodTable, () => gMethodRecs.length, (r) => gMethodRecs[r][2].toString(), sel((r) => selectMemberRec(gMethodRecs, r))));
   gTargets.add(onTextChange(gBrowserSrc, (s) => highlightView(gBrowserSrc)));
+}
+
+// Delete the selected member from its class, then re-accept the class — so the
+// removal is live and saved, exactly like any other edit.
+void removeMethod() {
+  if (!gBrUserApp) { log("world classes are read-only"); return; }
+  if (gBrSelClass == null || gBrClassSrc == null) { log("select a class first"); return; }
+  if (gSelMemberSrc == null || gSelMemberSrc.isEmpty) {
+    log("select a member in the Variables or Methods pane to remove");
+    return;
+  }
+  var gone = gSelMemberSig;
+  var updated = _replaceOnce(gBrClassSrc, gSelMemberSrc, "");
+  ask('acceptMany', [updated]).then((r) {
+    if (r.toString().startsWith("ERR")) { log("Remove Method — " + r); return; }
+    log("Removed " + gBrSelClass + " >> " + (gone != null ? gone : "member"));
+    gBrClassSrc = updated;
+    gSelMemberSrc = null; gSelMemberSig = null;
+    gBrMode = 'definition';
+    _reloadBrowserClass();
+    updateSourcePane();
+  });
 }
 
 void openBrowser() {

@@ -141,6 +141,13 @@ Cocoa splitView(List frame, bool vertical) {
   return sp;
 }
 
+// The control socket addresses buttons by title, but two titles are used on more
+// than one tab: "Find" is both a toolbar tab-switcher and the Find tab's search
+// button, and "Accept" is both the Workspace editor's and the browser's. The
+// plain title keeps its historic (last-registered) meaning; these aliases let a
+// driver name the one it actually means.
+Cocoa alias(String name, Cocoa b) { gButtons[name] = b; return b; }
+
 Cocoa _mono(double sz) => Cocoa.cls("NSFont").userFixedPitchFontOfSize(sz);
 
 Cocoa button(Cocoa parent, String title, List frame, CocoaAction fn) {
@@ -226,7 +233,7 @@ void buildWindow() {
   texturedBox(bar, [0.0, 0.0, 900.0, 44.0], kWidthSizable + kHeightSizable);
   iconButton(bar, "Workspace", "texteditor", [8.0, 6.0, 36.0, 32.0], (s) => switchTab(0));
   iconButton(bar, "Browser", "hierarchy", [48.0, 6.0, 36.0, 32.0], (s) => switchTab(1));
-  iconButton(bar, "Find", "open", [88.0, 6.0, 36.0, 32.0], (s) => switchTab(3));
+  alias("tab:Find", iconButton(bar, "Find", "open", [88.0, 6.0, 36.0, 32.0], (s) => switchTab(3)));
   iconButton(bar, "Docs", "documentation", [128.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
   gMetrics = label(bar, [520.0, 13.0, 372.0, 18.0]);
   gMetrics.setAlignment(2); // right
@@ -244,7 +251,7 @@ void buildWindow() {
   var ws = addTab(gTabView, "workspace", 868.0, 420.0);
   button(ws, "Do It", [8.0, 388.0, 84.0, 28.0], (s) => run(false));
   button(ws, "Print It", [98.0, 388.0, 90.0, 28.0], (s) => run(true));
-  button(ws, "Accept", [194.0, 388.0, 92.0, 28.0], (s) => acceptEditor());
+  alias("ws:Accept", button(ws, "Accept", [194.0, 388.0, 92.0, 28.0], (s) => acceptEditor()));
   button(ws, "Clear", [292.0, 388.0, 74.0, 28.0], (s) {
     gLog.clear(); gTranscript.setString(""); repaint();
   });
@@ -324,8 +331,8 @@ Cocoa tableIn(Cocoa parent, List frame) {
   table.setHeaderView(null);
   table.setUsesAlternatingRowBackgroundColors(true);
   // Follow the enclosing pane when a splitter resizes it.
-  table.setAutoresizingMask(kWidthSizable + kHeightSizable);
-  table.setColumnAutoresizingStyle(1);   // NSTableViewUniformColumnAutoresizingStyle
+  table.setAutoresizingMask(kWidthSizable);   // height is the table's own business
+  table.setColumnAutoresizingStyle(1);        // NSTableViewUniformColumnAutoresizingStyle
   scroll.setDocumentView(table);
   scroll.setAutoresizingMask(kWidthSizable + kHeightSizable);
   parent.addSubview(scroll);
@@ -339,9 +346,7 @@ void buildBrowserTab(Cocoa br) {
   button(br, "instance", [372.0, 394.0, 84.0, 22.0], (s) => setSide('i'));
   button(br, "class", [460.0, 394.0, 66.0, 22.0], (s) => setSide('c'));
   br.setAutoresizesSubviews(true);
-  for (var t in <String>["+ Class", "+ Method", "instance", "class"]) {
-    gButtons[t].setAutoresizingMask(kMinYMargin);   // ride the top edge
-  }
+  pinTop(<String>["+ Class", "+ Method", "instance", "class"]);   // ride the top edge
 
   // The browser proper is two nested split views, so every separator is a
   // draggable splitter: the four panes side by side over the source area.
@@ -364,7 +369,7 @@ void buildBrowserTab(Cocoa br) {
   button(lower, "Definition", [86.0, 126.0, 92.0, 22.0], (s) => setMode('definition'));
   button(lower, "Source", [182.0, 126.0, 72.0, 22.0], (s) => setMode('source'));
   gStatus = label(lower, [262.0, 128.0, 320.0, 18.0]);
-  button(lower, "Accept", [586.0, 126.0, 68.0, 22.0], (s) => browserAccept());
+  alias("br:Accept", button(lower, "Accept", [586.0, 126.0, 68.0, 22.0], (s) => browserAccept()));
   button(lower, "Cancel", [658.0, 126.0, 64.0, 22.0], (s) => browserCancel());
   button(lower, "Remove", [726.0, 126.0, 90.0, 22.0], (s) => browserRemove());
   pinTop(<String>["Comment", "Definition", "Source"]);          // ride the top edge
@@ -527,10 +532,25 @@ void browserAccept() {
     });
     return;
   }
-  // Definition mode / a brand-new class: accept the whole source.
+  // Definition mode / a brand-new class: accept the whole source. Select what we
+  // just accepted, so "+ Method" (and the member panes) work straight away —
+  // otherwise a freshly created class is left with nothing selected and the next
+  // click on + Method just says "select a user class first".
   var decls = splitTopLevel(text);
   if (decls.isEmpty) { log("(nothing to accept)"); return; }
-  ask('acceptMany', decls).then((r) { log("✓ Accept — " + r); _reloadClassList(); });
+  var name = _classNameOf(decls[0]);
+  ask('acceptMany', decls).then((r) {
+    log("✓ Accept — " + r);
+    if (r.toString().startsWith("ERR")) return;   // reload cancelled: keep the edits
+    if (name != null) {
+      gBrSelCat = 'User App'; gBrUserApp = true;
+      gBrSelClass = name;
+      gBrClassSrc = text;
+      gSelMemberSrc = null; gSelMemberSig = null;
+    }
+    _reloadClassList();
+    updateStatus();
+  });
 }
 
 void _reloadBrowserClass() {
@@ -542,10 +562,35 @@ void _reloadBrowserClass() {
 
 void _reloadClassList() {
   updateMetrics();
-  if (gBrSelCat == null) return;
+  if (gBrSelCat == null) { gBrSelCat = 'User App'; gBrUserApp = true; }
   ask(gBrUserApp ? 'classes' : 'worldclasses', gBrUserApp ? '' : gBrSelCat).then((r) {
-    gBrClasses = _dl(r); gClassTable.reloadData(); repaint();
+    gBrClasses = _dl(r);
+    gClassTable.reloadData();
+    _showClassSelection();
+    repaint();
   });
+}
+
+/// The name a declaration defines, or null if it isn't a class/enum.
+String _classNameOf(String d) {
+  var m = new RegExp(r'^\s*(?:abstract\s+)?(?:class|enum)\s+(\w+)').firstMatch(d);
+  return m != null ? m.group(1) : null;
+}
+
+// Mirror gBrSelClass into the Classes pane, so the highlighted row always agrees
+// with what Accept / + Method act on. Reloading a table otherwise leaves the OLD
+// row index highlighted, which is how a click could look like it selected one
+// class while the browser was acting on another.
+void _showClassSelection() {
+  if (gBrSelClass == null) { gClassTable.deselectAll(null); return; }
+  for (var i = 0; i < gBrClasses.length; i++) {
+    if (gBrClasses[i].toString() != gBrSelClass) continue;
+    gClassTable.selectRowIndexes(
+        Cocoa.cls("NSIndexSet").indexSetWithIndex(i), byExtendingSelection: false);
+    gClassTable.scrollRowToVisible(i);
+    return;
+  }
+  gClassTable.deselectAll(null);   // it isn't in this list any more
 }
 
 // Insert a new member just before the class's closing brace.
@@ -558,7 +603,9 @@ String _insertMember(String classSrc, String member) {
 // + New Class: drop a class template into the Definition pane; edit + Accept creates it.
 void newClass() {
   gBrUserApp = true;
+  gBrSelCat = 'User App';   // a new class is always the user app's, whatever was browsed
   gBrSelClass = null; gSelMemberSrc = null; gSelMemberSig = null;
+  gClassTable.deselectAll(null);
   gClassMembers = <dynamic>[]; gVarRecs = <dynamic>[]; gMethodRecs = <dynamic>[];
   gVarTable.reloadData(); gMethodTable.reloadData();
   gBrMode = 'definition';
@@ -572,7 +619,14 @@ void newClass() {
 
 // + New Method: drop a method template into the Source pane; edit + Accept adds it.
 void newMethod() {
-  if (!gBrUserApp || gBrSelClass == null) { log("select a user class first"); return; }
+  if (!gBrUserApp) {
+    log("'" + gBrSelCat + "' is a world library (read-only) — pick User App to add methods");
+    return;
+  }
+  if (gBrSelClass == null) {
+    log("select a class in the Classes pane first (a new class needs Accept before you can add methods)");
+    return;
+  }
   gSelMemberSrc = null; gSelMemberSig = null;   // new member — nothing to replace
   gBrMode = 'source';
   var tmpl = (gBrSide == 'c') ? "static newMethod() {\n  \n}" : "newMethod() {\n  \n}";
@@ -600,7 +654,7 @@ void buildFindTab(Cocoa fd) {
   var mf = _mono(13.0); if (!mf.isNil) gFindField.setFont(mf);
   fd.addSubview(gFindField);
   gFindField.setAutoresizingMask(kMinYMargin + kWidthSizable);
-  button(fd, "Find", [412.0, 386.0, 76.0, 28.0], (s) => runFind('find'));
+  alias("find:Search", button(fd, "Find", [412.0, 386.0, 76.0, 28.0], (s) => runFind('find')));
   button(fd, "Senders", [494.0, 386.0, 92.0, 28.0], (s) => runFind('senders'));
   pinTop(<String>["Find", "Senders"], kMinXMargin);
   var hint = label(fd, [598.0, 390.0, 262.0, 18.0]);
@@ -1031,8 +1085,12 @@ main() async {
   var server = await ServerSocket.bind(InternetAddress.LOOPBACK_IP_V4, 7644);
   stderr.writeln("dartui workspace control on 127.0.0.1:7644");
   server.listen((Socket socket) {
+    // A driver that hangs up before we answer (a timed-out `nc`, say) would
+    // otherwise surface as an unhandled SocketException in the UI isolate.
+    socket.done.catchError((e) {});
     socket.transform(UTF8.decoder).transform(new LineSplitter()).listen((line) async {
-      socket.write(await handle(line) + "\n");
-    });
-  });
+      var reply = await handle(line);
+      try { socket.write(reply + "\n"); } catch (e) {}
+    }, onError: (e) {}, cancelOnError: true);
+  }, onError: (e) => log("control socket: " + e.toString()));
 }

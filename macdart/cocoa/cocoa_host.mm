@@ -17,14 +17,67 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "include/dart_api.h"
+#include "include/dart_tools_api.h"
 
 static CFRunLoopRef g_main_loop;
 static CFRunLoopSourceRef g_pump_source;
 static bool g_in_pump;   // guards against re-entering the message loop
 static bool g_pending;   // a wakeup arrived while pumping — don't lose it
+
+// A UI-isolate hot reload, driven from HERE rather than from Dart.
+// The UI isolate cannot reload itself from its own stack: it would be rewriting
+// the frames it is standing on, with AppKit holding its closures. It can be
+// reloaded perfectly well by the HOST, though — the same flag-and-drain
+// discipline a modal panel needs. Dart raises the flag and returns; the reload
+// happens below, at the top of the pump, with no Dart frames live.
+static bool g_ui_ready = false;   // has main() ever finished building the UI?
+static bool g_ui_reload_requested = false;
+static char g_ui_reload_status[1024] = {0};
+
+// Dart calls this once the window is up. Until then, an isolate error means the
+// UI never started, and there is nothing for [NSApp run] to show.
+extern "C" void macdart_ui_ready(void) { g_ui_ready = true; }
+
+extern "C" void macdart_request_ui_reload(void) {
+  g_ui_reload_requested = true;
+  if (g_pump_source != NULL) {
+    CFRunLoopSourceSignal(g_pump_source);
+    CFRunLoopWakeUp(g_main_loop);
+  }
+}
+
+// Answers (and clears) the outcome of the last host-driven reload, so Dart can
+// report it without the host having to call back into Dart.
+extern "C" const char* macdart_take_ui_reload_status(void) {
+  if (g_ui_reload_status[0] == '\0') return NULL;
+  static char out[1024];
+  snprintf(out, sizeof(out), "%s", g_ui_reload_status);
+  g_ui_reload_status[0] = '\0';
+  return out;
+}
+
+// Reload the UI isolate's own sources. Only ever called from PumpPerform, after
+// Dart_HandleMessages has returned — i.e. the isolate is entered but quiescent.
+// ReloadSources is atomic: if the new source does not compile, it is CANCELLED
+// and the running code is untouched, so a syntax error here costs nothing.
+static void PerformUiReload(void) {
+  g_ui_reload_requested = false;
+  Dart_EnterScope();
+  Dart_Handle r = Dart_WorkspaceReloadSources(true /* force_reload */);
+  if (Dart_IsError(r)) {
+    snprintf(g_ui_reload_status, sizeof(g_ui_reload_status), "ERR: %s",
+             Dart_GetError(r));
+    fprintf(stderr, "dartui: UI reload cancelled: %s\n", Dart_GetError(r));
+  } else {
+    snprintf(g_ui_reload_status, sizeof(g_ui_reload_status), "ok");
+    fprintf(stderr, "dartui: UI reloaded\n");
+  }
+  Dart_ExitScope();
+}
 
 // Runs on thread 0 (via the run-loop source). Drains the UI isolate's message
 // queue: the queued main() on the first tick, then socket events, timers, and
@@ -45,11 +98,22 @@ static void PumpPerform(void* info) {
     Dart_EnterScope();
     Dart_Handle r = Dart_HandleMessages();
     if (Dart_IsError(r)) {
-      // A UI-isolate callback threw. Log and keep the app alive (leak-over-crash);
-      // a genuinely fatal VM error would have aborted the process already.
+      // Once the UI is up, a callback that throws is survivable: log it and keep
+      // the window (leak-over-crash). BEFORE that, the script itself failed to
+      // load or build a window — carrying on would leave a running process with
+      // nothing on screen and no control socket, which looks like a hang. Say
+      // how to recover and stop.
       fprintf(stderr, "dartui: UI isolate error: %s\n", Dart_GetError(r));
+      if (!g_ui_ready) {
+        fprintf(stderr,
+                "dartui: the UI never started — recover the last good source "
+                "with:\n    ./start-gui.sh --restore\n");
+        exit(70);
+      }
     }
     Dart_ExitScope();
+    // Dart is off the stack here — the only safe moment to swap its code out.
+    if (g_ui_reload_requested) PerformUiReload();
   } while (g_pending);
   g_in_pump = false;
 }

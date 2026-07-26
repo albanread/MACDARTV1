@@ -342,6 +342,9 @@ static void Cocoa_nsStringUtf8(Dart_NativeArguments args) {
 void Workspace_eval(Dart_NativeArguments args);
 void Workspace_reload(Dart_NativeArguments args);
 void Workspace_vmStats(Dart_NativeArguments args);
+void Workspace_requestUiReload(Dart_NativeArguments args);
+void Workspace_uiReloadStatus(Dart_NativeArguments args);
+void Workspace_uiReady(Dart_NativeArguments args);
 void Cocoa_setSelectorAction(Dart_NativeArguments args);
 void Cocoa_setSplitMinSize(Dart_NativeArguments args);
 
@@ -373,6 +376,9 @@ void Sqlite_query(Dart_NativeArguments args);
   V(Workspace_eval, 1)                                                         \
   V(Workspace_reload, 0)                                                       \
   V(Workspace_vmStats, 0)                                                      \
+  V(Workspace_requestUiReload, 0)                                              \
+  V(Workspace_uiReloadStatus, 0)                                               \
+  V(Workspace_uiReady, 0)                                                      \
   V(Cocoa_setSelectorAction, 3)                                                \
   V(Cocoa_setSplitMinSize, 2)                                                  \
   V(Cocoa_registerCallbackDispatch, 1)                                         \

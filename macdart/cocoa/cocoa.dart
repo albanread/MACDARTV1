@@ -35,6 +35,22 @@ String wsReload() native "Workspace_reload";
 /// could only be guessed.
 List wsVmStats() native "Workspace_vmStats";
 
+/// Ask the HOST to hot-reload this (UI) isolate from its source on disk.
+/// Returns immediately: the reload happens at the top of the host's pump, with
+/// no Dart frames live — an isolate cannot safely rewrite the code it is
+/// standing in. Poll [wsUiReloadStatus] for the outcome.
+String wsRequestUiReload() native "Workspace_requestUiReload";
+
+/// The outcome of the last [wsRequestUiReload]: "" if none yet, "ok", or
+/// "ERR: ..." if the reload was cancelled (in which case the running code is
+/// untouched — ReloadSources is atomic). Reading it clears it.
+String wsUiReloadStatus() native "Workspace_uiReloadStatus";
+
+/// Tell the host the window is up. Before this, the host treats a UI-isolate
+/// error as fatal — a workspace that failed to load would otherwise sit there as
+/// a running process with no window and no control socket.
+String wsUiReady() native "Workspace_uiReady";
+
 // --- Low-level natives ------------------------------------------------------
 int _nsStringFromCString(String s) native "Cocoa_nsStringFromCString";
 int _nsStringLength(int handle) native "Cocoa_nsStringLength";

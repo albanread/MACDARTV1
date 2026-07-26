@@ -6,6 +6,7 @@
 #   ./start-gui.sh -b              run it detached, logging to /tmp
 #   ./start-gui.sh -r              rebuild dartui first
 #   ./start-gui.sh -f              start from a fresh image (the old one is kept)
+#   ./start-gui.sh --restore       put the last-good UI source back, then run
 #
 # `dartui` is the GUI host: the `dart` binary plus a thread-0 AppKit host, so the
 # UI isolate runs where AppKit is legal. It takes the workspace script as its
@@ -19,18 +20,36 @@ UI_SCRIPT="$ROOT/macdart/cocoa/workspace/workspace.dart"
 IMAGE="$HOME/.macdart/workspace.sqlite"
 PORT=7644                       # the workspace's loopback control socket
 LOG=/tmp/macdart-gui.log
+LAST_GOOD="$HOME/.macdart/workspace.last-good.dart"
 
-background=0 rebuild=0 fresh=0
+background=0 rebuild=0 fresh=0 restore=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -b|--background) background=1 ;;
     -r|--rebuild)    rebuild=1 ;;
     -f|--fresh)      fresh=1 ;;
-    -h|--help)       sed -n '3,8p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --restore)       restore=1 ;;
+    -h|--help)       sed -n '3,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "start-gui.sh: unknown option '$1' (try --help)" >&2; exit 2 ;;
   esac
   shift
 done
+
+# The way back from a UI edit that will not even boot. The workspace keeps a copy
+# of the source that last started it cleanly; this puts that copy back. The
+# broken version is kept alongside, so nothing you wrote is thrown away.
+if [ "$restore" = 1 ]; then
+  if [ ! -f "$LAST_GOOD" ]; then
+    echo "start-gui.sh: no recovery copy at $LAST_GOOD" >&2
+    echo "  one is written a few seconds after each clean start" >&2
+    exit 1
+  fi
+  broken="$UI_SCRIPT.broken.$(date +%Y%m%d-%H%M%S)"
+  cp "$UI_SCRIPT" "$broken"
+  cp "$LAST_GOOD" "$UI_SCRIPT"
+  echo "restored $LAST_GOOD -> $UI_SCRIPT"
+  echo "kept the version that was there as $broken"
+fi
 
 if [ "$rebuild" = 1 ]; then
   if [ ! -f "$ROOT/macdart/build/build.ninja" ]; then

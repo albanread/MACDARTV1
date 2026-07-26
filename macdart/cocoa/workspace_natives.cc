@@ -11,6 +11,12 @@
 #include "include/dart_api.h"
 #include "include/dart_tools_api.h"
 
+// Implemented by the GUI host (macdart/cocoa/cocoa_host.mm); absent in the
+// plain `dart` build, which never links this path.
+extern "C" void macdart_request_ui_reload(void);
+extern "C" void macdart_ui_ready(void);
+extern "C" const char* macdart_take_ui_reload_status(void);
+
 namespace dart {
 namespace bin {
 
@@ -88,6 +94,31 @@ void Workspace_vmStats(Dart_NativeArguments args) {
     Dart_ListSetAt(list, i, Dart_NewInteger(v[i]));
   }
   Dart_SetReturnValue(args, list);
+}
+
+// wsRequestUiReload(): ask the HOST to hot-reload the UI isolate.
+// Deliberately indirect. The UI isolate cannot reload itself from its own stack
+// — it would be replacing the code it is standing in, while AppKit holds its
+// closures. This raises a flag and returns; cocoa_host.mm performs the reload at
+// the top of the pump, once Dart is off the stack. Only meaningful in dartui.
+void Workspace_requestUiReload(Dart_NativeArguments args) {
+  macdart_request_ui_reload();
+  Dart_SetReturnValue(args, Dart_NewStringFromCString(""));
+}
+
+// wsUiReady(): the window is up. Until this is called, the host treats any UI
+// isolate error as fatal rather than leaving a process with no window.
+void Workspace_uiReady(Dart_NativeArguments args) {
+  macdart_ui_ready();
+  Dart_SetReturnValue(args, Dart_NewStringFromCString(""));
+}
+
+// wsUiReloadStatus() -> "" | "ok" | "ERR: ...". Takes (and clears) the outcome
+// of the last host-driven reload, so the UI can report it on its next tick
+// without the host having to call back into Dart.
+void Workspace_uiReloadStatus(Dart_NativeArguments args) {
+  const char* s = macdart_take_ui_reload_status();
+  Dart_SetReturnValue(args, Dart_NewStringFromCString(s != NULL ? s : ""));
 }
 
 }  // namespace bin

@@ -401,6 +401,7 @@ void startMetrics() {
 }
 
 void pollVmStats() {
+  pollUiReload();   // the host leaves its reload result for us to report
   if (gPolling || gLang == null || gMetricVals.isEmpty) return;
   gPolling = true;
   askQuiet('vmstats', '', const Duration(seconds: 2)).then((r) {
@@ -1241,6 +1242,10 @@ void buildMenu() {
   menuItem(own, "Edit workspace.dart", "", (s) => editProjectFile('workspace'));
   menuItem(own, "Edit language.dart", "", (s) => editProjectFile('language'));
   menuItem(own, "Edit cocoa.dart", "", (s) => editProjectFile('cocoa'));
+  menuSep(own);
+  menuItem(own, "Reload UI from Source", "r", (s) => reloadUi())
+      .setKeyEquivalentModifierMask(kCmd + kCtrl);
+  menuItem(own, "Revert UI to Last Good", "", (s) => revertUi());
 
   app.setMainMenu(mainMenu);
 }
@@ -1383,6 +1388,9 @@ Future<String> handle(String line) async {
     case 'edclasses': { var o = <String>[]; for (var i = 0; i < gEdPicker.numberOfItems(); i++) o.add(gEdPicker.itemTitleAtIndex(i).UTF8String()); return o.join(','); }
     case 'log': return gLog.join('\n');   // the transcript, for headless testing
     case 'edit': editProjectFile(arg.trim()); return "ok";
+    case 'uireload': await reloadUi(); return "ok";
+    case 'uirevert': await revertUi(); return "ok";
+    case 'uilastgood': return gLastGood == null ? "(none yet)" : gLastGood;
     case 'edload': editorLoad(); return "ok";
     case 'ednew': editorNew(); return "ok";
     case 'edsave': editorSaveImage(); return "ok";
@@ -1683,6 +1691,87 @@ void editorFormat() {
   if (f == src) { log("Format - already tidy"); return; }
   edSetText(f);
   log("Format - re-indented");
+}
+
+// --- reloading the UI itself ------------------------------------------------
+// The UI isolate cannot reload itself from its own stack — it would be replacing
+// the code it is standing in, with AppKit holding its closures. The HOST can,
+// though: wsRequestUiReload() raises a flag and returns, and cocoa_host.mm does
+// the reload at the top of its pump with no Dart frames live. ReloadSources is
+// atomic, so a source that does not compile is cancelled and the running UI is
+// untouched.
+//
+// What a reload DOES change is behaviour: method bodies, new methods, morphed
+// classes. It does NOT rebuild the window — views already constructed by
+// buildWindow() keep the frames they were given, so a layout change still needs
+// a restart. Say so rather than let it look broken.
+String gLastGood;                  // a copy of the UI source that booted us
+
+/// After the app has run for a moment, keep a copy of the UI source that got it
+/// here. This file is the only thing that can rescue a bad edit, so it is
+/// written only once per launch, and only by a build that actually booted.
+void snapshotLastGood() {
+  new Timer(const Duration(seconds: 6), () {
+    try {
+      var src = new File(Platform.script.toFilePath()).readAsStringSync();
+      var dir = new Directory(_macdartDir());
+      if (!dir.existsSync()) dir.createSync(recursive: true);
+      gLastGood = _macdartDir() + "/workspace.last-good.dart";
+      new File(gLastGood).writeAsStringSync(src);
+    } catch (e) {
+      log("could not save a recovery copy of the UI — " + e.toString());
+    }
+  });
+}
+
+String _macdartDir() => Platform.environment['HOME'] + "/.macdart";
+
+/// Hot-reload the UI from workspace.dart on disk. Syntax-checked first: a
+/// cancelled reload is harmless but uninformative, and this way the error points
+/// at a line.
+Future reloadUi() async {
+  var path = Platform.script.toFilePath();
+  String src;
+  try { src = new File(path).readAsStringSync(); }
+  catch (e) { log("UI reload: cannot read " + path + " — " + e.toString()); return; }
+
+  var r = await compileCheck(src, standalone: true);
+  if (!r.ok) {
+    log("✗ UI reload refused — " + r.message);
+    return;
+  }
+  log("reloading the UI from " + path + " …");
+  wsRequestUiReload();          // the host takes it from here
+}
+
+/// Put the last-good UI source back, then reload it. The way out of an edit that
+/// compiled but left the UI misbehaving.
+Future revertUi() async {
+  if (gLastGood == null || !new File(gLastGood).existsSync()) {
+    log("no recovery copy yet (one is saved a few seconds after a clean start)");
+    return;
+  }
+  var path = Platform.script.toFilePath();
+  try {
+    new File(path).writeAsStringSync(new File(gLastGood).readAsStringSync());
+  } catch (e) {
+    log("revert failed — " + e.toString());
+    return;
+  }
+  log("restored " + gLastGood + " over " + path);
+  await reloadUi();
+}
+
+// Polled from the metrics tick: the host leaves its result here rather than
+// calling back into Dart from outside the message loop.
+void pollUiReload() {
+  var s = wsUiReloadStatus();
+  if (s.isEmpty) return;
+  if (s == "ok") {
+    log("✓ UI reloaded — behaviour is live; view LAYOUT still needs a restart");
+  } else {
+    log("✗ UI reload cancelled (the running UI is untouched) — " + s);
+  }
 }
 
 // --- editing the workspace's own source -------------------------------------
@@ -2044,6 +2133,7 @@ main() async {
   await spawnLanguage();
   log("language isolate ready — image: " + gDbPath);
   startMetrics();   // ~4 Hz VM counters in the toolbar
+  snapshotLastGood();
 
   var server = await ServerSocket.bind(InternetAddress.LOOPBACK_IP_V4, 7644);
   stderr.writeln("dartui workspace control on 127.0.0.1:7644");

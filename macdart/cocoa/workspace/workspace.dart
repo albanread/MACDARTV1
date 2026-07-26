@@ -2227,8 +2227,10 @@ Future dbgEval([String expr]) async {
   var r = await vmsCall('evaluateInFrame', <String, dynamic>{
     'isolateId': gLangIsolateId, 'frameIndex': gDbgFrame, 'expression': src});
   if (r == null) { dbgStatus("evaluate failed"); return; }
+  // A failed evaluate carries the VM's whole stack trace; the first line is the
+  // part that says what went wrong.
   var shown = (r['kind'] == 'Error' || r['message'] != null)
-      ? ("error: " + (r['message'] != null ? r['message'].toString() : r.toString()))
+      ? ("error: " + _firstLine((r['message'] != null ? r['message'] : r).toString()))
       : dbgValue(r);
   dbgStatus(src + "  =>  " + shown);
   log("debug eval: " + src + " => " + shown);

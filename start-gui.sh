@@ -96,7 +96,14 @@ fi
 
 ARGS=()
 if [ "$observe" = 1 ]; then
-  ARGS+=("--observe=$obsport")
+  # --enable-vm-service, NOT --observe: --observe also sets
+  # --pause-isolates-on-exit and --pause-isolates-on-unhandled-exceptions, and
+  # both are wrong here. The watchdog respawns the language isolate as normal
+  # operation, and pause-on-exit left the dead ones parked and still listed by
+  # getVM (a client resolving "the language isolate" could pick a corpse); an
+  # unhandled exception in a do-it is how errors are REPORTED here, not a reason
+  # to freeze the isolate with no debugger attached.
+  ARGS+=("--enable-vm-service=$obsport")
   echo "observatory / control plane: ws://127.0.0.1:$obsport/ws"
   echo '  (macdart/tcl/dartui.tcl - obs for VM introspection, ui for the GUI)' 
 fi

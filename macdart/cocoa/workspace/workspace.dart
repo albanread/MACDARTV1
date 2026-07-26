@@ -1553,7 +1553,18 @@ Future<String> handle(String line) async {
       b.performClick(null);
       return "clicked " + arg;
     case 'doit': return await ask('doit', arg);
-    case 'accept': return await ask('accept', arg);   // persisted in the image
+    case 'accept': {
+      // Scripted accepts go through the same gate as the buttons. This verb
+      // used to be the one unguarded door into the image, which is how source
+      // the reloader refuses got in during testing.
+      var r = await checkDecls(<dynamic>[arg]);
+      if (!r.ok) {
+        return "ERR: refused — " + r.message +
+               (r.line > 0 ? "  (line " + r.line.toString() + ")" : "");
+      }
+      return await ask('accept', arg);   // persisted in the image
+    }
+    case 'classsrc': return (await ask('classsrc', arg)).toString();
     case 'remove': return await ask('remove', arg);
     case 'kill': await respawnLanguage("manual kill"); return "ok";
     case 'quit':
@@ -2635,14 +2646,19 @@ String _cleanError(String msg, int offset) {
 /// Check [decls] and, if they compile, run [commit]. Otherwise say why and
 /// leave the buffer untouched — a cancelled hot reload is a far worse outcome
 /// than a refused Accept.
-Future guardedAccept(List decls, String what, void commit()) async {
+/// Compile [decls] against the image without committing anything. The single
+/// gate every route into the image goes through — buttons and scripts alike.
+Future<CheckResult> checkDecls(List decls) async {
   var names = <String>[];
   for (var d in decls) {
     var n = _classNameOf(d.toString());
     if (n != null) names.add(n);
   }
-  var joined = decls.join("\n\n");
-  var r = await compileCheck(joined, replacing: names);
+  return await compileCheck(decls.join("\n\n"), replacing: names);
+}
+
+Future guardedAccept(List decls, String what, void commit()) async {
+  var r = await checkDecls(decls);
   if (!r.ok) {
     log("✗ " + what + " refused — " + r.message);
     if (r.line > 0) _selectLine(r.line);

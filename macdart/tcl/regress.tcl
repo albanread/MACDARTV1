@@ -63,6 +63,20 @@ ui click ws:Accept
 after 4000
 check "broken refused"    [ui doit {(){ try { new TclBad(); return "leaked"; } catch (e) { return "refused"; } }()}] refused
 
+section "scripted accept is gated like the buttons"
+# The accept verb was once the unguarded door into the image.
+check "script broken refused" \
+    [expr {[string match ERR:* [ui accept {class ScriptBad { int f() { var x = ; } }}]]}] 1
+check "and never reached it"  \
+    [expr {[string match ERR:* [ui doit {new ScriptBad()}]]}] 1
+check "script valid accepted" \
+    [expr {[string match accepted* [ui accept {class ScriptOk { int n = 3; int t() => n * 2; }}]]}] 1
+check "and it runs"           [ui doit {new ScriptOk().t()}] 6
+# accepted as a one-liner, stored multi-line so a breakpoint can resolve in it
+check "stored multi-line"     [expr {[llength [split [ui classsrc ScriptOk] \n]] > 1}] 1
+ui remove ScriptOk
+after 1500
+
 section "the ui rebuilds itself"
 check "rebuild layout"    [ui uirebuild] ok
 after 800

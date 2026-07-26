@@ -494,16 +494,27 @@ Cocoa browserPane(Cocoa split, double w, double h) {
   return v;
 }
 
-// A New/Remove pair across the bottom of a column. The Remove button gets the
-// larger share, since "Remove Method" is the longest label here and a truncated
-// button is worse than an uneven split.
-void paneButtons(Cocoa pane, double w, String leftTitle, CocoaAction leftFn,
-                 String rightTitle, CocoaAction rightFn) {
-  var lw = (w * 0.42) - 6.0, rw = (w * 0.58) - 6.0;
+// Shrink a pane button's label so a New/Remove pair fits a narrow column.
+void _paneBtnFont(Cocoa b) {
+  var f = Cocoa.cls("NSFont").systemFontOfSize(11.0);
+  if (!f.isNil) b.setFont(f);
+}
+
+// A New/Remove pair across the bottom of a column, at FIXED widths anchored to
+// opposite edges. Springs-and-struts cannot split a width between two siblings:
+// give both kWidthSizable with fixed margins and the left one absorbs the whole
+// delta and grows straight over its neighbour. Anchoring instead means a wider
+// column opens a gap in the middle, which is harmless, and they can never overlap.
+void paneButtons(Cocoa pane, double w, String leftTitle, double lw, CocoaAction leftFn,
+                 String rightTitle, double rw, CocoaAction rightFn,
+                 [String leftTip = "", String rightTip = ""]) {
   var l = button(pane, leftTitle, [4.0, 3.0, lw, 22.0], leftFn);
-  var r = button(pane, rightTitle, [(w * 0.42) + 2.0, 3.0, rw, 22.0], rightFn);
-  l.setAutoresizingMask(kWidthSizable);
-  r.setAutoresizingMask(kWidthSizable + kMinXMargin);
+  var r = button(pane, rightTitle, [w - 4.0 - rw, 3.0, rw, 22.0], rightFn);
+  l.setAutoresizingMask(0);             // rides the left edge
+  r.setAutoresizingMask(kMinXMargin);   // rides the right edge
+  l.setToolTip(leftTip);
+  r.setToolTip(rightTip);
+  _paneBtnFont(l); _paneBtnFont(r);
 }
 
 void buildBrowserTab(Cocoa br) {
@@ -522,23 +533,26 @@ void buildBrowserTab(Cocoa br) {
   // Classes — list over its own New/Remove.
   var classPane = browserPane(hsplit, cw, ph);
   gClassTable = tableIn(classPane, [0.0, kPaneBtnH, cw, ph - kPaneBtnH]);
-  paneButtons(classPane, cw, "+ Class", (s) => newClass(),
-                             "Remove Class", (s) => browserRemove());
+  paneButtons(classPane, cw, "+ Class", 66.0, (s) => newClass(),
+                             "− Class", 66.0, (s) => browserRemove(),
+                             "New class", "Remove the selected class");
 
   // Variables — the instance/class toggle governs this column and Methods, so it
   // rides the top of this pane rather than floating in the tab.
   var varPane = browserPane(hsplit, cw, ph);
   gVarTable = tableIn(varPane, [0.0, 0.0, cw, ph - kPaneBtnH]);
-  var bi = button(varPane, "instance", [4.0, ph - 24.0, (cw / 2.0) - 6.0, 22.0], (s) => setSide('i'));
-  var bc = button(varPane, "class", [(cw / 2.0) + 2.0, ph - 24.0, (cw / 2.0) - 6.0, 22.0], (s) => setSide('c'));
-  bi.setAutoresizingMask(kWidthSizable + kMinYMargin);
-  bc.setAutoresizingMask(kWidthSizable + kMinXMargin + kMinYMargin);
+  var bi = button(varPane, "instance", [4.0, ph - 24.0, 72.0, 22.0], (s) => setSide('i'));
+  var bc = button(varPane, "class", [78.0, ph - 24.0, 56.0, 22.0], (s) => setSide('c'));
+  bi.setAutoresizingMask(kMinYMargin);   // a fixed-size pair, kept together at
+  bc.setAutoresizingMask(kMinYMargin);   // the top-left of the column
+  _paneBtnFont(bi); _paneBtnFont(bc);
 
   // Methods — list over its own New/Remove.
   var methPane = browserPane(hsplit, cw, ph);
   gMethodTable = tableIn(methPane, [0.0, kPaneBtnH, cw, ph - kPaneBtnH]);
-  paneButtons(methPane, cw, "+ Method", (s) => newMethod(),
-                             "Remove Method", (s) => removeMethod());
+  paneButtons(methPane, cw, "+ Method", 74.0, (s) => newMethod(),
+                             "− Method", 74.0, (s) => removeMethod(),
+                             "New method", "Remove the selected member");
 
   // Lower half: the mode/action row pinned above the source view, both inside one
   // container so the horizontal splitter moves them together.
@@ -1285,16 +1299,16 @@ Future<String> handle(String line) async {
       var o = <String>[];
       o.add("content   " + gContent.bounds().toString());
       o.add("tabview   " + gTabView.frame().toString());
-      var br = gTabView.tabViewItemAtIndex(1).view();
-      o.add("browser   " + br.frame().toString() + " subviews=" + br.subviews().count().toString());
-      for (var t in <String>["+ Class", "instance", "Comment", "Accept", "Remove"]) {
+      for (var t in <String>["+ Class", "− Class", "+ Method", "− Method",
+                             "instance", "class", "Comment", "Accept", "Clear"]) {
         var b = gButtons[t];
-        o.add(t.padRight(10) + b.frame().toString() +
-              " hidden=" + b.isHidden().toString() +
-              " super=" + b.superview().frame().toString());
+        if (b == null) { o.add(t.padRight(14) + "(absent)"); continue; }
+        var f = b.frame(), sf = b.superview().frame();
+        o.add(t.padRight(14) + "x=" + f[0].toStringAsFixed(0) +
+              " w=" + f[2].toStringAsFixed(0) +
+              " right=" + (f[0] + f[2]).toStringAsFixed(0) +
+              "  pane w=" + sf[2].toStringAsFixed(0));
       }
-      o.add("srcScroll " + gBrowserSrc.enclosingScrollView().frame().toString());
-      o.add("transcript" + gTranscript.enclosingScrollView().frame().toString());
       return o.join("\n");
     }
     case 'snap': return await snapshot(arg.isEmpty ? "/tmp/dartui.png" : arg);

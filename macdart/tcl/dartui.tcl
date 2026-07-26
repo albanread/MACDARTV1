@@ -33,6 +33,11 @@ namespace eval dartui {
     variable seq 0
     variable uiIsolate ""
     variable events {}
+    variable rx ""            ;# bytes received, not yet consumed
+    variable rxflag 0
+    variable timeoutMs 30000  ;# every read has a deadline: a silent server is an
+                              ;# ERROR, never a hang — the old blocking read parked
+                              ;# the whole suite when a do-it stopped at a breakpoint
 
     # -- RFC 6455, the part we need ------------------------------------------
     proc wsOpen {host port path} {
@@ -58,6 +63,7 @@ namespace eval dartui {
 
     # A client frame MUST be masked (RFC 6455 §5.3); servers never mask.
     proc wsSend {s text} {
+        fconfigure $s -blocking 1
         set payload [encoding convertto utf-8 $text]
         set n [string length $payload]
         set hdr [binary format c 0x81]
@@ -84,23 +90,48 @@ namespace eval dartui {
         puts -nonewline $s $mask
         puts -nonewline $s [binary format cu* $out]
         flush $s
+        fconfigure $s -blocking 0
+    }
+
+    proc _readable {s} {
+        variable rx
+        variable rxflag
+        set d [read $s]
+        if {[string length $d]} { append rx $d; set rxflag data }
+        if {[eof $s]} { set rxflag eof }
+    }
+
+    proc _need {n} {
+        variable rx
+        variable rxflag
+        variable timeoutMs
+        while {[string length $rx] < $n} {
+            set t [after $timeoutMs {set ::dartui::rxflag timeout}]
+            vwait ::dartui::rxflag
+            after cancel $t
+            if {$rxflag eq "timeout"} {
+                error "dartui: no reply within ${timeoutMs}ms — is the isolate paused, or the app gone?"
+            }
+            if {$rxflag eq "eof"} { error "dartui: the vm-service closed the connection" }
+        }
+    }
+
+    proc _take {n} {
+        variable rx
+        set out [string range $rx 0 [expr {$n - 1}]]
+        set rx [string range $rx $n end]
+        return $out
     }
 
     proc wsRecv {s} {
-        set h [read $s 2]
-        if {[string length $h] < 2} { error "dartui: connection closed" }
-        binary scan $h cucu b0 b1
+        _need 2
+        binary scan [_take 2] cucu b0 b1
         set opcode [expr {$b0 & 0x0f}]
         set len [expr {$b1 & 0x7f}]
-        if {$len == 126} {
-            binary scan [read $s 2] Su len
-        } elseif {$len == 127} {
-            binary scan [read $s 8] Wu len
-        }
-        set payload ""
-        while {[string length $payload] < $len} {
-            append payload [read $s [expr {$len - [string length $payload]}]]
-        }
+        if {$len == 126} { _need 2; binary scan [_take 2] Su len }
+        if {$len == 127} { _need 8; binary scan [_take 8] Wu len }
+        _need $len
+        set payload [_take $len]
         if {$opcode == 8} { error "dartui: server closed the connection" }
         return [encoding convertfrom utf-8 $payload]
     }
@@ -127,6 +158,8 @@ namespace eval dartui {
             error "dartui: cannot parse $url"
         }
         set sock [wsOpen $host $port $path]
+        fconfigure $sock -blocking 0
+        fileevent $sock readable [list ::dartui::_readable $sock]
         return $url
     }
 
@@ -204,6 +237,16 @@ proc ui {args} {
 }
 
 proc on {stream} { ::dartui::rpc streamListen [list streamId $stream] ; return $stream }
+
+# Fire a command WITHOUT waiting for its result — for a do-it that will stop at
+# a breakpoint, whose reply cannot arrive until Continue. Awaiting that on the
+# one connection would deadlock; the server answers "started" immediately.
+proc uibg {args} {
+    if {$::dartui::uiIsolate eq ""} { ::dartui::resolveUi }
+    set r [::dartui::rpc ext.dartui.send \
+               [list isolateId $::dartui::uiIsolate line [join $args " "] nowait true]]
+    return [dict get $r reply]
+}
 
 proc events {} {
     set e $::dartui::events

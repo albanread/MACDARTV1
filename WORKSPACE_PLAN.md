@@ -66,10 +66,14 @@ So:
 
 Copied from MACVM's `control.rs` + `objc.rs`, but simpler and better in Dart.
 
-- **Transport**: a loopback `ServerSocket.bind(InternetAddress.loopbackIPv4, 7644)`
-  in the UI isolate (`dart:io`). Newline-delimited JSON, one request/reply per
-  line. No Rust listener-thread/mpsc dance — the socket's events are pumped on
-  thread 0 with everything else.
+- **Transport** *(unified since — see below)*: originally a loopback
+  `ServerSocket.bind(InternetAddress.loopbackIPv4, 7644)` in the UI isolate,
+  newline-delimited, plus a framed channel on 7645 for `macvm rusttcl`. Both are
+  gone: the process now has exactly ONE listener, the vm-service WebSocket
+  (`ws://127.0.0.1:8181/ws`), and GUI control rides it as the `ext.dartui.send`
+  service extension (client: `macdart/tcl/dartui.tcl` — `obs` for introspection,
+  `ui` for control, `uibg` for commands that will stop at a breakpoint). The
+  verbs below are unchanged; only the wire moved.
 - **Verbs** (MACVM's proven core + sugar): `ping`, `eval <expr>` → printString,
   `doit <src>` (run on language isolate), `snap <path>` (PNG to file), `view
   <name>` (switch tab), `settext/gettext <pane>`, `click <id>`, `sleep <ms>`.

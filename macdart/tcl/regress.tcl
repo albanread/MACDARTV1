@@ -50,7 +50,7 @@ section "gui control (same socket)"
 check "switch tab"        [ui tab 1] ok
 after 300
 check "toolbar button"    [ui click Browser] "clicked Browser"
-check "menu bar shape"    [ui menus] "7: NSMenuItem | File | Edit | Code | View | Source | Debug"
+check "menu bar shape"    [ui menus] "8: NSMenuItem | File | Edit | Code | Demos | View | Source | Debug"
 
 section "accept is compile-checked"
 ui tab 0
@@ -119,19 +119,77 @@ check "breakpoint resolved" [expr {[string match *resolved=true* [ui dbgbreak $l
 check "not paused yet"    [ui dbgstate] running
 
 # stop on the breakpoint and inspect the frame
-set s2 [socket 127.0.0.1 7644]
-fconfigure $s2 -translation binary -blocking 0
-puts -nonewline $s2 "doit new DbgT().step()\n"
-flush $s2
+check "bg trigger" [uibg doit new DbgT().step()] started
 after 3000
 check "paused"            [expr {[string match paused* [ui dbgstate]]}] 1
 check "gui alive stopped" [ui ping] pong
 check "locals bound"      [expr {[string match *this=* [ui dbgvars]]}] 1
 check "eval in frame"     [expr {[string match *=>*2* [ui dbgeval {n + 2}]]}] 1
+# A breakpoint must survive an edit: accepting anything rewrites the scratch
+# file the VM breaks in, and its line numbers move.
+# committing code into a STOPPED isolate must be refused, not queued — the
+# queued form fired invisibly on Continue and once deadlocked this very suite
+check "accept refused while paused" \
+    [expr {[string match ERR:* [ui accept {class Nope { int q = 1; }}]]}] 1
 ui dbgstep
 after 800
 check "resumed"           [ui dbgstate] running
+# an edit AFTER resume rewrites the scratch; the anchored breakpoint must survive
+ui accept {class Pad { int p1() => 1; int p2() => 2; int p3() => 3; }}
+after 3000
+uibg doit new DbgT().step()
+after 3000
+check "breakpoint survived an edit" [expr {[string match paused* [ui dbgstate]]}] 1
+ui dbgstep
+after 800
+# A SYNCHRONOUS doit that stops at the breakpoint must be answered at once —
+# its real reply cannot exist until Continue, and holding the RPC open for that
+# parks the client against its read deadline on the one connection (the
+# original hang, third edition). The result goes to the transcript instead.
+set t0 [clock milliseconds]
+set r [ui doit new DbgT().step()]
+set waited [expr {[clock milliseconds] - $t0}]
+check "sync doit answers while stopping" \
+    [expr {[string match "stopped in the debugger*" $r] && $waited < 5000}] 1
+after 500
+check "and it is paused"  [expr {[string match paused* [ui dbgstate]]}] 1
+# Restarting the language isolate while it sits at a breakpoint must not leave
+# a ghost pause behind: the pause died with its isolate. This once wedged the
+# workspace — everything refused with "press Continue first" over a corpse.
+ui menuclick {Debug/Restart Language Isolate}
+after 4000
+check "restart clears the pause" [ui dbgstate] running
+check "and doits work at once"   [ui doit 2+2] 4
 ui dbgclear
+ui remove Pad
+after 1500
+
+section "demos (isolates drawing through the ui isolate)"
+check "demos listed"      [expr {[llength [split [ui demos] \n]] >= 4}] 1
+# pixmap.dart has no "// Demo:" header: a library demos import, not a program
+check "libraries not listed" [expr {![string match -nocase *pixmap* [ui demos]]}] 1
+check "demo starts"       [expr {[string match started* [ui demorun bounce]]}] 1
+after 1500
+set ds [ui demostatus]
+set n 0
+regexp {(\d+) frames} $ds -> n
+check "frames flowing"    [expr {[string match running* $ds] && $n > 0}] 1
+check "gui alive under a demo" [ui ping] pong
+ui snap /tmp/dartui_demo.png
+check "demo stops"        [ui demostop] ok
+check "idle after stop"   [ui demostatus] idle
+# the parallel one: four workers zoom ~4s (paced for the screen), then a clean
+# finish lets its isolate exit — poll rather than guess the duration
+ui demorun mandelbrot
+set zoomDone 0
+for {set i 0} {$i < 30} {incr i} {
+    after 500
+    if {[string match finished* [ui demostatus]]} { set zoomDone 1; break }
+}
+check "mandelbrot finished" \
+    [expr {$zoomDone && [string match {*pixmaps from 4 worker isolates*} [ui log]]}] 1
+check "its isolate exited"  [expr {[string match finished* [ui demostatus]]}] 1
+ui demostop
 
 section "cleanup"
 ui remove TclOk

@@ -8,7 +8,8 @@
 #   ./start-gui.sh -f              start from a fresh image (the old one is kept)
 #   ./start-gui.sh --restore       put the last-good UI source back, then run
 #   ./start-gui.sh -s              supervise: restart it if it dies unexpectedly
-#   ./start-gui.sh --no-observe    leave the vm-service (Observatory) off
+#   ./start-gui.sh --no-observe    leave the vm-service off (it is the ONE control
+#                                  plane: no Tcl driving, no debugger Attach)
 #
 # `dartui` is the GUI host: the `dart` binary plus a thread-0 AppKit host, so the
 # UI isolate runs where AppKit is legal. It takes the workspace script as its
@@ -20,7 +21,6 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DARTUI="$ROOT/macdart/build/dartui"
 UI_SCRIPT="$ROOT/macdart/cocoa/workspace/workspace.dart"
 IMAGE="$HOME/.macdart/workspace.sqlite"
-PORT=7644                       # the workspace's loopback control socket
 LOG=/tmp/macdart-gui.log
 LAST_GOOD="$HOME/.macdart/workspace.last-good.dart"
 
@@ -35,7 +35,7 @@ while [ $# -gt 0 ]; do
     -s|--supervise)  supervise=1 ;;
     --no-observe)    observe=0 ;;
     --observe=*)     obsport="${1#--observe=}" ;;
-    -h|--help)       sed -n '3,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)       sed -n '3,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "start-gui.sh: unknown option '$1' (try --help)" >&2; exit 2 ;;
   esac
   shift
@@ -72,12 +72,18 @@ if [ ! -x "$DARTUI" ]; then
   exit 1
 fi
 
-# A second instance cannot bind the control socket, so stop before we confuse
-# two windows sharing one image.
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "start-gui.sh: something is already listening on 127.0.0.1:$PORT" >&2
-  echo "  the workspace is probably already running — quit it first (Cmd-Q), or:" >&2
-  echo "    printf 'quit\\n' | nc -w1 127.0.0.1 $PORT" >&2
+# Two windows sharing one image is the thing to prevent. The vm-service port is
+# the only listener now (the 7644/7645 sockets are gone), so it is the check —
+# and with --no-observe there is no listener at all, so fall back to looking for
+# the process itself.
+if [ "$observe" = 1 ] && lsof -nP -iTCP:"$obsport" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "start-gui.sh: something is already listening on 127.0.0.1:$obsport" >&2
+  echo "  the workspace is probably already running — quit it first (Cmd-Q, or" >&2
+  echo "  'ui quit' from a tclsh with macdart/tcl/dartui.tcl loaded)" >&2
+  exit 1
+fi
+if pgrep -f "build/dartui .*workspace.dart" >/dev/null 2>&1; then
+  echo "start-gui.sh: a dartui workspace process is already running — quit it first" >&2
   exit 1
 fi
 
@@ -109,7 +115,6 @@ if [ "$observe" = 1 ]; then
 fi
 
 echo "image:   $IMAGE"
-echo "control: 127.0.0.1:$PORT   (e.g. printf 'snap /tmp/x.png\\n' | nc -w1 127.0.0.1 $PORT)"
 
 # Keep it running across an unexpected death, but never in a tight loop: a fault
 # that reproduces the moment the UI is back would just spin, hiding itself.

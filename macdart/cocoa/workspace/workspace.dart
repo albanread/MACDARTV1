@@ -335,8 +335,9 @@ void buildChrome() {
   iconButton(bar, "Browser", "hierarchy", [48.0, 6.0, 36.0, 32.0], (s) => switchTab(1));
   iconButton(bar, "Editor", "blankSheet", [88.0, 6.0, 36.0, 32.0], (s) => switchTab(4));
   alias("tab:Find", iconButton(bar, "Find", "open", [128.0, 6.0, 36.0, 32.0], (s) => switchTab(3)));
-  iconButton(bar, "Debug", "abstract", [168.0, 6.0, 36.0, 32.0], (s) => switchTab(5));
-  iconButton(bar, "Docs", "documentation", [208.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
+  iconButton(bar, "Debug", "goForward", [168.0, 6.0, 36.0, 32.0], (s) => switchTab(5));
+  iconButton(bar, "Demos", "canvas", [208.0, 6.0, 36.0, 32.0], (s) => switchTab(6));
+  iconButton(bar, "Docs", "documentation", [248.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
   buildMetricsCluster(bar, 900.0);
 
   // Tabless content host (the toolbar buttons are the tab bar). It absorbs all
@@ -374,6 +375,9 @@ void buildChrome() {
 
   // Debugger tab: breakpoints and stepping in the LANGUAGE isolate.
   buildDebugTab(addTab(gTabView, "debug", 868.0, 420.0));
+
+  // Demos tab: a canvas that demo isolates draw on, through this isolate.
+  buildDemosTab(addTab(gTabView, "demos", 868.0, 420.0));
 
   // Transcript dock (shared across tabs): docked to the bottom at a fixed
   // height, widening with the window.
@@ -425,6 +429,7 @@ void startMetrics() {
 
 void pollVmStats() {
   pollUiReload();   // the host leaves its reload result for us to report
+  if (gDbgPaused) return;   // a poll now would just queue against the stopped isolate
   if (gPolling || gLang == null || gMetricVals.isEmpty) return;
   gPolling = true;
   askQuiet('vmstats', '', const Duration(seconds: 2)).then((r) {
@@ -1247,12 +1252,33 @@ void buildMenu() {
       .setKeyEquivalentModifierMask(kCmd + kOpt);
   menuItem(code, "Analyze", "b", (s) { switchTab(4); editorAnalyze(); });
 
+  // Demos: standalone programs from demos/ beside the UI source, each spawned
+  // into its own isolate, drawing on the Demos tab's canvas through this
+  // isolate. The menu IS the folder — drop a file in, Rescan, run it.
+  var demos = subMenu(mainMenu, "Demos");
+  var found = scanDemos();
+  if (found.isEmpty) {
+    menuItem(demos, "(no demos found in demos/)", "", (s) {});
+  }
+  for (var d in found) {
+    var title = d[0], path = d[1];
+    menuItem(demos, title, "", (s) => runDemoAt(title, path));
+  }
+  menuSep(demos);
+  menuItem(demos, "Stop Demo", ".", (s) => stopDemo("stopped"));
+  menuItem(demos, "Rescan Demos Folder", "", (s) {
+    buildMenu();   // setMainMenu: replaces the bar, so this rescans cleanly
+    log("demos rescanned — " + scanDemos().length.toString() + " found");
+  });
+
   var view = subMenu(mainMenu, "View");
   menuItem(view, "Workspace", "1", (s) => switchTab(0));
   menuItem(view, "Browser", "2", (s) => switchTab(1));
   menuItem(view, "Editor", "3", (s) => switchTab(4));
   menuItem(view, "Find", "4", (s) => switchTab(3));
   menuItem(view, "Docs", "5", (s) => switchTab(2));
+  menuItem(view, "Debugger", "6", (s) => switchTab(5));
+  menuItem(view, "Demos", "7", (s) => switchTab(6));
   menuSep(view);
   menuItem(view, "Clear Transcript", "k", (s) {
     gLog.clear(); gTranscript.setString(""); repaint();
@@ -1334,6 +1360,13 @@ List formatDecls(List decls) {
 
 Future ask(String cmd, var arg) async {   // arg/result may be a String or a List
   if (gLang == null) return "ERR: language isolate restarting…";
+  // A message sent now would QUEUE against the stopped isolate, invisibly, and
+  // all fire the moment you press Continue — and with the watchdog rightly
+  // suspended while paused, nothing would ever time it out. Refuse loudly.
+  if (gDbgPaused) {
+    return "ERR: the language isolate is stopped in the debugger — press "
+           "Continue first ('" + cmd + "' was not sent; Evaluate works while paused)";
+  }
   // Every accept path funnels through here, including the socket verbs, so this
   // is the one place formatting has to happen.
   if (cmd == 'acceptMany' || cmd == 'acceptLive') {
@@ -1341,6 +1374,7 @@ Future ask(String cmd, var arg) async {   // arg/result may be a String or a Lis
   } else if (cmd == 'accept') {
     arg = formatDecls(<dynamic>[arg])[0];
   }
+  var gen = gLangGen;   // which isolate this was sent to
   var rp = new ReceivePort();
   gLang.send([cmd, arg, rp.sendPort]);
 
@@ -1352,6 +1386,15 @@ Future ask(String cmd, var arg) async {   // arg/result may be a String or a Lis
   var tick;
   tick = new Timer.periodic(const Duration(milliseconds: 250), (t) {
     if (done.isCompleted) { t.cancel(); return; }
+    // The isolate this was sent to is gone (restarted under us — say, Restart
+    // while it sat at a breakpoint). No reply is ever coming, and timing out
+    // 6 seconds later would respawn the REPLACEMENT for a crime it didn't
+    // commit. Fail the request now, respawn nothing.
+    if (gLangGen != gen) {
+      t.cancel();
+      done.complete("ERR: " + cmd + " was lost — the language isolate was restarted");
+      return;
+    }
     if (debugHolding) { since.reset(); return; }   // stopped: not runaway
     if (since.elapsed >= _kDoitTimeout && !done.isCompleted) {
       t.cancel();
@@ -1363,11 +1406,51 @@ Future ask(String cmd, var arg) async {   // arg/result may be a String or a Lis
   tick.cancel();
   sub.cancel();
   rp.close();
+  // An accept rewrites the scratch file, so every anchored breakpoint has to be
+  // mapped to its new line and re-armed.
+  if (!identical(result, _kTimeout) && gLangGen == gen &&
+      (cmd == 'acceptMany' || cmd == 'acceptLive' || cmd == 'accept' ||
+       cmd == 'remove') &&
+      gLangIsolateId != null) {
+    await dbgReResolve();
+  }
   if (identical(result, _kTimeout)) {
     await respawnLanguage("'" + cmd + "' timed out — killed runaway code");
     return "ERR: " + cmd + " timed out (isolate restarted)";
   }
   return result;
+}
+
+// --- answering the socket while user code is stopped -------------------------
+// A socket verb that runs user code can stop at a breakpoint, and then its
+// reply cannot exist until Continue. Holding the RPC open for that parks the
+// client against its read deadline — on the ONE connection, that is the suite's
+// old hang in new clothes. So: if the language isolate pauses while such a verb
+// is still in flight, answer NOW with what is true ("stopped in the debugger"),
+// and hand the real result to the transcript when it finally lands.
+List<Completer> _pauseGates = <Completer>[];
+
+void _tripPauseGates() {
+  var gates = _pauseGates;
+  _pauseGates = <Completer>[];
+  for (var c in gates) { if (!c.isCompleted) c.complete(); }
+}
+
+final Object _kParked = new Object();
+
+Future<String> askDeferrable(String cmd, var arg) async {
+  var gate = new Completer();
+  _pauseGates.add(gate);
+  var work = ask(cmd, arg);
+  var r = await Future.any(<Future>[
+    work,
+    gate.future.then((_) => _kParked),
+  ]);
+  _pauseGates.remove(gate);   // won or lost, this race is decided
+  if (!identical(r, _kParked)) return r.toString();
+  work.then((real) => log("(after the pause) " + cmd + " => " + real.toString()));
+  return "stopped in the debugger — '" + cmd + "' is parked at a breakpoint; "
+         "its result will print on Continue";
 }
 
 // Spawn the language isolate from the scratch file, with error/exit monitoring.
@@ -1403,10 +1486,21 @@ Future respawnLanguage(String why) async {
   log("⚠ " + why + " — restarting language isolate…");
   gLang = null;
   try { if (gLangIsolate != null) gLangIsolate.kill(priority: Isolate.IMMEDIATE); } catch (e) {}
+  // If the old isolate died sitting at a breakpoint, no Resume event is ever
+  // coming for it. Left alone, gDbgPaused stays true and every ask() is refused
+  // with "press Continue first" — a ghost pause over a corpse, which reads as
+  // the whole app hanging. The pause died with its isolate; say so.
+  dbgForgetPause("the stopped isolate was restarted — nothing is paused now");
   await spawnLanguage();   // boots from the image
   gRespawning = false;
   log("language isolate restarted (declarations reloaded from the image)");
   guiEvent('languageRestarted', <String, String>{'why': why});
+  if (gLangIsolateId != null) {          // the debugger was attached: re-target
+    if (await vmsResolveTarget()) {
+      await vmsCall('streamListen', <String, dynamic>{'streamId': 'Debug'});
+      await dbgReResolve();
+    }
+  }
   updateMetrics();
 }
 
@@ -1436,8 +1530,12 @@ Future<String> handle(String line) async {
       var r = await vmsCall('addBreakpoint', <String, dynamic>{
           'isolateId': gLangIsolateId, 'scriptId': gLangScriptId, 'line': ln});
       if (r == null) return "ERR: no breakpoint at line " + ln.toString();
-      gDbgBpLines.add(ln); dbgLoadSource();
-      return "breakpoint at " + ln.toString() + " resolved=" + r['resolved'].toString();
+      var anchor = _anchorFor(_scratchLines(), ln);
+      if (anchor == null) return "ERR: line " + ln.toString() + " is outside any declaration";
+      gDbgBreaks.add(new DbgBreak(anchor[0], anchor[1], ln, r['id']));
+      dbgLoadSource();
+      return "breakpoint in " + anchor[0] + " +" + anchor[1].toString() +
+             " (line " + ln.toString() + ") resolved=" + r['resolved'].toString();
     }
     case 'dbgvars': {
       var o = <String>[];
@@ -1485,6 +1583,28 @@ Future<String> handle(String line) async {
       }
       return o.join("\n");
     }
+    case 'demos': {
+      var o = <String>[];
+      for (var d in scanDemos()) o.add(d[0]);
+      return o.isEmpty ? "(none)" : o.join('\n');
+    }
+    case 'demorun': {
+      var want = arg.trim().toLowerCase();
+      if (want.isEmpty) return "ERR: demorun <title or filename fragment>";
+      for (var d in scanDemos()) {
+        if (d[0].toLowerCase().contains(want) ||
+            d[1].split('/').last.toLowerCase().contains(want)) {
+          await runDemoAt(d[0], d[1]);
+          return gDemoTitle == null ? "ERR: demo failed to start" : "started " + d[0];
+        }
+      }
+      return "ERR: no demo matching " + arg;
+    }
+    case 'demostop': stopDemo("stopped"); return "ok";
+    case 'demostatus': return gDemoTitle == null
+        ? "idle"
+        : (gDemoIso == null ? "finished " : "running ") + gDemoTitle +
+          " — " + gDemoFrames.toString() + " frames";
     case 'snap': return await snapshot(arg.isEmpty ? "/tmp/dartui.png" : arg);
     case 'tab': switchTab(int.parse(arg)); return "ok";
     case 'brcat': selectCategory(int.parse(arg)); return "ok";
@@ -1552,20 +1672,21 @@ Future<String> handle(String line) async {
       if (b == null) return "ERR: no button " + arg;
       b.performClick(null);
       return "clicked " + arg;
-    case 'doit': return await ask('doit', arg);
+    case 'doit': return await askDeferrable('doit', arg);
     case 'accept': {
       // Scripted accepts go through the same gate as the buttons. This verb
       // used to be the one unguarded door into the image, which is how source
       // the reloader refuses got in during testing.
+      if (gDbgPaused) return await ask('accept', arg);   // refused with the reason
       var r = await checkDecls(<dynamic>[arg]);
       if (!r.ok) {
         return "ERR: refused — " + r.message +
                (r.line > 0 ? "  (line " + r.line.toString() + ")" : "");
       }
-      return await ask('accept', arg);   // persisted in the image
+      return await askDeferrable('accept', arg);   // persisted in the image
     }
-    case 'classsrc': return (await ask('classsrc', arg)).toString();
-    case 'remove': return await ask('remove', arg);
+    case 'classsrc': return await askDeferrable('classsrc', arg);
+    case 'remove': return await askDeferrable('remove', arg);
     case 'kill': await respawnLanguage("manual kill"); return "ok";
     case 'quit':
       Cocoa.cls("NSApplication").sharedApplication().terminate(null); return "ok";
@@ -1897,8 +2018,15 @@ void editorFormat() {
 // debug the LANGUAGE isolate precisely because that is a different isolate: user
 // code stops, this one keeps drawing. An isolate cannot debug itself.
 //
+// Socket accounting, since we have been burned by drift here: the process owns
+// exactly ONE listener, the vm-service (ws://127.0.0.1:8181/ws). This client is
+// a loopback CONNECTION to that same listener, not a second server — this VM
+// has no in-process API for speaking the service protocol, so the service's own
+// front door is the supported way in, even from inside. External drivers
+// (macdart/tcl/dartui.tcl) are further connections to the same door.
+//
 // dart:io gives us the WebSocket, so no native code is involved. Requires the
-// process to have been started with --observe (start-gui.sh does by default).
+// vm-service to be on (start-gui.sh passes --enable-vm-service by default).
 WebSocket gVms;                        // the service connection, null when off
 int gVmsSeq = 0;
 Map<int, Completer> gVmsPending = <int, Completer>{};
@@ -1914,7 +2042,8 @@ Future<bool> vmsConnect([String url = 'ws://127.0.0.1:8181/ws']) async {
     gVms = await WebSocket.connect(url);
   } catch (e) {
     gVmsConnecting = false;
-    log("debugger: no vm-service at " + url + " — start with --observe  (" +
+    log("debugger: no vm-service at " + url +
+        " — start-gui.sh enables it unless --no-observe was passed  (" +
         e.toString() + ")");
     return false;
   }
@@ -1928,9 +2057,22 @@ Future<bool> vmsConnect([String url = 'ws://127.0.0.1:8181/ws']) async {
     } else if (d['method'] == 'streamNotify') {
       onVmsEvent(d['params']);
     }
-  }, onDone: () { gVms = null; dbgStatus("vm-service disconnected"); },
-     onError: (e) { gVms = null; });
+  }, onDone: () { gVms = null; _failPendingVms("vm-service disconnected"); },
+     onError: (e) { gVms = null; _failPendingVms("vm-service error: " + e.toString()); });
   return true;
+}
+
+// A dead connection answers everything in flight NOW: each pending vmsCall
+// otherwise sits out its own 10-second timeout, serially, and a caller chaining
+// a few of them (dbgReResolve does) turns one disconnect into a half-minute of
+// nothing happening.
+void _failPendingVms(String why) {
+  var pending = gVmsPending;
+  gVmsPending = <int, Completer>{};
+  for (var c in pending.values) {
+    if (!c.isCompleted) c.complete(<String, dynamic>{'error': {'message': why}});
+  }
+  dbgStatus(why);
 }
 
 Future vmsCall(String method, [Map params]) async {
@@ -1943,7 +2085,10 @@ Future vmsCall(String method, [Map params]) async {
     'params': params != null ? params : <String, dynamic>{}
   }));
   var reply = await c.future.timeout(const Duration(seconds: 10),
-      onTimeout: () => <String, dynamic>{'error': {'message': 'timed out'}});
+      onTimeout: () {
+        gVmsPending.remove(id);   // a reply this late is nobody's answer
+        return <String, dynamic>{'error': {'message': 'timed out'}};
+      });
   if (reply['error'] != null) {
     dbgStatus("vm-service: " + method + ": " + reply['error']['message'].toString());
     return null;
@@ -1970,6 +2115,95 @@ Future<bool> vmsResolveTarget() async {
   return false;
 }
 
+// A breakpoint remembered by WHERE IT IS IN YOUR CODE, not by a line number in
+// the generated file. The language isolate's scratch file is rewritten from the
+// image on every accept and at every boot, so a raw line number goes stale the
+// moment you edit anything — mid-test a breakpoint in fact() silently moved from
+// line 53 to 47 and simply stopped being hit. Anchoring to
+// (declaration, offset within it) survives that: after each reload the anchor is
+// mapped to the new line and re-armed.
+class DbgBreak {
+  String decl;      // the declaration it lives in
+  int offset;       // lines from that declaration's first line
+  int line;         // where it currently sits in the scratch file
+  String vmId;      // the vm-service's id, so it can be removed
+  DbgBreak(this.decl, this.offset, this.line, this.vmId);
+}
+
+List<DbgBreak> gDbgBreaks = <DbgBreak>[];
+
+// The scratch's declarations start at column 0, so a top-level declaration is a
+// line that begins with a non-space and is not a comment or an import.
+final RegExp _declStart =
+    new RegExp(r'^(?:abstract\s+)?(?:class|enum|typedef)\s+(\w+)|^(?:var|final)\s+(\w+)');
+
+String _declNameOfLine(String line) {
+  var m = _declStart.firstMatch(line);
+  if (m == null) return null;
+  return m.group(1) != null ? m.group(1) : m.group(2);
+}
+
+List<String> _scratchLines() {
+  if (gDbgScratch == null) return <String>[];
+  try { return new File(gDbgScratch).readAsStringSync().split('\n'); }
+  catch (e) { return <String>[]; }
+}
+
+/// The declaration containing 1-based [line], and how far into it we are.
+/// Returns null when the line is outside any declaration (the header, say).
+List _anchorFor(List<String> lines, int line) {
+  for (var i = line - 1; i >= 0 && i < lines.length; i--) {
+    var name = _declNameOfLine(lines[i]);
+    if (name != null) return <dynamic>[name, line - (i + 1)];
+  }
+  return null;
+}
+
+int _lineForAnchor(List<String> lines, String decl, int offset) {
+  for (var i = 0; i < lines.length; i++) {
+    if (_declNameOfLine(lines[i]) == decl) return i + 1 + offset;
+  }
+  return 0;   // the declaration is gone
+}
+
+/// Re-arm every breakpoint against the current scratch file. Called after an
+/// accept (which rewrites it) and after a respawn (which also renumbers, and
+/// gives the isolate a new id).
+Future dbgReResolve() async {
+  if (gLangIsolateId == null || gDbgBreaks.isEmpty) return;
+  // A reload recompiles the library, and the SCRIPT gets a new id — re-arming
+  // against the one captured at attach time fails with nothing but a null, which
+  // read as "could not re-arm". Re-resolve the target first.
+  if (!await vmsResolveTarget()) return;
+  var lines = _scratchLines();
+  var kept = <DbgBreak>[];
+  for (var b in gDbgBreaks) {
+    var line = _lineForAnchor(lines, b.decl, b.offset);
+    if (line <= 0) {
+      log("debugger: dropped a breakpoint — " + b.decl + " is gone");
+      continue;
+    }
+    if (b.vmId != null) {
+      await vmsCall('removeBreakpoint', <String, dynamic>{
+        'isolateId': gLangIsolateId, 'breakpointId': b.vmId});
+    }
+    var r = await vmsCall('addBreakpoint', <String, dynamic>{
+      'isolateId': gLangIsolateId, 'scriptId': gLangScriptId, 'line': line});
+    if (r == null) {
+      log("debugger: could not re-arm " + b.decl + "+" + b.offset.toString());
+      continue;
+    }
+    b.line = line;
+    b.vmId = r['id'];
+    kept.add(b);
+  }
+  gDbgBreaks = kept;
+  dbgLoadSource();
+  if (kept.isNotEmpty) {
+    dbgStatus(kept.length.toString() + " breakpoint(s) re-armed after the reload");
+  }
+}
+
 // --- Debugger tab -----------------------------------------------------------
 // Breakpoints, pause/step, and the stack, against the LANGUAGE isolate. The
 // window stays live while user code is stopped because the debugger runs in a
@@ -1982,7 +2216,7 @@ Cocoa gDbgSrc, gDbgStack, gDbgLocals, gDbgStatusLbl, gDbgEvalField;
 List gDbgFrames = <dynamic>[];        // [functionName, frameJson]
 List gDbgVars = <dynamic>[];          // [name, renderedValue] for the chosen frame
 int gDbgFrame = 0;                    // which frame locals and eval apply to
-List gDbgBpLines = <dynamic>[];       // breakpoint line numbers we set
+// (breakpoints are anchored to a declaration — see DbgBreak below)
 bool gDbgPaused = false;
 String gDbgScratch;                   // the scratch path, for the source pane
 
@@ -2067,7 +2301,7 @@ void buildDebugTab(Cocoa db) {
   split.setPosition(560.0, ofDividerAtIndex: 0);
   setSplitMinSize(split, 160.0);
   db.addSubview(split);
-  dbgStatus("not attached — press Attach (the app must run with --observe)");
+  dbgStatus("not attached — press Attach (needs the vm-service: start-gui.sh enables it)");
 }
 
 Future dbgAttach() async {
@@ -2091,7 +2325,7 @@ void dbgLoadSource() {
   for (var i = 0; i < lines.length; i++) {
     var n = (i + 1).toString();
     while (n.length < 4) n = " " + n;
-    out.write(gDbgBpLines.contains(i + 1) ? "*" : " ");
+    out.write(_dbgHasBreakAt(i + 1) ? "*" : " ");
     out.write(n);
     out.write("  ");
     out.write(lines[i]);
@@ -2123,10 +2357,21 @@ Future dbgToggleBreak() async {
               "(a one-line class has no body line to stop on — Format it)");
     return;
   }
-  gDbgBpLines.add(line);
+  var anchor = _anchorFor(_scratchLines(), line);
+  if (anchor == null) {
+    dbgStatus("line " + line.toString() + " is outside any declaration");
+    return;
+  }
+  gDbgBreaks.add(new DbgBreak(anchor[0], anchor[1], line, r['id']));
   dbgLoadSource();
-  dbgStatus("breakpoint at line " + line.toString() +
-            (r['resolved'] == true ? " (resolved)" : " (pending)"));
+  dbgStatus("breakpoint in " + anchor[0] + " +" + anchor[1].toString() +
+            " (line " + line.toString() + ")" +
+            (r['resolved'] == true ? " resolved" : " pending"));
+}
+
+bool _dbgHasBreakAt(int line) {
+  for (var b in gDbgBreaks) if (b.line == line) return true;
+  return false;
 }
 
 Future dbgClearBreaks() async {
@@ -2138,7 +2383,7 @@ Future dbgClearBreaks() async {
         'isolateId': gLangIsolateId, 'breakpointId': bp['id']});
     }
   }
-  gDbgBpLines = <dynamic>[];
+  gDbgBreaks = <DbgBreak>[];
   dbgLoadSource();
   dbgStatus("breakpoints cleared");
 }
@@ -2166,14 +2411,32 @@ Future dbgResume(String step) async {
 void onVmsEvent(Map params) {
   var e = params['event'];
   if (e == null) return;
+  // The Debug stream carries EVERY isolate's events. Another client — an
+  // Observatory in a browser, say — pausing some other isolate must not flip
+  // this debugger's state: gDbgPaused going true here freezes the whole
+  // workspace ("press Continue first") over an isolate we are not even showing.
+  var iso = e['isolate'] is Map ? e['isolate']['id'] : null;
+  if (gLangIsolateId == null || iso != gLangIsolateId) return;
   var kind = e['kind'].toString();
   if (kind.startsWith('Pause')) {
     if (!gDbgPaused) { gDbgPaused = true; debugHold(); }
+    _tripPauseGates();
     dbgOnPaused(kind);
   } else if (kind == 'Resume') {
     if (gDbgPaused) { gDbgPaused = false; debugRelease(); }
     dbgStatus("running");
   }
+}
+
+/// Forget a pause whose isolate no longer exists (it was killed or restarted).
+/// This is state cleanup, NOT a resume: there is nothing left to resume.
+void dbgForgetPause(String why) {
+  if (gDbgPaused) { gDbgPaused = false; debugRelease(); }
+  gDbgFrames = <dynamic>[];
+  gDbgVars = <dynamic>[];
+  if (gDbgStack != null) gDbgStack.reloadData();
+  if (gDbgLocals != null) gDbgLocals.reloadData();
+  dbgStatus(why);
 }
 
 Future dbgOnPaused(String kind) async {
@@ -2236,6 +2499,256 @@ Future dbgEval([String expr]) async {
   log("debug eval: " + src + " => " + shown);
 }
 
+// --- Demos tab ---------------------------------------------------------------
+// Graphical demos, and a worked example of this app's own law: only the UI
+// isolate may touch AppKit, because only it lives on thread 0. So a demo is a
+// STANDALONE Dart program in demos/ next to this file, spawned into its own
+// isolate (Isolate.spawnUri) — and free to spawn more of its own workers. Demo
+// code never imports dart:cocoa: it computes, and sends draw commands over its
+// SendPort; this isolate replays them into an NSImage with NSBezierPath and
+// shows it in an NSImageView. Thread-correct by construction, and a runaway
+// demo costs its isolate (Stop kills it), never the window.
+//
+// Demo -> UI messages (everything plain lists, so they cross the port cheaply):
+//   ['draw', cmds]     replay a draw list onto the canvas (see below)
+//   ['status', text]   one line under the canvas
+//   ['done', text]     the demo is finished (logged; the isolate may then exit)
+// Draw commands, coordinates TOP-LEFT (the renderer flips into AppKit's
+// bottom-left; demos should never have to know):
+//   ['clear', r,g,b]
+//   ['rect', x,y,w,h, r,g,b, fill]        fill true/false
+//   ['oval', x,y,w,h, r,g,b, fill]
+//   ['line', x1,y1,x2,y2, r,g,b, width]
+//   ['text', x,y, string, size, r,g,b]
+// The demo learns the canvas size from its args: main(args, ui) gets
+// [width, height] as strings.
+Cocoa gDemoView, gDemoStatusLbl, gDemoImage;
+Isolate gDemoIso;
+ReceivePort gDemoPort, gDemoErrPort, gDemoExitPort;
+String gDemoTitle;                     // the running demo, null when idle
+int gDemoFrames = 0;
+bool gDemoFinished = false;            // saw 'done' (so exit is not news)
+const double kDemoW = 848.0, kDemoH = 352.0;
+
+void buildDemosTab(Cocoa dm) {
+  button(dm, "Stop", [8.0, 392.0, 64.0, 24.0], (s) => stopDemo("stopped"));
+  pinTop(<String>["Stop"]);
+  gDemoStatusLbl = label(dm, [82.0, 396.0, 778.0, 16.0]);
+  gDemoStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
+  // The image survives a chrome rebuild on purpose: a demo that is mid-flight
+  // keeps drawing into it while the views around it are torn down and rebuilt.
+  if (gDemoImage == null) {
+    gDemoImage = Cocoa.cls("NSImage").alloc().initWithSize([kDemoW, kDemoH]);
+    renderDemo(<dynamic>[
+      <dynamic>['clear', 0.07, 0.07, 0.09],
+      <dynamic>['text', 14.0, 14.0,
+        'Demos menu: pick one. It runs in its own isolate and draws here.',
+        13.0, 0.62, 0.66, 0.76],
+    ]);
+  }
+  gDemoView = Cocoa.cls("NSImageView").alloc().initWithFrame([8.0, 8.0, 852.0, 378.0]);
+  gDemoView.setImageScaling(3);        // NSImageScaleProportionallyUpOrDown
+  gDemoView.setImage(gDemoImage);
+  gDemoView.setAutoresizingMask(kWidthSizable + kHeightSizable);
+  dm.addSubview(gDemoView);
+  demoStatus(gDemoTitle == null
+      ? "idle — pick something from the Demos menu"
+      : "running " + gDemoTitle);
+}
+
+void demoStatus(String s) {
+  if (gDemoStatusLbl != null) gDemoStatusLbl.setStringValue(s);
+  repaint();
+}
+
+double _d(v) => (v as num).toDouble();
+
+Cocoa _demoColor(r, g, b) => Cocoa.cls("NSColor")
+    .colorWithCalibratedRed(_d(r), green: _d(g), blue: _d(b), alpha: 1.0);
+
+/// Replay one draw list into the canvas image — the only place demo output
+/// touches AppKit, and it runs on thread 0 by construction. Wrapped in an
+/// autorelease pool: at 30fps the colours and paths would otherwise pile up
+/// until the next drain.
+void renderDemo(List cmds) {
+  if (gDemoImage == null) return;
+  autoreleasePool(() {
+    gDemoImage.lockFocus();
+    for (var c in cmds) {
+      if (c is! List || c.isEmpty) continue;
+      var op = c[0];
+      if (op == 'clear') {
+        _demoColor(c[1], c[2], c[3]).setFill();
+        Cocoa.cls("NSBezierPath").fillRect([0.0, 0.0, kDemoW, kDemoH]);
+      } else if (op == 'rect' || op == 'oval') {
+        var rect = [_d(c[1]), kDemoH - _d(c[2]) - _d(c[4]), _d(c[3]), _d(c[4])];
+        var col = _demoColor(c[5], c[6], c[7]);
+        var fill = c.length > 8 && c[8] == true;
+        if (op == 'rect') {
+          if (fill) { col.setFill(); Cocoa.cls("NSBezierPath").fillRect(rect); }
+          else { col.setStroke(); Cocoa.cls("NSBezierPath").strokeRect(rect); }
+        } else {
+          var path = Cocoa.cls("NSBezierPath").bezierPathWithOvalInRect(rect);
+          if (fill) { col.setFill(); path.fill(); }
+          else { col.setStroke(); path.stroke(); }
+        }
+      } else if (op == 'line') {
+        _demoColor(c[5], c[6], c[7]).setStroke();
+        Cocoa.cls("NSBezierPath").setDefaultLineWidth(c.length > 8 ? _d(c[8]) : 1.0);
+        Cocoa.cls("NSBezierPath").strokeLineFromPoint(
+            [_d(c[1]), kDemoH - _d(c[2])],
+            toPoint: [_d(c[3]), kDemoH - _d(c[4])]);
+      } else if (op == 'text') {
+        var sz = _d(c[4]);
+        var attrs = Cocoa.cls("NSMutableDictionary").dictionary();
+        var f = _mono(sz);
+        if (!f.isNil) attrs.setObject(f, forKey: "NSFont");
+        attrs.setObject(_demoColor(c[5], c[6], c[7]), forKey: "NSColor");
+        Cocoa.cls("NSString").stringWithString(c[3].toString())
+            .drawAtPoint([_d(c[1]), kDemoH - _d(c[2]) - sz * 1.25],
+                withAttributes: attrs);
+      } else if (op == 'blit') {
+        // ['blit', x, y, dw, dh, base64-bmp] — a demos/pixmap.dart Pixmap.
+        // The whole image crosses as one string; NSImage does the decode and
+        // drawInRect: does the scaling.
+        var data = Cocoa.cls("NSData").alloc()
+            .initWithBase64EncodedString(c[5].toString(), options: 1);
+        if (data.isNil) { log("blit: base64 decode failed (" + c[5].toString().length.toString() + " chars)"); continue; }
+        var img = Cocoa.cls("NSImage").alloc().initWithData(data);
+        if (img.isNil) { log("blit: NSImage rejected the BMP (" + data.length().toString() + " bytes)"); continue; }
+        var dw = _d(c[3]), dh = _d(c[4]);
+        // The single-argument drawInRect:, deliberately. The full
+        // drawInRect:fromRect:operation:fraction: takes TWO NSRects — eight
+        // doubles, exactly filling v0–v7 — so `fraction` must spill to the
+        // stack, which the bridge's marshaler does not do: fraction arrived as
+        // garbage and the image composited invisibly. One rect fits in
+        // registers; whole image, source-over, fraction 1 is what we want.
+        img.drawInRect([_d(c[1]), kDemoH - _d(c[2]) - dh, dw, dh]);
+      }
+    }
+    gDemoImage.unlockFocus();
+  });
+  // Off the Demos tab, keep rendering (the demo is live) but skip the window
+  // redisplay — no point repainting pixels nobody can see at 30fps.
+  if (gTab == 6 && gDemoView != null) {
+    gDemoView.setImage(gDemoImage);    // never trust the view's cached rep
+    gDemoView.setNeedsDisplay(true);
+    repaint();
+    // NOTE: display() reaches the screen at demo rates ONLY when frames leave
+    // the run loop idle time between them — an unpaced burst renders every
+    // frame but the screen shows just the last. Demos must pace themselves
+    // (~30ms); see 04_mandelbrot. (A CATransaction flush here looked like the
+    // fix and ABORTED the app — unprobed AppKit from a hot path, the exact
+    // trap the probe law exists for.)
+  }
+}
+
+String demosDir() => Platform.script.resolve('demos/').toFilePath();
+
+/// `[title, path]` per demo file, sorted by filename. The title is the file's
+/// `// Demo:` header, so the menu reads like a playbill, not a directory.
+List<List<String>> scanDemos() {
+  var out = <List<String>>[];
+  try {
+    var files = <String>[];
+    for (var f in new Directory(demosDir()).listSync()) {
+      if (f.path.endsWith('.dart')) files.add(f.path);
+    }
+    files.sort();
+    for (var path in files) {
+      var title;
+      try {
+        for (var line in new File(path).readAsLinesSync().take(5)) {
+          // The marker must OPEN the line: a file that merely mentions it in
+          // prose (pixmap.dart's header does) is not declaring itself a demo.
+          if (line.startsWith('// Demo:')) { title = line.substring(8).trim(); break; }
+        }
+      } catch (e) {}
+      // No header, no listing: files like pixmap.dart are LIBRARIES the demos
+      // import, not programs to spawn.
+      if (title == null) continue;
+      out.add(<String>[title, path]);
+    }
+  } catch (e) {}   // no demos folder: the menu will say so
+  return out;
+}
+
+Future runDemoAt(String title, String path) async {
+  stopDemo(null);
+  gDemoFrames = 0;
+  gDemoFinished = false;
+  gDemoTitle = title;
+  switchTab(6);
+  demoStatus("starting " + title + "…");
+  gDemoPort = new ReceivePort();
+  gDemoErrPort = new ReceivePort();
+  gDemoExitPort = new ReceivePort();
+  gDemoPort.listen(onDemoMsg);
+  gDemoErrPort.listen((e) {
+    var m = (e is List && e.length > 0) ? e[0].toString() : e.toString();
+    log("⚠ demo error: " + _firstLine(m));
+    demoStatus(title + " — error: " + _firstLine(m));
+  });
+  gDemoExitPort.listen((_) {
+    gDemoIso = null;
+    if (!gDemoFinished) demoStatus(title + " — demo isolate exited");
+  });
+  try {
+    gDemoIso = await Isolate.spawnUri(Uri.parse('file://' + path),
+        <String>[kDemoW.toInt().toString(), kDemoH.toInt().toString()],
+        gDemoPort.sendPort,
+        onError: gDemoErrPort.sendPort, onExit: gDemoExitPort.sendPort,
+        errorsAreFatal: false);
+  } catch (e) {
+    log("✗ demo failed to load — " + _firstLine(e.toString()));
+    demoStatus("failed to load " + title + " — " + _firstLine(e.toString()));
+    stopDemo(null);
+    return;
+  }
+  log("demo: " + title + "  (" + path.split('/').last + ")");
+}
+
+void stopDemo(String why) {
+  if (gDemoIso != null) {
+    try { gDemoIso.kill(priority: Isolate.IMMEDIATE); } catch (e) {}
+  }
+  gDemoIso = null;
+  if (gDemoPort != null) gDemoPort.close();
+  if (gDemoErrPort != null) gDemoErrPort.close();
+  if (gDemoExitPort != null) gDemoExitPort.close();
+  gDemoPort = null; gDemoErrPort = null; gDemoExitPort = null;
+  if (gDemoTitle != null && why != null) {
+    demoStatus(gDemoTitle + " — " + why);
+    log("demo " + why + " — " + gDemoTitle);
+  }
+  gDemoTitle = null;
+}
+
+void onDemoMsg(msg) {
+  // A demo sending garbage must cost the frame, never the window: this runs in
+  // the isolate's MESSAGE HANDLER, where an uncaught throw is fatal.
+  try { _onDemoMsg(msg); }
+  catch (e) { log("⚠ demo message dropped — " + _firstLine(e.toString())); }
+}
+
+void _onDemoMsg(msg) {
+  if (msg is! List || msg.isEmpty) return;
+  var kind = msg[0];
+  if (kind == 'draw') {
+    gDemoFrames++;
+    renderDemo(msg[1]);
+    if (gDemoFrames % 30 == 1 && gDemoTitle != null) {
+      demoStatus(gDemoTitle + " — frame " + gDemoFrames.toString());
+    }
+  } else if (kind == 'status') {
+    demoStatus((gDemoTitle != null ? gDemoTitle + " — " : "") + msg[1].toString());
+  } else if (kind == 'done') {
+    gDemoFinished = true;
+    demoStatus((gDemoTitle != null ? gDemoTitle + " — " : "") + msg[1].toString());
+    log("demo done — " + msg[1].toString());
+  }
+}
+
 // --- the vm-service front door (one control plane) ---------------------------
 // The Observatory's vm-service is already linked into dartui, and this VM has
 // service extensions — a custom JSON-RPC method served over the SAME WebSocket
@@ -2261,9 +2774,23 @@ void registerServiceExtensions() {
           ServiceExtensionResponse.kInvalidParams,
           "ext.dartui.send needs a 'line' parameter");
     }
-    var reply = await handle(line);
-    return new ServiceExtensionResponse.result(
-        JSON.encode(<String, String>{'reply': reply.toString()}));
+    try {
+      // nowait: fire the command and answer immediately. A do-it that stops at
+      // a breakpoint cannot reply until Continue, and a client awaiting it on
+      // the one connection would deadlock — the exact hang the old suite had.
+      if (params['nowait'] == 'true') {
+        handle(line).catchError((e) => log("bg command failed — " + e.toString()));
+        return new ServiceExtensionResponse.result(
+            JSON.encode(<String, String>{'reply': 'started'}));
+      }
+      var reply = await handle(line);
+      return new ServiceExtensionResponse.result(
+          JSON.encode(<String, String>{'reply': reply.toString()}));
+    } catch (e) {
+      // A bug in one verb costs that call an ERR, never the app its window.
+      return new ServiceExtensionResponse.result(
+          JSON.encode(<String, String>{'reply': 'ERR: ' + e.toString()}));
+    }
   });
 }
 
@@ -2275,66 +2802,6 @@ void guiEvent(String what, Map<String, String> data) {
     data.forEach((k, v) { m[k] = v; });
     postEvent('dartui', m);
   } catch (e) {}   // no vm-service running: the GUI must not care
-}
-
-// --- framed control channel (for `macvm rusttcl`) ---------------------------
-// A second, opt-in channel that speaks MACVM's control protocol verbatim, so its
-// TCL shell drives this app with no new interpreter: `macvm rusttcl` ->
-// `gui connect 7645` -> `gui ping` / `gui doit ...` / `gui snap ...`, with real
-// set/if/while/proc/expr around them.
-//
-// Wire format (cocoa_gui/src/control.rs and src/rusttcl/verbs.rs gui_request):
-//   both directions   <byte-length>\n<bytes>
-//   reply payload     "OK\n<result>"  or  "ERR <message>"
-// The client strips OK and trims, and turns ERR into a TCL error. The length is
-// in BYTES, not characters — a multi-byte reply framed by character count would
-// desynchronise the stream.
-//
-// The plain line protocol on 7644 is untouched: it has no framing, so a
-// multi-line reply there is ambiguous, which is exactly what this fixes.
-const int kCtlPort = 7645;
-
-void _writeFrame(Socket s, String payload) {
-  var bytes = UTF8.encode(payload);
-  s.add(UTF8.encode(bytes.length.toString() + "\n"));
-  s.add(bytes);
-}
-
-Future _ctlChain = new Future.value();   // one command at a time, in order
-
-Future startControlChannel() async {
-  var server = await ServerSocket.bind(InternetAddress.LOOPBACK_IP_V4, kCtlPort);
-  stderr.writeln("dartui framed control on 127.0.0.1:" + kCtlPort.toString() +
-                 "  (macvm rusttcl: `gui connect " + kCtlPort.toString() + "`)");
-  server.listen((Socket socket) {
-    var buf = <int>[];
-    socket.done.catchError((e) {});
-    socket.listen((List<int> data) {
-      buf.addAll(data);
-      while (true) {
-        var nl = buf.indexOf(10);                       // '\n'
-        if (nl < 0) break;
-        var head = new String.fromCharCodes(buf.sublist(0, nl)).trim();
-        var len = int.parse(head, onError: (_) => -1);
-        if (len < 0) { socket.destroy(); return; }      // not a frame; hang up
-        if (buf.length < nl + 1 + len) break;           // body still arriving
-        var cmd = UTF8.decode(buf.sublist(nl + 1, nl + 1 + len));
-        buf = buf.sublist(nl + 1 + len);
-        _ctlChain = _ctlChain.then((_) => _serveFrame(socket, cmd));
-      }
-    }, onError: (e) {}, cancelOnError: true);
-  }, onError: (e) => log("control channel: " + e.toString()));
-}
-
-Future _serveFrame(Socket socket, String cmd) async {
-  var reply;
-  try {
-    reply = await handle(cmd);
-  } catch (e) {
-    reply = "ERR " + e.toString();
-  }
-  var payload = reply.toString().startsWith("ERR") ? reply : ("OK\n" + reply);
-  try { _writeFrame(socket, payload); } catch (e) {}
 }
 
 // --- rebuilding the view tree -----------------------------------------------
@@ -2389,6 +2856,9 @@ void rebuildUi() {
   gBrowserSrc = null; gStatus = null; gEdText = null; gEdPicker = null;
   gEdStatus = null; gFindField = null; gFindTable = null; gEditor = null;
   gTranscript = null; gTabView = null;
+  // The demo VIEW dies with the tree; the demo IMAGE and its isolate live on —
+  // buildDemosTab reattaches them, so a running demo just keeps drawing.
+  gDemoView = null; gDemoStatusLbl = null;
   // The ObjC action targets outlive this: AppKit holds them unretained and we
   // never owned a reference. Their tickets are gone, so a stale one now fails
   // closed (dart:cocoa's dispatch returns on an unknown ticket) rather than
@@ -2660,6 +3130,10 @@ Future<CheckResult> checkDecls(List decls) async {
 }
 
 Future guardedAccept(List decls, String what, void commit()) async {
+  if (gDbgPaused) {
+    log("✗ " + what + " refused — the language isolate is stopped in the debugger; Continue first");
+    return;
+  }
   var r = await checkDecls(decls);
   if (!r.ok) {
     log("✗ " + what + " refused — " + r.message);
@@ -2795,12 +3269,19 @@ void _selectLine(int line) {
 
 const _docsText = '''MACDART Workspace - a native Dart V1 IDE
 
-TABS (View menu, Cmd-1..5)
+TABS (View menu, Cmd-1..7)
   Workspace  a scratch pane: Do It / Print It against the live language isolate.
   Browser    a Smalltalk-style class browser over the image and the world.
   Editor     one whole class as text, with Analyze and Format.
   Find       name search and senders over the image.
   Docs       this page.
+  Debugger   breakpoints, stepping and evaluation in the language isolate.
+  Demos      a canvas that demo programs draw on. Each demo in demos/ runs in
+             its OWN isolate (some spawn workers of their own) and sends draw
+             commands here - only this UI isolate ever touches AppKit. Shapes
+             go as ['rect'|'oval'|'line'|'text', ...] lists; whole images go as
+             a Pixmap (demos/pixmap.dart), which crosses as ONE blit command.
+             Only files with a "// Demo:" header line are listed in the menu.
 
 THE IMAGE AND THE WORLD
   The world is the VM snapshot (dart:core and friends) - read-only. Your app is
@@ -2820,7 +3301,10 @@ MENUS
          commands, routed to whichever text view has focus.
   Code   Do It (Cmd-D), Print It (Cmd-P), Format (Opt-Cmd-F), Analyze (Cmd-B),
          Restart Language Isolate.
-  View   the five tabs, and Clear Transcript (Cmd-K).
+  Demos  one item per file in demos/ - picking one spawns it as an isolate and
+         switches to the Demos tab. Stop Demo is Cmd-. and kills the isolate.
+         Drop a new .dart in the folder and Rescan.
+  View   the tabs, and Clear Transcript (Cmd-K).
 
 EDITOR
   Analyze compiles the buffer for real (dart --compile_all in a separate
@@ -2837,7 +3321,9 @@ TOOLBAR
 ARCHITECTURE
   Two isolates: this UI isolate (pinned to the AppKit thread, builds the views)
   and a language isolate (runs your code, holds state), talking over SendPort.
-  A loopback control socket (127.0.0.1:7644) drives the UI and captures snapshots.
+  ONE control plane: the VM's service WebSocket (ws://127.0.0.1:8181/ws)
+  carries Observatory introspection, GUI control (the ext.dartui.send
+  extension — macdart/tcl/dartui.tcl), and pushed events.
 ''';
 
 main() async {
@@ -2860,21 +3346,13 @@ main() async {
   startMetrics();   // ~4 Hz VM counters in the toolbar
   snapshotLastGood();
 
-  var server = await ServerSocket.bind(InternetAddress.LOOPBACK_IP_V4, 7644);
-  stderr.writeln("dartui workspace control on 127.0.0.1:7644");
-  await startControlChannel();
+  // ONE listener: the vm-service. Control rides it as the ext.dartui.send
+  // extension (macdart/tcl/dartui.tcl), introspection is the Observatory
+  // protocol, events are its streams. The old line socket (7644) and the framed
+  // channel (7645) are gone — three listeners was the opposite of unified.
   registerServiceExtensions();
-  // The window and both channels are up. Until this point the host treats a UI
-  // isolate error as fatal, so a workspace that failed to load exits instead of
-  // sitting there as a process with no window.
+  // The window and the control plane are up. Until this point the host treats a
+  // UI isolate error as fatal, so a workspace that failed to load exits instead
+  // of sitting there as a process with no window.
   wsUiReady();
-  server.listen((Socket socket) {
-    // A driver that hangs up before we answer (a timed-out `nc`, say) would
-    // otherwise surface as an unhandled SocketException in the UI isolate.
-    socket.done.catchError((e) {});
-    socket.transform(UTF8.decoder).transform(new LineSplitter()).listen((line) async {
-      var reply = await handle(line);
-      try { socket.write(reply + "\n"); } catch (e) {}
-    }, onError: (e) {}, cancelOnError: true);
-  }, onError: (e) => log("control socket: " + e.toString()));
 }

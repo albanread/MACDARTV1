@@ -108,6 +108,24 @@ See [`macdart/BUILD.md`](macdart/BUILD.md) for details, the debug build, and the
 test runner. The full plan and the reasoning behind it are in
 [`PORTING_PLAN.md`](PORTING_PLAN.md).
 
+## The workspace GUI
+
+A native Cocoa IDE for V1 Dart — a Smalltalk-style class browser, a live
+workspace, a whole-class editor with a real compile check, and live VM counters —
+written in Dart itself through a `dart:cocoa` bridge:
+
+```bash
+./start-gui.sh              # foreground; --rebuild, --background, --fresh
+```
+
+It runs on `dartui`, the GUI host: the same VM plus a thread-0 AppKit host, so
+the UI isolate lives where AppKit is legal while your code runs in a second
+isolate that can be killed and respawned without taking the window with it. Your
+classes are held as source in a SQLite image at `~/.macdart/workspace.sqlite`,
+loaded over the VM snapshot at boot, so an Accept is live *and* survives a
+restart — and thanks to this VM's `become`, existing instances morph in place
+across a class-structure change. See [`WORKSPACE_PLAN.md`](WORKSPACE_PLAN.md).
+
 ## Licensing
 
 The Dart VM and core libraries this project ports are **BSD-3-Clause**:

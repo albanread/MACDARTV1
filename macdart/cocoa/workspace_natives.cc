@@ -66,5 +66,29 @@ void Workspace_reload(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, Dart_NewStringFromCString(""));
 }
 
+// wsVmStats() -> List<int>. This isolate's live VM counters for the workspace
+// toolbar — heap used/capacity, GC collection counts, and (only when the VM ran
+// with --compiler_stats) functions compiled/optimized and generated code bytes.
+// Layout and caveats: dart_tools_api.h. Nothing here is estimated: a counter the
+// VM cannot answer comes back 0, so the toolbar can say so rather than showing a
+// number that looks measured but isn't.
+void Workspace_vmStats(Dart_NativeArguments args) {
+  int64_t v[kDartWorkspaceVmStatCount];
+  Dart_Handle err = Dart_WorkspaceVmStats(v, kDartWorkspaceVmStatCount);
+  if (Dart_IsError(err)) {
+    Dart_SetReturnValue(args, err);
+    return;
+  }
+  Dart_Handle list = Dart_NewList(kDartWorkspaceVmStatCount);
+  if (Dart_IsError(list)) {
+    Dart_SetReturnValue(args, list);
+    return;
+  }
+  for (intptr_t i = 0; i < kDartWorkspaceVmStatCount; i++) {
+    Dart_ListSetAt(list, i, Dart_NewInteger(v[i]));
+  }
+  Dart_SetReturnValue(args, list);
+}
+
 }  // namespace bin
 }  // namespace dart

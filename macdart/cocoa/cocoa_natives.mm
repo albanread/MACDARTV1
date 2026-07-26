@@ -341,6 +341,7 @@ static void Cocoa_nsStringUtf8(Dart_NativeArguments args) {
 // primitives, registered here until they move to a dart:workspace library.
 void Workspace_eval(Dart_NativeArguments args);
 void Workspace_reload(Dart_NativeArguments args);
+void Workspace_vmStats(Dart_NativeArguments args);
 
 // Reverse-callback natives (defined in cocoa_callbacks.mm) — target-action,
 // delegates, and the syntax-highlight span applier.
@@ -369,6 +370,7 @@ void Sqlite_query(Dart_NativeArguments args);
   V(Cocoa_release, 1)                                                          \
   V(Workspace_eval, 1)                                                         \
   V(Workspace_reload, 0)                                                       \
+  V(Workspace_vmStats, 0)                                                      \
   V(Cocoa_registerCallbackDispatch, 1)                                         \
   V(Cocoa_makeActionTarget, 1)                                                 \
   V(Cocoa_wireAction, 2)                                                       \

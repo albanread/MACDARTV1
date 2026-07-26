@@ -54,6 +54,7 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'worldclasssrc') out = _worldClassSrc(arg);
       else if (cmd == 'find') out = _find(arg);
       else if (cmd == 'senders') out = _senders(arg);
+      else if (cmd == 'vmstats') out = wsVmStats();
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();
     } catch (e) {

@@ -26,6 +26,15 @@ String wsEval(String src) native "Workspace_eval";
 /// unsafe change → restart the isolate). See WORKSPACE_PLAN.md §5.
 String wsReload() native "Workspace_reload";
 
+/// This isolate's live VM counters, for the workspace toolbar:
+/// `[newUsed, newCapacity, oldUsed, oldCapacity, scavenges, markSweeps,
+///   functionsCompiled, functionsOptimized, codeBytes]` — bytes and counts.
+/// The last three are 0 unless the VM was started with `--compiler_stats`
+/// (the counters are compiled behind that flag), and there is deliberately no
+/// allocation rate: this VM keeps no cumulative allocation counter, so one
+/// could only be guessed.
+List wsVmStats() native "Workspace_vmStats";
+
 // --- Low-level natives ------------------------------------------------------
 int _nsStringFromCString(String s) native "Cocoa_nsStringFromCString";
 int _nsStringLength(int handle) native "Cocoa_nsStringLength";

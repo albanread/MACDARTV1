@@ -10,7 +10,7 @@ import 'dart:isolate';
 import 'dart:convert';
 import 'dart:async';
 
-Cocoa gWindow, gContent, gTabView, gEditor, gTranscript, gMetrics;
+Cocoa gWindow, gContent, gTabView, gEditor, gTranscript;
 SendPort gLang;
 List<String> gLog = <String>[];
 Map<String, Cocoa> gButtons = <String, Cocoa>{};
@@ -131,6 +131,53 @@ Cocoa iconButton(Cocoa parent, String title, String icon, List frame, CocoaActio
   return b;
 }
 
+// Right-anchored MEM / JIT / CODE / GC cells at the end of the toolbar: a muted
+// caption over a value, MEM wider because it carries "used/capacity" plus a 2px
+// usage bar (MACVM's buildMetricsClusterIn: / buildMemBarAt:width:in:). The bar
+// is two plain-colour NSBoxes — a light track with a fill on top — which keeps
+// us off CGColorRef marshalling entirely.
+void buildMetricsCluster(Cocoa bar, double barW) {
+  const double kCell = 64.0, kMem = 104.0, kGap = 6.0;
+  var total = kMem + 3 * kCell + 3 * kGap;
+  var x = barW - 8.0 - total;
+  var caption = Cocoa.cls("NSFont").systemFontOfSize(9.0);
+  var value = Cocoa.cls("NSFont").systemFontOfSize(12.0);
+  var muted = Cocoa.cls("NSColor").secondaryLabelColor();
+  for (var name in _kCells) {
+    var w = (name == "MEM") ? kMem : kCell;
+    var cap = label(bar, [x, 26.0, w, 12.0]);
+    cap.setStringValue(name);
+    if (!caption.isNil) cap.setFont(caption);
+    if (!muted.isNil) cap.setTextColor(muted);
+    cap.setAutoresizingMask(kMinXMargin);
+    var val = label(bar, [x, 8.0, w, 16.0]);
+    val.setStringValue("—");            // no reading yet — not a fake zero
+    if (!value.isNil) val.setFont(value);
+    val.setAutoresizingMask(kMinXMargin);
+    gMetricVals[name] = val;
+    if (name == "MEM") buildMemBar(bar, x, w - 8.0);
+    x += w + kGap;
+  }
+}
+
+// A 2px used/capacity bar under the MEM value: a light track with a fill drawn
+// over it, both borderless NSBoxes with a plain fill colour.
+void buildMemBar(Cocoa bar, double x, double w) {
+  gMemBarWidth = w;
+  var track = Cocoa.cls("NSBox").alloc().initWithFrame([x, 6.0, w, 2.0]);
+  track.setBoxType(4); track.setBorderType(0);
+  var grey = Cocoa.cls("NSColor").tertiaryLabelColor();
+  if (!grey.isNil) track.setFillColor(grey);
+  track.setAutoresizingMask(kMinXMargin);
+  bar.addSubview(track);
+  gMemBarFill = Cocoa.cls("NSBox").alloc().initWithFrame([x, 6.0, 1.0, 2.0]);
+  gMemBarFill.setBoxType(4); gMemBarFill.setBorderType(0);
+  var ink = Cocoa.cls("NSColor").secondaryLabelColor();
+  if (!ink.isNil) gMemBarFill.setFillColor(ink);
+  gMemBarFill.setAutoresizingMask(kMinXMargin);
+  bar.addSubview(gMemBarFill);
+}
+
 /// A draggable pane splitter (MACVM's browser shape). [vertical] true = panes
 /// side by side with vertical dividers.
 Cocoa splitView(List frame, bool vertical) {
@@ -235,9 +282,7 @@ void buildWindow() {
   iconButton(bar, "Browser", "hierarchy", [48.0, 6.0, 36.0, 32.0], (s) => switchTab(1));
   alias("tab:Find", iconButton(bar, "Find", "open", [88.0, 6.0, 36.0, 32.0], (s) => switchTab(3)));
   iconButton(bar, "Docs", "documentation", [128.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
-  gMetrics = label(bar, [520.0, 13.0, 372.0, 18.0]);
-  gMetrics.setAlignment(2); // right
-  gMetrics.setAutoresizingMask(kMinXMargin);   // stays right-anchored
+  buildMetricsCluster(bar, 900.0);
 
   // Tabless content host (the toolbar buttons are the tab bar). It absorbs all
   // the slack when the window resizes: pinned between the transcript below and
@@ -289,11 +334,74 @@ void buildWindow() {
   Cocoa.cls("NSApplication").sharedApplication().activateIgnoringOtherApps(true);
 }
 
+// --- VM metrics cluster (MACVM's toolbar readout) ---------------------------
+// The numbers come from the LANGUAGE isolate (where user code runs), sampled
+// over the port — see Dart_WorkspaceVmStats. Everything shown is read straight
+// off the VM; nothing is estimated, and a counter the VM cannot answer shows
+// "—" rather than a plausible-looking zero. (MACVM's ALLOC B/s cell has no
+// equivalent here: this VM keeps no cumulative allocation counter, so a rate
+// could only be guessed.)
+Map<String, Cocoa> gMetricVals = <String, Cocoa>{};
+Cocoa gMemBarFill;
+double gMemBarWidth = 0.0;
+bool gPolling = false;                     // one sample in flight at a time
+const List<String> _kCells = const <String>["MEM", "JIT", "CODE", "GC"];
+
+/// `1536` -> `1.5K`. Base 1024, one decimal past the first suffix — MACVM's
+/// format_bytes, so the two toolbars read the same.
+String formatBytes(int n) {
+  if (n < 1024) return n.toString() + "B";
+  const List<String> units = const <String>["K", "M", "G", "T"];
+  var v = n.toDouble();
+  var u = -1;
+  while (v >= 1024.0 && u < units.length - 1) { v /= 1024.0; u++; }
+  return v.toStringAsFixed(1) + units[u];
+}
+
 void updateMetrics() {
-  if (gMetrics == null) return;
-  var st = cocoaStats();   // [wraps, releases]
-  gMetrics.setStringValue(
-      "cocoa: " + st[0].toString() + " wrapped / " + st[1].toString() + " freed");
+  if (gMetricVals.isEmpty) return;
+  pollVmStats();
+}
+
+// ~4 Hz, like MACVM. Skips while a sample is outstanding, and while the
+// language isolate is restarting.
+void startMetrics() {
+  new Timer.periodic(const Duration(milliseconds: 250), (t) => pollVmStats());
+}
+
+void pollVmStats() {
+  if (gPolling || gLang == null || gMetricVals.isEmpty) return;
+  gPolling = true;
+  askQuiet('vmstats', '', const Duration(seconds: 2)).then((r) {
+    gPolling = false;
+    if (r is! List || r.length < 9) return;   // busy or restarting: leave the last reading
+    renderMetrics(r);
+  }).catchError((e) { gPolling = false; });
+}
+
+void renderMetrics(List v) {
+  var used = v[0] + v[2];              // new + old heap in use
+  var cap = v[1] + v[3];
+  _setCell("MEM", formatBytes(used) + "/" + formatBytes(cap));
+  // Compiler counters are only live when the VM ran with --compiler_stats.
+  var compiled = v[6], optimized = v[7], codeBytes = v[8];
+  _setCell("JIT", compiled == 0 && optimized == 0
+      ? "—" : compiled.toString() + "c·" + optimized.toString() + "o");
+  _setCell("CODE", codeBytes == 0 ? "—" : formatBytes(codeBytes));
+  _setCell("GC", v[4].toString() + "·" + v[5].toString());   // scavenge · mark-sweep
+  if (gMemBarFill != null && cap > 0) {
+    var f = gMemBarWidth * (used / cap);
+    if (f < 1.0) f = 1.0;
+    if (f > gMemBarWidth) f = gMemBarWidth;
+    var fr = gMemBarFill.frame();
+    gMemBarFill.setFrame([fr[0], fr[1], f, fr[3]]);
+  }
+  repaint();
+}
+
+void _setCell(String name, String value) {
+  var tf = gMetricVals[name];
+  if (tf != null) tf.setStringValue(value);
 }
 
 // Force pending UI changes onto the screen. Updates driven from the run-loop
@@ -908,6 +1016,20 @@ void buildMenu() {
 // Time-boxed request to the language isolate. If it doesn't reply in time the
 // isolate is presumed hung (a runaway do-it), and the watchdog kills + respawns
 // it so the workspace can never wedge.
+// A request the WATCHDOG MUST IGNORE. The metrics poll runs continuously, so if
+// it went through ask() a long-running do-it would make it time out and the
+// watchdog would kill the user's language isolate mid-computation — the poll
+// would be shooting the thing it is measuring. This just gives up quietly
+// instead, and never logs: the isolate is busy, which is not an error.
+Future askQuiet(String cmd, var arg, Duration limit) async {
+  if (gLang == null) return null;
+  var rp = new ReceivePort();
+  gLang.send([cmd, arg, rp.sendPort]);
+  var result = await rp.first.timeout(limit, onTimeout: () => _kTimeout);
+  rp.close();
+  return identical(result, _kTimeout) ? null : result;
+}
+
 Future ask(String cmd, var arg) async {   // arg/result may be a String or a List
   if (gLang == null) return "ERR: language isolate restarting…";
   var rp = new ReceivePort();
@@ -1081,6 +1203,7 @@ main() async {
   new File(gScratch).writeAsStringSync(new File(templatePath).readAsStringSync());
   await spawnLanguage();
   log("language isolate ready — image: " + gDbPath);
+  startMetrics();   // ~4 Hz VM counters in the toolbar
 
   var server = await ServerSocket.bind(InternetAddress.LOOPBACK_IP_V4, 7644);
   stderr.writeln("dartui workspace control on 127.0.0.1:7644");

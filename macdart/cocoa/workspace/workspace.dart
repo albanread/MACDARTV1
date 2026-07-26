@@ -261,6 +261,7 @@ void pinTop(List<String> titles, [int extra = 0]) {
 void switchTab(int i) {
   gTabView.selectTabViewItemAtIndex(i);
   if (i == 1) openBrowser();
+  if (i == 4) editorRefreshClasses();
   updateMetrics();
   repaint();
 }
@@ -280,8 +281,9 @@ void buildWindow() {
   texturedBox(bar, [0.0, 0.0, 900.0, 44.0], kWidthSizable + kHeightSizable);
   iconButton(bar, "Workspace", "texteditor", [8.0, 6.0, 36.0, 32.0], (s) => switchTab(0));
   iconButton(bar, "Browser", "hierarchy", [48.0, 6.0, 36.0, 32.0], (s) => switchTab(1));
-  alias("tab:Find", iconButton(bar, "Find", "open", [88.0, 6.0, 36.0, 32.0], (s) => switchTab(3)));
-  iconButton(bar, "Docs", "documentation", [128.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
+  iconButton(bar, "Editor", "blankSheet", [88.0, 6.0, 36.0, 32.0], (s) => switchTab(4));
+  alias("tab:Find", iconButton(bar, "Find", "open", [128.0, 6.0, 36.0, 32.0], (s) => switchTab(3)));
+  iconButton(bar, "Docs", "documentation", [168.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
   buildMetricsCluster(bar, 900.0);
 
   // Tabless content host (the toolbar buttons are the tab bar). It absorbs all
@@ -316,6 +318,9 @@ void buildWindow() {
 
   // Find tab.
   buildFindTab(addTab(gTabView, "find", 868.0, 420.0));
+
+  // Editor tab: a whole class as text, against the image or a .dart file.
+  buildEditorTab(addTab(gTabView, "editor", 868.0, 420.0));
 
   // Transcript dock (shared across tabs): docked to the bottom at a fixed
   // height, widening with the window.
@@ -1142,6 +1147,17 @@ Future<String> handle(String line) async {
     case 'findset': gFindField.setStringValue(arg); return "ok";
     case 'findrun': runFind(arg.length > 0 ? arg : 'find'); return "ok";
     case 'findsel': findNavigate(int.parse(arg)); return "ok";
+    case 'edsettext': edSetText(arg.replaceAll('\\n', '\n')); return "ok";
+    case 'edtext': return edText();
+    case 'edstatus': return gEdStatus.stringValue().UTF8String();
+    case 'edpick': gEdPicker.selectItemWithTitle(arg); return "ok";
+    case 'edclasses': { var o = <String>[]; for (var i = 0; i < gEdPicker.numberOfItems(); i++) o.add(gEdPicker.itemTitleAtIndex(i).UTF8String()); return o.join(','); }
+    case 'edload': editorLoad(); return "ok";
+    case 'ednew': editorNew(); return "ok";
+    case 'edsave': editorSaveImage(); return "ok";
+    case 'edlive': editorAddToWorld(); return "ok";
+    case 'edformat': editorFormat(); return "ok";
+    case 'edanalyze': await editorAnalyze(); return "ok";
     case 'settext':
       gEditor.setString(arg.replaceAll('\\n', '\n'));
       highlight();
@@ -1159,6 +1175,349 @@ Future<String> handle(String line) async {
       Cocoa.cls("NSApplication").sharedApplication().terminate(null); return "ok";
     default: return "ERR: unknown " + cmd;
   }
+}
+
+
+// --- Editor tab -------------------------------------------------------------
+// A whole class as text (MACVM's editor). The class picker + Load/Save work on
+// the SQLite IMAGE; Open…/Save File… work on plain .dart FILES; File In brings a
+// file's declarations into the image. Format re-indents, Analyze compiles for
+// real. What each button touches is spelled out in the status line, because
+// "saved" and "live" are different things here.
+Cocoa gEdText, gEdPicker, gEdStatus;
+String gEdFile;            // the .dart file the buffer came from, if any
+String gEdClass;           // the image class the buffer came from, if any
+
+void buildEditorTab(Cocoa ed) {
+  gEdPicker = Cocoa.cls("NSPopUpButton").alloc()
+      .initWithFrame([8.0, 390.0, 300.0, 26.0], pullsDown: false);
+  ed.addSubview(gEdPicker);
+  gEdPicker.setAutoresizingMask(kMinYMargin);
+  gTargets.add(onAction(gEdPicker, (s) => defer(() => editorLoad())));
+
+  button(ed, "Load", [316.0, 390.0, 68.0, 26.0], (s) => editorLoad());
+  button(ed, "Save to Image", [390.0, 390.0, 118.0, 26.0], (s) => editorSaveImage());
+  button(ed, "Add to World", [514.0, 390.0, 112.0, 26.0], (s) => editorAddToWorld());
+
+  button(ed, "New", [8.0, 360.0, 60.0, 24.0], (s) => editorNew());
+  button(ed, "Open…", [72.0, 360.0, 76.0, 24.0], (s) => editorOpen());
+  button(ed, "Save File…", [152.0, 360.0, 96.0, 24.0], (s) => editorSaveFile());
+  button(ed, "File In", [252.0, 360.0, 74.0, 24.0], (s) => editorFileIn());
+  button(ed, "Format", [330.0, 360.0, 74.0, 24.0], (s) => editorFormat());
+  button(ed, "Analyze", [408.0, 360.0, 80.0, 24.0], (s) => editorAnalyze());
+  pinTop(<String>["Load", "Save to Image", "Add to World", "New", "Open…",
+                  "Save File…", "File In", "Format", "Analyze"]);
+
+  gEdStatus = label(ed, [8.0, 340.0, 852.0, 16.0]);
+  gEdStatus.setAutoresizingMask(kMinYMargin + kWidthSizable);
+  gEdText = scrolledTextView(ed, [8.0, 8.0, 852.0, 326.0], true);
+  var mf = _mono(13.0);
+  if (!mf.isNil) gEdText.setFont(mf);
+  anchorScroll(gEdText, kWidthSizable + kHeightSizable);
+  gTargets.add(onTextChange(gEdText, (s) => highlightView(gEdText)));
+  edStatus("empty — pick a class and Load, or Open… a .dart file");
+}
+
+void edStatus(String s) {
+  if (gEdStatus != null) gEdStatus.setStringValue(s);
+}
+
+String edText() => gEdText.string().UTF8String();
+
+void edSetText(String s) {
+  gEdText.setString(s);
+  highlightView(gEdText);
+  repaint();
+}
+
+// Repopulate the class picker from the image.
+void editorRefreshClasses() {
+  ask('classes', '').then((r) {
+    var names = _dl(r);
+    var keep = gEdClass;
+    gEdPicker.removeAllItems();
+    for (var n in names) gEdPicker.addItemWithTitle(n.toString());
+    if (keep != null) gEdPicker.selectItemWithTitle(keep);
+    repaint();
+  });
+}
+
+void editorLoad() {
+  if (gEdPicker.numberOfItems() == 0) { log("editor: no classes in the image yet"); return; }
+  var name = gEdPicker.titleOfSelectedItem().UTF8String();
+  ask('classsrc', name).then((r) {
+    gEdClass = name; gEdFile = null;
+    edSetText(r.toString());
+    edStatus(name + "  ·  from the image  ·  Save to Image = live + saved");
+  });
+}
+
+// Editor -> image AND live (this is Accept: the image is the source of truth).
+void editorSaveImage() {
+  var decls = splitTopLevel(edText());
+  if (decls.isEmpty) { log("editor: nothing to save"); return; }
+  ask('acceptMany', decls).then((r) {
+    log("✓ Save to Image — " + r);
+    if (!r.toString().startsWith("ERR")) {
+      gEdClass = _classNameOf(decls[0]);
+      edStatus((gEdClass != null ? gEdClass : "(saved)") + "  ·  live + saved in the image");
+      editorRefreshClasses();
+      _reloadClassList();
+    }
+  });
+}
+
+// Editor -> live isolate ONLY. Try a class in the running world without
+// committing it: a respawn (or the next launch) re-reads the image and it is gone.
+void editorAddToWorld() {
+  var decls = splitTopLevel(edText());
+  if (decls.isEmpty) { log("editor: nothing to add"); return; }
+  ask('acceptLive', decls).then((r) {
+    log("✓ Add to World — " + r);
+    if (!r.toString().startsWith("ERR")) {
+      edStatus("live in the running world — NOT saved to the image");
+    }
+  });
+}
+
+void editorNew() {
+  gEdClass = null; gEdFile = null;
+  edSetText("class NewClass {\n  \n}\n");
+  edStatus("new class — rename it, then Save to Image");
+}
+
+// --- files ------------------------------------------------------------------
+// A modal panel spins its own AppKit event pump. Our button actions already run
+// from the isolate message loop (see [defer]), i.e. with Dart on the stack, so
+// the panel is deferred one more hop via Timer.run: the stack unwinds first and
+// the pump is idle when the panel takes over. (MACVM hit the same hazard —
+// cocoa_gui/src/panels.rs runs its panels from a drain pass, never in a callback.)
+void _panel(String kind, void done(String path)) {
+  new Timer.run(() {
+    var p = (kind == 'open')
+        ? Cocoa.cls("NSOpenPanel").openPanel()
+        : Cocoa.cls("NSSavePanel").savePanel();
+    p.setAllowedFileTypes(["dart"]);
+    if (kind == 'open') {
+      p.setCanChooseFiles(true);
+      p.setAllowsMultipleSelection(false);
+    } else {
+      p.setNameFieldStringValue((gEdClass != null ? gEdClass : "Untitled") + ".dart");
+    }
+    var rc = p.runModal();
+    if (rc != 1) return;                        // NSModalResponseOK
+    var url = p.URL();
+    if (url.isNil) return;
+    done(url.path().UTF8String());
+  });
+}
+
+void editorOpen() {
+  _panel('open', (path) {
+    try {
+      var src = new File(path).readAsStringSync();
+      gEdFile = path; gEdClass = null;
+      edSetText(src);
+      edStatus(path + "  ·  a file on disk — File In to bring it into the image");
+    } catch (e) { log("editor: open failed — " + e.toString()); }
+  });
+}
+
+void editorSaveFile() {
+  _panel('save', (path) {
+    try {
+      new File(path).writeAsStringSync(edText());
+      gEdFile = path;
+      edStatus(path + "  ·  written to disk (the image is unchanged)");
+      log("✓ saved " + path);
+    } catch (e) { log("editor: save failed — " + e.toString()); }
+  });
+}
+
+// A .dart file's declarations -> the image (+ live). The file-in of MACVM.
+void editorFileIn() {
+  _panel('open', (path) {
+    var src;
+    try { src = new File(path).readAsStringSync(); }
+    catch (e) { log("editor: file in failed — " + e.toString()); return; }
+    var decls = splitTopLevel(src);
+    if (decls.isEmpty) { log("editor: " + path + " has no top-level declarations"); return; }
+    gEdFile = path; gEdClass = null;
+    edSetText(src);
+    ask('acceptMany', decls).then((r) {
+      log("✓ File In (" + decls.length.toString() + " declaration(s)) — " + r);
+      edStatus(path + "  ·  filed in: " + decls.length.toString() + " declaration(s) live + saved");
+      editorRefreshClasses();
+      _reloadClassList();
+    });
+  });
+}
+
+// --- Format -----------------------------------------------------------------
+// Re-indent only: 2 spaces per brace depth, computed from CODE braces alone.
+// lexDart already knows which spans are strings and comments, so their contents
+// - including braces and quotes inside them - are never counted and never
+// rewritten. A line whose start lies inside a multi-line string or comment is
+// emitted verbatim.
+String formatDart(String src) {
+  var spans = lexDart(src);
+  // pos -> is it inside a string(2) or comment(3) span?
+  var lit = new List<bool>.filled(src.length + 1, false);
+  for (var i = 0; i + 2 < spans.length; i += 3) {
+    var kind = spans[i + 2];
+    if (kind != 2 && kind != 3) continue;
+    var s = spans[i], n = spans[i + 1];
+    for (var p = s; p < s + n && p < lit.length; p++) lit[p] = true;
+  }
+  // A line is left verbatim only if it CONTINUES a literal that opened on an
+  // earlier line (a triple-quoted string, a block comment). A line that merely
+  // begins with // still gets indented like the code around it.
+  var cont = new List<bool>.filled(src.length + 1, false);
+  for (var i = 0; i + 2 < spans.length; i += 3) {
+    var kind = spans[i + 2];
+    if (kind != 2 && kind != 3) continue;
+    var s = spans[i], n = spans[i + 1];
+    var nl = src.indexOf('\n', s);
+    if (nl < 0 || nl >= s + n) continue;      // single-line literal
+    for (var p = nl + 1; p < s + n && p < cont.length; p++) cont[p] = true;
+  }
+  var out = new StringBuffer();
+  var depth = 0, i = 0, n = src.length;
+  while (i <= n) {
+    var eol = src.indexOf('\n', i);
+    if (eol < 0) eol = n;
+    var line = src.substring(i, eol);
+    var trimmed = line.trim();
+    if (i < n && cont[i]) {
+      out.write(line);                       // continues a literal: verbatim
+    } else if (trimmed.isEmpty) {
+      // collapses to a bare empty line
+    } else {
+      var lead = trimmed.codeUnitAt(0);      // a leading closer dedents its line
+      var d = depth;
+      if (lead == 0x7D || lead == 0x29 || lead == 0x5D) d = depth - 1;
+      if (d < 0) d = 0;
+      for (var k = 0; k < d; k++) out.write("  ");
+      out.write(trimmed);
+    }
+    for (var p = i; p < eol; p++) {          // net depth from CODE braces only
+      if (lit[p]) continue;
+      var c = src.codeUnitAt(p);
+      if (c == 0x7B) depth++;
+      else if (c == 0x7D) depth--;
+    }
+    if (depth < 0) depth = 0;
+    if (eol >= n) break;
+    out.write("\n");
+    i = eol + 1;
+  }
+  var text = out.toString();
+  if (!text.endsWith("\n")) text += "\n";
+  return text;
+}
+
+// The token stream ignoring whitespace - the formatter's safety gate. If this
+// differs before and after, the reformat changed something other than layout, so
+// we refuse to apply it rather than silently mangling the user's class.
+String _tokenSignature(String src) {
+  var spans = lexDart(src);
+  var b = new StringBuffer();
+  for (var i = 0; i + 2 < spans.length; i += 3) {
+    b.write(spans[i + 2].toString());
+    b.write(':');
+    b.write(src.substring(spans[i], spans[i] + spans[i + 1]).trim());
+    b.write('|');
+  }
+  return b.toString();
+}
+
+void editorFormat() {
+  var src = edText();
+  if (src.trim().isEmpty) return;
+  var f = formatDart(src);
+  if (_tokenSignature(src) != _tokenSignature(f)) {
+    log("Format REFUSED: that would have changed more than layout (left untouched)");
+    return;
+  }
+  if (f == src) { log("Format - already tidy"); return; }
+  edSetText(f);
+  log("Format - re-indented");
+}
+
+// --- Analyze ----------------------------------------------------------------
+// A REAL compile by the real front end: write the buffer to a temp file and spawn
+// a throwaway isolate on it. A compile error arrives on the error port carrying
+// the VM's own message ("line 12 pos 7: ..."). The trial isolate is separate, so
+// nothing can disturb the live language isolate, and it is always killed.
+Future editorAnalyze() async {
+  var src = edText();
+  if (src.trim().isEmpty) return;
+  var path = Directory.systemTemp.path + "/macdart_analyze.dart";
+  var probe = src;
+  if (!new RegExp(r'(?:^|\n)\s*(?:void\s+)?main\s*\(').hasMatch(src)) {
+    probe = src + "\n\nmain() {}\n";        // spawnUri needs an entry point
+  }
+  var err = new ReceivePort();
+  var exited = new ReceivePort();
+  var iso = null;
+  var failure = null;
+  try {
+    new File(path).writeAsStringSync(probe);
+    iso = await Isolate.spawnUri(Uri.parse('file://' + path), <String>[], null,
+        onError: err.sendPort, onExit: exited.sendPort, errorsAreFatal: true);
+    // Whichever lands first: an error, a clean exit, or the time limit.
+    var first = await Future.any(<Future>[
+      err.first,
+      exited.first.then((_) => null),
+      new Future.delayed(const Duration(seconds: 5), () => 'TIMEOUT'),
+    ]);
+    if (first is List && first.length > 0) failure = first[0].toString();
+    else if (first == 'TIMEOUT') failure = 'analysis timed out';
+  } catch (e) {
+    failure = e.toString();
+  } finally {
+    try { if (iso != null) iso.kill(priority: Isolate.IMMEDIATE); } catch (e) {}
+    err.close();
+    exited.close();
+    try { new File(path).deleteSync(); } catch (e) {}
+  }
+  if (failure == null) {
+    edStatus("Analyze: compiles cleanly");
+    log("Analyze: compiles cleanly");
+    return;
+  }
+  var line = _errorLine(failure);
+  edStatus("Analyze FAILED: " + _firstLine(failure));
+  log("Analyze FAILED: " + failure);
+  if (line > 0) _selectLine(line);
+}
+
+String _firstLine(String s) {
+  var i = s.indexOf('\n');
+  return i < 0 ? s : s.substring(0, i);
+}
+
+// "...: line 12 pos 7: unexpected token" -> 12
+int _errorLine(String msg) {
+  var m = new RegExp(r'line (\d+) pos \d+').firstMatch(msg);
+  if (m == null) m = new RegExp(r'\.dart:(\d+):').firstMatch(msg);
+  return m != null ? int.parse(m.group(1)) : 0;
+}
+
+// Put the caret on the offending line, so the error is where the user is looking.
+void _selectLine(int line) {
+  var src = edText();
+  var start = 0;
+  for (var i = 1; i < line; i++) {
+    var nl = src.indexOf('\n', start);
+    if (nl < 0) return;
+    start = nl + 1;
+  }
+  var end = src.indexOf('\n', start);
+  if (end < 0) end = src.length;
+  gEdText.setSelectedRange([start, end - start]);
+  gEdText.scrollRangeToVisible([start, end - start]);
+  repaint();
 }
 
 const _docsText = '''MACDART Workspace — a native Dart V1 IDE

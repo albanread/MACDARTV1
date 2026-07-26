@@ -40,6 +40,7 @@ main(List args, SendPort uiPort) {
       if (cmd == 'doit') out = _doit(arg);
       else if (cmd == 'accept') out = _accept(arg);
       else if (cmd == 'acceptMany') out = _acceptMany(arg);
+      else if (cmd == 'acceptLive') out = _acceptLive(arg);
       else if (cmd == 'reset') out = _reset(arg);
       else if (cmd == 'remove') out = _remove(arg);
       else if (cmd == 'classes') out = _classNames();
@@ -112,6 +113,22 @@ String _acceptMany(List decls) {
   }
   var err = _rebuildAndReload();
   return err.isEmpty ? ('accepted ' + names.join(', ')) : err;
+}
+
+// Live-only accept: make declarations live in THIS isolate without touching the
+// image. The editor's "Add to World" — try a class in the running world without
+// committing it, so the next boot (or a watchdog respawn, which re-reads the
+// image) comes back without it. Deliberately not persisted.
+String _acceptLive(List decls) {
+  var names = <String>[];
+  for (var d in decls) {
+    var s = d.toString().trim();
+    var name = _declName(s);
+    _decls[name] = s;
+    names.add(name);
+  }
+  var err = _rebuildAndReload();
+  return err.isEmpty ? ('live (not saved): ' + names.join(', ')) : err;
 }
 
 // Replace the whole declaration set at once (kept for scripted use / replay).

@@ -86,6 +86,61 @@ void defer(void body()) {
 /// A table-selection handler that runs deferred (see [defer]).
 SelectFn sel(void body(int row)) => (r) => defer(() => body(r));
 
+// --- chrome: MACVM's toolbar texture + icon set -----------------------------
+// The icons (assets/icons-mono/*.svg) and the tiled grain (assets/toolbar-texture.png)
+// are the SAME files MACVM's Cocoa UI uses, so the two systems look like siblings.
+String gAssets;   // .../cocoa/workspace/assets/
+
+// NSView autoresizing masks.
+const int kMinXMargin = 1, kWidthSizable = 2, kMinYMargin = 8, kHeightSizable = 16;
+
+/// The tiled grain as a backing box: a borderless NSBox filled with the texture
+/// as a pattern colour, added FIRST so everything placed after it draws on top.
+/// Fails soft — if the texture is missing, no box (never a blank hole).
+Cocoa texturedBox(Cocoa parent, List frame, int mask) {
+  var img = Cocoa.cls("NSImage").alloc().initWithContentsOfFile(gAssets + "toolbar-texture.png");
+  if (img.isNil) return null;
+  var box = Cocoa.cls("NSBox").alloc().initWithFrame(frame);
+  box.setBoxType(4);      // NSBoxCustom
+  box.setBorderType(0);   // NSNoBorder
+  box.setFillColor(Cocoa.cls("NSColor").colorWithPatternImage(img));
+  box.setAutoresizingMask(mask);
+  parent.addSubview(box);
+  return box;
+}
+
+/// An icon-only toolbar button. The SVG is set as a TEMPLATE image, so AppKit
+/// tints it to the current appearance (light/dark) instead of us theming it.
+/// Falls back to the text title if the icon fails to load — never an invisible
+/// control. Keyed in [gButtons] under [title], so `click <title>` keeps working.
+Cocoa iconButton(Cocoa parent, String title, String icon, List frame, CocoaAction fn) {
+  var b = Cocoa.cls("NSButton").alloc().initWithFrame(frame);
+  b.setTitle(title);
+  b.setBordered(false);
+  b.setToolTip(title);    // an icon-only bar still has to be discoverable
+  var img = Cocoa.cls("NSImage").alloc().initWithContentsOfFile(
+      gAssets + "icons-mono/" + icon + ".svg");
+  if (!img.isNil) {
+    img.setTemplate(true);
+    b.setImage(img);
+    b.setImagePosition(1);   // NSImageOnly
+  }
+  parent.addSubview(b);
+  gButtons[title] = b;
+  gTargets.add(onAction(b, (s) => defer(() => fn(s))));   // see [defer]
+  return b;
+}
+
+/// A draggable pane splitter (MACVM's browser shape). [vertical] true = panes
+/// side by side with vertical dividers.
+Cocoa splitView(List frame, bool vertical) {
+  var sp = Cocoa.cls("NSSplitView").alloc().initWithFrame(frame);
+  sp.setVertical(vertical);
+  sp.setDividerStyle(3);   // NSSplitViewDividerStylePaneSplitter — visibly grabbable
+  sp.setAutoresizingMask(kWidthSizable + kHeightSizable);
+  return sp;
+}
+
 Cocoa _mono(double sz) => Cocoa.cls("NSFont").userFixedPitchFontOfSize(sz);
 
 Cocoa button(Cocoa parent, String title, List frame, CocoaAction fn) {
@@ -148,13 +203,19 @@ void buildWindow() {
   gContent = gWindow.contentView();
   gContent.setWantsLayer(true);   // layer-back the view tree so CATransaction flush can present pump-driven redraws
 
-  // Toolbar band: view-switchers on the left, a live metrics label on the right.
-  button(gContent, "Workspace", [16.0, 604.0, 110.0, 28.0], (s) => switchTab(0));
-  button(gContent, "Browser", [132.0, 604.0, 92.0, 28.0], (s) => switchTab(1));
-  button(gContent, "Find", [230.0, 604.0, 64.0, 28.0], (s) => switchTab(3));
-  button(gContent, "Docs", [300.0, 604.0, 66.0, 28.0], (s) => switchTab(2));
-  gMetrics = label(gContent, [520.0, 608.0, 364.0, 18.0]);
+  // Toolbar band: a textured strip carrying icon view-switchers on the left and
+  // a live metrics readout on the right (MACVM's CocoaUI toolbar, same assets).
+  var bar = Cocoa.cls("NSView").alloc().initWithFrame([0.0, 596.0, 900.0, 44.0]);
+  bar.setAutoresizingMask(kWidthSizable + kMinYMargin);   // pinned to the top edge
+  gContent.addSubview(bar);
+  texturedBox(bar, [0.0, 0.0, 900.0, 44.0], kWidthSizable + kHeightSizable);
+  iconButton(bar, "Workspace", "texteditor", [8.0, 6.0, 36.0, 32.0], (s) => switchTab(0));
+  iconButton(bar, "Browser", "hierarchy", [48.0, 6.0, 36.0, 32.0], (s) => switchTab(1));
+  iconButton(bar, "Find", "open", [88.0, 6.0, 36.0, 32.0], (s) => switchTab(3));
+  iconButton(bar, "Docs", "documentation", [128.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
+  gMetrics = label(bar, [520.0, 13.0, 372.0, 18.0]);
   gMetrics.setAlignment(2); // right
+  gMetrics.setAutoresizingMask(kMinXMargin);   // stays right-anchored
 
   // Tabless content host (the toolbar buttons are the tab bar).
   gTabView = Cocoa.cls("NSTabView").alloc().initWithFrame([16.0, 176.0, 868.0, 420.0]);
@@ -239,7 +300,11 @@ Cocoa tableIn(Cocoa parent, List frame) {
   table.addTableColumn(col);
   table.setHeaderView(null);
   table.setUsesAlternatingRowBackgroundColors(true);
+  // Follow the enclosing pane when a splitter resizes it.
+  table.setAutoresizingMask(kWidthSizable + kHeightSizable);
+  table.setColumnAutoresizingStyle(1);   // NSTableViewUniformColumnAutoresizingStyle
   scroll.setDocumentView(table);
+  scroll.setAutoresizingMask(kWidthSizable + kHeightSizable);
   parent.addSubview(scroll);
   return table;
 }
@@ -250,23 +315,51 @@ void buildBrowserTab(Cocoa br) {
   button(br, "+ Method", [90.0, 394.0, 90.0, 22.0], (s) => newMethod());
   button(br, "instance", [372.0, 394.0, 84.0, 22.0], (s) => setSide('i'));
   button(br, "class", [460.0, 394.0, 66.0, 22.0], (s) => setSide('c'));
+  br.setAutoresizesSubviews(true);
+  for (var t in <String>["+ Class", "+ Method", "instance", "class"]) {
+    gButtons[t].setAutoresizingMask(kMinYMargin);   // ride the top edge
+  }
 
-  // Four panes: Categories | Classes | Variables | Methods.
-  gCatTable = tableIn(br, [8.0, 196.0, 158.0, 218.0]);
-  gClassTable = tableIn(br, [174.0, 196.0, 190.0, 218.0]);
-  gVarTable = tableIn(br, [372.0, 196.0, 224.0, 190.0]);
-  gMethodTable = tableIn(br, [604.0, 196.0, 256.0, 190.0]);
+  // The browser proper is two nested split views, so every separator is a
+  // draggable splitter: the four panes side by side over the source area.
+  var vsplit = splitView([8.0, 8.0, 852.0, 380.0], false);
+  var hsplit = splitView([0.0, 0.0, 852.0, 220.0], true);
 
-  // Source pane modes + actions (over the source view).
-  button(br, "Comment", [8.0, 168.0, 84.0, 22.0], (s) => setMode('comment'));
-  button(br, "Definition", [94.0, 168.0, 92.0, 22.0], (s) => setMode('definition'));
-  button(br, "Source", [190.0, 168.0, 72.0, 22.0], (s) => setMode('source'));
-  gStatus = label(br, [270.0, 170.0, 320.0, 18.0]);
-  button(br, "Accept", [594.0, 168.0, 68.0, 22.0], (s) => browserAccept());
-  button(br, "Cancel", [666.0, 168.0, 64.0, 22.0], (s) => browserCancel());
-  button(br, "Remove", [734.0, 168.0, 90.0, 22.0], (s) => browserRemove());
+  // Four panes: Categories | Classes | Variables | Methods. Each scroll view is
+  // a split pane, so the splitter resizes it directly.
+  var cw = 213.0;
+  gCatTable = tableIn(hsplit, [0.0, 0.0, cw, 220.0]);
+  gClassTable = tableIn(hsplit, [0.0, 0.0, cw, 220.0]);
+  gVarTable = tableIn(hsplit, [0.0, 0.0, cw, 220.0]);
+  gMethodTable = tableIn(hsplit, [0.0, 0.0, cw, 220.0]);
 
-  gBrowserSrc = scrolledTextView(br, [8.0, 8.0, 852.0, 152.0], true);
+  // Lower half: the mode/action row pinned above the source view, both inside
+  // one container so the horizontal splitter moves them together.
+  var lower = Cocoa.cls("NSView").alloc().initWithFrame([0.0, 0.0, 852.0, 150.0]);
+  lower.setAutoresizesSubviews(true);
+  button(lower, "Comment", [0.0, 126.0, 84.0, 22.0], (s) => setMode('comment'));
+  button(lower, "Definition", [86.0, 126.0, 92.0, 22.0], (s) => setMode('definition'));
+  button(lower, "Source", [182.0, 126.0, 72.0, 22.0], (s) => setMode('source'));
+  gStatus = label(lower, [262.0, 128.0, 320.0, 18.0]);
+  button(lower, "Accept", [586.0, 126.0, 68.0, 22.0], (s) => browserAccept());
+  button(lower, "Cancel", [658.0, 126.0, 64.0, 22.0], (s) => browserCancel());
+  button(lower, "Remove", [726.0, 126.0, 90.0, 22.0], (s) => browserRemove());
+  for (var t in <String>["Comment", "Definition", "Source", "Accept", "Cancel", "Remove"]) {
+    gButtons[t].setAutoresizingMask(kMinYMargin);   // the row rides the top edge
+  }
+  gStatus.setAutoresizingMask(kMinYMargin);
+  gBrowserSrc = scrolledTextView(lower, [0.0, 0.0, 852.0, 122.0], true);
+  gBrowserSrc.enclosingScrollView().setAutoresizingMask(kWidthSizable + kHeightSizable);
+
+  vsplit.addSubview(hsplit);
+  vsplit.addSubview(lower);
+  vsplit.adjustSubviews();
+  hsplit.adjustSubviews();
+  vsplit.setPosition(220.0, ofDividerAtIndex: 0);
+  hsplit.setPosition(cw, ofDividerAtIndex: 0);
+  hsplit.setPosition(cw * 2, ofDividerAtIndex: 1);
+  hsplit.setPosition(cw * 3, ofDividerAtIndex: 2);
+  br.addSubview(vsplit);
   var mf = _mono(13.0);
   if (!mf.isNil) gBrowserSrc.setFont(mf);
 
@@ -867,6 +960,7 @@ ARCHITECTURE
   ⌘Q quits.''';
 
 main() async {
+  gAssets = Platform.script.resolve('assets/').toFilePath();   // icons + texture
   initEvents();     // AppKit callbacks re-enter through this port — see [defer]
   buildWindow();
 

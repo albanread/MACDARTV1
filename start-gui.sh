@@ -7,6 +7,7 @@
 #   ./start-gui.sh -r              rebuild dartui first
 #   ./start-gui.sh -f              start from a fresh image (the old one is kept)
 #   ./start-gui.sh --restore       put the last-good UI source back, then run
+#   ./start-gui.sh -s              supervise: restart it if it dies unexpectedly
 #
 # `dartui` is the GUI host: the `dart` binary plus a thread-0 AppKit host, so the
 # UI isolate runs where AppKit is legal. It takes the workspace script as its
@@ -22,14 +23,15 @@ PORT=7644                       # the workspace's loopback control socket
 LOG=/tmp/macdart-gui.log
 LAST_GOOD="$HOME/.macdart/workspace.last-good.dart"
 
-background=0 rebuild=0 fresh=0 restore=0
+background=0 rebuild=0 fresh=0 restore=0 supervise=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -b|--background) background=1 ;;
     -r|--rebuild)    rebuild=1 ;;
     -f|--fresh)      fresh=1 ;;
     --restore)       restore=1 ;;
-    -h|--help)       sed -n '3,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -s|--supervise)  supervise=1 ;;
+    -h|--help)       sed -n '3,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "start-gui.sh: unknown option '$1' (try --help)" >&2; exit 2 ;;
   esac
   shift
@@ -90,6 +92,36 @@ fi
 
 echo "image:   $IMAGE"
 echo "control: 127.0.0.1:$PORT   (e.g. printf 'snap /tmp/x.png\\n' | nc -w1 127.0.0.1 $PORT)"
+
+# Keep it running across an unexpected death, but never in a tight loop: a fault
+# that reproduces the moment the UI is back would just spin, hiding itself.
+# Three failures inside a minute is that, and exit 70 (the host's "the UI never
+# started") is not worth retrying at all — the source on disk is broken.
+if [ "$supervise" = 1 ]; then
+  fails=0
+  window=$(date +%s)
+  while true; do
+    "$DARTUI" "$UI_SCRIPT" || rc=$?
+    rc=${rc:-0}
+    [ "$rc" = 0 ] && { echo "workspace exited cleanly"; exit 0; }
+    if [ "$rc" = 70 ]; then
+      echo "start-gui.sh: the UI source does not load — not retrying." >&2
+      echo "  recover it with: ./start-gui.sh --restore" >&2
+      exit 1
+    fi
+    now=$(date +%s)
+    [ $((now - window)) -gt 60 ] && { fails=0; window=$now; }
+    fails=$((fails + 1))
+    if [ "$fails" -ge 3 ]; then
+      echo "start-gui.sh: died $fails times in under a minute (last exit $rc)." >&2
+      echo "  not restarting again. Try: ./start-gui.sh --restore" >&2
+      exit 1
+    fi
+    echo "workspace died (exit $rc) — restarting [$fails/3]…" >&2
+    rc=0
+    sleep 1
+  done
+fi
 
 if [ "$background" = 1 ]; then
   nohup "$DARTUI" "$UI_SCRIPT" >"$LOG" 2>&1 </dev/null &

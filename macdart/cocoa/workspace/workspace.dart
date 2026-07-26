@@ -73,7 +73,19 @@ void initEvents() {
   _evSend = _evPort.sendPort;
   _evPort.listen((id) {
     var body = _evPending.remove(id);
-    if (body != null) body();
+    if (body == null) return;
+    // Every UI action arrives here, so an uncaught throw would be an unhandled
+    // exception in the isolate's MESSAGE HANDLER — fatal to the root isolate,
+    // which takes the window and your unsaved work with it. A bug in one button
+    // must cost that button, not the app. (Found by the Debug menu's test error,
+    // which killed the process before this.)
+    try {
+      body();
+    } catch (e, st) {
+      log("✗ UI action failed — " + e.toString());
+      stderr.writeln("dartui: UI action failed: " + e.toString() + "\n" +
+                     st.toString());
+    }
   });
 }
 
@@ -292,11 +304,23 @@ void clearUndo() {
 }
 
 void buildWindow() {
-  buildMenu();
   gWindow = Cocoa.cls("NSWindow").alloc().initWithContentRect(
       [0.0, 0.0, 900.0, 640.0], styleMask: 15, backing: 2, defer: false);
   gWindow.setTitle("MACDART Workspace");
+  // Below this the panes stop being usable, so don't let the window get there.
+  gWindow.setContentMinSize([680.0, 480.0]);
   gContent = gWindow.contentView();
+  buildChrome();
+  gWindow.center();
+  gWindow.makeKeyAndOrderFront(null);
+  Cocoa.cls("NSApplication").sharedApplication().activateIgnoringOtherApps(true);
+}
+
+/// Everything inside the window: the menu bar and the whole view tree. Separated
+/// from [buildWindow] so it can be run AGAIN over a torn-down content view — a
+/// source reload changes behaviour, but only re-running this moves a button.
+void buildChrome() {
+  buildMenu();
 
   // Toolbar band: a textured strip carrying icon view-switchers on the left and
   // a live metrics readout on the right (MACVM's CocoaUI toolbar, same assets).
@@ -353,16 +377,8 @@ void buildWindow() {
     gLog.clear(); gTranscript.setString(""); repaint();
   }).setAutoresizingMask(kMinXMargin);
 
-  // Below this the panes stop being usable, so don't let the window get there.
-  gWindow.setContentMinSize([680.0, 480.0]);
-
   gTabView.selectTabViewItemAtIndex(0);
-  log("workspace ready — Workspace / Browser / Docs");
   updateMetrics();
-
-  gWindow.center();
-  gWindow.makeKeyAndOrderFront(null);
-  Cocoa.cls("NSApplication").sharedApplication().activateIgnoringOtherApps(true);
 }
 
 // --- VM metrics cluster (MACVM's toolbar readout) ---------------------------
@@ -1223,8 +1239,6 @@ void buildMenu() {
   menuItem(code, "Format", "f", (s) { switchTab(4); editorFormat(); })
       .setKeyEquivalentModifierMask(kCmd + kOpt);
   menuItem(code, "Analyze", "b", (s) { switchTab(4); editorAnalyze(); });
-  menuSep(code);
-  menuItem(code, "Restart Language Isolate", "", (s) => respawnLanguage("restart from the menu"));
 
   var view = subMenu(mainMenu, "View");
   menuItem(view, "Workspace", "1", (s) => switchTab(0));
@@ -1242,10 +1256,25 @@ void buildMenu() {
   menuItem(own, "Edit workspace.dart", "", (s) => editProjectFile('workspace'));
   menuItem(own, "Edit language.dart", "", (s) => editProjectFile('language'));
   menuItem(own, "Edit cocoa.dart", "", (s) => editProjectFile('cocoa'));
-  menuSep(own);
-  menuItem(own, "Reload UI from Source", "r", (s) => reloadUi())
+
+  // Debug: the UI's own lifecycle. Reload swaps the code; Rebuild re-runs
+  // buildChrome so layout changes land; Revert is the way back from an edit that
+  // compiled but misbehaves.
+  var dbg = subMenu(mainMenu, "Debug");
+  menuItem(dbg, "Reload UI from Source", "r", (s) => reloadUi())
       .setKeyEquivalentModifierMask(kCmd + kCtrl);
-  menuItem(own, "Revert UI to Last Good", "", (s) => revertUi());
+  menuItem(dbg, "Rebuild UI Layout", "l", (s) => rebuildUi())
+      .setKeyEquivalentModifierMask(kCmd + kCtrl);
+  menuItem(dbg, "Revert UI to Last Good", "", (s) => revertUi());
+  menuSep(dbg);
+  menuItem(dbg, "Restart Language Isolate", "", (s) => respawnLanguage("restart from the Debug menu"));
+  menuSep(dbg);
+  // Proves the recovery path actually recovers. Post-startup a thrown callback
+  // is survivable: the host logs it and keeps the window.
+  menuItem(dbg, "Raise a Test Error", "", (s) {
+    log("raising a deliberate error — the window should survive it");
+    throw "deliberate test error from the Debug menu";
+  });
 
   app.setMainMenu(mainMenu);
 }
@@ -1389,6 +1418,30 @@ Future<String> handle(String line) async {
     case 'log': return gLog.join('\n');   // the transcript, for headless testing
     case 'edit': editProjectFile(arg.trim()); return "ok";
     case 'uireload': await reloadUi(); return "ok";
+    case 'uirebuild': rebuildUi(); return "ok";
+    case 'menuclick': {   // "menuclick Debug/Rebuild UI Layout" — drive a menu item
+      var i = arg.indexOf('/');
+      if (i < 0) return "ERR: use menuclick <Menu>/<Item>";
+      var mm = Cocoa.cls("NSApplication").sharedApplication().mainMenu();
+      var top = mm.itemWithTitle(arg.substring(0, i));
+      if (top.isNil) return "ERR: no menu " + arg.substring(0, i);
+      var sub = top.submenu();
+      var want = arg.substring(i + 1);
+      for (var k = 0; k < sub.numberOfItems(); k++) {
+        if (sub.itemAtIndex(k).title().UTF8String() != want) continue;
+        sub.performActionForItemAtIndex(k);
+        return "clicked " + arg;
+      }
+      return "ERR: no item " + want;
+    }
+    case 'menus': {   // the menu bar's top-level titles, to catch duplication
+      var mm = Cocoa.cls("NSApplication").sharedApplication().mainMenu();
+      var out = <String>[];
+      for (var i = 0; i < mm.numberOfItems(); i++) {
+        out.add(mm.itemAtIndex(i).title().UTF8String());
+      }
+      return out.length.toString() + ": " + out.join(" | ");
+    }
     case 'uirevert': await revertUi(); return "ok";
     case 'uilastgood': return gLastGood == null ? "(none yet)" : gLastGood;
     case 'edload': editorLoad(); return "ok";
@@ -1693,6 +1746,80 @@ void editorFormat() {
   log("Format - re-indented");
 }
 
+// --- rebuilding the view tree -----------------------------------------------
+// A source reload swaps CODE; it does not move a view that buildChrome() already
+// positioned. Re-running buildChrome() over a torn-down content view does, so a
+// layout change goes live like everything else.
+//
+// MACVM documents the trap here (world/64_cocoaui.mst installMenu): the menu bar
+// is a NATIVE object that SURVIVES the rebuild, so re-running the menu code
+// against it appends a second full set of submenus — duplicates, the stale half
+// greyed out because their targets are dead. We are immune by construction:
+// buildMenu() builds a FRESH NSMenu and setMainMenu: REPLACES the bar rather
+// than adding to it. Verified after a rebuild, because "immune by construction"
+// is exactly the kind of claim that quietly stops being true.
+List<int> _rebuildTimes = <int>[];   // ms timestamps, for the storm backstop
+const int _kStormN = 5;              // this many rebuilds...
+const int _kStormMs = 8000;          // ...within this long is a storm
+
+// N rebuilds in T seconds means something faults the instant the UI is back.
+// Looping forever would just hide it (MACVM's Layer-3 backstop, same reasoning).
+bool _rebuildAllowed() {
+  var now = new DateTime.now().millisecondsSinceEpoch;
+  var recent = <int>[];
+  for (var t in _rebuildTimes) if (now - t < _kStormMs) recent.add(t);
+  recent.add(now);
+  _rebuildTimes = recent;
+  if (recent.length > _kStormN) {
+    log("✗ rebuild storm — " + recent.length.toString() + " rebuilds in " +
+        (_kStormMs ~/ 1000).toString() + "s. Stopping rather than looping.");
+    log("  recover with:  ./start-gui.sh --restore");
+    return false;
+  }
+  return true;
+}
+
+/// Tear the window's contents down and build them again from the current code.
+/// The NSWindow itself is kept, so position and size survive; so does the
+/// transcript, the tab you were on, and an unsaved Editor buffer.
+void rebuildUi() {
+  if (gWindow == null || !_rebuildAllowed()) return;
+  var tab = gTab;
+  var edBuf = gEdText != null ? edText() : null;
+  var edStat = (gEdStatus != null) ? gEdStatus.stringValue().UTF8String() : null;
+
+  // Drop every Dart-side handle into the old tree BEFORE it goes away, so
+  // nothing later reaches through a stale wrapper.
+  gButtons.clear();
+  gTargets.clear();
+  gMetricVals.clear();
+  gMemBarFill = null;
+  gCatTable = null; gClassTable = null; gVarTable = null; gMethodTable = null;
+  gBrowserSrc = null; gStatus = null; gEdText = null; gEdPicker = null;
+  gEdStatus = null; gFindField = null; gFindTable = null; gEditor = null;
+  gTranscript = null; gTabView = null;
+  // The ObjC action targets outlive this: AppKit holds them unretained and we
+  // never owned a reference. Their tickets are gone, so a stale one now fails
+  // closed (dart:cocoa's dispatch returns on an unknown ticket) rather than
+  // firing into a dead handler. A few small objects per rebuild is the price.
+  disposeCallbacks();
+
+  var subs = gContent.subviews();
+  while (gContent.subviews().count() > 0) {
+    gContent.subviews().objectAtIndex(0).removeFromSuperview();
+  }
+
+  buildChrome();
+
+  gTranscript.setString(gLog.join("\n"));
+  gTranscript.scrollToEndOfDocument(null);
+  if (edBuf != null && edBuf.length > 0) edSetText(edBuf);
+  if (edStat != null && edStat.length > 0) edStatus(edStat);
+  switchTab(tab);
+  log("UI layout rebuilt");
+  repaint();
+}
+
 // --- reloading the UI itself ------------------------------------------------
 // The UI isolate cannot reload itself from its own stack — it would be replacing
 // the code it is standing in, with AppKit holding its closures. The HOST can,
@@ -1768,7 +1895,8 @@ void pollUiReload() {
   var s = wsUiReloadStatus();
   if (s.isEmpty) return;
   if (s == "ok") {
-    log("✓ UI reloaded — behaviour is live; view LAYOUT still needs a restart");
+    log("✓ UI reloaded");
+    rebuildUi();      // re-run buildChrome so layout changes take effect too
   } else {
     log("✗ UI reload cancelled (the running UI is untouched) — " + s);
   }

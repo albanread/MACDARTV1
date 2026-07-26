@@ -130,6 +130,14 @@ void _ensureDispatch() {
   }
 }
 
+/// Forget every callback registered so far. Called when the UI tears its view
+/// tree down: the ObjC targets outlive it (AppKit holds them unretained and we
+/// never owned a reference), but their tickets are gone, so a stale one now
+/// fails closed in [_cocoaDispatch] instead of firing into a dead handler.
+void disposeCallbacks() {
+  _cbHandlers.clear();
+}
+
 /// Wire [control]'s action to [fn] (e.g. an `NSButton`'s click). Returns the
 /// target object; AppKit holds targets weakly, so keep a reference to it alive.
 Cocoa onAction(Cocoa control, CocoaAction fn) {

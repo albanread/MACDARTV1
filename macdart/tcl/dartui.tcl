@@ -148,7 +148,15 @@ namespace eval dartui {
         variable events
         set id [incr seq]
         set p {}
-        foreach {k v} $params { lappend p "[jsonStr $k]:[jsonStr $v]" }
+        # Numbers must go over as JSON numbers: evaluateInFrame rejects a
+        # frameIndex sent as "0" with Invalid params.
+        foreach {k v} $params {
+            if {[string is integer -strict $v]} {
+                lappend p "[jsonStr $k]:$v"
+            } else {
+                lappend p "[jsonStr $k]:[jsonStr $v]"
+            }
+        }
         set req "\{\"jsonrpc\":\"2.0\",\"id\":$id,\"method\":[jsonStr $method],\"params\":\{[join $p ,]\}\}"
         wsSend $sock $req
         # Replies and pushed events share the socket; keep anything that is not

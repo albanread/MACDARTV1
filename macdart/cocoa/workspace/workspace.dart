@@ -1417,6 +1417,13 @@ Future<String> handle(String line) async {
       gDbgBpLines.add(ln); dbgLoadSource();
       return "breakpoint at " + ln.toString() + " resolved=" + r['resolved'].toString();
     }
+    case 'dbgvars': {
+      var o = <String>[];
+      for (var v in gDbgVars) o.add(v[0].toString() + "=" + v[1].toString());
+      return o.isEmpty ? "(none)" : o.join(", ");
+    }
+    case 'dbgframe': { dbgSelectFrame(int.parse(arg.trim(), onError: (_) => 0)); return "ok"; }
+    case 'dbgeval': { await dbgEval(arg); return gDbgStatusLbl.stringValue().UTF8String(); }
     case 'dbgsource': return gDbgSrc == null ? "" : gDbgSrc.string().UTF8String();
     case 'dbgstate': return gDbgPaused
         ? ("paused, " + gDbgFrames.length.toString() + " frames, top=" +
@@ -1896,11 +1903,36 @@ Future<bool> vmsResolveTarget() async {
 // Breakpoints address the language isolate's root script — the scratch file the
 // image is written into — so that is what the source pane shows. Line numbers
 // here are the numbers the VM uses, which is why they are displayed.
-Cocoa gDbgSrc, gDbgStack, gDbgStatusLbl, gDbgBps;
-List gDbgFrames = <dynamic>[];        // [functionName, location]
+Cocoa gDbgSrc, gDbgStack, gDbgLocals, gDbgStatusLbl, gDbgEvalField;
+List gDbgFrames = <dynamic>[];        // [functionName, frameJson]
+List gDbgVars = <dynamic>[];          // [name, renderedValue] for the chosen frame
+int gDbgFrame = 0;                    // which frame locals and eval apply to
 List gDbgBpLines = <dynamic>[];       // breakpoint line numbers we set
 bool gDbgPaused = false;
 String gDbgScratch;                   // the scratch path, for the source pane
+
+// A vm-service value comes back as an @Instance: primitives carry
+// valueAsString, everything else is identified by its class. Show the value when
+// there is one and the class when there is not, rather than a handle nobody can
+// read.
+String dbgValue(var v) {
+  if (v == null) return "null";
+  if (v is! Map) return v.toString();
+  if (v['valueAsString'] != null) {
+    var s = v['valueAsString'].toString();
+    if (v['kind'] == 'String') s = "'" + s + "'";
+    if (v['valueAsStringIsTruncated'] == true) s = s + "…";
+    return s;
+  }
+  if (v['kind'] == 'Null') return "null";
+  if (v['class'] != null && v['class']['name'] != null) {
+    var cls = v['class']['name'].toString();
+    if (v['length'] != null) return cls + "(" + v['length'].toString() + ")";
+    return "a " + cls;
+  }
+  if (v['kind'] != null) return v['kind'].toString();
+  return v.toString();
+}
 
 void dbgStatus(String s) {
   if (gDbgStatusLbl != null) gDbgStatusLbl.setStringValue(s);
@@ -1923,18 +1955,38 @@ void buildDebugTab(Cocoa db) {
   gDbgStatusLbl = label(db, [8.0, 372.0, 852.0, 16.0]);
   gDbgStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
 
+  gDbgEvalField = Cocoa.cls("NSTextField").alloc().initWithFrame([8.0, 344.0, 700.0, 24.0]);
+  gDbgEvalField.setStringValue("");
+  var ef = _mono(12.0); if (!ef.isNil) gDbgEvalField.setFont(ef);
+  db.addSubview(gDbgEvalField);
+  gDbgEvalField.setAutoresizingMask(kMinYMargin + kWidthSizable);
+  button(db, "Evaluate", [714.0, 343.0, 84.0, 26.0], (s) => dbgEval());
+  pinTop(<String>["Evaluate"], kMinXMargin);
+
   // source on the left, stack on the right
-  var split = splitView([8.0, 8.0, 852.0, 358.0], true);
-  var srcPane = browserPane(split, 560.0, 358.0);
-  gDbgSrc = scrolledTextView(srcPane, [0.0, 0.0, 560.0, 358.0], false);
+  var split = splitView([8.0, 8.0, 852.0, 330.0], true);
+  var srcPane = browserPane(split, 560.0, 330.0);
+  gDbgSrc = scrolledTextView(srcPane, [0.0, 0.0, 560.0, 330.0], false);
   var mf = _mono(12.0);
   if (!mf.isNil) gDbgSrc.setFont(mf);
   anchorScroll(gDbgSrc, kWidthSizable + kHeightSizable);
 
-  var stackPane = browserPane(split, 284.0, 358.0);
-  gDbgStack = tableIn(stackPane, [0.0, 0.0, 284.0, 358.0]);
+  // stack over locals, so selecting a frame changes what you are looking at
+  var right = browserPane(split, 284.0, 358.0);
+  var rsplit = splitView([0.0, 0.0, 284.0, 358.0], false);
+  var stackPane = browserPane(rsplit, 284.0, 170.0);
+  gDbgStack = tableIn(stackPane, [0.0, 0.0, 284.0, 170.0]);
   gTargets.add(onTable(gDbgStack, () => gDbgFrames.length,
       (r) => gDbgFrames[r][0].toString(), sel(dbgSelectFrame)));
+  var localsPane = browserPane(rsplit, 284.0, 188.0);
+  gDbgLocals = tableIn(localsPane, [0.0, 0.0, 284.0, 188.0]);
+  gTargets.add(onTable(gDbgLocals, () => gDbgVars.length,
+      (r) => gDbgVars[r][0].toString() + " = " + gDbgVars[r][1].toString(),
+      (r) {}));
+  rsplit.adjustSubviews();
+  rsplit.setPosition(170.0, ofDividerAtIndex: 0);
+  setSplitMinSize(rsplit, 60.0);
+  right.addSubview(rsplit);
 
   split.adjustSubviews();
   split.setPosition(560.0, ofDividerAtIndex: 0);
@@ -2059,6 +2111,8 @@ Future dbgOnPaused(String kind) async {
     }
   }
   gDbgStack.reloadData();
+  gDbgFrame = 0;
+  dbgShowVars(0);
   switchTab(5);
   dbgStatus(kind + " — " + gDbgFrames.length.toString() +
             " frames; the window stays live because this is a different isolate");
@@ -2068,7 +2122,41 @@ Future dbgOnPaused(String kind) async {
 
 void dbgSelectFrame(int row) {
   if (row < 0 || row >= gDbgFrames.length) return;
-  dbgStatus("frame: " + gDbgFrames[row][0].toString());
+  gDbgFrame = row;
+  dbgShowVars(row);
+  dbgStatus("frame " + row.toString() + ": " + gDbgFrames[row][0].toString() +
+            " — locals and Evaluate now apply to this frame");
+}
+
+// A frame carries its own bound variables; no extra round trip needed.
+void dbgShowVars(int row) {
+  gDbgVars = <dynamic>[];
+  if (row >= 0 && row < gDbgFrames.length) {
+    var f = gDbgFrames[row][1];
+    if (f is Map && f['vars'] != null) {
+      for (var v in f['vars']) {
+        gDbgVars.add(<dynamic>[v['name'].toString(), dbgValue(v['value'])]);
+      }
+    }
+  }
+  if (gDbgLocals != null) gDbgLocals.reloadData();
+  repaint();
+}
+
+/// Run an expression IN the selected frame, so it sees that frame's locals.
+Future dbgEval([String expr]) async {
+  if (gLangIsolateId == null) { dbgStatus("attach first"); return; }
+  if (!gDbgPaused) { dbgStatus("evaluate needs the isolate stopped"); return; }
+  var src = expr != null ? expr : gDbgEvalField.stringValue().UTF8String();
+  if (src.trim().isEmpty) return;
+  var r = await vmsCall('evaluateInFrame', <String, dynamic>{
+    'isolateId': gLangIsolateId, 'frameIndex': gDbgFrame, 'expression': src});
+  if (r == null) { dbgStatus("evaluate failed"); return; }
+  var shown = (r['kind'] == 'Error' || r['message'] != null)
+      ? ("error: " + (r['message'] != null ? r['message'].toString() : r.toString()))
+      : dbgValue(r);
+  dbgStatus(src + "  =>  " + shown);
+  log("debug eval: " + src + " => " + shown);
 }
 
 // --- the vm-service front door (one control plane) ---------------------------

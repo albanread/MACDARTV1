@@ -90,18 +90,38 @@ check "debug class live"  [ui doit {new DbgT().step()}] 1
 set iso [ui dbgattach]
 check "attached"          [expr {[string match isolates/* $iso]}] 1
 # the VM's own line numbering, read back from the source pane the debugger shows
+# Scope the search to DbgT: `n = n + 1;` also appears in Counter, which is
+# stored as a one-liner and has no body line to break on.
 set line 0
 set n 0
+set inClass 0
 foreach l [split [ui dbgsource] \n] {
     incr n
-    if {[string match {*n = n + 1;*} $l] && $line == 0} { set line $n }
+    if {[string match {*class DbgT*} $l]} { set inClass 1 }
+    if {$inClass && [string match {*n = n + 1;*} $l] && $line == 0} { set line $n }
 }
 check "found body line"   [expr {$line > 0}] 1
-ui dbgbreak $line
+check "breakpoint resolved" [expr {[string match *resolved=true* [ui dbgbreak $line]]}] 1
 check "not paused yet"    [ui dbgstate] running
+
+# stop on the breakpoint and inspect the frame
+set s2 [socket 127.0.0.1 7644]
+fconfigure $s2 -translation binary -blocking 0
+puts -nonewline $s2 "doit new DbgT().step()\n"
+flush $s2
+after 3000
+check "paused"            [expr {[string match paused* [ui dbgstate]]}] 1
+check "gui alive stopped" [ui ping] pong
+check "locals bound"      [expr {[string match *this=* [ui dbgvars]]}] 1
+check "eval in frame"     [expr {[string match *=>*2* [ui dbgeval {n + 2}]]}] 1
+ui dbgstep
+after 800
+check "resumed"           [ui dbgstate] running
+ui dbgclear
 
 section "cleanup"
 ui remove TclOk
+ui remove DbgT
 after 1500
 
 puts "\npassed $passed, failed $failed"

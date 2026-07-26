@@ -287,10 +287,12 @@ void switchTab(int i) {
   // Paste would be greyed out until the user clicked the source pane. Put focus
   // on the tab's text view instead.
   var focus = (i == 0) ? gEditor : (i == 1) ? gBrowserSrc
-            : (i == 3) ? gFindField : (i == 4) ? gEdText : null;
+            : (i == 3) ? gFindField : (i == 4) ? gEdText
+            : (i == 5) ? gDbgSrc : null;
   if (focus != null) gWindow.makeFirstResponder(focus);
   if (i == 1) openBrowser();
   if (i == 4) editorRefreshClasses();
+  if (i == 5 && gLangIsolateId != null) dbgLoadSource();
   updateMetrics();
   repaint();
 }
@@ -333,7 +335,8 @@ void buildChrome() {
   iconButton(bar, "Browser", "hierarchy", [48.0, 6.0, 36.0, 32.0], (s) => switchTab(1));
   iconButton(bar, "Editor", "blankSheet", [88.0, 6.0, 36.0, 32.0], (s) => switchTab(4));
   alias("tab:Find", iconButton(bar, "Find", "open", [128.0, 6.0, 36.0, 32.0], (s) => switchTab(3)));
-  iconButton(bar, "Docs", "documentation", [168.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
+  iconButton(bar, "Debug", "abstract", [168.0, 6.0, 36.0, 32.0], (s) => switchTab(5));
+  iconButton(bar, "Docs", "documentation", [208.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
   buildMetricsCluster(bar, 900.0);
 
   // Tabless content host (the toolbar buttons are the tab bar). It absorbs all
@@ -368,6 +371,9 @@ void buildChrome() {
 
   // Editor tab: a whole class as text, against the image or a .dart file.
   buildEditorTab(addTab(gTabView, "editor", 868.0, 420.0));
+
+  // Debugger tab: breakpoints and stepping in the LANGUAGE isolate.
+  buildDebugTab(addTab(gTabView, "debug", 868.0, 420.0));
 
   // Transcript dock (shared across tabs): docked to the bottom at a fixed
   // height, widening with the window.
@@ -1270,6 +1276,8 @@ void buildMenu() {
   menuSep(dbg);
   menuItem(dbg, "Restart Language Isolate", "", (s) => respawnLanguage("restart from the Debug menu"));
   menuSep(dbg);
+  menuItem(dbg, "Attach Debugger", "", (s) { switchTab(5); dbgAttach(); });
+  menuSep(dbg);
   // Proves the recovery path actually recovers. Post-startup a thrown callback
   // is survivable: the host logs it and keeps the window.
   menuItem(dbg, "Raise a Test Error", "", (s) {
@@ -1297,11 +1305,41 @@ Future askQuiet(String cmd, var arg, Duration limit) async {
   return identical(result, _kTimeout) ? null : result;
 }
 
+// While the debugger holds the language isolate stopped, the watchdog must not
+// count that as a runaway. Without this it kills the very isolate you are
+// debugging: sitting on a breakpoint for six seconds produced
+// "'doit' timed out — killed runaway code — restarting language isolate".
+// A plain timeout cannot tell "paused at a breakpoint" from "while(true)"; the
+// debugger can, so it raises this and the clock stops.
+int gDebugHold = 0;
+
+void debugHold() { gDebugHold++; }
+void debugRelease() { if (gDebugHold > 0) gDebugHold--; }
+bool get debugHolding => gDebugHold > 0;
+
 Future ask(String cmd, var arg) async {   // arg/result may be a String or a List
   if (gLang == null) return "ERR: language isolate restarting…";
   var rp = new ReceivePort();
   gLang.send([cmd, arg, rp.sendPort]);
-  var result = await rp.first.timeout(_kDoitTimeout, onTimeout: () => _kTimeout);
+
+  // The deadline is checked on a tick rather than by Future.timeout, so time
+  // spent stopped in the debugger can be given back instead of counted.
+  var done = new Completer();
+  var sub = rp.listen((msg) { if (!done.isCompleted) done.complete(msg); });
+  var since = new Stopwatch()..start();
+  var tick;
+  tick = new Timer.periodic(const Duration(milliseconds: 250), (t) {
+    if (done.isCompleted) { t.cancel(); return; }
+    if (debugHolding) { since.reset(); return; }   // stopped: not runaway
+    if (since.elapsed >= _kDoitTimeout && !done.isCompleted) {
+      t.cancel();
+      done.complete(_kTimeout);
+    }
+  });
+
+  var result = await done.future;
+  tick.cancel();
+  sub.cancel();
   rp.close();
   if (identical(result, _kTimeout)) {
     await respawnLanguage("'" + cmd + "' timed out — killed runaway code");
@@ -1369,6 +1407,25 @@ Future<String> handle(String line) async {
   var arg = sp < 0 ? "" : line.substring(sp + 1);
   switch (cmd) {
     case 'ping': return "pong";
+    case 'dbgattach': await dbgAttach(); return gLangIsolateId == null ? "ERR: not attached" : gLangIsolateId;
+    case 'dbgbreak': {
+      if (gLangIsolateId == null) return "ERR: attach first";
+      var ln = int.parse(arg.trim(), onError: (_) => 0);
+      var r = await vmsCall('addBreakpoint', <String, dynamic>{
+          'isolateId': gLangIsolateId, 'scriptId': gLangScriptId, 'line': ln});
+      if (r == null) return "ERR: no breakpoint at line " + ln.toString();
+      gDbgBpLines.add(ln); dbgLoadSource();
+      return "breakpoint at " + ln.toString() + " resolved=" + r['resolved'].toString();
+    }
+    case 'dbgsource': return gDbgSrc == null ? "" : gDbgSrc.string().UTF8String();
+    case 'dbgstate': return gDbgPaused
+        ? ("paused, " + gDbgFrames.length.toString() + " frames, top=" +
+           (gDbgFrames.isEmpty ? "?" : gDbgFrames[0][0].toString()))
+        : "running";
+    case 'dbgstep': await dbgResume(arg.trim().isEmpty ? null : arg.trim()); return "ok";
+    case 'dbgclear': await dbgClearBreaks(); return "ok";
+    case 'dbghold': debugHold(); return "held (watchdog paused), depth " + gDebugHold.toString();
+    case 'dbgrelease': debugRelease(); return "released, depth " + gDebugHold.toString();
     case 'sleep': {   // a pacing aid for scripts; does not block the isolate
       var ms = int.parse(arg.trim(), onError: (_) => 0);
       if (ms > 0) await new Future.delayed(new Duration(milliseconds: ms));
@@ -1751,6 +1808,267 @@ void editorFormat() {
   if (f == src) { log("Format - already tidy"); return; }
   edSetText(f);
   log("Format - re-indented");
+}
+
+// --- vm-service client (the debugger's transport) ---------------------------
+// The UI isolate talks JSON-RPC to the VM's own service over a WebSocket. It can
+// debug the LANGUAGE isolate precisely because that is a different isolate: user
+// code stops, this one keeps drawing. An isolate cannot debug itself.
+//
+// dart:io gives us the WebSocket, so no native code is involved. Requires the
+// process to have been started with --observe (start-gui.sh does by default).
+WebSocket gVms;                        // the service connection, null when off
+int gVmsSeq = 0;
+Map<int, Completer> gVmsPending = <int, Completer>{};
+String gLangIsolateId;                 // the isolate we debug
+String gLangScriptId;                  // its root script (the scratch file)
+bool gVmsConnecting = false;
+
+Future<bool> vmsConnect([String url = 'ws://127.0.0.1:8181/ws']) async {
+  if (gVms != null) return true;
+  if (gVmsConnecting) return false;
+  gVmsConnecting = true;
+  try {
+    gVms = await WebSocket.connect(url);
+  } catch (e) {
+    gVmsConnecting = false;
+    log("debugger: no vm-service at " + url + " — start with --observe  (" +
+        e.toString() + ")");
+    return false;
+  }
+  gVmsConnecting = false;
+  gVms.listen((data) {
+    var d;
+    try { d = JSON.decode(data.toString()); } catch (e) { return; }
+    if (d['id'] != null) {
+      var c = gVmsPending.remove(d['id'] is int ? d['id'] : int.parse(d['id'].toString()));
+      if (c != null && !c.isCompleted) c.complete(d);
+    } else if (d['method'] == 'streamNotify') {
+      onVmsEvent(d['params']);
+    }
+  }, onDone: () { gVms = null; dbgStatus("vm-service disconnected"); },
+     onError: (e) { gVms = null; });
+  return true;
+}
+
+Future vmsCall(String method, [Map params]) async {
+  if (gVms == null) return null;
+  var id = ++gVmsSeq;
+  var c = new Completer();
+  gVmsPending[id] = c;
+  gVms.add(JSON.encode(<String, dynamic>{
+    'jsonrpc': '2.0', 'id': id, 'method': method,
+    'params': params != null ? params : <String, dynamic>{}
+  }));
+  var reply = await c.future.timeout(const Duration(seconds: 10),
+      onTimeout: () => <String, dynamic>{'error': {'message': 'timed out'}});
+  if (reply['error'] != null) {
+    dbgStatus("vm-service: " + method + ": " + reply['error']['message'].toString());
+    return null;
+  }
+  return reply['result'];
+}
+
+/// Find the language isolate and its script — the thing we set breakpoints in.
+Future<bool> vmsResolveTarget() async {
+  var vm = await vmsCall('getVM');
+  if (vm == null) return false;
+  for (var iso in vm['isolates']) {
+    if (!iso['name'].toString().contains('macdart_ws_lang')) continue;
+    gLangIsolateId = iso['id'];
+    var info = await vmsCall('getIsolate', <String, dynamic>{'isolateId': gLangIsolateId});
+    if (info == null || info['rootLib'] == null) return false;
+    var lib = await vmsCall('getObject', <String, dynamic>{
+      'isolateId': gLangIsolateId, 'objectId': info['rootLib']['id']});
+    if (lib == null || lib['scripts'] == null || lib['scripts'].isEmpty) return false;
+    gLangScriptId = lib['scripts'][0]['id'];
+    return true;
+  }
+  dbgStatus("debugger: no language isolate found");
+  return false;
+}
+
+// --- Debugger tab -----------------------------------------------------------
+// Breakpoints, pause/step, and the stack, against the LANGUAGE isolate. The
+// window stays live while user code is stopped because the debugger runs in a
+// different isolate from the code it is debugging.
+//
+// Breakpoints address the language isolate's root script — the scratch file the
+// image is written into — so that is what the source pane shows. Line numbers
+// here are the numbers the VM uses, which is why they are displayed.
+Cocoa gDbgSrc, gDbgStack, gDbgStatusLbl, gDbgBps;
+List gDbgFrames = <dynamic>[];        // [functionName, location]
+List gDbgBpLines = <dynamic>[];       // breakpoint line numbers we set
+bool gDbgPaused = false;
+String gDbgScratch;                   // the scratch path, for the source pane
+
+void dbgStatus(String s) {
+  if (gDbgStatusLbl != null) gDbgStatusLbl.setStringValue(s);
+  repaint();
+}
+
+void buildDebugTab(Cocoa db) {
+  db.setAutoresizesSubviews(true);
+  button(db, "Attach", [8.0, 392.0, 72.0, 24.0], (s) => dbgAttach());
+  button(db, "Pause", [84.0, 392.0, 62.0, 24.0], (s) => dbgPause());
+  button(db, "Continue", [150.0, 392.0, 80.0, 24.0], (s) => dbgResume(null));
+  button(db, "Step Over", [234.0, 392.0, 84.0, 24.0], (s) => dbgResume('Over'));
+  button(db, "Step In", [322.0, 392.0, 72.0, 24.0], (s) => dbgResume('Into'));
+  button(db, "Step Out", [398.0, 392.0, 78.0, 24.0], (s) => dbgResume('Out'));
+  button(db, "Break Here", [480.0, 392.0, 92.0, 24.0], (s) => dbgToggleBreak());
+  button(db, "Clear Breaks", [576.0, 392.0, 100.0, 24.0], (s) => dbgClearBreaks());
+  pinTop(<String>["Attach", "Pause", "Continue", "Step Over", "Step In",
+                  "Step Out", "Break Here", "Clear Breaks"]);
+
+  gDbgStatusLbl = label(db, [8.0, 372.0, 852.0, 16.0]);
+  gDbgStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
+
+  // source on the left, stack on the right
+  var split = splitView([8.0, 8.0, 852.0, 358.0], true);
+  var srcPane = browserPane(split, 560.0, 358.0);
+  gDbgSrc = scrolledTextView(srcPane, [0.0, 0.0, 560.0, 358.0], false);
+  var mf = _mono(12.0);
+  if (!mf.isNil) gDbgSrc.setFont(mf);
+  anchorScroll(gDbgSrc, kWidthSizable + kHeightSizable);
+
+  var stackPane = browserPane(split, 284.0, 358.0);
+  gDbgStack = tableIn(stackPane, [0.0, 0.0, 284.0, 358.0]);
+  gTargets.add(onTable(gDbgStack, () => gDbgFrames.length,
+      (r) => gDbgFrames[r][0].toString(), sel(dbgSelectFrame)));
+
+  split.adjustSubviews();
+  split.setPosition(560.0, ofDividerAtIndex: 0);
+  setSplitMinSize(split, 160.0);
+  db.addSubview(split);
+  dbgStatus("not attached — press Attach (the app must run with --observe)");
+}
+
+Future dbgAttach() async {
+  if (!await vmsConnect()) return;
+  if (!await vmsResolveTarget()) return;
+  await vmsCall('streamListen', <String, dynamic>{'streamId': 'Debug'});
+  gDbgScratch = gScratch;
+  dbgLoadSource();
+  dbgStatus("attached to the language isolate — click a line, then Break Here");
+  log("debugger attached (" + gLangIsolateId + ")");
+}
+
+// The source the VM sees: the scratch file, with the VM's own line numbers.
+void dbgLoadSource() {
+  if (gDbgScratch == null) return;
+  String src;
+  try { src = new File(gDbgScratch).readAsStringSync(); }
+  catch (e) { dbgStatus("cannot read " + gDbgScratch); return; }
+  var lines = src.split('\n');
+  var out = new StringBuffer();
+  for (var i = 0; i < lines.length; i++) {
+    var n = (i + 1).toString();
+    while (n.length < 4) n = " " + n;
+    out.write(gDbgBpLines.contains(i + 1) ? "*" : " ");
+    out.write(n);
+    out.write("  ");
+    out.write(lines[i]);
+    out.write("\n");
+  }
+  gDbgSrc.setString(out.toString());
+  repaint();
+}
+
+/// The 1-based line the caret sits on in the source pane.
+int dbgCaretLine() {
+  var r = gDbgSrc.selectedRange();
+  var pos = (r is List && r.length > 0) ? r[0] : 0;
+  var text = gDbgSrc.string().UTF8String();
+  var line = 1;
+  for (var i = 0; i < pos && i < text.length; i++) {
+    if (text.codeUnitAt(i) == 0x0A) line++;
+  }
+  return line;
+}
+
+Future dbgToggleBreak() async {
+  if (gLangIsolateId == null) { dbgStatus("attach first"); return; }
+  var line = dbgCaretLine();
+  var r = await vmsCall('addBreakpoint', <String, dynamic>{
+    'isolateId': gLangIsolateId, 'scriptId': gLangScriptId, 'line': line});
+  if (r == null) {
+    dbgStatus("line " + line.toString() + ": no breakpoint there "
+              "(a one-line class has no body line to stop on — Format it)");
+    return;
+  }
+  gDbgBpLines.add(line);
+  dbgLoadSource();
+  dbgStatus("breakpoint at line " + line.toString() +
+            (r['resolved'] == true ? " (resolved)" : " (pending)"));
+}
+
+Future dbgClearBreaks() async {
+  if (gLangIsolateId == null) return;
+  var info = await vmsCall('getIsolate', <String, dynamic>{'isolateId': gLangIsolateId});
+  if (info != null && info['breakpoints'] != null) {
+    for (var bp in info['breakpoints']) {
+      await vmsCall('removeBreakpoint', <String, dynamic>{
+        'isolateId': gLangIsolateId, 'breakpointId': bp['id']});
+    }
+  }
+  gDbgBpLines = <dynamic>[];
+  dbgLoadSource();
+  dbgStatus("breakpoints cleared");
+}
+
+Future dbgPause() async {
+  if (gLangIsolateId == null) { dbgStatus("attach first"); return; }
+  await vmsCall('pause', <String, dynamic>{'isolateId': gLangIsolateId});
+}
+
+Future dbgResume(String step) async {
+  if (gLangIsolateId == null) return;
+  var p = <String, dynamic>{'isolateId': gLangIsolateId};
+  if (step != null) p['step'] = step;
+  await vmsCall('resume', p);
+  // The hold is dropped here, not on the Resume event: the watchdog clock must
+  // stay stopped until user code is genuinely running again.
+  if (gDbgPaused) { gDbgPaused = false; debugRelease(); }
+  gDbgFrames = <dynamic>[];
+  gDbgStack.reloadData();
+  dbgStatus(step == null ? "running" : "stepping " + step);
+}
+
+// Debug-stream events. A pause is where the watchdog has to be told to stop
+// counting — see debugHold().
+void onVmsEvent(Map params) {
+  var e = params['event'];
+  if (e == null) return;
+  var kind = e['kind'].toString();
+  if (kind.startsWith('Pause')) {
+    if (!gDbgPaused) { gDbgPaused = true; debugHold(); }
+    dbgOnPaused(kind);
+  } else if (kind == 'Resume') {
+    if (gDbgPaused) { gDbgPaused = false; debugRelease(); }
+    dbgStatus("running");
+  }
+}
+
+Future dbgOnPaused(String kind) async {
+  var stk = await vmsCall('getStack', <String, dynamic>{'isolateId': gLangIsolateId});
+  gDbgFrames = <dynamic>[];
+  if (stk != null && stk['frames'] != null) {
+    for (var f in stk['frames']) {
+      var name = (f['function'] != null) ? f['function']['name'].toString() : '?';
+      gDbgFrames.add(<dynamic>[name, f]);
+    }
+  }
+  gDbgStack.reloadData();
+  switchTab(5);
+  dbgStatus(kind + " — " + gDbgFrames.length.toString() +
+            " frames; the window stays live because this is a different isolate");
+  log("debugger: " + kind);
+  repaint();
+}
+
+void dbgSelectFrame(int row) {
+  if (row < 0 || row >= gDbgFrames.length) return;
+  dbgStatus("frame: " + gDbgFrames[row][0].toString());
 }
 
 // --- the vm-service front door (one control plane) ---------------------------

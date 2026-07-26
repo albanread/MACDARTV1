@@ -82,6 +82,24 @@ ui ping
 check "gui event pushed"  [expr {[llength [events]] > 0}] 1
 check "image reloaded"    [ui doit {new Blorp().triple()}] 3
 
+section "debugger (language isolate, from the UI isolate)"
+ui settext {class DbgT {\n  int n = 0;\n  int step() {\n    n = n + 1;\n    return n;\n  }\n}}
+ui click ws:Accept
+after 4000
+check "debug class live"  [ui doit {new DbgT().step()}] 1
+set iso [ui dbgattach]
+check "attached"          [expr {[string match isolates/* $iso]}] 1
+# the VM's own line numbering, read back from the source pane the debugger shows
+set line 0
+set n 0
+foreach l [split [ui dbgsource] \n] {
+    incr n
+    if {[string match {*n = n + 1;*} $l] && $line == 0} { set line $n }
+}
+check "found body line"   [expr {$line > 0}] 1
+ui dbgbreak $line
+check "not paused yet"    [ui dbgstate] running
+
 section "cleanup"
 ui remove TclOk
 after 1500

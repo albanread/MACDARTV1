@@ -168,27 +168,34 @@ void _imageUpsert(String name, String source) {
   }
 }
 
-String _accept(String decl) {
-  var name = _declName(decl);
-  _decls[name] = decl.trim();
-  _imageUpsert(name, decl.trim());
-  var err = _rebuildAndReload();
-  return err.isEmpty ? ('accepted ' + name) : err;
-}
+String _accept(String decl) => _acceptMany(<String>[decl]);
 
 // GUI Accept: the editor's top-level declarations, redefining by name; UPSERT
 // each into the image, then reload ONCE (live instances of a changed class morph).
 String _acceptMany(List decls) {
   var names = <String>[];
+  var prev = <String, String>{};        // name -> what was there (null = new)
   for (var d in decls) {
     var s = d.toString().trim();
     var name = _declName(s);
+    prev[name] = _decls.containsKey(name) ? _decls[name] : null;
     _decls[name] = s;
-    _imageUpsert(name, s);
     names.add(name);
   }
   var err = _rebuildAndReload();
-  return err.isEmpty ? ('accepted ' + names.join(', ')) : err;
+  if (err.isNotEmpty) {
+    // The image is the source of truth for the NEXT boot, so it must never keep
+    // source the VM has just refused: writing it before the reload meant a
+    // cancelled reload left a class that would fail to load on the next start.
+    // Put back what was there and reload that, so live and saved agree again.
+    prev.forEach((name, old) {
+      if (old == null) _decls.remove(name); else _decls[name] = old;
+    });
+    _rebuildAndReload();
+    return err;
+  }
+  for (var name in names) _imageUpsert(name, _decls[name]);
+  return 'accepted ' + names.join(', ');
 }
 
 // Live-only accept: make declarations live in THIS isolate without touching the
@@ -197,14 +204,23 @@ String _acceptMany(List decls) {
 // image) comes back without it. Deliberately not persisted.
 String _acceptLive(List decls) {
   var names = <String>[];
+  var prev = <String, String>{};
   for (var d in decls) {
     var s = d.toString().trim();
     var name = _declName(s);
+    prev[name] = _decls.containsKey(name) ? _decls[name] : null;
     _decls[name] = s;
     names.add(name);
   }
   var err = _rebuildAndReload();
-  return err.isEmpty ? ('live (not saved): ' + names.join(', ')) : err;
+  if (err.isNotEmpty) {            // roll back, same reasoning as _acceptMany
+    prev.forEach((name, old) {
+      if (old == null) _decls.remove(name); else _decls[name] = old;
+    });
+    _rebuildAndReload();
+    return err;
+  }
+  return 'live (not saved): ' + names.join(', ');
 }
 
 // Replace the whole declaration set at once (kept for scripted use / replay).

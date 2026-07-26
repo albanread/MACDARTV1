@@ -1317,8 +1317,30 @@ void debugHold() { gDebugHold++; }
 void debugRelease() { if (gDebugHold > 0) gDebugHold--; }
 bool get debugHolding => gDebugHold > 0;
 
+/// Store declarations formatted, so the image never holds a one-liner. A class
+/// on a single line has no body line for a breakpoint to resolve on — that is
+/// what made Counter undebuggable. Falls back to the original text if formatting
+/// would change anything but layout, so this can never damage a declaration.
+List formatDecls(List decls) {
+  var out = <dynamic>[];
+  for (var d in decls) {
+    var src = d.toString();
+    var f;
+    try { f = formatDart(src); } catch (e) { out.add(src); continue; }
+    out.add(_tokenSignature(f) == _tokenSignature(src) ? f : src);
+  }
+  return out;
+}
+
 Future ask(String cmd, var arg) async {   // arg/result may be a String or a List
   if (gLang == null) return "ERR: language isolate restarting…";
+  // Every accept path funnels through here, including the socket verbs, so this
+  // is the one place formatting has to happen.
+  if (cmd == 'acceptMany' || cmd == 'acceptLive') {
+    if (arg is List) arg = formatDecls(arg);
+  } else if (cmd == 'accept') {
+    arg = formatDecls(<dynamic>[arg])[0];
+  }
   var rp = new ReceivePort();
   gLang.send([cmd, arg, rp.sendPort]);
 
@@ -1732,7 +1754,49 @@ void editorFileIn() {
 // - including braces and quotes inside them - are never counted and never
 // rewritten. A line whose start lies inside a multi-line string or comment is
 // emitted verbatim.
-String formatDart(String src) {
+String formatDart(String src) => _reindent(_breakStatements(src));
+
+// Put each brace and statement on its own line. Re-indenting alone cannot help a
+// class stored as a ONE-LINER: there is no body line for a breakpoint to resolve
+// on, which is why `Counter` could not be debugged. Literal-aware — a brace or
+// semicolon inside a string or comment is left alone — and a semicolon inside
+// parentheses (a for-header) does not end a line.
+String _breakStatements(String src) {
+  var spans = lexDart(src);
+  var lit = new List<bool>.filled(src.length + 1, false);
+  for (var i = 0; i + 2 < spans.length; i += 3) {
+    var k = spans[i + 2];
+    if (k != 2 && k != 3) continue;
+    for (var p = spans[i]; p < spans[i] + spans[i + 1] && p < lit.length; p++) {
+      lit[p] = true;
+    }
+  }
+  var out = new StringBuffer();
+  var paren = 0;
+  var atLineStart = true;      // also suppresses runs of blank lines
+  var i = 0, n = src.length;
+  while (i < n) {
+    var c = src.codeUnitAt(i);
+    if (lit[i]) { out.write(src[i]); atLineStart = (c == 0x0A); i++; continue; }
+    if (c == 0x0A) { if (!atLineStart) { out.write('\n'); atLineStart = true; } i++; continue; }
+    if (c == 0x20 || c == 0x09) { if (!atLineStart) out.write(' '); i++; continue; }
+    if (c == 0x28) paren++;
+    if (c == 0x29 && paren > 0) paren--;
+    if (c == 0x7B) { out.write('{\n'); atLineStart = true; i++; continue; }
+    if (c == 0x7D) {
+      if (!atLineStart) out.write('\n');
+      out.write('}\n');
+      atLineStart = true; i++; continue;
+    }
+    if (c == 0x3B && paren == 0) { out.write(';\n'); atLineStart = true; i++; continue; }
+    out.write(src[i]);
+    atLineStart = false;
+    i++;
+  }
+  return out.toString();
+}
+
+String _reindent(String src) {
   var spans = lexDart(src);
   // pos -> is it inside a string(2) or comment(3) span?
   var lit = new List<bool>.filled(src.length + 1, false);

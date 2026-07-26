@@ -756,11 +756,13 @@ void browserAccept() {
     var newClass = (gSelMemberSrc != null && gSelMemberSrc.length > 0)
         ? _replaceOnce(gBrClassSrc, gSelMemberSrc, text)
         : _insertMember(gBrClassSrc, text);
-    gSelMemberSrc = text;
-    ask('acceptMany', [newClass]).then((r) {
-      log("✓ Accept — " + r);
-      gBrClassSrc = newClass;
-      _reloadBrowserClass();
+    guardedAccept(<String>[newClass], "Accept", () {
+      gSelMemberSrc = text;
+      ask('acceptMany', [newClass]).then((r) {
+        log("✓ Accept — " + r);
+        gBrClassSrc = newClass;
+        _reloadBrowserClass();
+      });
     });
     return;
   }
@@ -771,6 +773,7 @@ void browserAccept() {
   var decls = splitTopLevel(text);
   if (decls.isEmpty) { log("(nothing to accept)"); return; }
   var name = _classNameOf(decls[0]);
+  guardedAccept(decls, "Accept", () {
   ask('acceptMany', decls).then((r) {
     log("✓ Accept — " + r);
     if (r.toString().startsWith("ERR")) return;   // reload cancelled: keep the edits
@@ -782,6 +785,7 @@ void browserAccept() {
     }
     _reloadClassList();
     updateStatus();
+  });
   });
 }
 
@@ -1061,13 +1065,15 @@ void run(bool printIt) {
 void acceptEditor() {
   var decls = splitTopLevel(gEditor.string().UTF8String());
   if (decls.isEmpty) { log("(nothing to accept)"); return; }
-  ask('acceptMany', decls).then((r) {
-    if (r.startsWith('accepted')) {
-      log("✓ Accept — " + r);
-    } else {
-      log("Accept failed — " + r);
-    }
-    updateMetrics();
+  guardedAccept(decls, "Accept", () {
+    ask('acceptMany', decls).then((r) {
+      if (r.startsWith('accepted')) {
+        log("✓ Accept — " + r);
+      } else {
+        log("Accept failed — " + r);
+      }
+      updateMetrics();
+    });
   });
 }
 
@@ -1230,6 +1236,12 @@ void buildMenu() {
     gLog.clear(); gTranscript.setString(""); repaint();
   });
 
+  // The workspace's own sources, editable from inside itself.
+  var own = subMenu(mainMenu, "Source");
+  menuItem(own, "Edit workspace.dart", "", (s) => editProjectFile('workspace'));
+  menuItem(own, "Edit language.dart", "", (s) => editProjectFile('language'));
+  menuItem(own, "Edit cocoa.dart", "", (s) => editProjectFile('cocoa'));
+
   app.setMainMenu(mainMenu);
 }
 
@@ -1369,6 +1381,8 @@ Future<String> handle(String line) async {
     case 'edstatus': return gEdStatus.stringValue().UTF8String();
     case 'edpick': gEdPicker.selectItemWithTitle(arg); return "ok";
     case 'edclasses': { var o = <String>[]; for (var i = 0; i < gEdPicker.numberOfItems(); i++) o.add(gEdPicker.itemTitleAtIndex(i).UTF8String()); return o.join(','); }
+    case 'log': return gLog.join('\n');   // the transcript, for headless testing
+    case 'edit': editProjectFile(arg.trim()); return "ok";
     case 'edload': editorLoad(); return "ok";
     case 'ednew': editorNew(); return "ok";
     case 'edsave': editorSaveImage(); return "ok";
@@ -1477,6 +1491,7 @@ void editorLoad() {
 void editorSaveImage() {
   var decls = splitTopLevel(edText());
   if (decls.isEmpty) { log("editor: nothing to save"); return; }
+  guardedAccept(decls, "Save to Image", () {
   ask('acceptMany', decls).then((r) {
     log("✓ Save to Image — " + r);
     if (!r.toString().startsWith("ERR")) {
@@ -1486,6 +1501,7 @@ void editorSaveImage() {
       _reloadClassList();
     }
   });
+  });
 }
 
 // Editor -> live isolate ONLY. Try a class in the running world without
@@ -1493,11 +1509,13 @@ void editorSaveImage() {
 void editorAddToWorld() {
   var decls = splitTopLevel(edText());
   if (decls.isEmpty) { log("editor: nothing to add"); return; }
+  guardedAccept(decls, "Add to World", () {
   ask('acceptLive', decls).then((r) {
     log("✓ Add to World — " + r);
     if (!r.toString().startsWith("ERR")) {
       edStatus("live in the running world — NOT saved to the image");
     }
+  });
   });
 }
 
@@ -1565,11 +1583,13 @@ void editorFileIn() {
     if (decls.isEmpty) { log("editor: " + path + " has no top-level declarations"); return; }
     gEdFile = path; gEdClass = null;
     edSetText(src);
+    guardedAccept(decls, "File In", () {
     ask('acceptMany', decls).then((r) {
       log("✓ File In (" + decls.length.toString() + " declaration(s)) — " + r);
       edStatus(path + "  ·  filed in: " + decls.length.toString() + " declaration(s) live + saved");
       editorRefreshClasses();
       _reloadClassList();
+    });
     });
   });
 }
@@ -1665,6 +1685,176 @@ void editorFormat() {
   log("Format - re-indented");
 }
 
+// --- editing the workspace's own source -------------------------------------
+// The UI is written in Dart, so it may as well be editable from inside itself.
+// These open the project's own files in the Editor. What a save DOES differs per
+// file, and the status line says so rather than leaving you to find out:
+//   workspace.dart  the UI you are looking at — a runtime script, so a restart
+//                   picks it up (it cannot hot-reload itself: this isolate IS
+//                   the window, and a bad reload leaves nothing to fix it with)
+//   language.dart   the TEMPLATE the language isolate is spawned from; the live
+//                   isolate runs a copy, so a restart picks it up
+//   cocoa.dart      the dart:cocoa bridge, baked into the VM snapshot — needs a
+//                   rebuild (./start-gui.sh --rebuild)
+const Map<String, List<String>> _kProjectFiles = const <String, List<String>>{
+  'workspace': const <String>['workspace.dart',
+      'the UI itself — restart to pick it up'],
+  'language': const <String>['language.dart',
+      'the language-isolate template — restart to pick it up'],
+  'cocoa': const <String>['../cocoa.dart',
+      'the dart:cocoa bridge — needs ./start-gui.sh --rebuild'],
+};
+
+String projectFilePath(String which) {
+  var e = _kProjectFiles[which];
+  if (e == null) return null;
+  return Platform.script.resolve(e[0]).toFilePath();
+}
+
+/// Open one of the workspace's own source files in the Editor.
+void editProjectFile(String which) {
+  var e = _kProjectFiles[which];
+  if (e == null) {
+    log("edit: unknown file '" + which + "' (workspace | language | cocoa)");
+    return;
+  }
+  var path = projectFilePath(which);
+  var f = new File(path);
+  if (!f.existsSync()) { log("edit: no such file — " + path); return; }
+  String src;
+  try { src = f.readAsStringSync(); }
+  catch (err) { log("edit: cannot read " + path + " — " + err.toString()); return; }
+  switchTab(4);
+  gEdFile = path;      // Save File… writes back here; Analyze compiles standalone
+  gEdClass = null;
+  edSetText(src);
+  edStatus(e[0] + "  ·  " + e[1]);
+  log("editing " + path);
+}
+
+// --- compile check ----------------------------------------------------------
+// One real compile, shared by every path that commits code. Nothing is accepted
+// on the strength of a brace count: the buffer is written to a temp file and put
+// through `dart --compile_all`, which compiles method BODIES too (spawnUri does
+// not — Dart 1 compiles them lazily, so a broken body would sail through).
+//
+// A declaration is never checked alone. Compiled by itself, `class A { B b; }`
+// fails with "cannot resolve class 'B'" the moment B is another class in your
+// image, so the probe is assembled as: the language isolate's imports, every
+// OTHER declaration in the image, then the code under test. Reported lines are
+// mapped back to the buffer the user is looking at.
+const String _kProbeImports =
+    "import 'dart:cocoa';\nimport 'dart:isolate';\nimport 'dart:io';\nimport 'dart:mirrors';\n";
+
+class CheckResult {
+  final bool ok;
+  final String message;   // "" when ok
+  final int line;         // 1-based line in the SOURCE UNDER TEST, 0 if unknown
+  CheckResult(this.ok, this.message, this.line);
+}
+
+int _countLines(String s) {
+  var n = 0;
+  for (var i = 0; i < s.length; i++) if (s.codeUnitAt(i) == 0x0A) n++;
+  return n;
+}
+
+/// Compile [src]. When [standalone] the text is compiled as its own program
+/// (it carries its own imports — a project file); otherwise it is compiled
+/// against the image, with declarations named in [replacing] left out so a
+/// redefinition does not collide with the version already there.
+Future<CheckResult> compileCheck(String src,
+    {bool standalone: false, List<String> replacing: null}) async {
+  var bin = _analyzeBinary();
+  if (bin == null) return new CheckResult(true, "", 0);   // no checker: don't block work
+
+  var probe, offset = 0;
+  if (standalone) {
+    // ALWAYS supply the entry point: _neutraliseMain has just renamed any main
+    // the file had, so without this the VM reports "no main" on a perfectly good
+    // file — and running the user's main is exactly what we are avoiding.
+    probe = _neutraliseMain(src) + "\n\nmain() {}\n";
+  } else {
+    var ctx = new StringBuffer();
+    ctx.write(_kProbeImports);
+    var others = _dl(await askQuiet('alldecls', '', const Duration(seconds: 3)));
+    var skip = replacing != null ? replacing : <String>[];
+    for (var d in others) {
+      if (skip.contains(d[0].toString())) continue;
+      ctx.write("\n");
+      ctx.write(d[1].toString());
+      ctx.write("\n");
+    }
+    ctx.write("\n");
+    var head = ctx.toString();
+    offset = _countLines(head);
+    probe = head + _neutraliseMain(src) + "\n\nmain() {}\n";
+  }
+
+  var path = Directory.systemTemp.path + "/macdart_check.dart";
+  var out;
+  try {
+    new File(path).writeAsStringSync(probe);
+    out = await Process.run(bin, <String>["--compile_all", path])
+        .timeout(const Duration(seconds: 20), onTimeout: () => null);
+  } catch (e) {
+    return new CheckResult(true, "", 0);   // could not run it: don't block work
+  } finally {
+    try { new File(path).deleteSync(); } catch (e) {}
+  }
+  if (out == null) return new CheckResult(true, "", 0);
+  if (out.exitCode == 0) return new CheckResult(true, "", 0);
+
+  var msg = out.stderr.toString().trim();
+  if (msg.isEmpty) msg = out.stdout.toString().trim();
+  // Native linking happens AFTER parsing, so reaching it means the source is
+  // syntactically sound — it just declares natives that only exist inside
+  // dartui (dart:cocoa does). Report the limit, not a phantom error.
+  if (msg.contains('native function') && msg.contains('cannot be found')) {
+    return new CheckResult(true,
+        "parses cleanly (its native functions only resolve inside dartui)", 0);
+  }
+  var line = _errorLine(msg) - offset;      // back into the user's own buffer
+  if (line < 1) line = 0;
+  return new CheckResult(false, _cleanError(_firstLine(msg), offset), line);
+}
+
+// The VM reports against the temp probe: an absolute path and a line number that
+// counts the image context we prepended. Neither means anything to someone
+// looking at their own buffer, so report the line THEY can see.
+String _cleanError(String msg, int offset) {
+  var m = msg;
+  var q = m.indexOf("': ");
+  if (m.startsWith("'file://") && q > 0) m = m.substring(q + 3);
+  if (offset > 0) {
+    var lm = new RegExp(r'line (\d+)').firstMatch(m);
+    if (lm != null) {
+      var n = int.parse(lm.group(1)) - offset;
+      if (n > 0) m = m.replaceFirst('line ' + lm.group(1), 'line ' + n.toString());
+    }
+  }
+  return m;
+}
+
+/// Check [decls] and, if they compile, run [commit]. Otherwise say why and
+/// leave the buffer untouched — a cancelled hot reload is a far worse outcome
+/// than a refused Accept.
+Future guardedAccept(List decls, String what, void commit()) async {
+  var names = <String>[];
+  for (var d in decls) {
+    var n = _classNameOf(d.toString());
+    if (n != null) names.add(n);
+  }
+  var joined = decls.join("\n\n");
+  var r = await compileCheck(joined, replacing: names);
+  if (!r.ok) {
+    log("✗ " + what + " refused — " + r.message);
+    if (r.line > 0) _selectLine(r.line);
+    return;
+  }
+  commit();
+}
+
 // --- Analyze ----------------------------------------------------------------
 // A REAL compile of every method body, by the real front end.
 //
@@ -1723,44 +1913,47 @@ String _neutraliseMain(String src) {
 Future editorAnalyze() async {
   var src = edText();
   if (src.trim().isEmpty) return;
-  var bin = _analyzeBinary();
-  if (bin == null) {
+  if (_analyzeBinary() == null) {
     log("Analyze unavailable: no dart binary beside " + Platform.resolvedExecutable);
     return;
   }
-  // Line numbers must map 1:1 onto the editor, so nothing above the buffer and
-  // no trimming: the empty main goes at the END.
-  var probe = _neutraliseMain(src) + "\n\nmain() {}\n";
-  var path = Directory.systemTemp.path + "/macdart_analyze.dart";
-  var out;
-  try {
-    new File(path).writeAsStringSync(probe);
-    out = await Process.run(bin, <String>["--compile_all", path])
-        .timeout(const Duration(seconds: 20), onTimeout: () => null);
-  } catch (e) {
-    log("Analyze failed to run: " + e.toString());
-    return;
-  } finally {
-    try { new File(path).deleteSync(); } catch (e) {}
-  }
-  if (out == null) { edStatus("Analyze timed out"); log("Analyze timed out"); return; }
-  if (out.exitCode == 0) {
-    edStatus("Analyze: compiles cleanly");
-    log("Analyze: compiles cleanly");
+  // A project file carries its own imports and is compiled as a program; an
+  // image class is compiled against the rest of the image.
+  var r = gEdFile != null
+      ? await compileCheck(src, standalone: true)
+      : await compileCheck(src, replacing: _bufferNames(src));
+  if (r.ok) {
+    var note = r.message.isEmpty ? "compiles cleanly" : r.message;
+    edStatus("Analyze: " + note);
+    log("Analyze: " + note);
     return;
   }
-  var msg = out.stderr.toString().trim();
-  if (msg.isEmpty) msg = out.stdout.toString().trim();
-  var first = _firstLine(msg);
-  edStatus("Analyze FAILED: " + first);
-  log("Analyze FAILED: " + msg);
-  var line = _errorLine(msg);
-  if (line > 0) _selectLine(line);
+  edStatus("Analyze FAILED: " + r.message);
+  log("Analyze FAILED: " + r.message);
+  if (r.line > 0) _selectLine(r.line);
 }
 
+// The declarations a buffer defines, so a check does not collide them with the
+// copies already in the image.
+List<String> _bufferNames(String src) {
+  var out = <String>[];
+  for (var d in splitTopLevel(src)) {
+    var n = _classNameOf(d);
+    if (n != null) out.add(n);
+  }
+  return out;
+}
+
+// The first line of a compile error is the whole story; the first line of a
+// RUNTIME error is just "Unhandled exception:", so carry the line after it too.
 String _firstLine(String s) {
-  var i = s.indexOf('\n');
-  return i < 0 ? s : s.substring(0, i);
+  var lines = s.split('\n');
+  if (lines.isEmpty) return s;
+  var first = lines[0].trim();
+  if (first.endsWith('exception:') && lines.length > 1) {
+    return first + ' ' + lines[1].trim();
+  }
+  return first;
 }
 
 // "...: line 12 pos 7: unexpected token" -> 12

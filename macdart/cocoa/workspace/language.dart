@@ -55,6 +55,7 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'worldclasssrc') out = _worldClassSrc(arg);
       else if (cmd == 'find') out = _find(arg);
       else if (cmd == 'senders') out = _senders(arg);
+      else if (cmd == 'alldecls') out = _allDecls();
       else if (cmd == 'vmstats') out = wsVmStats();
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();
@@ -235,6 +236,15 @@ String _rebuildAndReload() {
   new File(_scratch).writeAsStringSync(
       text.substring(0, s) + '\n' + region + '\n' + text.substring(e));
   return wsReload();
+}
+
+// Every declaration as [name, source]. The UI compiles a proposed edit against
+// these before accepting it: a class checked ALONE would be rejected the moment
+// it referenced another class in the image.
+List _allDecls() {
+  var out = <List>[];
+  _decls.forEach((name, src) { out.add([name, src]); });
+  return out;
 }
 
 // --- browser data (user app) ------------------------------------------------

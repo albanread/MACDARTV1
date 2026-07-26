@@ -28,6 +28,7 @@ static Dart_PersistentHandle g_dispatch = NULL;
 static std::unordered_map<void*, int64_t> g_ticket_of;  // instance ptr -> ticket
 static std::mutex g_mu;
 static Class g_action_class = nil;
+static std::unordered_map<void*, double> g_split_min;  // split view -> min pane size
 
 // Invoke the Dart dispatcher; returns the raw result handle (NULL on failure).
 // Caller must be inside a Dart scope and marshal the result per kind.
@@ -102,6 +103,42 @@ static void SelectionChangedIMP(id self, SEL _cmd, id note) {
   Dart_ExitScope();
 }
 
+// NSSplitView delegate: keep every pane at least g_split_min points.
+// Deliberately implemented in ObjC rather than dispatched into Dart — AppKit
+// calls these continuously while a divider is dragged, and a Dart_InvokeClosure
+// per frame would make dragging lurch.
+static double SplitMinFor(id sv) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  std::unordered_map<void*, double>::iterator it = g_split_min.find((void*)sv);
+  return (it == g_split_min.end()) ? 0.0 : it->second;
+}
+
+// The lowest position divider `idx` may take: every pane before it at minimum.
+static CGFloat ConstrainMinIMP(id self, SEL _cmd, id sv, CGFloat proposed,
+                               NSInteger idx) {
+  (void)self; (void)_cmd;
+  double m = SplitMinFor(sv);
+  if (m <= 0.0) return proposed;
+  CGFloat t = [(NSSplitView*)sv dividerThickness];
+  CGFloat want = (CGFloat)((idx + 1) * m) + (CGFloat)(idx * t);
+  return proposed > want ? proposed : want;
+}
+
+// The highest position divider `idx` may take: every pane after it at minimum.
+static CGFloat ConstrainMaxIMP(id self, SEL _cmd, id sv, CGFloat proposed,
+                               NSInteger idx) {
+  (void)self; (void)_cmd;
+  double m = SplitMinFor(sv);
+  if (m <= 0.0) return proposed;
+  NSSplitView* s = (NSSplitView*)sv;
+  NSInteger n = (NSInteger)[[s subviews] count];
+  CGFloat t = [s dividerThickness];
+  CGFloat len = [s isVertical] ? [s bounds].size.width : [s bounds].size.height;
+  CGFloat tail = (CGFloat)(n - 1 - idx);
+  CGFloat want = len - tail * (CGFloat)m - tail * t;
+  return proposed < want ? proposed : want;
+}
+
 static void EnsureActionClass() {
   if (g_action_class != nil) return;
   g_action_class = objc_allocateClassPair([NSObject class], "MacdartActionTarget", 0);
@@ -110,6 +147,12 @@ static void EnsureActionClass() {
   class_addMethod(g_action_class, sel_registerName("numberOfRowsInTableView:"), (IMP)NumRowsIMP, "q@:@");
   class_addMethod(g_action_class, sel_registerName("tableView:objectValueForTableColumn:row:"), (IMP)ObjectValueIMP, "@@:@@q");
   class_addMethod(g_action_class, sel_registerName("tableViewSelectionDidChange:"), (IMP)SelectionChangedIMP, "v@:@");
+  class_addMethod(g_action_class,
+                  sel_registerName("splitView:constrainMinCoordinate:ofSubviewAt:"),
+                  (IMP)ConstrainMinIMP, "d40@0:8@16d24q32");
+  class_addMethod(g_action_class,
+                  sel_registerName("splitView:constrainMaxCoordinate:ofSubviewAt:"),
+                  (IMP)ConstrainMaxIMP, "d40@0:8@16d24q32");
   objc_registerClassPair(g_action_class);
 }
 
@@ -165,6 +208,27 @@ void Cocoa_setSelectorAction(Dart_NativeArguments args) {
                                         (id)t);
   ((void (*)(id, SEL, SEL))objc_msgSend)((id)c, sel_registerName("setAction:"),
                                          sel_registerName(name));
+}
+
+// _setSplitMinSize(int splitView, double minSize): stop the user dragging any
+// pane of `splitView` below `minSize` points. Installs a delegate that answers
+// AppKit's constrain callbacks natively.
+void Cocoa_setSplitMinSize(Dart_NativeArguments args) {
+  int64_t h = 0;
+  double m = 0.0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &h);
+  Dart_DoubleValue(Dart_GetNativeArgument(args, 1), &m);
+  id sv = (id)h;
+  if (sv == nil) return;
+  EnsureActionClass();
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_split_min[(void*)sv] = m;
+  }
+  // A delegate with no ticket: only the split-view callbacks above will fire on
+  // it, and Dispatch() fails closed for everything else.
+  id del = class_createInstance(g_action_class, 0);
+  ((void (*)(id, SEL, id))objc_msgSend)(sv, sel_registerName("setDelegate:"), del);
 }
 
 // --- Syntax highlighting: batched attribute application ----------------------

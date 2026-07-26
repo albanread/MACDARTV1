@@ -38,6 +38,7 @@ String gBrMode = 'source';         // comment | definition | source
 String gBrSelCat, gBrSelClass, gBrClassSrc, gBrClassComment, gSelMemberSrc;
 bool gBrUserApp = true;            // is the selected category editable (user app)?
 int gTab = 0;                      // the visible tab, for context-sensitive menu items
+String gSelPane;                   // 'v' or 'm': which member pane owns the selection
 List _dl(dynamic r) => r is List ? r : <dynamic>[];   // reply -> list
 
 // Find state.
@@ -540,18 +541,22 @@ void buildBrowserTab(Cocoa br) {
   // Variables — the instance/class toggle governs this column and Methods, so it
   // rides the top of this pane rather than floating in the tab.
   var varPane = browserPane(hsplit, cw, ph);
-  gVarTable = tableIn(varPane, [0.0, 0.0, cw, ph - kPaneBtnH]);
+  gVarTable = tableIn(varPane, [0.0, kPaneBtnH, cw, ph - (2.0 * kPaneBtnH)]);
   var bi = button(varPane, "instance", [4.0, ph - 24.0, 72.0, 22.0], (s) => setSide('i'));
   var bc = button(varPane, "class", [78.0, ph - 24.0, 56.0, 22.0], (s) => setSide('c'));
   bi.setAutoresizingMask(kMinYMargin);   // a fixed-size pair, kept together at
   bc.setAutoresizingMask(kMinYMargin);   // the top-left of the column
   _paneBtnFont(bi); _paneBtnFont(bc);
+  paneButtons(varPane, cw, "+ Variable", 82.0, (s) => newVariable(),
+                           "− Variable", 82.0, (s) => removeMember('v'),
+                           "New instance or class variable",
+                           "Remove the selected variable");
 
   // Methods — list over its own New/Remove.
   var methPane = browserPane(hsplit, cw, ph);
   gMethodTable = tableIn(methPane, [0.0, kPaneBtnH, cw, ph - kPaneBtnH]);
   paneButtons(methPane, cw, "+ Method", 74.0, (s) => newMethod(),
-                             "− Method", 74.0, (s) => removeMethod(),
+                             "− Method", 74.0, (s) => removeMember('m'),
                              "New method", "Remove the selected member");
 
   // Lower half: the mode/action row pinned above the source view, both inside one
@@ -579,23 +584,35 @@ void buildBrowserTab(Cocoa br) {
   hsplit.setPosition(cw * 2, ofDividerAtIndex: 1);
   hsplit.setPosition(cw * 3, ofDividerAtIndex: 2);
   br.addSubview(vsplit);
+  // A column narrower than this would let its own +/- buttons overlap, and the
+  // source pane needs room to be worth editing in.
+  setSplitMinSize(hsplit, 150.0);
+  setSplitMinSize(vsplit, 90.0);
   var mf = _mono(13.0);
   if (!mf.isNil) gBrowserSrc.setFont(mf);
 
   gTargets.add(onTable(gCatTable, () => gBrCats.length, (r) => gBrCats[r].toString(), sel(selectCategory)));
   gTargets.add(onTable(gClassTable, () => gBrClasses.length, (r) => gBrClasses[r].toString(), sel(selectClass)));
-  gTargets.add(onTable(gVarTable, () => gVarRecs.length, (r) => gVarRecs[r][2].toString(), sel((r) => selectMemberRec(gVarRecs, r))));
-  gTargets.add(onTable(gMethodTable, () => gMethodRecs.length, (r) => gMethodRecs[r][2].toString(), sel((r) => selectMemberRec(gMethodRecs, r))));
+  gTargets.add(onTable(gVarTable, () => gVarRecs.length, (r) => gVarRecs[r][2].toString(),
+      sel((r) { gSelPane = 'v'; selectMemberRec(gVarRecs, r); })));
+  gTargets.add(onTable(gMethodTable, () => gMethodRecs.length, (r) => gMethodRecs[r][2].toString(),
+      sel((r) { gSelPane = 'm'; selectMemberRec(gMethodRecs, r); })));
   gTargets.add(onTextChange(gBrowserSrc, (s) => highlightView(gBrowserSrc)));
 }
 
 // Delete the selected member from its class, then re-accept the class — so the
-// removal is live and saved, exactly like any other edit.
-void removeMethod() {
+// removal is live and saved, exactly like any other edit. [pane] is 'v' or 'm':
+// each column removes only from ITS OWN list, so clicking − Method can never
+// delete the variable you had selected in the pane next door.
+void removeMember(String pane) {
   if (!gBrUserApp) { log("world classes are read-only"); return; }
   if (gBrSelClass == null || gBrClassSrc == null) { log("select a class first"); return; }
+  if (gSelPane != pane) {
+    log(pane == 'v' ? "select a variable first" : "select a method first");
+    return;
+  }
   if (gSelMemberSrc == null || gSelMemberSrc.isEmpty) {
-    log("select a member in the Variables or Methods pane to remove");
+    log("select a member to remove");
     return;
   }
   var gone = gSelMemberSig;
@@ -833,6 +850,24 @@ void newClass() {
 }
 
 // + New Method: drop a method template into the Source pane; edit + Accept adds it.
+// Drop a variable template into the source pane; Accept inserts it into the
+// class. Which side it lands on follows the instance/class toggle.
+void newVariable() {
+  if (!gBrUserApp) {
+    log("'" + gBrSelCat + "' is a world library (read-only)");
+    return;
+  }
+  if (gBrSelClass == null) { log("select a class in the Classes pane first"); return; }
+  gSelMemberSrc = null; gSelMemberSig = null;
+  gBrMode = 'source';
+  gBrowserSrc.setString(gBrSide == 'c' ? "static int newVar = 0;" : "int newVar = 0;");
+  highlightView(gBrowserSrc);
+  updateStatus();
+  repaint();
+  log("+ New " + (gBrSide == 'c' ? "class" : "instance") + " variable in " +
+      gBrSelClass + " — edit and Accept");
+}
+
 void newMethod() {
   if (!gBrUserApp) {
     log("'" + gBrSelCat + "' is a world library (read-only) — pick User App to add methods");
@@ -1315,8 +1350,10 @@ Future<String> handle(String line) async {
     case 'tab': switchTab(int.parse(arg)); return "ok";
     case 'brcat': selectCategory(int.parse(arg)); return "ok";
     case 'brclass': selectClass(int.parse(arg)); return "ok";
-    case 'brvar': selectMemberRec(gVarRecs, int.parse(arg)); return "ok";
-    case 'brmethod': selectMemberRec(gMethodRecs, int.parse(arg)); return "ok";
+    // Mirror the real click path, which tags the owning pane (see gSelPane) —
+    // a verb that skipped that would make the harness lie about what a user does.
+    case 'brvar': gSelPane = 'v'; selectMemberRec(gVarRecs, int.parse(arg)); return "ok";
+    case 'brmethod': gSelPane = 'm'; selectMemberRec(gMethodRecs, int.parse(arg)); return "ok";
     case 'brside': setSide(arg); return "ok";
     case 'brmode': setMode(arg); return "ok";
     case 'brnewclass': newClass(); return "ok";

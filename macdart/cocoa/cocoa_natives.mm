@@ -343,6 +343,7 @@ void Workspace_eval(Dart_NativeArguments args);
 void Workspace_reload(Dart_NativeArguments args);
 void Workspace_vmStats(Dart_NativeArguments args);
 void Cocoa_setSelectorAction(Dart_NativeArguments args);
+void Cocoa_setSplitMinSize(Dart_NativeArguments args);
 
 // Reverse-callback natives (defined in cocoa_callbacks.mm) — target-action,
 // delegates, and the syntax-highlight span applier.
@@ -373,6 +374,7 @@ void Sqlite_query(Dart_NativeArguments args);
   V(Workspace_reload, 0)                                                       \
   V(Workspace_vmStats, 0)                                                      \
   V(Cocoa_setSelectorAction, 3)                                                \
+  V(Cocoa_setSplitMinSize, 2)                                                  \
   V(Cocoa_registerCallbackDispatch, 1)                                         \
   V(Cocoa_makeActionTarget, 1)                                                 \
   V(Cocoa_wireAction, 2)                                                       \

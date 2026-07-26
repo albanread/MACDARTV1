@@ -160,6 +160,15 @@ void setSelectorAction(Cocoa control, String selector, [Cocoa target]) {
   _setSelectorAction(control.handle, selector, target == null ? 0 : target.handle);
 }
 
+void _setSplitMinSize(int splitView, double minSize) native "Cocoa_setSplitMinSize";
+
+/// Stop the user dragging any pane of [splitView] below [minSize] points.
+/// Enforced by a native delegate: AppKit asks on every frame of a drag, so this
+/// must not round-trip into Dart.
+void setSplitMinSize(Cocoa splitView, double minSize) {
+  _setSplitMinSize(splitView.handle, minSize);
+}
+
 void _applySpans(int textStorage, List spans) native "Cocoa_applySpans";
 
 /// Colour [textView] with syntax-highlight runs: a flat `[start, len, kind, …]`

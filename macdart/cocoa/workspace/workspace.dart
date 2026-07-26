@@ -183,9 +183,25 @@ Cocoa label(Cocoa parent, List frame) {
 Cocoa addTab(Cocoa tabView, String ident, double w, double h) {
   var item = Cocoa.cls("NSTabViewItem").alloc().initWithIdentifier(ident);
   var view = Cocoa.cls("NSView").alloc().initWithFrame([0.0, 0.0, w, h]);
+  view.setAutoresizingMask(kWidthSizable + kHeightSizable);
+  view.setAutoresizesSubviews(true);
   item.setView(view);
   tabView.addTabViewItem(item);
   return view;
+}
+
+/// Anchor a scrolled text view's SCROLL view (the text view is its document, so
+/// the mask belongs on the scroll view, not the text view).
+void anchorScroll(Cocoa textView, int mask) {
+  textView.enclosingScrollView().setAutoresizingMask(mask);
+}
+
+/// Pin controls to the top edge of their container, so a taller container grows
+/// downward under them instead of leaving them stranded.
+void pinTop(List<String> titles, [int extra = 0]) {
+  for (var t in titles) {
+    if (gButtons[t] != null) gButtons[t].setAutoresizingMask(kMinYMargin + extra);
+  }
 }
 
 void switchTab(int i) {
@@ -201,7 +217,6 @@ void buildWindow() {
       [0.0, 0.0, 900.0, 640.0], styleMask: 15, backing: 2, defer: false);
   gWindow.setTitle("MACDART Workspace");
   gContent = gWindow.contentView();
-  gContent.setWantsLayer(true);   // layer-back the view tree so CATransaction flush can present pump-driven redraws
 
   // Toolbar band: a textured strip carrying icon view-switchers on the left and
   // a live metrics readout on the right (MACVM's CocoaUI toolbar, same assets).
@@ -217,9 +232,12 @@ void buildWindow() {
   gMetrics.setAlignment(2); // right
   gMetrics.setAutoresizingMask(kMinXMargin);   // stays right-anchored
 
-  // Tabless content host (the toolbar buttons are the tab bar).
+  // Tabless content host (the toolbar buttons are the tab bar). It absorbs all
+  // the slack when the window resizes: pinned between the transcript below and
+  // the toolbar above, so its top edge always meets the toolbar's bottom.
   gTabView = Cocoa.cls("NSTabView").alloc().initWithFrame([16.0, 176.0, 868.0, 420.0]);
   gTabView.setTabViewType(6); // NSNoTabsNoBorder
+  gTabView.setAutoresizingMask(kWidthSizable + kHeightSizable);
   gContent.addSubview(gTabView);
 
   // Workspace tab: Do It / Print It / Clear + a highlighted editor.
@@ -230,7 +248,9 @@ void buildWindow() {
   button(ws, "Clear", [292.0, 388.0, 74.0, 28.0], (s) {
     gLog.clear(); gTranscript.setString(""); repaint();
   });
+  pinTop(<String>["Do It", "Print It", "Accept", "Clear"]);
   gEditor = scrolledTextView(ws, [8.0, 8.0, 852.0, 372.0], true);
+  anchorScroll(gEditor, kWidthSizable + kHeightSizable);
   gTargets.add(onTextChange(gEditor, (s) => highlight()));
 
   // Browser tab: a Smalltalk-style class browser (World / User App).
@@ -238,13 +258,20 @@ void buildWindow() {
 
   // Docs tab.
   var dc = addTab(gTabView, "docs", 868.0, 420.0);
-  scrolledTextView(dc, [8.0, 8.0, 852.0, 404.0], false).setString(_docsText);
+  var docs = scrolledTextView(dc, [8.0, 8.0, 852.0, 404.0], false);
+  docs.setString(_docsText);
+  anchorScroll(docs, kWidthSizable + kHeightSizable);
 
   // Find tab.
   buildFindTab(addTab(gTabView, "find", 868.0, 420.0));
 
-  // Transcript dock (shared across tabs).
+  // Transcript dock (shared across tabs): docked to the bottom at a fixed
+  // height, widening with the window.
   gTranscript = scrolledTextView(gContent, [16.0, 12.0, 868.0, 152.0], false);
+  anchorScroll(gTranscript, kWidthSizable);
+
+  // Below this the panes stop being usable, so don't let the window get there.
+  gWindow.setContentMinSize([680.0, 480.0]);
 
   gTabView.selectTabViewItemAtIndex(0);
   log("workspace ready — Workspace / Browser / Docs");
@@ -262,18 +289,14 @@ void updateMetrics() {
       "cocoa: " + st[0].toString() + " wrapped / " + st[1].toString() + " freed");
 }
 
-// Force pending UI changes onto the SCREEN. `display()` redraws dirty views into
-// the window's (layer-backed) backing store, but updates driven from the
-// run-loop pump — async `.then` continuations, cross-isolate replies, socket
-// commands — happen OUTSIDE an AppKit event, so they never get AppKit's
-// end-of-event commit and the on-screen window stays stale until the next OS
-// event (a mouse move). `[CATransaction flush]` commits the pending layer
-// changes to the render server immediately, so the screen updates now. (Offscreen
-// snapshots force-render, which is why they always looked correct and masked
-// this.) See WORKSPACE_PLAN.md §5 "redraw gotcha".
+// Force pending UI changes onto the screen. Updates driven from the run-loop
+// pump — async `.then` continuations, cross-isolate replies, socket commands —
+// happen OUTSIDE an AppKit event, so they never get AppKit's end-of-event
+// display flush and the window would otherwise stay stale until the next OS
+// event. (Offscreen snapshots force-render, so they always look correct and
+// mask this — verify real interaction, not snapshots.)
 void repaint() {
   gWindow.display();
-  try { Cocoa.cls("CATransaction").flush(); } catch (e) {}
 }
 
 void log(String line) {
@@ -344,12 +367,11 @@ void buildBrowserTab(Cocoa br) {
   button(lower, "Accept", [586.0, 126.0, 68.0, 22.0], (s) => browserAccept());
   button(lower, "Cancel", [658.0, 126.0, 64.0, 22.0], (s) => browserCancel());
   button(lower, "Remove", [726.0, 126.0, 90.0, 22.0], (s) => browserRemove());
-  for (var t in <String>["Comment", "Definition", "Source", "Accept", "Cancel", "Remove"]) {
-    gButtons[t].setAutoresizingMask(kMinYMargin);   // the row rides the top edge
-  }
-  gStatus.setAutoresizingMask(kMinYMargin);
+  pinTop(<String>["Comment", "Definition", "Source"]);          // ride the top edge
+  pinTop(<String>["Accept", "Cancel", "Remove"], kMinXMargin);  // ...and the right edge
+  gStatus.setAutoresizingMask(kMinYMargin + kWidthSizable);
   gBrowserSrc = scrolledTextView(lower, [0.0, 0.0, 852.0, 122.0], true);
-  gBrowserSrc.enclosingScrollView().setAutoresizingMask(kWidthSizable + kHeightSizable);
+  anchorScroll(gBrowserSrc, kWidthSizable + kHeightSizable);
 
   vsplit.addSubview(hsplit);
   vsplit.addSubview(lower);
@@ -577,9 +599,13 @@ void buildFindTab(Cocoa fd) {
   gFindField.setStringValue("");
   var mf = _mono(13.0); if (!mf.isNil) gFindField.setFont(mf);
   fd.addSubview(gFindField);
+  gFindField.setAutoresizingMask(kMinYMargin + kWidthSizable);
   button(fd, "Find", [412.0, 386.0, 76.0, 28.0], (s) => runFind('find'));
   button(fd, "Senders", [494.0, 386.0, 92.0, 28.0], (s) => runFind('senders'));
-  label(fd, [598.0, 390.0, 262.0, 18.0]).setStringValue("name search / senders — click a result to open it");
+  pinTop(<String>["Find", "Senders"], kMinXMargin);
+  var hint = label(fd, [598.0, 390.0, 262.0, 18.0]);
+  hint.setStringValue("name search / senders — click a result to open it");
+  hint.setAutoresizingMask(kMinYMargin + kMinXMargin);
   gFindTable = tableIn(fd, [8.0, 8.0, 852.0, 368.0]);
   gTargets.add(onTable(gFindTable, () => gFindResults.length, (r) => _findRowLabel(r), sel(findNavigate)));
 }
@@ -899,6 +925,31 @@ Future<String> handle(String line) async {
   var arg = sp < 0 ? "" : line.substring(sp + 1);
   switch (cmd) {
     case 'ping': return "pong";
+    case 'resize': {   // "resize W H" — drive the window size to test the layout
+      var wh = arg.split(' ');
+      var f = gWindow.frame();
+      var w = double.parse(wh[0]), h = double.parse(wh[1]);
+      gWindow.setFrame([f[0], f[1] + f[3] - h, w, h], display: true);
+      repaint();
+      var b = gContent.bounds();
+      return "content " + b[2].toString() + "x" + b[3].toString();
+    }
+    case 'frames': {
+      var o = <String>[];
+      o.add("content   " + gContent.bounds().toString());
+      o.add("tabview   " + gTabView.frame().toString());
+      var br = gTabView.tabViewItemAtIndex(1).view();
+      o.add("browser   " + br.frame().toString() + " subviews=" + br.subviews().count().toString());
+      for (var t in <String>["+ Class", "instance", "Comment", "Accept", "Remove"]) {
+        var b = gButtons[t];
+        o.add(t.padRight(10) + b.frame().toString() +
+              " hidden=" + b.isHidden().toString() +
+              " super=" + b.superview().frame().toString());
+      }
+      o.add("srcScroll " + gBrowserSrc.enclosingScrollView().frame().toString());
+      o.add("transcript" + gTranscript.enclosingScrollView().frame().toString());
+      return o.join("\n");
+    }
     case 'snap': return await snapshot(arg.isEmpty ? "/tmp/dartui.png" : arg);
     case 'tab': switchTab(int.parse(arg)); return "ok";
     case 'brcat': selectCategory(int.parse(arg)); return "ok";

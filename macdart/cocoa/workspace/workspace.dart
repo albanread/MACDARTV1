@@ -263,10 +263,31 @@ void pinTop(List<String> titles, [int extra = 0]) {
 void switchTab(int i) {
   gTabView.selectTabViewItemAtIndex(i);
   gTab = i;
+  // The undo manager belongs to the WINDOW and is shared by every text view in
+  // it, and undo: is implemented by NSWindow — so without this, typing in the
+  // Workspace, switching tabs and pressing Cmd-Z would silently undo that edit
+  // off-screen, in a buffer the user is no longer looking at.
+  clearUndo();
+  // NSTabView hands the first responder to the first view in the new tab's
+  // key-view loop, which for the Browser is the Categories table — Cut/Copy/
+  // Paste would be greyed out until the user clicked the source pane. Put focus
+  // on the tab's text view instead.
+  var focus = (i == 0) ? gEditor : (i == 1) ? gBrowserSrc
+            : (i == 3) ? gFindField : (i == 4) ? gEdText : null;
+  if (focus != null) gWindow.makeFirstResponder(focus);
   if (i == 1) openBrowser();
   if (i == 4) editorRefreshClasses();
   updateMetrics();
   repaint();
+}
+
+/// Drop the window's undo stack. Needed whenever we replace a text view's
+/// contents programmatically: setString: registers no undo action but does NOT
+/// clear the stack, so a later Undo would splice the PREVIOUS buffer's edits
+/// into freshly loaded content.
+void clearUndo() {
+  var um = gWindow.undoManager();
+  if (!um.isNil) um.removeAllActions();
 }
 
 void buildWindow() {
@@ -588,6 +609,7 @@ void updateSourcePane() {
   else if (gBrMode == 'definition') text = gBrClassSrc != null ? gBrClassSrc : "";
   else text = (gSelMemberSrc != null && gSelMemberSrc.length > 0) ? gSelMemberSrc : (gBrClassSrc != null ? gBrClassSrc : "");
   gBrowserSrc.setString(text);
+  clearUndo();
   highlightView(gBrowserSrc);
   updateStatus();
   repaint();
@@ -1041,6 +1063,9 @@ void menuSave() {
 }
 
 void buildMenu() {
+  // With no .app bundle there is no CFBundleName, so macOS titles the
+  // application menu from the process name — "dartui" without this.
+  Cocoa.cls("NSProcessInfo").processInfo().setProcessName("MACDART");
   var app = Cocoa.cls("NSApplication").sharedApplication();
   var mainMenu = Cocoa.cls("NSMenu").alloc().init();
 
@@ -1049,7 +1074,7 @@ void buildMenu() {
   mainMenu.addItem(appItem);
   var appMenu = Cocoa.cls("NSMenu").alloc().init();
   appItem.setSubmenu(appMenu);
-  menuItem(appMenu, "Quit MACDART", "q", (s) => app.terminate(null));
+  stdItem(appMenu, "Quit MACDART", "q", "terminate:");
 
   var file = subMenu(mainMenu, "File");
   menuItem(file, "New Class", "n", (s) { switchTab(4); editorNew(); });
@@ -1077,7 +1102,7 @@ void buildMenu() {
   menuItem(code, "Print It", "p", (s) => run(true));
   menuSep(code);
   menuItem(code, "Format", "f", (s) { switchTab(4); editorFormat(); })
-      .setKeyEquivalentModifierMask(kCmd + kCtrl);
+      .setKeyEquivalentModifierMask(kCmd + kOpt);
   menuItem(code, "Analyze", "b", (s) { switchTab(4); editorAnalyze(); });
   menuSep(code);
   menuItem(code, "Restart Language Isolate", "", (s) => respawnLanguage("restart from the menu"));
@@ -1271,7 +1296,10 @@ void buildEditorTab(Cocoa ed) {
       .initWithFrame([8.0, 390.0, 300.0, 26.0], pullsDown: false);
   ed.addSubview(gEdPicker);
   gEdPicker.setAutoresizingMask(kMinYMargin);
-  gTargets.add(onAction(gEdPicker, (s) => defer(() => editorLoad())));
+  // Deliberately NO action on the picker. Populating an NSPopUpButton changes
+  // its selection and fires its action, and that action runs later (see [defer]),
+  // so any "am I refreshing?" flag is already clear by the time it arrives — the
+  // refresh would Load over an unsaved buffer. The picker selects; Load loads.
 
   button(ed, "Load", [316.0, 390.0, 68.0, 26.0], (s) => editorLoad());
   button(ed, "Save to Image", [390.0, 390.0, 118.0, 26.0], (s) => editorSaveImage());
@@ -1304,6 +1332,7 @@ String edText() => gEdText.string().UTF8String();
 
 void edSetText(String s) {
   gEdText.setString(s);
+  clearUndo();
   highlightView(gEdText);
   repaint();
 }
@@ -1523,50 +1552,95 @@ void editorFormat() {
 }
 
 // --- Analyze ----------------------------------------------------------------
-// A REAL compile by the real front end: write the buffer to a temp file and spawn
-// a throwaway isolate on it. A compile error arrives on the error port carrying
-// the VM's own message ("line 12 pos 7: ..."). The trial isolate is separate, so
-// nothing can disturb the live language isolate, and it is always killed.
+// A REAL compile of every method body, by the real front end.
+//
+// Two things this has to get right, both learned the hard way:
+//  1. Isolate.spawnUri is NOT enough. Dart 1 compiles method bodies lazily, so
+//     spawning `class Foo { f() { var x = ; } }` succeeds and Analyze would
+//     report it clean — a false all-clear on exactly the error it exists to
+//     catch. `dart --compile_all` compiles everything up front and reports it.
+//  2. --compile_all still RUNS main, and so did the old spawnUri version: a
+//     buffer whose main() called exit() would have taken the workspace down with
+//     it, and any main() with side effects ran every time Analyze was pressed.
+//     So a top-level main is renamed out of the way first and we supply an empty
+//     one. Pressing Analyze must never execute the user's program.
+String _analyzeBinary() {
+  var dir = new File(Platform.resolvedExecutable).parent.path;
+  for (var c in <String>[dir + "/../build-release/dart", dir + "/dart"]) {
+    if (new File(c).existsSync()) return c;
+  }
+  return null;
+}
+
+// Rename a TOP-LEVEL `main` so the trial cannot execute it. Literal-aware (via
+// lexDart) so `main(` inside a string or comment is left alone, and depth-aware
+// so a method called main() inside a class is not touched.
+String _neutraliseMain(String src) {
+  var spans = lexDart(src);
+  var lit = new List<bool>.filled(src.length + 1, false);
+  for (var i = 0; i + 2 < spans.length; i += 3) {
+    var k = spans[i + 2];
+    if (k != 2 && k != 3) continue;
+    for (var p = spans[i]; p < spans[i] + spans[i + 1] && p < lit.length; p++) lit[p] = true;
+  }
+  var depth = 0, i = 0, n = src.length;
+  while (i < n) {
+    if (lit[i]) { i++; continue; }
+    var c = src.codeUnitAt(i);
+    if (c == 0x7B) { depth++; i++; continue; }
+    if (c == 0x7D) { depth--; i++; continue; }
+    if (depth == 0 && _isIdentStart(c)) {
+      var s = i;
+      while (i < n && _isIdentPart(src.codeUnitAt(i))) i++;
+      if (src.substring(s, i) == "main") {
+        var j = i;
+        while (j < n && src.codeUnitAt(j) <= 0x20) j++;
+        if (j < n && src.codeUnitAt(j) == 0x28) {          // main (
+          return src.substring(0, s) + "__wsMain" + src.substring(i);
+        }
+      }
+      continue;
+    }
+    i++;
+  }
+  return src;
+}
+
 Future editorAnalyze() async {
   var src = edText();
   if (src.trim().isEmpty) return;
-  var path = Directory.systemTemp.path + "/macdart_analyze.dart";
-  var probe = src;
-  if (!new RegExp(r'(?:^|\n)\s*(?:void\s+)?main\s*\(').hasMatch(src)) {
-    probe = src + "\n\nmain() {}\n";        // spawnUri needs an entry point
+  var bin = _analyzeBinary();
+  if (bin == null) {
+    log("Analyze unavailable: no dart binary beside " + Platform.resolvedExecutable);
+    return;
   }
-  var err = new ReceivePort();
-  var exited = new ReceivePort();
-  var iso = null;
-  var failure = null;
+  // Line numbers must map 1:1 onto the editor, so nothing above the buffer and
+  // no trimming: the empty main goes at the END.
+  var probe = _neutraliseMain(src) + "\n\nmain() {}\n";
+  var path = Directory.systemTemp.path + "/macdart_analyze.dart";
+  var out;
   try {
     new File(path).writeAsStringSync(probe);
-    iso = await Isolate.spawnUri(Uri.parse('file://' + path), <String>[], null,
-        onError: err.sendPort, onExit: exited.sendPort, errorsAreFatal: true);
-    // Whichever lands first: an error, a clean exit, or the time limit.
-    var first = await Future.any(<Future>[
-      err.first,
-      exited.first.then((_) => null),
-      new Future.delayed(const Duration(seconds: 5), () => 'TIMEOUT'),
-    ]);
-    if (first is List && first.length > 0) failure = first[0].toString();
-    else if (first == 'TIMEOUT') failure = 'analysis timed out';
+    out = await Process.run(bin, <String>["--compile_all", path])
+        .timeout(const Duration(seconds: 20), onTimeout: () => null);
   } catch (e) {
-    failure = e.toString();
+    log("Analyze failed to run: " + e.toString());
+    return;
   } finally {
-    try { if (iso != null) iso.kill(priority: Isolate.IMMEDIATE); } catch (e) {}
-    err.close();
-    exited.close();
     try { new File(path).deleteSync(); } catch (e) {}
   }
-  if (failure == null) {
+  if (out == null) { edStatus("Analyze timed out"); log("Analyze timed out"); return; }
+  if (out.exitCode == 0) {
     edStatus("Analyze: compiles cleanly");
     log("Analyze: compiles cleanly");
     return;
   }
-  var line = _errorLine(failure);
-  edStatus("Analyze FAILED: " + _firstLine(failure));
-  log("Analyze FAILED: " + failure);
+  var msg = out.stderr.toString().trim();
+  if (msg.isEmpty) msg = out.stdout.toString().trim();
+  var first = _firstLine(msg);
+  edStatus("Analyze FAILED: " + first);
+  log("Analyze FAILED: " + msg);
+  var line = _errorLine(msg);
   if (line > 0) _selectLine(line);
 }
 
@@ -1598,30 +1672,52 @@ void _selectLine(int line) {
   repaint();
 }
 
-const _docsText = '''MACDART Workspace — a native Dart V1 IDE
+const _docsText = '''MACDART Workspace - a native Dart V1 IDE
 
-WORKSPACE
-  Type Dart in the code pane, then:
-    Do It    (⌘D) — run the selection (or whole buffer); value goes to the
-                    transcript. Multi-statement code with a `return` works.
-    Print It (⌘P) — evaluate and print the value.
-  Syntax highlighting is live as you type.
+TABS (View menu, Cmd-1..5)
+  Workspace  a scratch pane: Do It / Print It against the live language isolate.
+  Browser    a Smalltalk-style class browser over the image and the world.
+  Editor     one whole class as text, with Analyze and Format.
+  Find       name search and senders over the image.
+  Docs       this page.
 
-  Declarations persist. To make a class or variable live across runs, evaluate
-  it (it is remembered), then redefine it later — existing instances are MORPHED
-  in place (fields kept by name, new fields initialised) via hot reload, so a
-  live object survives a class-structure change.
+THE IMAGE AND THE WORLD
+  The world is the VM snapshot (dart:core and friends) - read-only. Your app is
+  source held in a SQLite image at ~/.macdart/workspace.sqlite and loaded on top
+  of it at boot. The image is the source of truth: a watchdog respawn re-reads it.
 
-BROWSER
-  Reflects the language isolate's live classes (dart:mirrors). Refresh after you
-  add or redefine classes.
+  Accept / Save to Image writes the image AND hot-reloads, so a change is live
+  AND survives a restart. Existing instances are MORPHED in place (fields kept by
+  name, new fields initialised), so a live object survives a class-structure
+  change. Add to World reloads WITHOUT writing the image: live now, gone next boot.
+
+MENUS
+  File   New Class, Open..., Save File..., File In..., Save (Cmd-S commits
+         whatever is in front of you: the editor to the image, the browser's
+         pane, or the workspace).
+  Edit   Undo/Redo/Cut/Copy/Paste/Select All - the standard Cocoa editing
+         commands, routed to whichever text view has focus.
+  Code   Do It (Cmd-D), Print It (Cmd-P), Format (Opt-Cmd-F), Analyze (Cmd-B),
+         Restart Language Isolate.
+  View   the five tabs, and Clear Transcript (Cmd-K).
+
+EDITOR
+  Analyze compiles the buffer for real (dart --compile_all in a separate
+  process), so errors inside method bodies are caught, and your own main() is
+  renamed out of the way first so pressing Analyze never runs your program.
+  Format re-indents only; it refuses to apply if that would change anything but
+  layout, so it cannot mangle a class.
+
+TOOLBAR
+  Live VM counters for the language isolate: MEM used/capacity with a usage bar,
+  JIT functions compiled/optimised, CODE generated bytes, GC scavenges/marksweeps.
+  A cell shows - when the VM cannot answer it.
 
 ARCHITECTURE
   Two isolates: this UI isolate (pinned to the AppKit thread, builds the views)
   and a language isolate (runs your code, holds state), talking over SendPort.
   A loopback control socket (127.0.0.1:7644) drives the UI and captures snapshots.
-
-  ⌘Q quits.''';
+''';
 
 main() async {
   gAssets = Platform.script.resolve('assets/').toFilePath();   // icons + texture

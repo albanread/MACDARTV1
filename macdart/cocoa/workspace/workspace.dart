@@ -9,6 +9,7 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:convert';
 import 'dart:async';
+import 'dart:developer';
 
 Cocoa gWindow, gContent, gTabView, gEditor, gTranscript;
 SendPort gLang;
@@ -1345,6 +1346,7 @@ Future respawnLanguage(String why) async {
   await spawnLanguage();   // boots from the image
   gRespawning = false;
   log("language isolate restarted (declarations reloaded from the image)");
+  guiEvent('languageRestarted', <String, String>{'why': why});
   updateMetrics();
 }
 
@@ -1751,6 +1753,47 @@ void editorFormat() {
   log("Format - re-indented");
 }
 
+// --- the vm-service front door (one control plane) ---------------------------
+// The Observatory's vm-service is already linked into dartui, and this VM has
+// service extensions — a custom JSON-RPC method served over the SAME WebSocket
+// the Observatory uses. So the GUI channel does not need its own socket, its own
+// wire format, or a bridge: it becomes `ext.dartui.send`, and one client speaks
+// JSON-RPC 2.0 for introspection (getVM, _getCpuProfile, …) AND for driving the
+// UI, over one connection.
+//
+// Deliberately ONE generic method rather than one per command: the verb set here
+// is large and still growing, and every verb already funnels through handle().
+// Registering each would mean remembering to register the next one.
+//
+// Thread-correct for free: an extension is invoked by delivering a message to
+// the registering isolate, so the handler runs on the same main-thread
+// CFRunLoop pump that already services the socket channels — no new path
+// touches AppKit from the wrong thread.
+void registerServiceExtensions() {
+  registerExtension('ext.dartui.send',
+      (String method, Map<String, String> params) async {
+    var line = params['line'];
+    if (line == null) {
+      return new ServiceExtensionResponse.error(
+          ServiceExtensionResponse.kInvalidParams,
+          "ext.dartui.send needs a 'line' parameter");
+    }
+    var reply = await handle(line);
+    return new ServiceExtensionResponse.result(
+        JSON.encode(<String, String>{'reply': reply.toString()}));
+  });
+}
+
+/// Push a GUI event onto the Extension stream of that same socket, so a client
+/// watching the Observatory sees UI activity without polling.
+void guiEvent(String what, Map<String, String> data) {
+  try {
+    var m = <String, String>{'event': what};
+    data.forEach((k, v) { m[k] = v; });
+    postEvent('dartui', m);
+  } catch (e) {}   // no vm-service running: the GUI must not care
+}
+
 // --- framed control channel (for `macvm rusttcl`) ---------------------------
 // A second, opt-in channel that speaks MACVM's control protocol verbatim, so its
 // TCL shell drives this app with no new interpreter: `macvm rusttcl` ->
@@ -1961,6 +2004,7 @@ void pollUiReload() {
   if (s.isEmpty) return;
   if (s == "ok") {
     log("✓ UI reloaded");
+    guiEvent('uiReloaded', <String, String>{});
     rebuildUi();      // re-run buildChrome so layout changes take effect too
   } else {
     log("✗ UI reload cancelled (the running UI is untouched) — " + s);
@@ -2331,6 +2375,7 @@ main() async {
   var server = await ServerSocket.bind(InternetAddress.LOOPBACK_IP_V4, 7644);
   stderr.writeln("dartui workspace control on 127.0.0.1:7644");
   await startControlChannel();
+  registerServiceExtensions();
   // The window and both channels are up. Until this point the host treats a UI
   // isolate error as fatal, so a workspace that failed to load exits instead of
   // sitting there as a process with no window.

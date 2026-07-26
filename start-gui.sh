@@ -8,6 +8,7 @@
 #   ./start-gui.sh -f              start from a fresh image (the old one is kept)
 #   ./start-gui.sh --restore       put the last-good UI source back, then run
 #   ./start-gui.sh -s              supervise: restart it if it dies unexpectedly
+#   ./start-gui.sh --no-observe    leave the vm-service (Observatory) off
 #
 # `dartui` is the GUI host: the `dart` binary plus a thread-0 AppKit host, so the
 # UI isolate runs where AppKit is legal. It takes the workspace script as its
@@ -24,6 +25,7 @@ LOG=/tmp/macdart-gui.log
 LAST_GOOD="$HOME/.macdart/workspace.last-good.dart"
 
 background=0 rebuild=0 fresh=0 restore=0 supervise=0
+observe=1 obsport=8181
 while [ $# -gt 0 ]; do
   case "$1" in
     -b|--background) background=1 ;;
@@ -31,7 +33,9 @@ while [ $# -gt 0 ]; do
     -f|--fresh)      fresh=1 ;;
     --restore)       restore=1 ;;
     -s|--supervise)  supervise=1 ;;
-    -h|--help)       sed -n '3,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --no-observe)    observe=0 ;;
+    --observe=*)     obsport="${1#--observe=}" ;;
+    -h|--help)       sed -n '3,11p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "start-gui.sh: unknown option '$1' (try --help)" >&2; exit 2 ;;
   esac
   shift
@@ -90,6 +94,13 @@ if [ ! -x "$ROOT/macdart/build-release/dart" ] && [ ! -x "$ROOT/macdart/build/da
   echo "note: no dart binary found for the Editor's Analyze button" >&2
 fi
 
+ARGS=()
+if [ "$observe" = 1 ]; then
+  ARGS+=("--observe=$obsport")
+  echo "observatory / control plane: ws://127.0.0.1:$obsport/ws"
+  echo '  (macdart/tcl/dartui.tcl - obs for VM introspection, ui for the GUI)' 
+fi
+
 echo "image:   $IMAGE"
 echo "control: 127.0.0.1:$PORT   (e.g. printf 'snap /tmp/x.png\\n' | nc -w1 127.0.0.1 $PORT)"
 
@@ -101,7 +112,7 @@ if [ "$supervise" = 1 ]; then
   fails=0
   window=$(date +%s)
   while true; do
-    "$DARTUI" "$UI_SCRIPT" || rc=$?
+    "$DARTUI" "${ARGS[@]}" "$UI_SCRIPT" || rc=$?
     rc=${rc:-0}
     [ "$rc" = 0 ] && { echo "workspace exited cleanly"; exit 0; }
     if [ "$rc" = 70 ]; then
@@ -124,8 +135,8 @@ if [ "$supervise" = 1 ]; then
 fi
 
 if [ "$background" = 1 ]; then
-  nohup "$DARTUI" "$UI_SCRIPT" >"$LOG" 2>&1 </dev/null &
+  nohup "$DARTUI" "${ARGS[@]}" "$UI_SCRIPT" >"$LOG" 2>&1 </dev/null &
   echo "started in the background (pid $!), logging to $LOG"
 else
-  exec "$DARTUI" "$UI_SCRIPT"
+  exec "$DARTUI" "${ARGS[@]}" "$UI_SCRIPT"
 fi

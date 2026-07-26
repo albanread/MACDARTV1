@@ -209,3 +209,165 @@
    Dart_Handle result = Dart_FinalizeLoading(false);
    if (Dart_IsError(result)) {
      const char* err_msg = Dart_GetError(library);
+
+--- a/runtime/bin/main.cc
++++ b/runtime/bin/main.cc
+@@ -1283,6 +1283,11 @@
+ }
+ 
+ 
++// Defined in macdart/cocoa/cocoa_host.mm — only linked into the `dartui`
++// executable (DART_UI_HOST). Services the UI isolate on OS thread 0 via
++// [NSApp run] + a Dart_HandleMessages() pump.
++extern "C" int macdart_run_ui_host(void);
++
+ bool RunMainIsolate(const char* script_name, CommandLineOptions* dart_options) {
+   // Call CreateIsolateAndSetup which creates an isolate and loads up
+   // the specified application script.
+@@ -1450,8 +1455,22 @@
+                            kNumIsolateArgs, isolate_args);
+       CHECK_RESULT(result);
+ 
++#if defined(DART_UI_HOST)
++      // GUI host build (`dartui`): main() was just queued as the startup
++      // message. Instead of Dart_RunLoop() (which services the isolate on a pool
++      // thread, where AppKit rejects NSWindow/NSView work), run [NSApp run] on
++      // THIS thread — OS thread 0 — with a CFRunLoopSource that calls
++      // Dart_HandleMessages(). So main() and all UI-isolate Dart (incl. the
++      // control socket and AppKit callbacks) run where AppKit is legal.
++      // See macdart/cocoa/cocoa_host.mm and WORKSPACE_PLAN.md.
++      int ui_rc = macdart_run_ui_host();
++      result = (ui_rc == 0) ? Dart_Null()
++                            : Dart_NewApiError("dartui host exited non-zero");
++      CHECK_RESULT(result);
++#else
+       // Keep handling messages until the last active receive port is closed.
+       result = Dart_RunLoop();
++#endif  // DART_UI_HOST
+       // Generate an app snapshot after execution if specified.
+       if (gen_snapshot_kind == kAppJIT) {
+         if (!Dart_IsCompilationError(result)) {
+@@ -1611,6 +1630,15 @@
+   bool print_flags_seen = false;
+   bool verbose_debug_seen = false;
+ 
++#if defined(DART_UI_HOST)
++  // The workspace toolbar reports JIT counters (functions compiled/optimized and
++  // generated code bytes). INC_STAT in vm/compiler_stats.h is compiled behind
++  // FLAG_compiler_stats, so without this they would read a flat 0. Costs an
++  // atomic increment and a timer scope per compilation. See
++  // Dart_WorkspaceVmStats and macdart/cocoa/workspace/workspace.dart.
++  vm_options.AddArgument("--compiler_stats");
++#endif
++
+   // Perform platform specific initialization.
+   if (!Platform::Initialize()) {
+     Log::PrintErr("Initialization failed\n");
+--- a/runtime/vm/dart_api_impl.cc
++++ b/runtime/vm/dart_api_impl.cc
+@@ -6277,6 +6277,72 @@
+ }
+ 
+ 
++// MACDART workspace liveness: hot-reload the current isolate's sources. Re-reads
++// the root script and its imports through the tag handler (so a rewritten
++// scratch file is picked up), recompiles changed libraries, and morphs live
++// instances to the new class shapes (InstanceMorpher + Become). Returns null on
++// success, or an error handle whose message is the reload's cancellation report
++// (an unsafe structural change) — the workspace surfaces that and offers a
++// restart. See WORKSPACE_PLAN.md §5 and macdart/cocoa/workspace_natives.cc.
++DART_EXPORT Dart_Handle Dart_WorkspaceReloadSources(bool force_reload) {
++  // DARTSCOPE transitions this thread Native->VM (reload internally does its own
++  // VM->Native hop to call the tag handler, which asserts it starts in VM state).
++  DARTSCOPE(Thread::Current());
++  Isolate* isolate = T->isolate();
++  if (!isolate->CanReload()) {
++    return Api::NewError("%s: isolate cannot reload in its current state",
++                         CURRENT_FUNC);
++  }
++  JSONStream js;
++  bool success = isolate->ReloadSources(&js, force_reload);
++  if (!success) {
++    return Api::NewError("reload cancelled: %s", js.ToCString());
++  }
++  return Api::Success();
++}
++
++
++// MACDART workspace metrics: sample this isolate's live VM counters for the
++// toolbar (see dart_tools_api.h for the layout). Everything here is read
++// straight off the isolate's heap and compiler stats — nothing is derived or
++// estimated, so a counter the VM cannot answer stays 0 rather than showing a
++// plausible-looking guess. See macdart/cocoa/workspace_natives.cc.
++DART_EXPORT Dart_Handle Dart_WorkspaceVmStats(int64_t* out, intptr_t count) {
++  if ((out == NULL) || (count < kDartWorkspaceVmStatCount)) {
++    return Api::NewError("%s: expects room for %d counters", CURRENT_FUNC,
++                         kDartWorkspaceVmStatCount);
++  }
++  DARTSCOPE(Thread::Current());
++  Isolate* isolate = T->isolate();
++  Heap* heap = isolate->heap();
++  const int64_t word = kWordSize;
++
++  // NB Heap::UsedInWords maps every space except kNew onto old_space_, so
++  // asking it for kCode would silently answer the OLD-SPACE total. Generated
++  // code is accounted by the compiler stats below instead.
++  out[0] = heap->UsedInWords(Heap::kNew) * word;
++  out[1] = heap->CapacityInWords(Heap::kNew) * word;
++  out[2] = heap->UsedInWords(Heap::kOld) * word;
++  out[3] = heap->CapacityInWords(Heap::kOld) * word;
++  out[4] = heap->new_space()->collections();
++  out[5] = heap->old_space()->collections();
++
++  // Compiled behind FLAG_support_compiler_stats && FLAG_compiler_stats (see
++  // INC_STAT in vm/compiler_stats.h); zero unless the VM was started with
++  // --compiler_stats.
++  out[6] = out[7] = out[8] = 0;
++  if (FLAG_support_compiler_stats && FLAG_compiler_stats) {
++    CompilerStats* cs = isolate->aggregate_compiler_stats();
++    if (cs != NULL) {
++      out[6] = cs->num_functions_compiled;
++      out[7] = cs->num_functions_optimized;
++      out[8] = cs->total_instr_size;
++    }
++  }
++  return Api::Success();
++}
++
++
+ DART_EXPORT void Dart_GlobalTimelineSetRecordedStreams(int64_t stream_mask) {
+   if (!FLAG_support_timeline) {
+     return;
+--- a/runtime/include/dart_tools_api.h
++++ b/runtime/include/dart_tools_api.h
+@@ -911,6 +911,30 @@
+  */
+ DART_EXPORT bool Dart_IsReloading();
+ 
++/**
++ * MACDART workspace extension: hot-reload the current isolate's sources,
++ * morphing live instances to new class shapes. Returns Dart_Null() on success
++ * or an error handle (message = the reload cancellation report) on an unsafe
++ * change. \param force_reload reload even libraries the VM thinks are unchanged.
++ */
++DART_EXPORT Dart_Handle Dart_WorkspaceReloadSources(bool force_reload);
++
++/*
++ * MACDART workspace extension: sample the current isolate's live VM counters
++ * for the workspace toolbar. Fills \p out with, in order:
++ *   0 heap new used     1 heap new capacity   (bytes)
++ *   2 heap old used     3 heap old capacity   (bytes)
++ *   4 scavenges (new-space collections)       5 mark-sweeps (old-space)
++ *   6 functions compiled  7 functions optimized  8 generated code bytes
++ * Entries 6-8 are only non-zero when the VM runs with --compiler_stats
++ * (INC_STAT is compiled behind that flag); they read 0 otherwise rather than
++ * being estimated. \p count must be at least kDartWorkspaceVmStatCount.
++ * NOTE deliberately absent: there is no cumulative allocation counter in this
++ * VM, so no allocation RATE is reported — it could only be guessed.
++ */
++#define kDartWorkspaceVmStatCount 9
++DART_EXPORT Dart_Handle Dart_WorkspaceVmStats(int64_t* out, intptr_t count);
++
+ /*
+  * ========
+  * Timeline

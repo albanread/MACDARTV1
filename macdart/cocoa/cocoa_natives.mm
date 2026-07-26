@@ -337,6 +337,30 @@ static void Cocoa_nsStringUtf8(Dart_NativeArguments args) {
 }
 
 // --- resolver ---------------------------------------------------------------
+// Workspace runtime natives (defined in workspace_natives.cc) — the live-eval
+// primitives, registered here until they move to a dart:workspace library.
+void Workspace_eval(Dart_NativeArguments args);
+void Workspace_reload(Dart_NativeArguments args);
+void Workspace_vmStats(Dart_NativeArguments args);
+void Workspace_requestUiReload(Dart_NativeArguments args);
+void Workspace_uiReloadStatus(Dart_NativeArguments args);
+void Workspace_uiReady(Dart_NativeArguments args);
+void Cocoa_setSelectorAction(Dart_NativeArguments args);
+void Cocoa_setSplitMinSize(Dart_NativeArguments args);
+
+// Reverse-callback natives (defined in cocoa_callbacks.mm) — target-action,
+// delegates, and the syntax-highlight span applier.
+void Cocoa_registerCallbackDispatch(Dart_NativeArguments args);
+void Cocoa_makeActionTarget(Dart_NativeArguments args);
+void Cocoa_wireAction(Dart_NativeArguments args);
+void Cocoa_applySpans(Dart_NativeArguments args);
+
+// SQLite image store (defined in sqlite_natives.cc).
+void Sqlite_open(Dart_NativeArguments args);
+void Sqlite_close(Dart_NativeArguments args);
+void Sqlite_exec(Dart_NativeArguments args);
+void Sqlite_query(Dart_NativeArguments args);
+
 #define COCOA_NATIVE_LIST(V)                                                   \
   V(Cocoa_getpid, 0)                                                           \
   V(Cocoa_nsStringFromCString, 1)                                              \
@@ -348,7 +372,23 @@ static void Cocoa_nsStringUtf8(Dart_NativeArguments args) {
   V(Cocoa_poolPush, 0)                                                         \
   V(Cocoa_poolPop, 1)                                                          \
   V(Cocoa_retain, 1)                                                           \
-  V(Cocoa_release, 1)
+  V(Cocoa_release, 1)                                                          \
+  V(Workspace_eval, 1)                                                         \
+  V(Workspace_reload, 0)                                                       \
+  V(Workspace_vmStats, 0)                                                      \
+  V(Workspace_requestUiReload, 0)                                              \
+  V(Workspace_uiReloadStatus, 0)                                               \
+  V(Workspace_uiReady, 0)                                                      \
+  V(Cocoa_setSelectorAction, 3)                                                \
+  V(Cocoa_setSplitMinSize, 2)                                                  \
+  V(Cocoa_registerCallbackDispatch, 1)                                         \
+  V(Cocoa_makeActionTarget, 1)                                                 \
+  V(Cocoa_wireAction, 2)                                                       \
+  V(Cocoa_applySpans, 2)                                                       \
+  V(Sqlite_open, 1)                                                            \
+  V(Sqlite_close, 1)                                                           \
+  V(Sqlite_exec, 3)                                                            \
+  V(Sqlite_query, 3)
 
 static struct CocoaEntry {
   const char* name_;

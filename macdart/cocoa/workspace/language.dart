@@ -65,14 +65,89 @@ main(List args, SendPort uiPort) {
   });
 }
 
-// --- do-it (transient eval) -------------------------------------------------
+// --- do-it ------------------------------------------------------------------
+// A do-it is ONE EXPRESSION compiled against this isolate's root library
+// (Dart_EvaluateExpr), so it sees every accepted class and can mutate top-level
+// state, but a `var` written inside it is a local of that evaluation and dies
+// with it. Workspace variables close that gap the Smalltalk way: `var x = expr`
+// (and an assignment to a name that does not exist yet) is promoted to a real
+// top-level declaration first, so it persists like anything else you Accept.
+final RegExp _wsVarDecl =
+    new RegExp(r'^\s*(?:var|final)\s+(\w+)\s*=\s*([\s\S]+?);?\s*$');
+// `=` but not `==` (an equality test is not an assignment).
+final RegExp _wsAssign = new RegExp(r'^\s*(\w+)\s*=(?!=)\s*([\s\S]+?);?\s*$');
+
 String _doit(String code) {
+  var m = _wsVarDecl.firstMatch(code);
+  if (m != null) {
+    var err = _declareWsVar(m.group(1));
+    if (err.isNotEmpty) return err;
+    var r = wsEval(m.group(1) + ' = ' + m.group(2));
+    if (!r.startsWith('ERR:')) _rememberWsValue(m.group(1), m.group(2));
+    return r;
+  }
   var r = wsEval(code);
   if (r.startsWith('ERR:') && r.contains('error:')) {
     var r2 = wsEval('((){ ' + code + ' })()');
     if (!r2.startsWith('ERR:')) return r2;
   }
+  if (!r.startsWith('ERR:')) {
+    // Reassigning an existing workspace variable keeps the image in step.
+    var a = _wsAssign.firstMatch(code);
+    if (a != null) _rememberWsValue(a.group(1), a.group(2));
+    return r;
+  }
+  // `x = expr` where x has never been declared: make it a workspace variable
+  // and run it again, rather than reporting a missing getter.
+  if (r.startsWith('ERR:')) {
+    var a = _wsAssign.firstMatch(code);
+    if (a != null && _missingTopLevel(r, a.group(1))) {
+      var err = _declareWsVar(a.group(1));
+      if (err.isEmpty) {
+        var r2 = wsEval(code);
+        if (!r2.startsWith('ERR:')) _rememberWsValue(a.group(1), a.group(2));
+        return r2;
+      }
+    }
+  }
   return r;
+}
+
+// The VM names the missing member as 'u' for a getter but 'u=' for a setter.
+bool _missingTopLevel(String err, String name) =>
+    err.contains('No top-level') &&
+    (err.contains("'" + name + "'") || err.contains("'" + name + "='"));
+
+// Mint `var <name>;` as a top-level declaration and make it live + saved.
+String _declareWsVar(String name) {
+  if (_decls.containsKey(name)) return '';
+  var src = 'var ' + name + ';';
+  _decls[name] = src;
+  _imageUpsert(name, src);
+  return _rebuildAndReload();
+}
+
+// A value we can honestly write back into the image as an initialiser, so the
+// variable comes back with it next launch. Only self-contained literals: an
+// arbitrary expression could have side effects, or fail, when re-run at boot.
+final RegExp _wsLiteral = new RegExp(
+    '^\\s*(?:-?\\d+(?:\\.\\d+)?|true|false|null|' +
+    "'[^'\\\\\\n]*'|\"[^\"\\\\\\n]*\")\\s*\$");
+
+// Keep the image's initialiser in step with the variable's current value, so a
+// scalar workspace variable survives a restart holding what you last put in it.
+// No reload: the live value is already set. A variable holding an OBJECT keeps
+// its declaration but comes back null — object graphs are not in the image.
+void _rememberWsValue(String name, String expr) {
+  if (!_decls.containsKey(name)) return;
+  var cur = _decls[name];
+  if (cur != null && !cur.startsWith('var ' + name)) return;   // not ours
+  var src = _wsLiteral.hasMatch(expr)
+      ? ('var ' + name + ' = ' + expr.trim() + ';')
+      : ('var ' + name + ';');
+  if (src == cur) return;
+  _decls[name] = src;
+  _imageUpsert(name, src);
 }
 
 // --- the image (user-app source) --------------------------------------------

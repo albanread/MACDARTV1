@@ -1367,6 +1367,11 @@ Future<String> handle(String line) async {
   var arg = sp < 0 ? "" : line.substring(sp + 1);
   switch (cmd) {
     case 'ping': return "pong";
+    case 'sleep': {   // a pacing aid for scripts; does not block the isolate
+      var ms = int.parse(arg.trim(), onError: (_) => 0);
+      if (ms > 0) await new Future.delayed(new Duration(milliseconds: ms));
+      return "";
+    }
     case 'resize': {   // "resize W H" — drive the window size to test the layout
       var wh = arg.split(' ');
       var f = gWindow.frame();
@@ -1744,6 +1749,66 @@ void editorFormat() {
   if (f == src) { log("Format - already tidy"); return; }
   edSetText(f);
   log("Format - re-indented");
+}
+
+// --- framed control channel (for `macvm rusttcl`) ---------------------------
+// A second, opt-in channel that speaks MACVM's control protocol verbatim, so its
+// TCL shell drives this app with no new interpreter: `macvm rusttcl` ->
+// `gui connect 7645` -> `gui ping` / `gui doit ...` / `gui snap ...`, with real
+// set/if/while/proc/expr around them.
+//
+// Wire format (cocoa_gui/src/control.rs and src/rusttcl/verbs.rs gui_request):
+//   both directions   <byte-length>\n<bytes>
+//   reply payload     "OK\n<result>"  or  "ERR <message>"
+// The client strips OK and trims, and turns ERR into a TCL error. The length is
+// in BYTES, not characters — a multi-byte reply framed by character count would
+// desynchronise the stream.
+//
+// The plain line protocol on 7644 is untouched: it has no framing, so a
+// multi-line reply there is ambiguous, which is exactly what this fixes.
+const int kCtlPort = 7645;
+
+void _writeFrame(Socket s, String payload) {
+  var bytes = UTF8.encode(payload);
+  s.add(UTF8.encode(bytes.length.toString() + "\n"));
+  s.add(bytes);
+}
+
+Future _ctlChain = new Future.value();   // one command at a time, in order
+
+Future startControlChannel() async {
+  var server = await ServerSocket.bind(InternetAddress.LOOPBACK_IP_V4, kCtlPort);
+  stderr.writeln("dartui framed control on 127.0.0.1:" + kCtlPort.toString() +
+                 "  (macvm rusttcl: `gui connect " + kCtlPort.toString() + "`)");
+  server.listen((Socket socket) {
+    var buf = <int>[];
+    socket.done.catchError((e) {});
+    socket.listen((List<int> data) {
+      buf.addAll(data);
+      while (true) {
+        var nl = buf.indexOf(10);                       // '\n'
+        if (nl < 0) break;
+        var head = new String.fromCharCodes(buf.sublist(0, nl)).trim();
+        var len = int.parse(head, onError: (_) => -1);
+        if (len < 0) { socket.destroy(); return; }      // not a frame; hang up
+        if (buf.length < nl + 1 + len) break;           // body still arriving
+        var cmd = UTF8.decode(buf.sublist(nl + 1, nl + 1 + len));
+        buf = buf.sublist(nl + 1 + len);
+        _ctlChain = _ctlChain.then((_) => _serveFrame(socket, cmd));
+      }
+    }, onError: (e) {}, cancelOnError: true);
+  }, onError: (e) => log("control channel: " + e.toString()));
+}
+
+Future _serveFrame(Socket socket, String cmd) async {
+  var reply;
+  try {
+    reply = await handle(cmd);
+  } catch (e) {
+    reply = "ERR " + e.toString();
+  }
+  var payload = reply.toString().startsWith("ERR") ? reply : ("OK\n" + reply);
+  try { _writeFrame(socket, payload); } catch (e) {}
 }
 
 // --- rebuilding the view tree -----------------------------------------------
@@ -2265,6 +2330,11 @@ main() async {
 
   var server = await ServerSocket.bind(InternetAddress.LOOPBACK_IP_V4, 7644);
   stderr.writeln("dartui workspace control on 127.0.0.1:7644");
+  await startControlChannel();
+  // The window and both channels are up. Until this point the host treats a UI
+  // isolate error as fatal, so a workspace that failed to load exits instead of
+  // sitting there as a process with no window.
+  wsUiReady();
   server.listen((Socket socket) {
     // A driver that hangs up before we answer (a timed-out `nc`, say) would
     // otherwise surface as an unhandled SocketException in the UI isolate.

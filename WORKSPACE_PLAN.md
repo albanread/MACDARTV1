@@ -328,9 +328,14 @@ stale generation / re-entrancy. Trampoline: `Dart_EnterIsolate(ui)` +
     run (proven: edit a method in the browser → live `42`, and `42` again after a
     full relaunch). Member-level edits replace in-source; Definition shows the whole
     class (Dart methods are inline).
-  - **Remaining polish:** protocols pane; Docs as markdown; Find/senders; the debug
-    reload assert; window-resize reflow; image path → `~/.macdart/` for
-    cross-session persistence.
+  - **Find + cross-session image ✅ DONE**: the image now lives at
+    `~/.macdart/workspace.sqlite` (created on first run) — persists across sessions
+    (verified: `new Widget().bump()` → 6 on a fresh launch). A **Find** tab: a
+    search field + **Find** (name search over classes/members) and **Senders**
+    (identifier references, word-boundary) over the image; results are `Class >>
+    member`, click one to open it in the Browser. Language-isolate `find`/`senders`.
+  - **Remaining polish:** protocols pane; Docs as rendered markdown; the debug
+    reload assert; window-resize reflow.
 
 ### Repo layout (new)
 - `macdart/cocoa/cocoa_host.mm` — the thread-0 GUI host (M1/M2). Linked only into

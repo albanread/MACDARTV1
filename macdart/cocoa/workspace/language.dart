@@ -51,6 +51,9 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'setcomment') out = _setComment(arg);
       else if (cmd == 'worldclasses') out = _worldClasses(arg.length > 0 ? arg : 'dart:core');
       else if (cmd == 'worldclassmembers') out = _worldClassMembers(arg);
+      else if (cmd == 'worldclasssrc') out = _worldClassSrc(arg);
+      else if (cmd == 'find') out = _find(arg);
+      else if (cmd == 'senders') out = _senders(arg);
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();
     } catch (e) {
@@ -300,8 +303,7 @@ List _worldClassMembers(String qualified) {   // "libUri|ClassName"
             } else if (d2 is MethodMirror) {
               MethodMirror mm = d2;
               if (mm.isSetter) return;
-              var sig = mm.isConstructor ? (n2 + '()') : (mm.isGetter ? ('get ' + n2) : (n2 + '()'));
-              out.add([mm.isStatic ? 'c' : 'i', 'method', sig, '']);
+              out.add([mm.isStatic ? 'c' : 'i', 'method', _methodSig(n2, mm), '']);
             }
           });
         }
@@ -311,8 +313,88 @@ List _worldClassMembers(String qualified) {   // "libUri|ClassName"
   return out;
 }
 
+// A synthesized, read-only "whole class" for a world class, reconstructed from
+// mirrors (superclass + interfaces, fields, getters, constructors, methods) —
+// so the Definition pane can show the ENTIRE class at once even though no source
+// exists on disk, the way an IDE shows a stubbed SDK declaration.
+String _worldClassSrc(String qualified) {   // "libUri|ClassName"
+  var parts = qualified.split('|');
+  if (parts.length != 2) return '';
+  var result = '';
+  currentMirrorSystem().libraries.forEach((uri, lib) {
+    if (uri.toString() != parts[0]) return;
+    lib.declarations.forEach((sym, decl) {
+      if (decl is! ClassMirror || MirrorSystem.getName(sym) != parts[1]) return;
+      ClassMirror cm = decl;
+      var head = new StringBuffer();
+      if (cm.isAbstract) head.write('abstract ');
+      head.write('class ' + parts[1]);
+      try {
+        var sc = cm.superclass;
+        if (sc != null) {
+          var scn = MirrorSystem.getName(sc.simpleName);
+          if (scn.length > 0 && scn != 'Object') head.write(' extends ' + scn);
+        }
+      } catch (e) {}
+      var fields = <String>[], accessors = <String>[], ctors = <String>[], methods = <String>[];
+      cm.declarations.forEach((s2, d2) {
+        var n2 = MirrorSystem.getName(s2);
+        if (d2 is VariableMirror) {
+          VariableMirror vm = d2;
+          fields.add('  ' + (vm.isStatic ? 'static ' : '') + (vm.isFinal ? 'final ' : '') + _typeName(vm.type) + ' ' + n2 + ';');
+        } else if (d2 is MethodMirror) {
+          MethodMirror mm = d2;
+          if (mm.isSetter) return;
+          var line = '  ' + (mm.isStatic ? 'static ' : '') + _methodSig(n2, mm) + ';';
+          if (mm.isConstructor) ctors.add(line);
+          else if (mm.isGetter) accessors.add(line);
+          else methods.add(line);
+        }
+      });
+      var buf = new StringBuffer();
+      buf.write('// ' + parts[0] + ' — read-only (synthesized from mirrors)\n');
+      buf.write(head.toString() + ' {\n');
+      var groups = <List<String>>[fields, accessors, ctors, methods];
+      var wrote = false;
+      for (var g in groups) {
+        if (g.isEmpty) continue;
+        if (wrote) buf.write('\n');
+        for (var l in g) buf.write(l + '\n');
+        wrote = true;
+      }
+      buf.write('}\n');
+      result = buf.toString();
+    });
+  });
+  return result;
+}
+
 String _typeName(TypeMirror t) {
   try { return MirrorSystem.getName(t.simpleName); } catch (e) { return 'var'; }
+}
+
+// A readable Dart signature for a mirror method — so the Members pane reads like
+// real source: `double get value`, `int bump()`, `void add(Metric m)`,
+// `Gauge(String name)` — instead of a bare, cryptic `get value`.
+String _methodSig(String name, MethodMirror mm) {
+  if (mm.isConstructor) return name + '(' + _paramSig(mm) + ')';
+  var ret = _typeName(mm.returnType);
+  if (mm.isGetter) return ret + ' get ' + name;
+  if (mm.isOperator) return ret + ' operator ' + name + '(' + _paramSig(mm) + ')';
+  return ret + ' ' + name + '(' + _paramSig(mm) + ')';
+}
+
+// Comma-joined `Type name` parameters (types only if a name is unavailable).
+String _paramSig(MethodMirror mm) {
+  try {
+    var ps = <String>[];
+    for (var p in mm.parameters) {
+      var t = _typeName(p.type);
+      var nm = MirrorSystem.getName(p.simpleName);
+      ps.add(nm.length > 0 ? (t + ' ' + nm) : t);
+    }
+    return ps.join(', ');
+  } catch (e) { return ''; }
 }
 
 // The class comment, stored in the image alongside its source.
@@ -328,4 +410,34 @@ String _setComment(List a) {
     _db.exec('UPDATE decls SET comment=? WHERE name=?', [a[1].toString(), a[0].toString()]);
   }
   return 'ok';
+}
+
+// --- Find (over the image) --------------------------------------------------
+// Name search: classes and members whose name contains `term`. Records
+// [class, memberSig] ('' = the class itself).
+List _find(String term) {
+  var t = term.toLowerCase();
+  var out = <List>[];
+  _decls.forEach((name, src) {
+    if (name.toLowerCase().contains(t)) out.add([name, '']);
+    for (var m in _splitMembers(src)) {
+      var sig = _memberSig(m);
+      if (sig.toLowerCase().contains(t)) out.add([name, sig]);
+    }
+  });
+  return out;
+}
+
+// Senders: classes whose source references `term` as an identifier.
+List _senders(String term) {
+  var re = new RegExp(r'\b' + _reEscape(term) + r'\b');
+  var out = <List>[];
+  _decls.forEach((name, src) {
+    if (re.hasMatch(src)) out.add([name, '']);
+  });
+  return out;
+}
+
+String _reEscape(String s) {
+  return s.replaceAllMapped(new RegExp(r'[.*+?^${}()|[\]\\]'), (m) => '\\' + m.group(0));
 }

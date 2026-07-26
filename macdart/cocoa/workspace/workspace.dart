@@ -39,6 +39,53 @@ String gBrSelCat, gBrSelClass, gBrClassSrc, gBrClassComment, gSelMemberSrc;
 bool gBrUserApp = true;            // is the selected category editable (user app)?
 List _dl(dynamic r) => r is List ? r : <dynamic>[];   // reply -> list
 
+// Find state.
+Cocoa gFindField, gFindTable;
+List gFindResults = <dynamic>[];   // [class, memberSig]
+
+// --- AppKit event -> isolate message ----------------------------------------
+// An AppKit callback reaches Dart through Dart_InvokeClosure, straight out of an
+// ObjC IMP — it does NOT arrive as an isolate message. That matters because this
+// VM drains the microtask queue in exactly ONE place: _RawReceivePortImpl.
+// _handleMessage (runtime/lib/isolate_patch.dart) calls _runPendingImmediateCallback()
+// after dispatching a message, and nowhere else. And an `async` function body is
+// started as `new Future.microtask(...)` (runtime/vm/parser.cc, Symbols::FutureMicrotask).
+//
+// So a handler that awaits — every browser navigation does, via ask() — would have
+// its body parked as a microtask that nothing ever drains: the request is never
+// even SENT, so no reply arrives, so no message is ever dispatched, so the queue
+// is never drained. The click does nothing, permanently. (Driving the same
+// function over the control socket works precisely because socket data IS a
+// message, so _handleMessage drains the microtask right after.)
+//
+// Fix: bounce the event through our own port. The handler then runs from inside
+// _handleMessage, where microtasks drain normally and async work completes. The
+// send also wakes the run-loop pump, so it runs promptly.
+ReceivePort _evPort;
+SendPort _evSend;
+int _evNext = 0;
+final Map<int, Function> _evPending = <int, Function>{};
+
+void initEvents() {
+  _evPort = new ReceivePort();
+  _evSend = _evPort.sendPort;
+  _evPort.listen((id) {
+    var body = _evPending.remove(id);
+    if (body != null) body();
+  });
+}
+
+/// Run [body] from the isolate's message loop rather than inline in the AppKit
+/// callback, so that any `async`/`await` work inside it actually runs.
+void defer(void body()) {
+  var id = _evNext++;
+  _evPending[id] = body;
+  _evSend.send(id);
+}
+
+/// A table-selection handler that runs deferred (see [defer]).
+SelectFn sel(void body(int row)) => (r) => defer(() => body(r));
+
 Cocoa _mono(double sz) => Cocoa.cls("NSFont").userFixedPitchFontOfSize(sz);
 
 Cocoa button(Cocoa parent, String title, List frame, CocoaAction fn) {
@@ -47,7 +94,7 @@ Cocoa button(Cocoa parent, String title, List frame, CocoaAction fn) {
   b.setBezelStyle(1);
   parent.addSubview(b);
   gButtons[title] = b;
-  gTargets.add(onAction(b, fn));
+  gTargets.add(onAction(b, (s) => defer(() => fn(s))));   // see [defer]
   return b;
 }
 
@@ -90,7 +137,7 @@ void switchTab(int i) {
   gTabView.selectTabViewItemAtIndex(i);
   if (i == 1) openBrowser();
   updateMetrics();
-  gWindow.display();
+  repaint();
 }
 
 void buildWindow() {
@@ -99,11 +146,13 @@ void buildWindow() {
       [0.0, 0.0, 900.0, 640.0], styleMask: 15, backing: 2, defer: false);
   gWindow.setTitle("MACDART Workspace");
   gContent = gWindow.contentView();
+  gContent.setWantsLayer(true);   // layer-back the view tree so CATransaction flush can present pump-driven redraws
 
   // Toolbar band: view-switchers on the left, a live metrics label on the right.
   button(gContent, "Workspace", [16.0, 604.0, 110.0, 28.0], (s) => switchTab(0));
   button(gContent, "Browser", [132.0, 604.0, 92.0, 28.0], (s) => switchTab(1));
-  button(gContent, "Docs", [230.0, 604.0, 80.0, 28.0], (s) => switchTab(2));
+  button(gContent, "Find", [230.0, 604.0, 64.0, 28.0], (s) => switchTab(3));
+  button(gContent, "Docs", [300.0, 604.0, 66.0, 28.0], (s) => switchTab(2));
   gMetrics = label(gContent, [520.0, 608.0, 364.0, 18.0]);
   gMetrics.setAlignment(2); // right
 
@@ -118,7 +167,7 @@ void buildWindow() {
   button(ws, "Print It", [98.0, 388.0, 90.0, 28.0], (s) => run(true));
   button(ws, "Accept", [194.0, 388.0, 92.0, 28.0], (s) => acceptEditor());
   button(ws, "Clear", [292.0, 388.0, 74.0, 28.0], (s) {
-    gLog.clear(); gTranscript.setString(""); gWindow.display();
+    gLog.clear(); gTranscript.setString(""); repaint();
   });
   gEditor = scrolledTextView(ws, [8.0, 8.0, 852.0, 372.0], true);
   gTargets.add(onTextChange(gEditor, (s) => highlight()));
@@ -129,6 +178,9 @@ void buildWindow() {
   // Docs tab.
   var dc = addTab(gTabView, "docs", 868.0, 420.0);
   scrolledTextView(dc, [8.0, 8.0, 852.0, 404.0], false).setString(_docsText);
+
+  // Find tab.
+  buildFindTab(addTab(gTabView, "find", 868.0, 420.0));
 
   // Transcript dock (shared across tabs).
   gTranscript = scrolledTextView(gContent, [16.0, 12.0, 868.0, 152.0], false);
@@ -149,12 +201,26 @@ void updateMetrics() {
       "cocoa: " + st[0].toString() + " wrapped / " + st[1].toString() + " freed");
 }
 
+// Force pending UI changes onto the SCREEN. `display()` redraws dirty views into
+// the window's (layer-backed) backing store, but updates driven from the
+// run-loop pump — async `.then` continuations, cross-isolate replies, socket
+// commands — happen OUTSIDE an AppKit event, so they never get AppKit's
+// end-of-event commit and the on-screen window stays stale until the next OS
+// event (a mouse move). `[CATransaction flush]` commits the pending layer
+// changes to the render server immediately, so the screen updates now. (Offscreen
+// snapshots force-render, which is why they always looked correct and masked
+// this.) See WORKSPACE_PLAN.md §5 "redraw gotcha".
+void repaint() {
+  gWindow.display();
+  try { Cocoa.cls("CATransaction").flush(); } catch (e) {}
+}
+
 void log(String line) {
   gLog.add(line);
   if (gLog.length > 200) gLog = gLog.sublist(gLog.length - 200);
   gTranscript.setString(gLog.join("\n"));
   gTranscript.scrollToEndOfDocument(null);
-  gWindow.display();   // async/callback updates run outside AppKit's event flush
+  repaint();   // async/callback updates run outside AppKit's event flush
 }
 
 // --- Smalltalk-style class browser ------------------------------------------
@@ -166,6 +232,7 @@ Cocoa tableIn(Cocoa parent, List frame) {
   var table = Cocoa.cls("NSTableView").alloc().initWithFrame([0.0, 0.0, frame[2], frame[3]]);
   var col = Cocoa.cls("NSTableColumn").alloc().initWithIdentifier("c");
   col.setWidth(frame[2] - 4.0);
+  col.setEditable(false);        // a browser pane: clicks SELECT the row, never edit the cell
   var cell = col.dataCell();
   var f = _mono(12.0);
   if (!cell.isNil && !f.isNil) cell.setFont(f);
@@ -203,10 +270,10 @@ void buildBrowserTab(Cocoa br) {
   var mf = _mono(13.0);
   if (!mf.isNil) gBrowserSrc.setFont(mf);
 
-  gTargets.add(onTable(gCatTable, () => gBrCats.length, (r) => gBrCats[r].toString(), (r) => selectCategory(r)));
-  gTargets.add(onTable(gClassTable, () => gBrClasses.length, (r) => gBrClasses[r].toString(), (r) => selectClass(r)));
-  gTargets.add(onTable(gVarTable, () => gVarRecs.length, (r) => gVarRecs[r][2].toString(), (r) => selectMemberRec(gVarRecs, r)));
-  gTargets.add(onTable(gMethodTable, () => gMethodRecs.length, (r) => gMethodRecs[r][2].toString(), (r) => selectMemberRec(gMethodRecs, r)));
+  gTargets.add(onTable(gCatTable, () => gBrCats.length, (r) => gBrCats[r].toString(), sel(selectCategory)));
+  gTargets.add(onTable(gClassTable, () => gBrClasses.length, (r) => gBrClasses[r].toString(), sel(selectClass)));
+  gTargets.add(onTable(gVarTable, () => gVarRecs.length, (r) => gVarRecs[r][2].toString(), sel((r) => selectMemberRec(gVarRecs, r))));
+  gTargets.add(onTable(gMethodTable, () => gMethodRecs.length, (r) => gMethodRecs[r][2].toString(), sel((r) => selectMemberRec(gMethodRecs, r))));
   gTargets.add(onTextChange(gBrowserSrc, (s) => highlightView(gBrowserSrc)));
 }
 
@@ -214,7 +281,7 @@ void openBrowser() {
   ask('categories', '').then((r) {
     gBrCats = _dl(r);
     gCatTable.reloadData();
-    gWindow.display();
+    repaint();
   });
 }
 
@@ -228,7 +295,7 @@ void selectCategory(int row) {
   ask(gBrUserApp ? 'classes' : 'worldclasses', gBrUserApp ? '' : gBrSelCat).then((r) {
     gBrClasses = _dl(r);
     gClassTable.reloadData(); gVarTable.reloadData(); gMethodTable.reloadData();
-    gWindow.display();
+    repaint();
   });
 }
 
@@ -238,15 +305,22 @@ void selectClass(int row) {
   gSelMemberSrc = null; gSelMemberSig = null;
   var membersCmd = gBrUserApp ? 'classmembers' : 'worldclassmembers';
   var membersArg = gBrUserApp ? gBrSelClass : (gBrSelCat + '|' + gBrSelClass);
-  ask(membersCmd, membersArg).then((r) { gClassMembers = _dl(r); filterMembers(); gWindow.display(); });
+  ask(membersCmd, membersArg).then((r) { gClassMembers = _dl(r); filterMembers(); repaint(); });
   if (gBrUserApp) {
     ask('classsrc', gBrSelClass).then((r) { gBrClassSrc = r.toString(); if (gBrMode == 'source') gBrMode = 'definition'; updateSourcePane(); });
     ask('classcomment', gBrSelClass).then((r) { gBrClassComment = r.toString(); });
   } else {
-    gBrClassSrc = "// " + gBrSelClass + "  —  world class (read-only)";
+    // A world class has no source on disk; synthesize the WHOLE class from
+    // mirrors so Definition shows fields + typed signatures (read-only).
+    gBrClassSrc = "// " + gBrSelClass + "  —  loading definition…";
     gBrClassComment = "";
     gBrMode = 'definition';
     updateSourcePane();
+    ask('worldclasssrc', gBrSelCat + '|' + gBrSelClass).then((r) {
+      var s = r.toString();
+      gBrClassSrc = s.length > 0 ? s : ("// " + gBrSelClass + "  —  world class (read-only)");
+      if (gBrMode == 'definition') updateSourcePane();
+    });
   }
 }
 
@@ -259,7 +333,7 @@ void filterMembers() {
   gVarTable.reloadData(); gMethodTable.reloadData();
 }
 
-void setSide(String side) { gBrSide = side; filterMembers(); gWindow.display(); }
+void setSide(String side) { gBrSide = side; filterMembers(); repaint(); }
 
 void selectMemberRec(List recs, int row) {
   if (row < 0 || row >= recs.length) return;
@@ -280,7 +354,7 @@ void updateSourcePane() {
   gBrowserSrc.setString(text);
   highlightView(gBrowserSrc);
   updateStatus();
-  gWindow.display();
+  repaint();
 }
 
 // The "edit Class>>member" status line. Accept both hot-reloads live AND writes
@@ -347,15 +421,15 @@ void browserAccept() {
 void _reloadBrowserClass() {
   updateMetrics();
   if (gBrSelClass == null || !gBrUserApp) return;
-  ask('classmembers', gBrSelClass).then((r) { gClassMembers = _dl(r); filterMembers(); gWindow.display(); });
-  ask('classsrc', gBrSelClass).then((r) { gBrClassSrc = r.toString(); gWindow.display(); });
+  ask('classmembers', gBrSelClass).then((r) { gClassMembers = _dl(r); filterMembers(); repaint(); });
+  ask('classsrc', gBrSelClass).then((r) { gBrClassSrc = r.toString(); repaint(); });
 }
 
 void _reloadClassList() {
   updateMetrics();
   if (gBrSelCat == null) return;
   ask(gBrUserApp ? 'classes' : 'worldclasses', gBrUserApp ? '' : gBrSelCat).then((r) {
-    gBrClasses = _dl(r); gClassTable.reloadData(); gWindow.display();
+    gBrClasses = _dl(r); gClassTable.reloadData(); repaint();
   });
 }
 
@@ -377,7 +451,7 @@ void newClass() {
   gBrowserSrc.setString(gBrClassSrc);
   highlightView(gBrowserSrc);
   updateStatus();
-  gWindow.display();
+  repaint();
   log("+ New Class — rename it, add members, then Accept");
 }
 
@@ -390,7 +464,7 @@ void newMethod() {
   gBrowserSrc.setString(tmpl);
   highlightView(gBrowserSrc);
   updateStatus();
-  gWindow.display();
+  repaint();
   log("+ New Method in " + gBrSelClass + " — edit and Accept");
 }
 
@@ -401,6 +475,53 @@ void browserRemove() {
     log("Browser — " + r);
     gBrSelClass = null; gSelMemberSrc = null; gBrowserSrc.setString("");
     selectCategory(0);
+  });
+}
+
+// --- Find (search / senders over the image) ---------------------------------
+void buildFindTab(Cocoa fd) {
+  gFindField = Cocoa.cls("NSTextField").alloc().initWithFrame([8.0, 388.0, 396.0, 24.0]);
+  gFindField.setStringValue("");
+  var mf = _mono(13.0); if (!mf.isNil) gFindField.setFont(mf);
+  fd.addSubview(gFindField);
+  button(fd, "Find", [412.0, 386.0, 76.0, 28.0], (s) => runFind('find'));
+  button(fd, "Senders", [494.0, 386.0, 92.0, 28.0], (s) => runFind('senders'));
+  label(fd, [598.0, 390.0, 262.0, 18.0]).setStringValue("name search / senders — click a result to open it");
+  gFindTable = tableIn(fd, [8.0, 8.0, 852.0, 368.0]);
+  gTargets.add(onTable(gFindTable, () => gFindResults.length, (r) => _findRowLabel(r), sel(findNavigate)));
+}
+
+String _findRowLabel(int r) {
+  if (r < 0 || r >= gFindResults.length) return "";
+  var rec = gFindResults[r];
+  var cls = rec[0].toString();
+  var member = (rec is List && rec.length > 1) ? rec[1].toString() : "";
+  return member.length > 0 ? (cls + "  >>  " + member) : cls;
+}
+
+void runFind(String cmd) {
+  var term = gFindField.stringValue().UTF8String().trim();   // NSTextField -> stringValue
+  if (term.length == 0) { gFindResults = <dynamic>[]; gFindTable.reloadData(); repaint(); return; }
+  ask(cmd, term).then((r) {
+    gFindResults = _dl(r);
+    gFindTable.reloadData();
+    repaint();
+    log((cmd == 'senders' ? "Senders of '" : "Find '") + term + "' — " + gFindResults.length.toString() + " result(s)");
+  });
+}
+
+// Click a result → open the Browser on that class.
+void findNavigate(int row) {
+  if (row < 0 || row >= gFindResults.length) return;
+  var cls = gFindResults[row][0].toString();
+  gTabView.selectTabViewItemAtIndex(1);   // Browser (no reset)
+  gBrSelCat = 'User App'; gBrUserApp = true;
+  ask('classes', '').then((r) {
+    gBrClasses = _dl(r); gClassTable.reloadData();
+    for (var i = 0; i < gBrClasses.length; i++) {
+      if (gBrClasses[i].toString() == cls) { selectClass(i); break; }
+    }
+    updateMetrics(); repaint();
   });
 }
 
@@ -585,7 +706,7 @@ Cocoa menuItem(Cocoa menu, String title, String key, CocoaAction fn) {
   it.setTitle(title);
   if (key.length > 0) it.setKeyEquivalent(key);   // Command modifier is default
   menu.addItem(it);
-  gTargets.add(onAction(it, fn));
+  gTargets.add(onAction(it, (s) => defer(() => fn(s))));   // see [defer]
   return it;
 }
 
@@ -698,6 +819,9 @@ Future<String> handle(String line) async {
     case 'brsettext': gBrowserSrc.setString(arg.replaceAll('\\n', '\n')); highlightView(gBrowserSrc); return "ok";
     case 'braccept': browserAccept(); return "ok";
     case 'brcancel': browserCancel(); return "ok";
+    case 'findset': gFindField.setStringValue(arg); return "ok";
+    case 'findrun': runFind(arg.length > 0 ? arg : 'find'); return "ok";
+    case 'findsel': findNavigate(int.parse(arg)); return "ok";
     case 'settext':
       gEditor.setString(arg.replaceAll('\\n', '\n'));
       highlight();
@@ -743,13 +867,18 @@ ARCHITECTURE
   ⌘Q quits.''';
 
 main() async {
+  initEvents();     // AppKit callbacks re-enter through this port — see [defer]
   buildWindow();
 
   // The language isolate hot-reloads (rewrites) its own root file, so spawn it
   // from a MUTABLE COPY of the tracked language.dart template, never the source.
   var templatePath = Platform.script.resolve('language.dart').toFilePath();
   gScratch = Directory.systemTemp.path + '/macdart_ws_lang.dart';
-  gDbPath = Directory.systemTemp.path + '/macdart_workspace.sqlite';  // the image
+  // The image lives in ~/.macdart so it persists across sessions.
+  var home = Platform.environment['HOME'];
+  var appDir = new Directory(home + '/.macdart');
+  if (!appDir.existsSync()) appDir.createSync(recursive: true);
+  gDbPath = home + '/.macdart/workspace.sqlite';
   new File(gScratch).writeAsStringSync(new File(templatePath).readAsStringSync());
   await spawnLanguage();
   log("language isolate ready — image: " + gDbPath);

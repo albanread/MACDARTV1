@@ -23,23 +23,34 @@
 
 static CFRunLoopRef g_main_loop;
 static CFRunLoopSourceRef g_pump_source;
-static bool g_in_pump;  // guards against re-entering the message loop
+static bool g_in_pump;   // guards against re-entering the message loop
+static bool g_pending;   // a wakeup arrived while pumping — don't lose it
 
 // Runs on thread 0 (via the run-loop source). Drains the UI isolate's message
 // queue: the queued main() on the first tick, then socket events, timers, and
 // cross-isolate replies.
 static void PumpPerform(void* info) {
   (void)info;
-  if (g_in_pump) return;  // AppKit callbacks may spin the loop — never nest
-  g_in_pump = true;
-  Dart_EnterScope();
-  Dart_Handle r = Dart_HandleMessages();
-  if (Dart_IsError(r)) {
-    // A UI-isolate callback threw. Log and keep the app alive (leak-over-crash);
-    // a genuinely fatal VM error would have aborted the process already.
-    fprintf(stderr, "dartui: UI isolate error: %s\n", Dart_GetError(r));
+  if (g_in_pump) {
+    // Re-entered (AppKit drawing can spin the loop). Handling messages here
+    // would nest the message loop, but simply returning would DROP this wakeup:
+    // the run loop clears a source's signalled flag before calling perform. So
+    // remember it and re-signal once the outer pump unwinds.
+    g_pending = true;
+    return;
   }
-  Dart_ExitScope();
+  g_in_pump = true;
+  do {
+    g_pending = false;
+    Dart_EnterScope();
+    Dart_Handle r = Dart_HandleMessages();
+    if (Dart_IsError(r)) {
+      // A UI-isolate callback threw. Log and keep the app alive (leak-over-crash);
+      // a genuinely fatal VM error would have aborted the process already.
+      fprintf(stderr, "dartui: UI isolate error: %s\n", Dart_GetError(r));
+    }
+    Dart_ExitScope();
+  } while (g_pending);
   g_in_pump = false;
 }
 
@@ -63,7 +74,11 @@ extern "C" int macdart_run_ui_host(void) {
     memset(&ctx, 0, sizeof(ctx));
     ctx.perform = PumpPerform;
     g_pump_source = CFRunLoopSourceCreate(NULL, 0, &ctx);
-    CFRunLoopAddSource(g_main_loop, g_pump_source, kCFRunLoopDefaultMode);
+    // COMMON modes, not just default: while AppKit tracks a mouse press (an
+    // NSTableView row click runs a nested loop in NSEventTrackingRunLoopMode) a
+    // default-mode-only source cannot fire, so isolate replies that land during
+    // the click would sit unhandled until the press ended.
+    CFRunLoopAddSource(g_main_loop, g_pump_source, kCFRunLoopCommonModes);
 
     // Route this isolate's message wakeups to our run loop instead of the VM's
     // pool threads. Applies to the current (UI) isolate only; spawned language

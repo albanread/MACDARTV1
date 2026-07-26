@@ -37,6 +37,7 @@ String gBrSide = 'i';              // instance | class
 String gBrMode = 'source';         // comment | definition | source
 String gBrSelCat, gBrSelClass, gBrClassSrc, gBrClassComment, gSelMemberSrc;
 bool gBrUserApp = true;            // is the selected category editable (user app)?
+int gTab = 0;                      // the visible tab, for context-sensitive menu items
 List _dl(dynamic r) => r is List ? r : <dynamic>[];   // reply -> list
 
 // Find state.
@@ -215,6 +216,7 @@ Cocoa scrolledTextView(Cocoa parent, List frame, bool editable) {
   var tv = Cocoa.cls("NSTextView").alloc()
       .initWithFrame([0.0, 0.0, frame[2], frame[3]]);
   tv.setEditable(editable);
+  tv.setAllowsUndo(editable);   // so Edit > Undo/Redo work in this view
   tv.setRichText(false);
   tv.setAutomaticQuoteSubstitutionEnabled(false);
   tv.setAutomaticDashSubstitutionEnabled(false);
@@ -260,6 +262,7 @@ void pinTop(List<String> titles, [int extra = 0]) {
 
 void switchTab(int i) {
   gTabView.selectTabViewItemAtIndex(i);
+  gTab = i;
   if (i == 1) openBrowser();
   if (i == 4) editorRefreshClasses();
   updateMetrics();
@@ -996,24 +999,99 @@ Cocoa menuItem(Cocoa menu, String title, String key, CocoaAction fn) {
   return it;
 }
 
+// --- main menu --------------------------------------------------------------
+// Modifier masks for setKeyEquivalentModifierMask: (Command is implied by
+// setKeyEquivalent:, so it is only spelled out when combining).
+const int kCmd = 1 << 20, kShift = 1 << 17, kCtrl = 1 << 18, kOpt = 1 << 19;
+
+Cocoa menuSep(Cocoa menu) {
+  var it = Cocoa.cls("NSMenuItem").separatorItem();
+  menu.addItem(it);
+  return it;
+}
+
+Cocoa subMenu(Cocoa mainMenu, String title) {
+  var item = Cocoa.cls("NSMenuItem").alloc().init();
+  item.setTitle(title);
+  mainMenu.addItem(item);
+  var m = Cocoa.cls("NSMenu").alloc().initWithTitle(title);
+  item.setSubmenu(m);
+  return m;
+}
+
+/// A menu item bound to one of Cocoa's OWN editing selectors, with a nil target
+/// so AppKit walks the responder chain to whatever currently has focus. This is
+/// what makes Cut/Copy/Paste/Undo work in the focused text view — routing them
+/// through our own action target instead would send them nowhere useful.
+Cocoa stdItem(Cocoa menu, String title, String key, String selector, [int mask = 0]) {
+  var it = Cocoa.cls("NSMenuItem").alloc().init();
+  it.setTitle(title);
+  if (key.length > 0) it.setKeyEquivalent(key);
+  if (mask != 0) it.setKeyEquivalentModifierMask(mask);
+  menu.addItem(it);
+  setSelectorAction(it, selector);   // target nil -> responder chain
+  return it;
+}
+
+// ⌘S means "commit what is in front of me", which differs per tab.
+void menuSave() {
+  if (gTab == 4) { editorSaveImage(); return; }
+  if (gTab == 1) { browserAccept(); return; }
+  acceptEditor();
+}
+
 void buildMenu() {
   var app = Cocoa.cls("NSApplication").sharedApplication();
   var mainMenu = Cocoa.cls("NSMenu").alloc().init();
 
+  // The first menu is the application menu; macOS titles it from the process.
   var appItem = Cocoa.cls("NSMenuItem").alloc().init();
   mainMenu.addItem(appItem);
   var appMenu = Cocoa.cls("NSMenu").alloc().init();
   appItem.setSubmenu(appMenu);
   menuItem(appMenu, "Quit MACDART", "q", (s) => app.terminate(null));
 
-  var wsItem = Cocoa.cls("NSMenuItem").alloc().init();
-  wsItem.setTitle("Workspace");
-  mainMenu.addItem(wsItem);
-  var wsMenu = Cocoa.cls("NSMenu").alloc().initWithTitle("Workspace");
-  wsItem.setSubmenu(wsMenu);
-  menuItem(wsMenu, "Do It", "d", (s) => run(false));
-  menuItem(wsMenu, "Print It", "p", (s) => run(true));
-  menuItem(wsMenu, "Accept", "s", (s) => acceptEditor());
+  var file = subMenu(mainMenu, "File");
+  menuItem(file, "New Class", "n", (s) { switchTab(4); editorNew(); });
+  menuItem(file, "Open…", "o", (s) { switchTab(4); editorOpen(); });
+  menuItem(file, "Save File…", "S", (s) { switchTab(4); editorSaveFile(); })
+      .setKeyEquivalentModifierMask(kCmd + kShift);
+  menuItem(file, "File In…", "i", (s) { switchTab(4); editorFileIn(); });
+  menuSep(file);
+  menuItem(file, "Save", "s", (s) => menuSave());
+
+  // Cocoa's own editing commands, dispatched through the responder chain.
+  var edit = subMenu(mainMenu, "Edit");
+  stdItem(edit, "Undo", "z", "undo:");
+  stdItem(edit, "Redo", "Z", "redo:", kCmd + kShift);
+  menuSep(edit);
+  stdItem(edit, "Cut", "x", "cut:");
+  stdItem(edit, "Copy", "c", "copy:");
+  stdItem(edit, "Paste", "v", "paste:");
+  stdItem(edit, "Delete", "", "delete:");
+  menuSep(edit);
+  stdItem(edit, "Select All", "a", "selectAll:");
+
+  var code = subMenu(mainMenu, "Code");
+  menuItem(code, "Do It", "d", (s) => run(false));
+  menuItem(code, "Print It", "p", (s) => run(true));
+  menuSep(code);
+  menuItem(code, "Format", "f", (s) { switchTab(4); editorFormat(); })
+      .setKeyEquivalentModifierMask(kCmd + kCtrl);
+  menuItem(code, "Analyze", "b", (s) { switchTab(4); editorAnalyze(); });
+  menuSep(code);
+  menuItem(code, "Restart Language Isolate", "", (s) => respawnLanguage("restart from the menu"));
+
+  var view = subMenu(mainMenu, "View");
+  menuItem(view, "Workspace", "1", (s) => switchTab(0));
+  menuItem(view, "Browser", "2", (s) => switchTab(1));
+  menuItem(view, "Editor", "3", (s) => switchTab(4));
+  menuItem(view, "Find", "4", (s) => switchTab(3));
+  menuItem(view, "Docs", "5", (s) => switchTab(2));
+  menuSep(view);
+  menuItem(view, "Clear Transcript", "k", (s) {
+    gLog.clear(); gTranscript.setString(""); repaint();
+  });
 
   app.setMainMenu(mainMenu);
 }

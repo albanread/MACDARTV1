@@ -85,6 +85,13 @@ extern "C" int macdart_run_ui_host(void) {
     // and compute isolates keep the VM's default off-main scheduling.
     Dart_SetMessageNotifyCallback(&NotifyUi);
 
+    // macOS injects Dictation and "Emoji & Symbols" into any menu titled "Edit".
+    // These opt-outs are only honoured if they are set BEFORE NSApplication is
+    // initialised, which happens here — before main() builds the menu bar.
+    [[NSUserDefaults standardUserDefaults]
+        registerDefaults:@{@"NSDisabledDictationMenuItem" : @YES,
+                           @"NSDisabledCharacterPaletteMenuItem" : @YES}];
+
     [NSApplication sharedApplication];
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
 

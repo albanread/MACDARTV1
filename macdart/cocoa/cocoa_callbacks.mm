@@ -147,6 +147,26 @@ void Cocoa_wireAction(Dart_NativeArguments args) {
   ((void (*)(id, SEL, SEL))objc_msgSend)(control, sel_registerName("setAction:"), sel_registerName("macdartInvoke:"));
 }
 
+// _setSelectorAction(int control, String selectorName, int target)
+// Point a control (here: an NSMenuItem) at a STANDARD ObjC selector by name,
+// with an arbitrary target — target 0 meaning nil, which is what makes AppKit
+// dispatch the action down the RESPONDER CHAIN. That is the only way Cut/Copy/
+// Paste/Undo reach whichever NSTextView currently has focus. It has to live here
+// because a SEL cannot be manufactured from Dart: cocoa_abi.cc maps the ':'
+// encoding onto a pointer and the bridge would hand across an NSString.
+void Cocoa_setSelectorAction(Dart_NativeArguments args) {
+  int64_t c = 0, t = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &c);
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 2), &t);
+  const char* name = NULL;
+  Dart_Handle sname = Dart_GetNativeArgument(args, 1);
+  if (Dart_IsError(Dart_StringToCString(sname, &name)) || name == NULL) return;
+  ((void (*)(id, SEL, id))objc_msgSend)((id)c, sel_registerName("setTarget:"),
+                                        (id)t);
+  ((void (*)(id, SEL, SEL))objc_msgSend)((id)c, sel_registerName("setAction:"),
+                                         sel_registerName(name));
+}
+
 // --- Syntax highlighting: batched attribute application ----------------------
 static NSColor* ColorForKind(int64_t kind) {
   switch (kind) {

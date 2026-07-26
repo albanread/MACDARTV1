@@ -149,6 +149,17 @@ Cocoa onTable(Cocoa tableView, RowCountFn rowCount, CellFn cellAt, SelectFn onSe
   return target;
 }
 
+void _setSelectorAction(int control, String selector, int target)
+    native "Cocoa_setSelectorAction";
+
+/// Point [control] at a STANDARD Cocoa selector by name (e.g. "cut:"). With no
+/// [target] the action goes to nil, so AppKit routes it down the responder chain
+/// to whatever has focus — which is how Cut/Copy/Paste/Undo reach the focused
+/// text view. A SEL cannot be built from Dart, hence the native.
+void setSelectorAction(Cocoa control, String selector, [Cocoa target]) {
+  _setSelectorAction(control.handle, selector, target == null ? 0 : target.handle);
+}
+
 void _applySpans(int textStorage, List spans) native "Cocoa_applySpans";
 
 /// Colour [textView] with syntax-highlight runs: a flat `[start, len, kind, …]`

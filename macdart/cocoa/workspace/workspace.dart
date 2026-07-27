@@ -293,6 +293,10 @@ void switchTab(int i) {
   if (i == 1) openBrowser();
   if (i == 4) editorRefreshClasses();
   if (i == 5 && gLangIsolateId != null) dbgLoadSource();
+  if (i == 7) appRefreshList();
+  // The keyboard belongs to a game only while the user is watching it: leaving
+  // the Demos tab returns every key to the workspace, coming back re-arms.
+  keyCapture(i == 6 && gDemoTitle != null);
   updateMetrics();
   repaint();
 }
@@ -337,7 +341,8 @@ void buildChrome() {
   alias("tab:Find", iconButton(bar, "Find", "open", [128.0, 6.0, 36.0, 32.0], (s) => switchTab(3)));
   iconButton(bar, "Debug", "goForward", [168.0, 6.0, 36.0, 32.0], (s) => switchTab(5));
   iconButton(bar, "Demos", "canvas", [208.0, 6.0, 36.0, 32.0], (s) => switchTab(6));
-  iconButton(bar, "Docs", "documentation", [248.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
+  iconButton(bar, "App", "home", [248.0, 6.0, 36.0, 32.0], (s) => switchTab(7));
+  iconButton(bar, "Docs", "documentation", [288.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
   buildMetricsCluster(bar, 900.0);
 
   // Tabless content host (the toolbar buttons are the tab bar). It absorbs all
@@ -378,6 +383,9 @@ void buildChrome() {
 
   // Demos tab: a canvas that demo isolates draw on, through this isolate.
   buildDemosTab(addTab(gTabView, "demos", 868.0, 420.0));
+
+  // App tab: the surface a user's own Cocoa app runs on.
+  buildAppTab(addTab(gTabView, "app", 868.0, 420.0));
 
   // Transcript dock (shared across tabs): docked to the bottom at a fixed
   // height, widening with the window.
@@ -838,8 +846,38 @@ void _reloadClassList() {
 
 /// The name a declaration defines, or null if it isn't a class/enum.
 String _classNameOf(String d) {
-  var m = new RegExp(r'^\s*(?:abstract\s+)?(?:class|enum)\s+(\w+)').firstMatch(d);
+  var m = new RegExp(r'^\s*(?:abstract\s+)?(?:class|enum)\s+(\w+)')
+      .firstMatch(afterLeadingComments(d));
   return m != null ? m.group(1) : null;
+}
+
+/// A declaration's text minus any comments in front of it. splitTopLevel keeps
+/// a leading doc comment attached to the declaration it documents (rightly —
+/// the comment belongs with the class), so every name matcher has to step over
+/// it. Without this a documented class is not recognised as a class at all, and
+/// the image stores it under whatever the fallback matcher finds in the prose.
+String afterLeadingComments(String s) {
+  var i = 0;
+  while (i < s.length) {
+    var c = s.codeUnitAt(i);
+    if (c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D) { i++; continue; }
+    if (c == 0x2F && i + 1 < s.length) {
+      var d = s.codeUnitAt(i + 1);
+      if (d == 0x2F) {                                  // // to end of line
+        while (i < s.length && s.codeUnitAt(i) != 0x0A) i++;
+        continue;
+      }
+      if (d == 0x2A) {                                  // /* … */
+        i += 2;
+        while (i + 1 < s.length &&
+               !(s.codeUnitAt(i) == 0x2A && s.codeUnitAt(i + 1) == 0x2F)) i++;
+        i = (i + 1 < s.length) ? i + 2 : s.length;
+        continue;
+      }
+    }
+    break;
+  }
+  return s.substring(i);
 }
 
 // Mirror gBrSelClass into the Classes pane, so the highlighted row always agrees
@@ -1271,6 +1309,25 @@ void buildMenu() {
     log("demos rescanned — " + scanDemos().length.toString() + " found");
   });
 
+  // Apps: your own Cocoa apps, running on the App pane. The examples in apps/
+  // are filed into the image (through the usual compile gate) and then run —
+  // after that they are ordinary image classes you edit in the Browser.
+  var apps = subMenu(mainMenu, "Apps");
+  var examples = scanApps();
+  for (var a in examples) {
+    var title = a[0], path = a[1];
+    menuItem(apps, "Install " + title, "", (s) => installApp(title, path));
+  }
+  if (examples.isNotEmpty) menuSep(apps);
+  menuItem(apps, "Run Selected", "", (s) {
+    if (gAppPicker == null || gAppPicker.numberOfItems() == 0) {
+      log("no app classes in the image (an app is a class with a build(ui) method)");
+      return;
+    }
+    appRun(gAppPicker.titleOfSelectedItem().UTF8String());
+  });
+  menuItem(apps, "Stop App", "", (s) => appStop());
+
   var view = subMenu(mainMenu, "View");
   menuItem(view, "Workspace", "1", (s) => switchTab(0));
   menuItem(view, "Browser", "2", (s) => switchTab(1));
@@ -1279,6 +1336,7 @@ void buildMenu() {
   menuItem(view, "Docs", "5", (s) => switchTab(2));
   menuItem(view, "Debugger", "6", (s) => switchTab(5));
   menuItem(view, "Demos", "7", (s) => switchTab(6));
+  menuItem(view, "App", "8", (s) => switchTab(7));
   menuSep(view);
   menuItem(view, "Clear Transcript", "k", (s) {
     gLog.clear(); gTranscript.setString(""); repaint();
@@ -1414,6 +1472,12 @@ Future ask(String cmd, var arg) async {   // arg/result may be a String or a Lis
       gLangIsolateId != null) {
     await dbgReResolve();
   }
+  // An Accept morphed the running app's instance; re-running build() puts the
+  // new layout on screen with the app's state intact.
+  if (!identical(result, _kTimeout) && gLangGen == gen && gAppName != null &&
+      (cmd == 'acceptMany' || cmd == 'acceptLive' || cmd == 'accept')) {
+    await appRebuild();
+  }
   if (identical(result, _kTimeout)) {
     await respawnLanguage("'" + cmd + "' timed out — killed runaway code");
     return "ERR: " + cmd + " timed out (isolate restarted)";
@@ -1454,16 +1518,31 @@ Future<String> askDeferrable(String cmd, var arg) async {
 }
 
 // Spawn the language isolate from the scratch file, with error/exit monitoring.
+//
+// The port STAYS OPEN after the handshake. It used to be `await fromLang.first`
+// then close, which left the language isolate unable to speak first — and a
+// user app that repaints on a Timer has no request to answer, so it needs to.
+// The first SendPort to arrive is the handshake; everything after is a push.
+ReceivePort gFromLang;
+
 Future spawnLanguage() async {
   var gen = ++gLangGen;
-  var fromLang = new ReceivePort();
+  if (gFromLang != null) gFromLang.close();     // never leak the old generation
+  gFromLang = new ReceivePort();
+  var handshake = new Completer();
+  gFromLang.listen((msg) {
+    if (msg is SendPort) {
+      if (!handshake.isCompleted) handshake.complete(msg);
+      return;
+    }
+    if (msg is List && msg.length > 3 && msg[0] == 'appui') onAppPush(msg);
+  });
   var errPort = new ReceivePort();
   var exitPort = new ReceivePort();
   gLangIsolate = await Isolate.spawnUri(
-      Uri.parse('file://' + gScratch), <String>[gScratch, gDbPath], fromLang.sendPort,
+      Uri.parse('file://' + gScratch), <String>[gScratch, gDbPath], gFromLang.sendPort,
       onError: errPort.sendPort, onExit: exitPort.sendPort, errorsAreFatal: false);
-  gLang = await fromLang.first;
-  fromLang.close();
+  gLang = await handshake.future;
   errPort.listen((e) {
     var m = (e is List && e.length > 0) ? e[0].toString() : e.toString();
     log("⚠ language error: " + m);
@@ -1491,6 +1570,7 @@ Future respawnLanguage(String why) async {
   // with "press Continue first" — a ghost pause over a corpse, which reads as
   // the whole app hanging. The pause died with its isolate; say so.
   dbgForgetPause("the stopped isolate was restarted — nothing is paused now");
+  appOnRespawn();   // the user app's instance died with it too
   await spawnLanguage();   // boots from the image
   gRespawning = false;
   log("language isolate restarted (declarations reloaded from the image)");
@@ -1600,12 +1680,73 @@ Future<String> handle(String line) async {
       }
       return "ERR: no demo matching " + arg;
     }
+    case 'apps': {
+      var r = await ask('apps', '');
+      var names = _dl(r);
+      return names.isEmpty ? "(none)" : names.join('\n');
+    }
+    case 'apprun': {
+      var name = arg.trim();
+      if (name.isEmpty) return "ERR: apprun <ClassName>";
+      await appRun(name);
+      return gAppName == null
+          ? gAppStatusLbl.stringValue().UTF8String()
+          : "running " + gAppName;
+    }
+    case 'appstop': await appStop(); return "ok";
+    case 'appstatus': return gAppName == null ? "idle" : "running " + gAppName;
+    case 'apptree': {
+      if (gAppName == null) return "(no app running)";
+      var o = <String>[];
+      for (var id in gAppOrder) {
+        var v = gAppViews[id];
+        if (v == null) continue;
+        var f = v.frame();
+        o.add(id.padRight(10) + gAppKinds[id].padRight(8) +
+              '"' + appValueOf(id) + '"  ' +
+              "x=" + (f[0] as num).toStringAsFixed(0) +
+              " y=" + (f[1] as num).toStringAsFixed(0) +
+              " w=" + (f[2] as num).toStringAsFixed(0) +
+              " h=" + (f[3] as num).toStringAsFixed(0));
+      }
+      return o.isEmpty ? "(no widgets)" : o.join('\n');
+    }
+    case 'appclick': {
+      var v = gAppViews[arg.trim()];
+      if (v == null) return "ERR: no widget " + arg.trim();
+      v.performClick(null);              // the real click path, as `click` does
+      return "clicked " + arg.trim();
+    }
+    case 'appset': {
+      var sp2 = arg.indexOf(' ');
+      if (sp2 < 0) return "ERR: appset <id> <text>";
+      var id = arg.substring(0, sp2), text = arg.substring(sp2 + 1);
+      var v = gAppViews[id];
+      if (v == null) return "ERR: no widget " + id;
+      v.setStringValue(text);
+      appFire(id, 'text', text);         // as typing into it would
+      return "ok";
+    }
+    case 'appget': {
+      var s = appValueOf(arg.trim());
+      return s == null ? "ERR: no widget " + arg.trim() : s;
+    }
     case 'demostop': stopDemo("stopped"); return "ok";
+    // received vs painted: if painted stalls while received climbs, the pacer
+    // is dropping every frame — the screen is NOT showing what the demo sends.
     case 'demostatus': return gDemoTitle == null
         ? "idle"
         : (gDemoIso == null ? "finished " : "running ") + gDemoTitle +
-          " — " + gDemoFrames.toString() + " frames";
+          " — " + gDemoFrames.toString() + " frames, " +
+          gDemoPaints.toString() + " painted";
     case 'snap': return await snapshot(arg.isEmpty ? "/tmp/dartui.png" : arg);
+    // The game pane's honest pixels: the offscreen texture, not the window
+    // (cacheDisplayInRect cannot see a CAMetalLayer).
+    case 'gpsnap': {
+      var e = gpSnap(arg.isEmpty ? "/tmp/gp.png" : arg);
+      return e.isEmpty ? "ok " + (arg.isEmpty ? "/tmp/gp.png" : arg) : "ERR: " + e;
+    }
+    case 'gpstat': return gpStat().toString();
     case 'tab': switchTab(int.parse(arg)); return "ok";
     case 'brcat': selectCategory(int.parse(arg)); return "ok";
     case 'brclass': selectClass(int.parse(arg)); return "ok";
@@ -1818,11 +1959,19 @@ void editorNew() {
 // the pump is idle when the panel takes over. (MACVM hit the same hazard —
 // cocoa_gui/src/panels.rs runs its panels from a drain pass, never in a callback.)
 void _panel(String kind, void done(String path)) {
-  new Timer.run(() {
+  // Timer.run is a STATIC method, not a named constructor: `new Timer.run(…)`
+  // threw NoSuchMethodError on every click, defer's catch ate it, and the
+  // panel simply never appeared. The deferral itself is still wanted — the
+  // modal session should start from a fresh message, not nested inside the
+  // AppKit action callout.
+  Timer.run(() {
     var p = (kind == 'open')
         ? Cocoa.cls("NSOpenPanel").openPanel()
         : Cocoa.cls("NSSavePanel").savePanel();
-    p.setAllowedFileTypes(["dart"]);
+    // A Dart List is a STRUCT to this bridge (NSRect and friends); for an id
+    // argument it marshals to nil, which silently removes the filter. Build a
+    // real NSArray through the bridge instead.
+    p.setAllowedFileTypes(Cocoa.cls("NSArray").arrayWithObject("dart"));
     if (kind == 'open') {
       p.setCanChooseFiles(true);
       p.setAllowsMultipleSelection(false);
@@ -2513,6 +2662,20 @@ Future dbgEval([String expr]) async {
 //   ['draw', cmds]     replay a draw list onto the canvas (see below)
 //   ['status', text]   one line under the canvas
 //   ['done', text]     the demo is finished (logged; the isolate may then exit)
+//   ['port', ctl]      opt into PULL pacing: the UI sends a tick on [ctl] to
+//                      invite each frame; the demo answers one tick with one
+//                      ['draw', …] and needs no Timer of its own. Preferred for
+//                      anything heavy — the demo then can never outrun the
+//                      renderer, and a slow machine degrades to fewer fps with
+//                      no frame ever computed just to be dropped. (Demos that
+//                      just push at their own rate still work; the pacer below
+//                      drops what the machine can't show.)
+//                      Each tick's payload is the GAMESTATE at that instant:
+//                      [downKeycodes, modifierFlags] from dart:cocoa keyState()
+//                      (left 123, right 124, down 125, up 126, space 49, A 0,
+//                      D 2). While a demo runs on this tab, plain keys are
+//                      captured for it — Cmd shortcuts stay with the app. So an
+//                      interactive game is just a pull demo that reads its tick.
 // Draw commands, coordinates TOP-LEFT (the renderer flips into AppKit's
 // bottom-left; demos should never have to know):
 //   ['clear', r,g,b]
@@ -2529,6 +2692,61 @@ String gDemoTitle;                     // the running demo, null when idle
 int gDemoFrames = 0;
 bool gDemoFinished = false;            // saw 'done' (so exit is not news)
 const double kDemoW = 848.0, kDemoH = 352.0;
+
+// A demo whose Timer enqueues draw lists faster than the renderer can paint
+// them would let HandleAllMessages drain an ever-growing queue, pegging the
+// main thread and starving AppKit — the frozen window a sampler caught. So the
+// paint is PACED to what the machine sustains: render inline (as the message
+// pump always has — repaint() is a synchronous gWindow.display(), so it only
+// reaches the screen from this context, NOT from a Timer), then refuse to paint
+// again until at least that paint's own COST has elapsed. Frames arriving inside
+// that gap are dropped cheaply, so the queue can't grow. A demo heavier than the
+// paint rate degrades to fewer fps; it never hangs.
+var gDrawClock = new Stopwatch()..start();
+int gDrawNextDueMs = 0;                 // earliest clock time the next paint may run
+int gDemoPaints = 0;                    // frames actually painted (vs received)
+const int kMinDrawGapMs = 15;           // idle floor between paints
+SendPort gDemoCtl;                      // pull-mode demo's tick port (null = push)
+const int kPullPeriodMs = 30;           // invite pull frames at ~33fps when cheap
+
+// The game pane (GAMEPANE_PLAN.md): a demo whose first frame opens with
+// ['gpopen', …] gets the Metal engine instead of the NSImage canvas. Its
+// whole frame list goes to the native in ONE call (gpApply) — applied
+// atomically, presented at the end, so MACVM's mid-frame flicker class
+// cannot exist here. The NSView is engine-owned and reused across games.
+bool gGpMode = false;
+Cocoa gGpView;
+
+void gpEnter(List cmds) {
+  var o = cmds[0];
+  int gi(int i, int dflt) =>
+      (o.length > i && o[i] is num) ? (o[i] as num).toInt() : dflt;
+  var w = gi(1, 424), h = gi(2, 240);
+  gGpView = gpOpen(w, h, gi(3, w), gi(4, h));
+  if (gDemoView != null) {
+    gGpView.setFrame(gDemoView.frame());
+    gGpView.setAutoresizingMask(kWidthSizable + kHeightSizable);
+    gDemoView.superview().addSubview(gGpView);
+    gDemoView.setHidden(true);
+  }
+  gGpMode = true;
+  var rest = cmds.sublist(1);
+  if (rest.isNotEmpty) {
+    var e = gpApply(rest);
+    if (e != null) log("⚠ gp: " + e.toString());
+  }
+}
+
+void gpLeave() {
+  if (!gGpMode) return;
+  gpClose();
+  if (gGpView != null) {
+    try { gGpView.removeFromSuperview(); } catch (e) {}
+  }
+  gGpView = null;                       // the native keeps the NSView for reuse
+  if (gDemoView != null) gDemoView.setHidden(false);
+  gGpMode = false;
+}
 
 void buildDemosTab(Cocoa dm) {
   button(dm, "Stop", [8.0, 392.0, 64.0, 24.0], (s) => stopDemo("stopped"));
@@ -2551,6 +2769,14 @@ void buildDemosTab(Cocoa dm) {
   gDemoView.setImage(gDemoImage);
   gDemoView.setAutoresizingMask(kWidthSizable + kHeightSizable);
   dm.addSubview(gDemoView);
+  // A chrome rebuild mid-game: the engine-owned Metal view survives the
+  // teardown (it is not ours to destroy); re-seat it over the fresh canvas.
+  if (gGpMode && gGpView != null) {
+    gGpView.setFrame(gDemoView.frame());
+    gGpView.setAutoresizingMask(kWidthSizable + kHeightSizable);
+    dm.addSubview(gGpView);
+    gDemoView.setHidden(true);
+  }
   demoStatus(gDemoTitle == null
       ? "idle — pick something from the Demos menu"
       : "running " + gDemoTitle);
@@ -2676,6 +2902,7 @@ List<List<String>> scanDemos() {
 Future runDemoAt(String title, String path) async {
   stopDemo(null);
   gDemoFrames = 0;
+  gDemoPaints = 0;
   gDemoFinished = false;
   gDemoTitle = title;
   switchTab(6);
@@ -2717,6 +2944,10 @@ void stopDemo(String why) {
   if (gDemoErrPort != null) gDemoErrPort.close();
   if (gDemoExitPort != null) gDemoExitPort.close();
   gDemoPort = null; gDemoErrPort = null; gDemoExitPort = null;
+  gDemoCtl = null;                      // orphan any scheduled pull tick
+  gDrawNextDueMs = 0;                   // let the next demo paint immediately
+  keyCapture(false);                    // the keyboard back to the workspace
+  gpLeave();                            // Metal pane down, NSImage canvas back
   if (gDemoTitle != null && why != null) {
     demoStatus(gDemoTitle + " — " + why);
     log("demo " + why + " — " + gDemoTitle);
@@ -2736,10 +2967,58 @@ void _onDemoMsg(msg) {
   var kind = msg[0];
   if (kind == 'draw') {
     gDemoFrames++;
-    renderDemo(msg[1]);
+    var cmds = msg[1];
+    // gpopen is SETUP, not a frame: it must neither consume the paint budget
+    // nor schedule a tick — the game's first real frame follows immediately
+    // behind it (answering the 'port' tick), and the pacer dropping THAT
+    // frame silently eats the game's one-time scene definitions.
+    if (!gGpMode && cmds is List && cmds.isNotEmpty && cmds[0] is List &&
+        (cmds[0] as List).isNotEmpty && cmds[0][0] == 'gpopen') {
+      gpEnter(cmds);                                   // Metal pane takes over
+      return;
+    }
+    var t = gDrawClock.elapsedMilliseconds;
+    if (t >= gDrawNextDueMs) {
+      if (gGpMode) {
+        var e = gpApply(cmds);                         // one native call/frame
+        if (e != null) log("⚠ gp: " + e.toString());
+      } else {
+        renderDemo(cmds);                              // inline: display() works
+      }
+      gDemoPaints++;
+      var end = gDrawClock.elapsedMilliseconds;
+      var cost = end - t;
+      // Due time counts from the END of this paint, and the gap is at least
+      // the paint's own cost: display() only reaches the glass when the run
+      // loop goes IDLE, so every paint must buy an equal breath of idle after
+      // it. (start+cost was tried and is wrong: a queued frame is already due
+      // the moment the paint ends — back-to-back paints, no idle, frozen glass.)
+      var gap = cost > kMinDrawGapMs ? cost : kMinDrawGapMs;
+      gDrawNextDueMs = end + gap;
+      if (gDemoCtl != null) {
+        // Pull mode: invite the next frame so it lands at ~kPullPeriodMs pace
+        // when paints are cheap, and no sooner than the idle debt when they
+        // are not. The port is captured: a tick must never reach a demo that
+        // replaced the one it was scheduled for.
+        var wait = kPullPeriodMs - cost;
+        if (wait < gap) wait = gap;
+        var p = gDemoCtl;
+        new Timer(new Duration(milliseconds: wait), () {
+          // The tick carries the GAMESTATE: [downKeycodes, modifierFlags] at
+          // this instant. Non-games ignore the payload; games read their input
+          // exactly once per frame with no event queue to drain.
+          if (identical(gDemoCtl, p)) p.send(keyState());
+        });
+      }
+    }
+    // else: behind — drop this frame cheaply so the message queue can't grow
+    // (an honest pull demo is never early, so never dropped)
     if (gDemoFrames % 30 == 1 && gDemoTitle != null) {
       demoStatus(gDemoTitle + " — frame " + gDemoFrames.toString());
     }
+  } else if (kind == 'port') {
+    gDemoCtl = msg[1];
+    gDemoCtl.send(keyState());           // the first invitation starts the loop
   } else if (kind == 'status') {
     demoStatus((gDemoTitle != null ? gDemoTitle + " — " : "") + msg[1].toString());
   } else if (kind == 'done') {
@@ -2747,6 +3026,306 @@ void _onDemoMsg(msg) {
     demoStatus((gDemoTitle != null ? gDemoTitle + " — " : "") + msg[1].toString());
     log("demo done — " + msg[1].toString());
   }
+}
+
+// --- App surface (APP_PANE_PLAN.md) ------------------------------------------
+// Where a user's own Cocoa app runs. The app itself lives in the LANGUAGE
+// isolate — that is where the image, morphing hot reload, the debugger and the
+// watchdog are — and it never touches AppKit, because only this isolate may.
+// It sends widget commands; this materialises real NSViews from them and sends
+// events back. One app at a time, on one surface (M2 adds the window).
+//
+// Commands, all top-left coordinates (flipped here, so apps never meet AppKit's
+// origin):  ['clear'] ['add', kind, id, props] ['set', id, props]
+//           ['remove', id] ['title', text] ['focus', id]
+Cocoa gAppPane, gAppPicker, gAppStatusLbl, gAppTitleLbl;
+Map<String, Cocoa> gAppViews = <String, Cocoa>{};
+Map<String, String> gAppKinds = <String, String>{};
+List<String> gAppOrder = <String>[];
+List gAppSpec = <dynamic>[];      // commands since the last clear, for a rebuild
+String gAppName;                  // the running app's class, null when idle
+const double kAppW = 852.0;
+
+void buildAppTab(Cocoa ap) {
+  ap.setAutoresizesSubviews(true);
+  gAppPicker = Cocoa.cls("NSPopUpButton").alloc()
+      .initWithFrame([8.0, 390.0, 220.0, 26.0], pullsDown: false);
+  ap.addSubview(gAppPicker);
+  gAppPicker.setAutoresizingMask(kMinYMargin);
+  button(ap, "Run", [234.0, 390.0, 60.0, 26.0], (s) {
+    if (gAppPicker.numberOfItems() == 0) { appStatus("no app classes in the image"); return; }
+    appRun(gAppPicker.titleOfSelectedItem().UTF8String());
+  });
+  button(ap, "Stop App", [298.0, 390.0, 84.0, 26.0], (s) => appStop());
+  pinTop(<String>["Run", "Stop App"]);
+  gAppTitleLbl = label(ap, [392.0, 394.0, 200.0, 16.0]);
+  gAppTitleLbl.setAutoresizingMask(kMinYMargin);
+  gAppStatusLbl = label(ap, [8.0, 366.0, 852.0, 16.0]);
+  gAppStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
+
+  // The app's own canvas: widgets are subviews of THIS, so clearing an app
+  // cannot touch the workspace's chrome.
+  gAppPane = Cocoa.cls("NSView").alloc().initWithFrame([8.0, 8.0, kAppW, 352.0]);
+  gAppPane.setAutoresizingMask(kWidthSizable + kHeightSizable);
+  gAppPane.setAutoresizesSubviews(false);
+  ap.addSubview(gAppPane);
+
+  appRefreshList();
+  appStatus(gAppName == null
+      ? "idle — pick a class with a build(ui) method and press Run"
+      : "running " + gAppName);
+}
+
+void appStatus(String s) {
+  if (gAppStatusLbl != null) gAppStatusLbl.setStringValue(s);
+  repaint();
+}
+
+double appPaneHeight() {
+  if (gAppPane == null) return 352.0;
+  var b = gAppPane.bounds();
+  return (b[3] as num).toDouble();
+}
+
+/// Top-left [x,y,w,h] in the surface -> an AppKit frame in the container.
+List _appFrame(var f) {
+  if (f is! List || f.length < 4) return [0.0, 0.0, 80.0, 20.0];
+  var x = (f[0] as num).toDouble(), y = (f[1] as num).toDouble();
+  var w = (f[2] as num).toDouble(), h = (f[3] as num).toDouble();
+  return [x, appPaneHeight() - y - h, w, h];
+}
+
+// macOS keeps the legacy NSTextAlignment order: left 0, right 1, center 2.
+int _appAlign(var a) {
+  var s = (a == null) ? 'left' : a.toString();
+  if (s == 'right') return 1;
+  if (s == 'center') return 2;
+  return 0;
+}
+
+void appRefreshList() {
+  if (gAppPicker == null) return;
+  ask('apps', '').then((r) {
+    if (gAppPicker == null) return;
+    var names = _dl(r);
+    gAppPicker.removeAllItems();
+    for (var n in names) gAppPicker.addItemWithTitle(n.toString());
+    if (gAppName != null) gAppPicker.selectItemWithTitle(gAppName);
+    repaint();
+  });
+}
+
+/// Apply one batch of commands. The batch is retained so the surface can be
+/// rebuilt from it — a UI layout rebuild tears the view tree down under a
+/// running app, and it has to come back exactly as it was.
+void onAppPush(List msg) {
+  try { appApply(msg[3], true); }
+  catch (e) { log("⚠ app command dropped — " + _firstLine(e.toString())); }
+}
+
+void appApply(List cmds, bool retain) {
+  if (gAppPane == null) return;
+  for (var c in cmds) {
+    if (c is! List || c.isEmpty) continue;
+    var op = c[0];
+    if (op == 'clear') {
+      appClearViews();
+      if (retain) gAppSpec = <dynamic>[];
+      continue;
+    }
+    if (retain) gAppSpec.add(c);
+    if (op == 'add') appAdd(c[1].toString(), c[2].toString(), c[3]);
+    else if (op == 'set') appSet(c[1].toString(), c[2]);
+    else if (op == 'remove') appRemove(c[1].toString());
+    else if (op == 'title') {
+      if (gAppTitleLbl != null) gAppTitleLbl.setStringValue(c[1].toString());
+    } else if (op == 'focus') {
+      var v = gAppViews[c[1].toString()];
+      if (v != null) gWindow.makeFirstResponder(v);
+    }
+  }
+  repaint();
+}
+
+void appClearViews() {
+  if (gAppPane != null) {
+    while (gAppPane.subviews().count() > 0) {
+      gAppPane.subviews().objectAtIndex(0).removeFromSuperview();
+    }
+  }
+  gAppViews.clear();
+  gAppKinds.clear();
+  gAppOrder = <String>[];
+}
+
+void appAdd(String kind, String id, Map p) {
+  appRemove(id);                       // rebuilding over an id replaces it
+  var frame = _appFrame(p['frame']);
+  var v;
+  if (kind == 'button') {
+    v = Cocoa.cls("NSButton").alloc().initWithFrame(frame);
+    v.setTitle(p['title'] == null ? '' : p['title'].toString());
+    v.setBezelStyle(1);
+    if (p['enabled'] == false) v.setEnabled(false);
+    gTargets.add(onAction(v, (s) => defer(() => appFire(id, 'click', ''))));
+  } else if (kind == 'field') {
+    v = Cocoa.cls("NSTextField").alloc().initWithFrame(frame);
+    v.setStringValue(p['text'] == null ? '' : p['text'].toString());
+    v.setAlignment(_appAlign(p['align']));
+    if (p['readOnly'] == true) { v.setEditable(false); v.setSelectable(true); }
+    gTargets.add(onTextChange(v, (s) => defer(() =>
+        appFire(id, 'text', s.stringValue().UTF8String()))));
+    gTargets.add(onAction(v, (s) => defer(() =>
+        appFire(id, 'enter', s.stringValue().UTF8String()))));
+  } else {                             // 'label', and anything unknown
+    kind = 'label';
+    v = Cocoa.cls("NSTextField").alloc().initWithFrame(frame);
+    v.setStringValue(p['text'] == null ? '' : p['text'].toString());
+    v.setAlignment(_appAlign(p['align']));
+    v.setBezeled(false); v.setEditable(false); v.setDrawsBackground(false);
+  }
+  gAppPane.addSubview(v);
+  gAppViews[id] = v;
+  gAppKinds[id] = kind;
+  gAppOrder.add(id);
+}
+
+void appSet(String id, Map p) {
+  var v = gAppViews[id];
+  if (v == null) return;
+  if (p['text'] != null) v.setStringValue(p['text'].toString());
+  if (p['title'] != null) v.setTitle(p['title'].toString());
+  if (p['enabled'] != null) v.setEnabled(p['enabled'] == true);
+}
+
+void appRemove(String id) {
+  var v = gAppViews.remove(id);
+  if (v != null) v.removeFromSuperview();
+  gAppKinds.remove(id);
+  gAppOrder.remove(id);
+}
+
+/// A widget's current value, as the user would read it.
+String appValueOf(String id) {
+  var v = gAppViews[id];
+  if (v == null) return null;
+  var kind = gAppKinds[id];
+  if (kind == 'button') return v.title().UTF8String();
+  return v.stringValue().UTF8String();
+}
+
+/// Deliver an event to the app. Deliberately an ordinary ask(): that inherits
+/// the watchdog (a runaway handler is killed, not left hanging), the debugger's
+/// pause guard, and generation checking.
+void appFire(String id, String kind, String value) {
+  if (gAppName == null) return;
+  ask('appevent', <dynamic>[id, kind, value]).then((r) {
+    var s = r.toString();
+    if (s.startsWith('ERR')) appStatus(s);
+  });
+}
+
+Future appRun(String name) async {
+  switchTab(7);
+  appStatus("starting " + name + "…");
+  var r = await ask('apprun', <dynamic>[name, kAppW, appPaneHeight()]);
+  var s = r.toString();
+  if (s.startsWith('ERR')) {
+    gAppName = null;
+    appStatus(s);
+    log("✗ app — " + s);
+    return;
+  }
+  gAppName = name;
+  appStatus("running " + name);
+  log("app: " + name);
+}
+
+Future appStop() async {
+  if (gAppName == null) { appStatus("no app running"); return; }
+  var was = gAppName;
+  gAppName = null;
+  await ask('appstop', '');
+  appClearViews();
+  gAppSpec = <dynamic>[];
+  if (gAppTitleLbl != null) gAppTitleLbl.setStringValue("");
+  appStatus("stopped " + was);
+}
+
+/// After an Accept that changed the running app's class: the instance was
+/// MORPHED by the reload, so re-running build() changes the layout while the
+/// app's state survives. This is the whole reason the App pane exists.
+Future appRebuild() async {
+  if (gAppName == null) return;
+  var r = await ask('appbuild', <dynamic>[gAppName, kAppW, appPaneHeight()]);
+  var s = r.toString();
+  if (s.startsWith('ERR')) appStatus(s);
+}
+
+/// The language isolate was restarted: its app instance died with it.
+void appOnRespawn() {
+  if (gAppName == null) return;
+  var was = gAppName;
+  gAppName = null;
+  appClearViews();
+  gAppSpec = <dynamic>[];
+  appStatus(was + " stopped — the language isolate restarted; press Run again");
+}
+
+/// Put the surface back after a UI layout rebuild tore the view tree down.
+void appRematerialise() {
+  if (gAppName == null || gAppSpec.isEmpty) return;
+  var spec = gAppSpec;
+  gAppSpec = <dynamic>[];
+  appApply(spec, true);
+}
+
+// The Apps menu is the apps/ folder, exactly like the Demos menu: a file with
+// an "// App:" header is an app you can install into the image and run.
+String appsDir() => Platform.script.resolve('apps/').toFilePath();
+
+List<List<String>> scanApps() {
+  var out = <List<String>>[];
+  try {
+    var files = <String>[];
+    for (var f in new Directory(appsDir()).listSync()) {
+      if (f.path.endsWith('.dart')) files.add(f.path);
+    }
+    files.sort();
+    for (var path in files) {
+      var title;
+      try {
+        for (var line in new File(path).readAsLinesSync().take(5)) {
+          if (line.startsWith('// App:')) { title = line.substring(7).trim(); break; }
+        }
+      } catch (e) {}
+      if (title == null) continue;    // a library the apps import, not an app
+      out.add(<String>[title, path]);
+    }
+  } catch (e) {}
+  return out;
+}
+
+/// File an example app into the image (through the same compile gate as every
+/// other route in), then run it.
+Future installApp(String title, String path) async {
+  var src;
+  try { src = new File(path).readAsStringSync(); }
+  catch (e) { log("✗ app — cannot read " + path); return; }
+  var decls = splitTopLevel(src);
+  if (decls.isEmpty) { log("✗ app — " + path + " has no declarations"); return; }
+  var name;
+  for (var d in decls) {
+    var n = _classNameOf(d.toString());
+    if (n != null && name == null) name = n;
+  }
+  if (name == null) { log("✗ app — no class in " + path); return; }
+  var r = await checkDecls(decls);
+  if (!r.ok) { log("✗ app refused — " + r.message); return; }
+  var reply = await ask('acceptMany', decls);
+  log("✓ installed " + title + " — " + reply.toString());
+  appRefreshList();
+  await appRun(name);
 }
 
 // --- the vm-service front door (one control plane) ---------------------------
@@ -2859,6 +3438,10 @@ void rebuildUi() {
   // The demo VIEW dies with the tree; the demo IMAGE and its isolate live on —
   // buildDemosTab reattaches them, so a running demo just keeps drawing.
   gDemoView = null; gDemoStatusLbl = null;
+  // Same for the app: its instance is in the language isolate and untouched by
+  // this. The widgets die here and are replayed from the retained spec below.
+  gAppPane = null; gAppPicker = null; gAppStatusLbl = null; gAppTitleLbl = null;
+  gAppViews.clear(); gAppKinds.clear(); gAppOrder = <String>[];
   // The ObjC action targets outlive this: AppKit holds them unretained and we
   // never owned a reference. Their tickets are gone, so a stale one now fails
   // closed (dart:cocoa's dispatch returns on an unknown ticket) rather than
@@ -2876,6 +3459,7 @@ void rebuildUi() {
   gTranscript.scrollToEndOfDocument(null);
   if (edBuf != null && edBuf.length > 0) edSetText(edBuf);
   if (edStat != null && edStat.length > 0) edStatus(edStat);
+  appRematerialise();   // a running app's widgets, rebuilt from its spec
   switchTab(tab);
   log("UI layout rebuilt");
   repaint();
@@ -3023,7 +3607,8 @@ void editProjectFile(String which) {
 // OTHER declaration in the image, then the code under test. Reported lines are
 // mapped back to the buffer the user is looking at.
 const String _kProbeImports =
-    "import 'dart:cocoa';\nimport 'dart:isolate';\nimport 'dart:io';\nimport 'dart:mirrors';\n";
+    "import 'dart:cocoa';\nimport 'dart:async';\nimport 'dart:isolate';\n"
+    "import 'dart:io';\nimport 'dart:mirrors';\n";
 
 class CheckResult {
   final bool ok;
@@ -3343,6 +3928,7 @@ main() async {
   new File(gScratch).writeAsStringSync(new File(templatePath).readAsStringSync());
   await spawnLanguage();
   log("language isolate ready — image: " + gDbPath);
+  keyWatch();       // record held keys app-wide; games poll it via pull ticks
   startMetrics();   // ~4 Hz VM counters in the toolbar
   snapshotLastGood();
 

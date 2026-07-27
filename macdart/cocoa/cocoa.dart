@@ -184,6 +184,52 @@ void setSelectorAction(Cocoa control, String selector, [Cocoa target]) {
   _setSelectorAction(control.handle, selector, target == null ? 0 : target.handle);
 }
 
+// --- gamestate key poller ----------------------------------------------------
+void _keyWatch() native "Cocoa_keyWatch";
+void _keyCapture(int on) native "Cocoa_keyCapture";
+List _keyState() native "Cocoa_keyState";
+
+/// Install the app-wide key monitor (idempotent; call once at boot). From then
+/// on [keyState] answers with what is held down RIGHT NOW.
+void keyWatch() => _keyWatch();
+
+/// While on, plain key events are consumed (no beep, no typing into views) so
+/// a game owns the keyboard; Command shortcuts always pass through. Toggling
+/// clears the held-key board.
+void keyCapture(bool on) => _keyCapture(on ? 1 : 0);
+
+/// `[downKeycodes, modifierFlags]` — the gamestate at the instant of the call:
+/// a `List<int>` of macOS virtual keycodes currently held (left 123, right 124,
+/// down 125, up 126, space 49, A 0, D 2, …) and the NSEvent modifier mask.
+List keyState() => _keyState();
+
+// --- game pane (GAMEPANE_PLAN.md) --------------------------------------------
+int _gpOpen(int w, int h, int worldW, int worldH) native "Cocoa_gpOpen";
+void _gpClose() native "Cocoa_gpClose";
+dynamic _gpApply(List cmds) native "Cocoa_gpApply";
+String _gpSnap(String path) native "Cocoa_gpSnap";
+List _gpStat() native "Cocoa_gpStat";
+
+/// Open (or re-open at a new size) the Metal game pane and return its NSView
+/// to embed. Logical resolution [w]x[h] (the layer upscales, nearest); the
+/// indexed world is [worldW]x[worldH] (clamped up to the viewport).
+Cocoa gpOpen(int w, int h, int worldW, int worldH) =>
+    new Cocoa._adopt(_gpOpen(w, h, worldW, worldH));
+
+/// Tear the engine's panes down (the view survives for reuse).
+void gpClose() => _gpClose();
+
+/// Apply one frame's gp* command list and present it. Returns null, or the
+/// first error as a String (the frame is still applied best-effort).
+dynamic gpApply(List cmds) => _gpApply(cmds);
+
+/// Write the last-rendered frame (the offscreen texture — the honest pixels
+/// a window snapshot cannot see) as a PNG. "" on success, else the error.
+String gpSnap(String path) => _gpSnap(path);
+
+/// `[open, framesPresented, logicalW, logicalH]`.
+List gpStat() => _gpStat();
+
 void _setSplitMinSize(int splitView, double minSize) native "Cocoa_setSplitMinSize";
 
 /// Stop the user dragging any pane of [splitView] below [minSize] points.

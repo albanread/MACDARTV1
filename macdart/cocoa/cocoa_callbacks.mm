@@ -267,5 +267,65 @@ void Cocoa_applySpans(Dart_NativeArguments args) {
   [ts endEditing];
 }
 
+// --- gamestate key poller ----------------------------------------------------
+// Interactive demos need to know which keys are DOWN at frame time — a poller,
+// not an event stream: games read state once per frame (the UI ships it with
+// each pull tick), and no event queue can back up. One NSEvent local monitor
+// records key transitions into a bitset with NO Dart round-trip per event; the
+// UI isolate polls Cocoa_keyState when it invites a frame. While `capture` is
+// on (a demo running on the Demos tab), non-Command key events are swallowed so
+// the game's keys neither beep nor type into the workspace; Cmd shortcuts
+// (quit, tabs) stay live. Everything here runs on thread 0: the monitor fires
+// on the main thread and the natives are called by the UI isolate.
+static bool g_keys_down[128];      // virtual keycode -> currently held
+static uint64_t g_key_mods = 0;    // NSEvent modifierFlags as last seen
+static bool g_key_capture = false;
+static id g_key_monitor = nil;
+
+void Cocoa_keyWatch(Dart_NativeArguments args) {
+  if (g_key_monitor != nil) return;
+  g_key_monitor = [[NSEvent
+      addLocalMonitorForEventsMatchingMask:(NSEventMaskKeyDown |
+                                            NSEventMaskKeyUp |
+                                            NSEventMaskFlagsChanged)
+      handler:^NSEvent*(NSEvent* e) {
+        NSEventType ty = [e type];
+        if (ty == NSEventTypeFlagsChanged) {
+          g_key_mods = (uint64_t)[e modifierFlags];
+          return e;                          // modifiers always pass through
+        }
+        unsigned short kc = [e keyCode];
+        if (kc < 128) g_keys_down[kc] = (ty == NSEventTypeKeyDown);
+        if (g_key_capture &&
+            !([e modifierFlags] & NSEventModifierFlagCommand)) {
+          return nil;                        // consumed by the game
+        }
+        return e;
+      }] retain];
+}
+
+void Cocoa_keyCapture(Dart_NativeArguments args) {
+  int64_t on = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &on);
+  g_key_capture = (on != 0);
+  // Capture edges clear the board: a key held across the toggle would
+  // otherwise stay stuck down if its keyUp lands elsewhere.
+  memset(g_keys_down, 0, sizeof(g_keys_down));
+}
+
+void Cocoa_keyState(Dart_NativeArguments args) {
+  int n = 0;
+  for (int i = 0; i < 128; i++) if (g_keys_down[i]) n++;
+  Dart_Handle down = Dart_NewList(n);
+  int j = 0;
+  for (int i = 0; i < 128; i++) {
+    if (g_keys_down[i]) Dart_ListSetAt(down, j++, Dart_NewInteger(i));
+  }
+  Dart_Handle out = Dart_NewList(2);
+  Dart_ListSetAt(out, 0, down);
+  Dart_ListSetAt(out, 1, Dart_NewInteger((int64_t)g_key_mods));
+  Dart_SetReturnValue(args, out);
+}
+
 }  // namespace bin
 }  // namespace dart

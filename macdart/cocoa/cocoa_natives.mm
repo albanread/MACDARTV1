@@ -92,6 +92,23 @@ static Dart_Handle CocoaType() {
   return Dart_HandleFromPersistent(g_cocoa_type);
 }
 
+// The Cocoa field names, cached as persistent handles. These are set on EVERY
+// wrapped object and read on EVERY send, so re-creating the String each time
+// (and, for MakeCocoa, resolving a constructor by name) showed up as the
+// dominant cost of a heavy demo frame in a sampler — enough to starve the UI.
+static Dart_PersistentHandle g_handle_name = NULL;
+static Dart_PersistentHandle g_wph_name = NULL;
+static Dart_Handle HandleName() {
+  if (g_handle_name == NULL)
+    g_handle_name = Dart_NewPersistentHandle(Dart_NewStringFromCString("_handle"));
+  return Dart_HandleFromPersistent(g_handle_name);
+}
+static Dart_Handle WphName() {
+  if (g_wph_name == NULL)
+    g_wph_name = Dart_NewPersistentHandle(Dart_NewStringFromCString("_wph"));
+  return Dart_HandleFromPersistent(g_wph_name);
+}
+
 // Observability: balance of retain-on-wrap vs release-on-finalize (a growing
 // gap that never settles indicates a leak). Finalizers may run off the mutator
 // thread, so these are atomic.
@@ -126,8 +143,17 @@ static bool IsInitFamily(const char* sel) {
 }
 
 static Dart_Handle MakeCocoa(int64_t handle) {
-  Dart_Handle argv[1] = {Dart_NewInteger(handle)};
-  return Dart_New(CocoaType(), Dart_NewStringFromCString("_adopt"), 1, argv);
+  // Dart_Allocate, NOT Dart_New("_adopt"): the constructor send re-resolved
+  // `_adopt` by name (a private-key string scan) on every wrap and dominated
+  // the render hot path. Allocate skips the constructor, so we set the two
+  // fields Cocoa._adopt/its initializer would have — _handle, and _wph = 0.
+  Dart_Handle type = CocoaType();
+  if (Dart_IsError(type)) return type;
+  Dart_Handle obj = Dart_Allocate(type);
+  if (Dart_IsError(obj)) return obj;
+  Dart_SetField(obj, HandleName(), Dart_NewInteger(handle));
+  Dart_SetField(obj, WphName(), Dart_NewInteger(0));
+  return obj;
 }
 
 // Wrap an object return in a Cocoa. Non-+1-family results are retained so the
@@ -141,8 +167,7 @@ static Dart_Handle WrapObject(id obj, const char* sel) {
   if (!IsPlusOneFamily(sel)) [obj retain];
   Dart_WeakPersistentHandle wph =
       Dart_NewWeakPersistentHandle(cocoa, (void*)obj, 0, ReleaseFinalizer);
-  Dart_SetField(cocoa, Dart_NewStringFromCString("_wph"),
-                Dart_NewInteger((int64_t)wph));
+  Dart_SetField(cocoa, WphName(), Dart_NewInteger((int64_t)wph));
   g_wraps.fetch_add(1);
   return cocoa;
 }
@@ -169,7 +194,7 @@ static void PoisonReceiver(Dart_Handle receiver) {
 // fixed-shape shim, and returns the result as the matching Dart value.
 static void Cocoa_send(Dart_NativeArguments args) {
   Dart_Handle receiver = Dart_GetNativeArgument(args, 0);
-  Dart_Handle hf = Dart_GetField(receiver, Dart_NewStringFromCString("_handle"));
+  Dart_Handle hf = Dart_GetField(receiver, HandleName());
   int64_t h = 0;
   if (!Dart_IsError(hf)) Dart_IntegerToInt64(hf, &h);
   id target = (id)h;
@@ -354,6 +379,17 @@ void Cocoa_registerCallbackDispatch(Dart_NativeArguments args);
 void Cocoa_makeActionTarget(Dart_NativeArguments args);
 void Cocoa_wireAction(Dart_NativeArguments args);
 void Cocoa_applySpans(Dart_NativeArguments args);
+void Cocoa_keyWatch(Dart_NativeArguments args);
+void Cocoa_keyCapture(Dart_NativeArguments args);
+void Cocoa_keyState(Dart_NativeArguments args);
+
+// Game pane natives (defined in gamepane/gp_natives.mm) — the Metal-layered
+// retro engine behind the Demos tab's gp* verbs (GAMEPANE_PLAN.md).
+void Cocoa_gpOpen(Dart_NativeArguments args);
+void Cocoa_gpClose(Dart_NativeArguments args);
+void Cocoa_gpApply(Dart_NativeArguments args);
+void Cocoa_gpSnap(Dart_NativeArguments args);
+void Cocoa_gpStat(Dart_NativeArguments args);
 
 // SQLite image store (defined in sqlite_natives.cc).
 void Sqlite_open(Dart_NativeArguments args);
@@ -385,6 +421,14 @@ void Sqlite_query(Dart_NativeArguments args);
   V(Cocoa_makeActionTarget, 1)                                                 \
   V(Cocoa_wireAction, 2)                                                       \
   V(Cocoa_applySpans, 2)                                                       \
+  V(Cocoa_keyWatch, 0)                                                         \
+  V(Cocoa_keyCapture, 1)                                                       \
+  V(Cocoa_keyState, 0)                                                         \
+  V(Cocoa_gpOpen, 4)                                                           \
+  V(Cocoa_gpClose, 0)                                                          \
+  V(Cocoa_gpApply, 1)                                                          \
+  V(Cocoa_gpSnap, 1)                                                           \
+  V(Cocoa_gpStat, 0)                                                           \
   V(Sqlite_open, 1)                                                            \
   V(Sqlite_close, 1)                                                           \
   V(Sqlite_exec, 3)                                                            \

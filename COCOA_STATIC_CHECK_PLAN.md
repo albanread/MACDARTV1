@@ -105,12 +105,21 @@ the rest at runtime, and the process never dies from a typo again.
 
 ## 5. Rollout
 
-1. **Layer 1 + the query natives** (this step): louder, class-aware exceptions
-   in `Cocoa_send`; `cocoaClassExists` / `cocoaSelectorInfo` querying the
-   runtime; verified headlessly through the standalone `dart` (the bridge links
-   there too, no window needed). `cocoaNearestSelectors` lands with the lint.
-2. **The lint pass** over the direct + local-dataflow shapes, wired into the
-   Accept compile-check with line mapping; the "did you mean" surfaces here.
+1. **Layer 1 + the query natives — DONE.** Louder, class-aware exceptions in
+   `Cocoa_send`; `cocoaClassExists` / `cocoaSelectorInfo` / `cocoaNearestSelectors`
+   querying the runtime (all three shipped up front). Verified headlessly.
+2. **The lint pass — DONE.** `cocoaLint(src)` in workspace.dart: a small
+   dedicated tokenizer (lexDart drops punctuation, so the lint needs its own),
+   the direct `Cocoa.cls("X").sel(...)` shape and the `var c = Cocoa.cls("X")`
+   local-dataflow shape, selector rebuilt exactly as `noSuchMethod` does. Runs
+   warn-only inside `guardedAccept` after the compile check (never blocks), and
+   is drivable headlessly via the `colint <source>` control verb. Catches
+   unknown class, unknown selector (+ "did you mean"), and the FP-register limit
+   (count `d`/`f` in the `@encode` after the `:` marker). Two gotchas learned:
+   skip Cocoa's own Dart members (`send`/`toString`/`handle`…) and require
+   parentheses (so bare getters like `.isNil` are not linted); and "has args"
+   must be decided from the token after `(`, not from seeing an identifier
+   (numbers tokenise as punctuation, so `fillRect([…])` looked 0-arg otherwise).
 3. **Optional BridgeSupport enrichment** — parse the framework XML into the
    SQLite image for concrete return-class inference on chains, plus free
    functions / constants / enums.

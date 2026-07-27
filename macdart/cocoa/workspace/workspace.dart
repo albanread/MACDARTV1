@@ -1782,6 +1782,10 @@ Future<String> handle(String line) async {
       var e = gpSnap(arg.isEmpty ? "/tmp/gp.png" : arg);
       return e.isEmpty ? "ok " + (arg.isEmpty ? "/tmp/gp.png" : arg) : "ERR: " + e;
     }
+    case 'colint': {                       // COCOA_STATIC_CHECK_PLAN.md §2
+      var f = cocoaLint(arg);
+      return f.isEmpty ? "clean" : f.join('\n');
+    }
     case 'gpstat': return gpStat().toString();
     case 'gpfull': gpFullscreen(arg.trim() == '1'); return "ok";
     case 'tab': switchTab(int.parse(arg)); return "ok";
@@ -3798,6 +3802,160 @@ Future<CheckResult> checkDecls(List decls) async {
   return await compileCheck(decls.join("\n\n"), replacing: names);
 }
 
+// --- Accept-time Cocoa lint (COCOA_STATIC_CHECK_PLAN.md §2) ------------------
+// Best-effort static check of dynamic Cocoa sends against the one database we
+// own — the loaded runtime (the cocoa* query natives). It recognises the two
+// shapes that carry a known class: `Cocoa.cls("X").sel(...)` and a local
+// `var c = Cocoa.cls("X")` then `c.sel(...)`. It rebuilds the ObjC selector the
+// way noSuchMethod does, then flags an unknown class, an unknown selector (with
+// a "did you mean"), or a call that trips the 8-FP-register marshaling limit.
+// Anything it cannot resolve it leaves alone; the louder runtime exceptions are
+// the net for the rest. Findings are WARNINGS — they never block Accept.
+
+class _CTok {                          // 0 ident, 1 string-content, 2 punct
+  final int kind; final String text; final int pos;
+  _CTok(this.kind, this.text, this.pos);
+}
+
+List<_CTok> _cocoaTokens(String s) {
+  var out = <_CTok>[]; var n = s.length, i = 0;
+  while (i < n) {
+    var c = s.codeUnitAt(i);
+    if (c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D) { i++; continue; }
+    if (c == 0x2F && i + 1 < n) {                       // comments
+      var d = s.codeUnitAt(i + 1);
+      if (d == 0x2F) { while (i < n && s.codeUnitAt(i) != 0x0A) i++; continue; }
+      if (d == 0x2A) { i += 2;
+        while (i + 1 < n && !(s.codeUnitAt(i) == 0x2A && s.codeUnitAt(i + 1) == 0x2F)) i++;
+        i = (i + 1 < n) ? i + 2 : n; continue; }
+    }
+    if (c == 0x27 || c == 0x22) {                       // string -> its content
+      var q = c, st = i; i++; var buf = new StringBuffer();
+      var triple = st + 2 < n && s.codeUnitAt(st + 1) == q && s.codeUnitAt(st + 2) == q;
+      if (triple) { i = st + 3;
+        while (i + 2 < n && !(s.codeUnitAt(i) == q && s.codeUnitAt(i + 1) == q && s.codeUnitAt(i + 2) == q)) { buf.writeCharCode(s.codeUnitAt(i)); i++; }
+        i = (i + 2 < n) ? i + 3 : n;
+      } else {
+        while (i < n && s.codeUnitAt(i) != q && s.codeUnitAt(i) != 0x0A) {
+          if (s.codeUnitAt(i) == 0x5C && i + 1 < n) i++;
+          buf.writeCharCode(s.codeUnitAt(i)); i++;
+        }
+        if (i < n && s.codeUnitAt(i) == q) i++;
+      }
+      out.add(new _CTok(1, buf.toString(), st)); continue;
+    }
+    if (_isIdentStart(c)) { var st = i; i++;
+      while (i < n && _isIdentPart(s.codeUnitAt(i))) i++;
+      out.add(new _CTok(0, s.substring(st, i), st)); continue;
+    }
+    out.add(new _CTok(2, new String.fromCharCode(c), i)); i++;   // one punct char
+  }
+  return out;
+}
+
+bool _tokIdent(List<_CTok> t, int i, String name) =>
+    i >= 0 && i < t.length && t[i].kind == 0 && t[i].text == name;
+bool _tokPunct(List<_CTok> t, int i, String ch) =>
+    i >= 0 && i < t.length && t[i].kind == 2 && t[i].text == ch;
+
+int _lineAt(String src, int pos) {
+  var line = 1;
+  for (var i = 0; i < pos && i < src.length; i++) if (src.codeUnitAt(i) == 0x0A) line++;
+  return line;
+}
+
+// Cocoa's OWN Dart members — not ObjC selectors, so never lint them.
+const List<String> _cocoaOwnMembers =
+    const <String>['send', 'toString', 'noSuchMethod', 'hashCode', 'runtimeType', 'cls'];
+
+// Rebuild the selector from a parenthesised call: name + ':' + one 'label:' per
+// named argument (noSuchMethod's own rule); a call with no args is the bare name.
+String _reconSelector(List<_CTok> toks, String method, int open) {
+  // Any content between the parens means at least one arg (numbers tokenise as
+  // punct, so "did we see an identifier" is NOT a reliable has-args test).
+  var first = open + 1;
+  if (first >= toks.length || _tokPunct(toks, first, ')')) return method;   // 0-arg
+  var i = first, depth = 1; var labels = <String>[]; var argStart = true;
+  while (i < toks.length && depth > 0) {
+    var t = toks[i];
+    if (t.kind == 2) {
+      if (t.text == '(' || t.text == '[' || t.text == '{') { depth++; argStart = false; }
+      else if (t.text == ')' || t.text == ']' || t.text == '}') { depth--; if (depth == 0) break; argStart = false; }
+      else if (t.text == ',' && depth == 1) { argStart = true; }
+      else argStart = false;
+    } else {
+      if (depth == 1 && argStart && t.kind == 0 && _tokPunct(toks, i + 1, ':')) labels.add(t.text);
+      argStart = false;
+    }
+    i++;
+  }
+  var sel = new StringBuffer()..write(method)..write(':');
+  for (var l in labels) sel..write(l)..write(':');
+  return sel.toString();
+}
+
+void _lintSend(List<String> out, String src, String cls, List<_CTok> toks, int mi) {
+  var method = toks[mi].text;
+  if (_cocoaOwnMembers.contains(method)) return;
+  if (!_tokPunct(toks, mi + 1, '(')) return;            // only parenthesised calls
+  var sel = _reconSelector(toks, method, mi + 1);
+  var info = cocoaSelectorInfo(cls, sel);
+  var line = _lineAt(src, toks[mi].pos);
+  if (info == null) {
+    var msg = 'L' + line.toString() + ': ' + cls + ' has no selector "' + sel + '"';
+    var near = cocoaNearestSelectors(cls, sel);
+    if (near is List && near.isNotEmpty) msg += ' — did you mean ' + near.take(3).join(', ');
+    out.add(msg);
+  } else {
+    var enc = info.length > 2 ? info[2].toString() : '';
+    var colon = enc.indexOf(':');                       // the _cmd marker; args follow
+    if (colon >= 0) {
+      var fp = 0;
+      for (var k = colon + 1; k < enc.length; k++) {
+        var ch = enc.codeUnitAt(k);
+        if (ch == 0x64 || ch == 0x66) fp++;             // 'd' double / 'f' float
+      }
+      if (fp > 8) out.add('L' + line.toString() + ': ' + cls + '.' + sel +
+          ' passes ' + fp.toString() + ' float args — the bridge marshals only 8 in registers; the rest arrive as garbage');
+    }
+  }
+}
+
+/// Lint [src] for suspect Cocoa sends; returns human-readable findings.
+List<String> cocoaLint(String src) {
+  var out = <String>[];
+  var toks = _cocoaTokens(src);
+  // pass 1: local vars bound directly to a class — `... name = Cocoa.cls("X")`
+  var varClass = <String, String>{};
+  for (var i = 1; i + 5 < toks.length; i++) {
+    if (_tokPunct(toks, i, '=') && _tokIdent(toks, i + 1, 'Cocoa') &&
+        _tokPunct(toks, i + 2, '.') && _tokIdent(toks, i + 3, 'cls') &&
+        _tokPunct(toks, i + 4, '(') && toks[i + 5].kind == 1 &&
+        toks[i - 1].kind == 0) {
+      varClass[toks[i - 1].text] = toks[i + 5].text;
+    }
+  }
+  // pass 2: check the two send shapes
+  for (var i = 0; i < toks.length; i++) {
+    if (_tokIdent(toks, i, 'Cocoa') && _tokPunct(toks, i + 1, '.') &&
+        _tokIdent(toks, i + 2, 'cls') && _tokPunct(toks, i + 3, '(') &&
+        i + 5 < toks.length && toks[i + 4].kind == 1 && _tokPunct(toks, i + 5, ')')) {
+      var cls = toks[i + 4].text;
+      if (!cocoaClassExists(cls)) {
+        out.add('L' + _lineAt(src, toks[i].pos).toString() + ': no such class "' + cls + '"');
+        continue;
+      }
+      if (_tokPunct(toks, i + 6, '.') && i + 7 < toks.length && toks[i + 7].kind == 0) {
+        _lintSend(out, src, cls, toks, i + 7);
+      }
+    } else if (toks[i].kind == 0 && varClass.containsKey(toks[i].text) &&
+               _tokPunct(toks, i + 1, '.') && i + 2 < toks.length && toks[i + 2].kind == 0) {
+      _lintSend(out, src, varClass[toks[i].text], toks, i + 2);
+    }
+  }
+  return out;
+}
+
 Future guardedAccept(List decls, String what, void commit()) async {
   if (gDbgPaused) {
     log("✗ " + what + " refused — the language isolate is stopped in the debugger; Continue first");
@@ -3814,6 +3972,15 @@ Future guardedAccept(List decls, String what, void commit()) async {
     log("✗ " + what + " refused — " + r.message);
     if (r.line > 0) _selectLine(r.line);
     return;
+  }
+  // Compiles — now lint the Cocoa sends. Warnings only: they inform, never
+  // block (best-effort static analysis of a dynamic bridge; the runtime net
+  // catches whatever this misses). See COCOA_STATIC_CHECK_PLAN.md §2.
+  var warned = 0;
+  for (var d in decls) {
+    for (var f in cocoaLint(d.toString())) {
+      if (warned++ < 12) log("⚠ cocoa — " + f);
+    }
   }
   commit();
 }

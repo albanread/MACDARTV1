@@ -294,6 +294,7 @@ void switchTab(int i) {
   if (i == 4) editorRefreshClasses();
   if (i == 5 && gLangIsolateId != null) dbgLoadSource();
   if (i == 7) appRefreshList();
+  if (i == 2) helpStart();   // index on first use, not at startup
   // The keyboard belongs to a game only while the user is watching it: leaving
   // the Demos tab returns every key to the workspace, coming back re-arms.
   keyCapture(i == 6 && gDemoTitle != null);
@@ -366,11 +367,8 @@ void buildChrome() {
   // Browser tab: a Smalltalk-style class browser (World / User App).
   buildBrowserTab(addTab(gTabView, "browser", 868.0, 420.0));
 
-  // Docs tab.
-  var dc = addTab(gTabView, "docs", 868.0, 420.0);
-  var docs = scrolledTextView(dc, [8.0, 8.0, 852.0, 404.0], false);
-  docs.setString(_docsText);
-  anchorScroll(docs, kWidthSizable + kHeightSizable);
+  // Docs tab: the workspace guide, and searchable Dart V1 help beside it.
+  buildDocsTab(addTab(gTabView, "docs", 868.0, 420.0));
 
   // Find tab.
   buildFindTab(addTab(gTabView, "find", 868.0, 420.0));
@@ -1713,6 +1711,29 @@ Future<String> handle(String line) async {
         }
       }
       return "ERR: no demo matching " + arg;
+    }
+    case 'helpsearch': {
+      await helpStart();
+      if (!await helpSettle()) return "ERR: the help index is not up";
+      helpSearch(arg);
+      await new Future.delayed(const Duration(milliseconds: 250));
+      var o = <String>[];
+      for (var r in gHelpRows) {
+        o.add(r[1].toString().padRight(10) + r[2].toString().padRight(17) + " " +
+              r[3].toString());
+      }
+      return o.isEmpty ? "(nothing matches " + arg + ")" : o.join('\n');
+    }
+    case 'helpsel': {
+      helpSelect(int.parse(arg.trim(), onError: (_) => 0));
+      await new Future.delayed(const Duration(milliseconds: 250));
+      return gHelpDetail.isEmpty ? "(nothing selected)" : _firstLine(gHelpDetail);
+    }
+    case 'helptext': return gHelpDetail;
+    case 'helpcount': {
+      await helpStart();
+      await helpSettle();
+      return gHelpCount.toString();
     }
     case 'apps': {
       var r = await ask('apps', '');
@@ -3082,6 +3103,167 @@ void _onDemoMsg(msg) {
   }
 }
 
+// --- Help: searchable Dart V1 reference --------------------------------------
+// The Docs tab is the workspace guide PLUS a search over the Dart V1 language
+// itself: every documented declaration in the SDK libraries this VM was built
+// from, the language specification, and dart:cocoa. Nothing is transcribed —
+// see help/indexer.dart — so the help cannot describe a language other than the
+// one you are running.
+//
+// The index lives in its own isolate: parsing ~9MB of source on thread 0 would
+// stall the window, and this isolate is the one that must never stall. Spawned
+// on first use, so startup pays nothing.
+Cocoa gHelpField, gHelpTable, gHelpText, gHelpStatusLbl;
+SendPort gHelpPort;                    // the indexer, once it is up
+ReceivePort gHelpFrom;
+List gHelpRows = <dynamic>[];          // [id, kind, where, name, summary]
+int gHelpCount = 0;
+bool gHelpStarting = false;
+String gHelpQuery = '';
+String gHelpDetail = '';
+
+void buildDocsTab(Cocoa dc) {
+  dc.setAutoresizesSubviews(true);
+  label(dc, [8.0, 394.0, 44.0, 18.0]).setStringValue("Search");
+  gHelpField = Cocoa.cls("NSTextField").alloc().initWithFrame([56.0, 390.0, 320.0, 24.0]);
+  var hf = _mono(12.0); if (!hf.isNil) gHelpField.setFont(hf);
+  dc.addSubview(gHelpField);
+  gHelpField.setAutoresizingMask(kMinYMargin);
+  gTargets.add(onTextChange(gHelpField, (s) =>
+      defer(() => helpSearch(s.stringValue().UTF8String()))));
+  button(dc, "Guide", [384.0, 389.0, 68.0, 26.0], (s) => helpShowGuide());
+  pinTop(<String>["Guide"]);
+  gHelpStatusLbl = label(dc, [460.0, 394.0, 400.0, 18.0]);
+  gHelpStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
+
+  // results on the left, the entry itself on the right
+  var split = splitView([8.0, 8.0, 852.0, 374.0], true);
+  var listPane = browserPane(split, 300.0, 374.0);
+  gHelpTable = tableIn(listPane, [0.0, 0.0, 300.0, 374.0]);
+  gTargets.add(onTable(gHelpTable, () => gHelpRows.length,
+      (r) => gHelpRows[r][3].toString(), sel(helpSelect)));
+  var textPane = browserPane(split, 544.0, 374.0);
+  gHelpText = scrolledTextView(textPane, [0.0, 0.0, 544.0, 374.0], false);
+  var mf = _mono(12.0);
+  if (!mf.isNil) gHelpText.setFont(mf);
+  anchorScroll(gHelpText, kWidthSizable + kHeightSizable);
+  split.adjustSubviews();
+  split.setPosition(300.0, ofDividerAtIndex: 0);
+  setSplitMinSize(split, 140.0);
+  dc.addSubview(split);
+
+  gHelpText.setString(gHelpDetail.isEmpty ? _docsText : gHelpDetail);
+  helpStatus(gHelpCount > 0
+      ? (gHelpCount.toString() + " entries — search the language, the libraries and dart:cocoa")
+      : "type to search the Dart V1 language and libraries");
+}
+
+void helpStatus(String s) {
+  if (gHelpStatusLbl != null) gHelpStatusLbl.setStringValue(s);
+  repaint();
+}
+
+void helpShowGuide() {
+  gHelpDetail = _docsText;
+  if (gHelpText != null) gHelpText.setString(_docsText);
+  repaint();
+}
+
+/// Bring the indexer up. Spawned once, on first use.
+Future helpStart() async {
+  if (gHelpPort != null || gHelpStarting) return;
+  gHelpStarting = true;
+  gHelpFrom = new ReceivePort();
+  gHelpFrom.listen(onHelpMsg);
+  var here = Platform.script;
+  var sdkLib = here.resolve('../../../sdk/sdk/lib').toFilePath();
+  var spec = here.resolve('../../../sdk/docs/language/dartLangSpec.tex').toFilePath();
+  var cocoa = here.resolve('../cocoa.dart').toFilePath();
+  helpStatus("indexing the SDK and the language spec…");
+  try {
+    await Isolate.spawnUri(here.resolve('help/indexer.dart'),
+        <String>[sdkLib, spec, cocoa], gHelpFrom.sendPort);
+  } catch (e) {
+    gHelpStarting = false;
+    helpStatus("help: could not start the indexer — " + _firstLine(e.toString()));
+  }
+}
+
+void onHelpMsg(msg) {
+  try {
+    if (msg is! List || msg.isEmpty) return;
+    var kind = msg[0];
+    if (kind == 'port') {
+      gHelpPort = msg[1];
+      gHelpStarting = false;
+      if (gHelpQuery.isNotEmpty) gHelpPort.send(<dynamic>['q', gHelpQuery]);
+    } else if (kind == 'ready') {
+      gHelpCount = msg[1];
+      helpStatus(gHelpCount.toString() +
+          " entries — the SDK this VM was built from, the language spec, dart:cocoa");
+    } else if (kind == 'status') {
+      helpStatus(msg[1].toString());
+    } else if (kind == 'results') {
+      if (msg[1].toString() != gHelpQuery) return;   // a stale query's answer
+      gHelpRows = msg[2];
+      gHelpTable.reloadData();
+      helpStatus(gHelpRows.isEmpty
+          ? ("nothing matches '" + gHelpQuery + "'")
+          : (gHelpRows.length.toString() + " for '" + gHelpQuery + "'"));
+      if (gHelpRows.isNotEmpty) helpSelect(0);
+    } else if (kind == 'detail') {
+      gHelpDetail = msg[2].toString();
+      gHelpText.setString(gHelpDetail);
+      gHelpText.scrollRangeToVisible([0, 0]);
+      repaint();
+    }
+  } catch (e) {
+    log("⚠ help message dropped — " + _firstLine(e.toString()));
+  }
+}
+
+void helpSearch(String q) {
+  gHelpQuery = q.trim();
+  if (gHelpPort == null) { helpStart(); return; }
+  if (gHelpQuery.isEmpty) {
+    gHelpRows = <dynamic>[];
+    gHelpTable.reloadData();
+    helpShowGuide();
+    helpStatus(gHelpCount.toString() + " entries — type to search");
+    return;
+  }
+  gHelpPort.send(<dynamic>['q', gHelpQuery]);
+}
+
+void helpSelect(int row) {
+  if (row < 0 || row >= gHelpRows.length) return;
+  // selectRowIndexes:, not the deprecated selectRow: — an unknown selector
+  // aborts the process, so only the form already proven here is used.
+  if (gHelpTable != null) {
+    gHelpTable.selectRowIndexes(
+        Cocoa.cls("NSIndexSet").indexSetWithIndex(row), byExtendingSelection: false);
+    gHelpTable.scrollRowToVisible(row);
+  }
+  if (gHelpPort == null) return;
+  gHelpPort.send(<dynamic>['get', gHelpRows[row][0]]);
+}
+
+/// Wait for the index and a query to settle — `settle` cannot see this work
+/// because it happens in another isolate.
+Future helpSettle([int maxMs = 60000]) async {
+  var waited = 0;
+  while (gHelpPort == null && waited < maxMs) {
+    await new Future.delayed(const Duration(milliseconds: 50));
+    waited += 50;
+  }
+  while (gHelpCount == 0 && waited < maxMs) {
+    await new Future.delayed(const Duration(milliseconds: 50));
+    waited += 50;
+  }
+  await new Future.delayed(const Duration(milliseconds: 120));
+  return gHelpCount > 0;
+}
+
 // --- App surface (APP_PANE_PLAN.md) ------------------------------------------
 // Where a user's own Cocoa app runs. The app itself lives in the LANGUAGE
 // isolate — that is where the image, morphing hot reload, the debugger and the
@@ -3526,6 +3708,7 @@ void rebuildUi() {
   // Same for the app: its instance is in the language isolate and untouched by
   // this. The widgets die here and are replayed from the retained spec below.
   gAppPane = null; gAppPicker = null; gAppStatusLbl = null; gAppTitleLbl = null;
+  gHelpField = null; gHelpTable = null; gHelpText = null; gHelpStatusLbl = null;
   gAppViews.clear(); gAppKinds.clear(); gAppOrder = <String>[];
   // The ObjC action targets outlive this: AppKit holds them unretained and we
   // never owned a reference. Their tickets are gone, so a stale one now fails
@@ -4134,7 +4317,16 @@ TABS (View menu, Cmd-1..7)
   Browser    a Smalltalk-style class browser over the image and the world.
   Editor     one whole class as text, with Analyze and Format.
   Find       name search and senders over the image.
-  Docs       this page.
+  Docs       this page, and SEARCHABLE DART V1 HELP beside it. Type in the
+             search box: every documented declaration in the SDK libraries this
+             VM was built from, every section of the Dart 1.24 language
+             specification, and dart:cocoa. Nothing is transcribed - the index
+             is parsed from those files (help/indexer.dart, in its own isolate),
+             so it cannot describe a language other than the one you are
+             running, and every entry cites its own file:line. Search a name
+             (Future, String.substring, spawnUri) or a keyword the libraries
+             cannot explain (await, async*, mixin, cascade). Guide comes back
+             here.
   Debugger   breakpoints, stepping and evaluation in the language isolate.
   Demos      a canvas that demo programs draw on. Each demo in demos/ runs in
              its OWN isolate (some spawn workers of their own) and sends draw

@@ -256,6 +256,25 @@ ui appclick k=
 check "and multiplies"       [ui appget d] 45
 ui appstop
 
+section "searchable Dart V1 help"
+# The index is parsed from the SDK this VM was built from, the language spec and
+# dart:cocoa — so these checks also assert the sources are still where we think.
+check "index built"        [expr {[ui helpcount] > 1500}] 1
+check "finds a class"      [expr {[string match {*dart:async*Future*} [ui helpsearch Future]]}] 1
+check "finds a member"     [expr {[string match {*String.substring*} [ui helpsearch substring]]}] 1
+check "finds the spec"     [expr {[string match {*spec*Await Expressions*} [ui helpsearch await]]}] 1
+check "finds dart:cocoa"   [expr {[string match {*dart:cocoa*wsEval*} [ui helpsearch wsEval]]}] 1
+# a keyword the libraries can never explain — only the spec can
+check "finds a keyword"    [expr {[string match {*spec*Yield*} [ui helpsearch {async*}]]}] 1
+check "hides private impl" [expr {![string match {*_Future*} [ui helpsearch Future]]}] 1
+ui helpsearch {String.substring}
+ui helpsel 0
+check "detail has the signature" \
+    [expr {[string match {*String substring(int startIndex*} [ui helptext]]}] 1
+check "detail cites its source" \
+    [expr {[string match {*sdk/lib/core/string.dart:*} [ui helptext]]}] 1
+check "gui alive after search" [ui ping] pong
+
 section "cleanup"
 ui remove TclOk
 ui remove DbgT

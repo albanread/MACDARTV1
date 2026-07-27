@@ -206,8 +206,20 @@ static void Cocoa_send(Dart_NativeArguments args) {
   // instance and class sends — a class's metaclass holds its class methods).
   Method m = class_getInstanceMethod(object_getClass(target), sel);
   if (m == NULL) {
-    Dart_ThrowException(Dart_NewStringFromCString(
-        "dart:cocoa: unknown selector (no method for this class)"));
+    // Name names: a not-found class shows up here as a nil receiver (Cocoa.cls
+    // of a typo'd name yields handle 0), which is a DIFFERENT mistake from a
+    // real object that lacks the selector. Say which. (Layer 1 of
+    // COCOA_STATIC_CHECK_PLAN.md; the Accept-time lint catches most before here.)
+    char buf[256];
+    if (target == nil) {
+      snprintf(buf, sizeof(buf),
+               "dart:cocoa: send to nil — a class was not found (selector '%s')",
+               sel_name ? sel_name : "?");
+    } else {
+      snprintf(buf, sizeof(buf), "dart:cocoa: %s has no selector '%s'",
+               class_getName(object_getClass(target)), sel_name ? sel_name : "?");
+    }
+    Dart_ThrowException(Dart_NewStringFromCString(buf));
     return;
   }
   int ret_tok = 0, arg_toks[16];
@@ -299,6 +311,108 @@ static void Cocoa_getClass(Dart_NativeArguments args) {
   const char* name = NULL;
   Dart_StringToCString(Dart_GetNativeArgument(args, 0), &name);
   Dart_SetReturnValue(args, Dart_NewInteger((int64_t)objc_getClass(name)));
+}
+
+// --- the runtime AS the Cocoa database (COCOA_STATIC_CHECK_PLAN.md) ----------
+// These let the workspace lint sends at Accept time against the authoritative
+// database we already own: the classes and methods loaded in THIS binary.
+
+// _cocoaClassExists(name) -> bool
+static void Cocoa_classExists(Dart_NativeArguments args) {
+  EnsureFrameworks();
+  const char* name = NULL;
+  Dart_StringToCString(Dart_GetNativeArgument(args, 0), &name);
+  Dart_SetReturnValue(args,
+      Dart_NewBoolean(name != NULL && objc_getClass(name) != NULL));
+}
+
+// _cocoaSelectorInfo(className, selector) -> [1, msgArgc, "@encode"] or null.
+// Checks the instance side then the class side; msgArgc excludes self/_cmd.
+static void Cocoa_selectorInfo(Dart_NativeArguments args) {
+  EnsureFrameworks();
+  const char* cls = NULL; const char* sel = NULL;
+  Dart_StringToCString(Dart_GetNativeArgument(args, 0), &cls);
+  Dart_StringToCString(Dart_GetNativeArgument(args, 1), &sel);
+  Class c = (cls != NULL) ? objc_getClass(cls) : NULL;
+  if (c == NULL || sel == NULL) { Dart_SetReturnValue(args, Dart_Null()); return; }
+  SEL s = sel_registerName(sel);
+  Method m = class_getInstanceMethod(c, s);
+  if (m == NULL) m = class_getClassMethod(c, s);
+  if (m == NULL) { Dart_SetReturnValue(args, Dart_Null()); return; }
+  int msg_args = (int)method_getNumberOfArguments(m) - 2;   // minus self, _cmd
+  const char* enc = method_getTypeEncoding(m);
+  Dart_Handle l = Dart_NewList(3);
+  Dart_ListSetAt(l, 0, Dart_NewInteger(1));
+  Dart_ListSetAt(l, 1, Dart_NewInteger(msg_args));
+  Dart_ListSetAt(l, 2, Dart_NewStringFromCString(enc ? enc : ""));
+  Dart_SetReturnValue(args, l);
+}
+
+// Case-sensitive Levenshtein, bounded — for "did you mean" suggestions.
+static int macdart_lev(const char* a, const char* b) {
+  int la = (int)strlen(a), lb = (int)strlen(b);
+  if (la > 120 || lb > 120) return 999;
+  int prev[121], cur[121];
+  for (int j = 0; j <= lb; j++) prev[j] = j;
+  for (int i = 1; i <= la; i++) {
+    cur[0] = i;
+    for (int j = 1; j <= lb; j++) {
+      int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+      int d = prev[j] + 1;
+      int ins = cur[j - 1] + 1; if (ins < d) d = ins;
+      int sub = prev[j - 1] + cost; if (sub < d) d = sub;
+      cur[j] = d;
+    }
+    memcpy(prev, cur, sizeof(int) * (lb + 1));
+  }
+  return prev[lb];
+}
+
+// _cocoaNearestSelectors(className, typo) -> up to 5 real selectors on the
+// class (instance side up the chain, plus its class methods) nearest to [typo].
+static void Cocoa_nearestSelectors(Dart_NativeArguments args) {
+  EnsureFrameworks();
+  const char* cls = NULL; const char* typo = NULL;
+  Dart_StringToCString(Dart_GetNativeArgument(args, 0), &cls);
+  Dart_StringToCString(Dart_GetNativeArgument(args, 1), &typo);
+  Class c = (cls != NULL) ? objc_getClass(cls) : NULL;
+  if (c == NULL || typo == NULL) { Dart_SetReturnValue(args, Dart_NewList(0)); return; }
+  const int K = 5;
+  char* best[5] = {0}; int bestd[5]; for (int i = 0; i < K; i++) bestd[i] = 1000;
+  int threshold = (int)strlen(typo) / 2 + 2;
+  for (int pass = 0; pass < 2; pass++) {
+    Class k = (pass == 0) ? c : object_getClass(c);   // instances, then class side
+    while (k != NULL) {
+      unsigned int n = 0;
+      Method* ms = class_copyMethodList(k, &n);
+      for (unsigned int i = 0; i < n; i++) {
+        const char* nm = sel_getName(method_getName(ms[i]));
+        int d = macdart_lev(typo, nm);
+        if (d >= threshold) continue;
+        int dup = 0;
+        for (int b = 0; b < K; b++) if (best[b] && strcmp(best[b], nm) == 0) { dup = 1; break; }
+        if (dup) continue;
+        for (int b = 0; b < K; b++) {
+          if (d < bestd[b]) {
+            if (best[K - 1]) free(best[K - 1]);
+            for (int z = K - 1; z > b; z--) { bestd[z] = bestd[z - 1]; best[z] = best[z - 1]; }
+            bestd[b] = d; best[b] = strdup(nm);
+            break;
+          }
+        }
+      }
+      if (ms) free(ms);
+      if (pass == 1) break;                 // only the leaf metaclass
+      k = class_getSuperclass(k);
+    }
+  }
+  int cnt = 0; for (int i = 0; i < K; i++) if (best[i]) cnt++;
+  Dart_Handle l = Dart_NewList(cnt);
+  int j = 0;
+  for (int i = 0; i < K; i++) {
+    if (best[i]) { Dart_ListSetAt(l, j++, Dart_NewStringFromCString(best[i])); free(best[i]); }
+  }
+  Dart_SetReturnValue(args, l);
 }
 
 // [wraps, releases] — for leak observability. A gap that never settles = leak.
@@ -405,6 +519,9 @@ void Sqlite_query(Dart_NativeArguments args);
   V(Cocoa_nsStringUtf8, 1)                                                     \
   V(Cocoa_send, 3)                                                             \
   V(Cocoa_getClass, 1)                                                         \
+  V(Cocoa_classExists, 1)                                                      \
+  V(Cocoa_selectorInfo, 2)                                                     \
+  V(Cocoa_nearestSelectors, 2)                                                 \
   V(Cocoa_stats, 0)                                                            \
   V(Cocoa_poolPush, 0)                                                         \
   V(Cocoa_poolPop, 1)                                                          \

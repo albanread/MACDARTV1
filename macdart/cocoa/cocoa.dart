@@ -57,6 +57,25 @@ int _nsStringLength(int handle) native "Cocoa_nsStringLength";
 String _nsStringUtf8(int handle) native "Cocoa_nsStringUtf8";
 
 int _getClass(String name) native "Cocoa_getClass";
+
+// --- checking sends against the runtime (COCOA_STATIC_CHECK_PLAN.md) ---------
+bool _cocoaClassExists(String name) native "Cocoa_classExists";
+List _cocoaSelectorInfo(String cls, String sel) native "Cocoa_selectorInfo";
+List _cocoaNearestSelectors(String cls, String typo) native "Cocoa_nearestSelectors";
+
+/// True if [name] is an Objective-C class loaded in THIS binary (the linked
+/// frameworks on this OS) — the authoritative Cocoa database we own.
+bool cocoaClassExists(String name) => _cocoaClassExists(name);
+
+/// `[1, msgArgc, "@encode"]` if [cls] responds to [sel] (instance or class
+/// method), else null. `msgArgc` is the number of keyword arguments (colons);
+/// the encoding string carries the argument and return types.
+List cocoaSelectorInfo(String cls, String sel) => _cocoaSelectorInfo(cls, sel);
+
+/// Up to five real selectors on [cls] nearest (edit distance) to a mistyped
+/// [typo] — the "did you mean" list for the Accept-time lint.
+List cocoaNearestSelectors(String cls, String typo) =>
+    _cocoaNearestSelectors(cls, typo);
 /// The general dynamic send: [receiver] a Cocoa, [selector] like
 /// "colorWithRed:...:", [args] the ordered arguments. Returns a Cocoa (for an
 /// object result — retained, released on GC), a String (char*), an int

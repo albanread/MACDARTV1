@@ -2,9 +2,10 @@
 //
 // Every layer of the engine at once, as a playable game. Layer 0: a twinkling
 // starfield fragment shader compiled AT RUNTIME from the MSL string below.
-// Layer 1: the indexed pane holds a ground strip. Layer 2: ship, shots and a
-// descending rank of invaders — all 16-colour sprites with their own
-// palettes. Layer 3: seven-segment score. Keys ride the pull tick
+// Layer 1: the indexed pane holds a ground strip. Layer 2: a 32-pixel player
+// fighter (16x12 art at scale 2), shots, and a descending rank of invaders —
+// all 16-colour sprites with their own palettes. Layer 3: seven-segment
+// score. Keys ride the pull tick
 // (← → or A/D move, space fires), sounds are synth presets (zap, explode,
 // hurt), and the looping theme is ABC notation compiled IN THIS ISOLATE
 // (demos/abc.dart), played through the Mac's GM synth. F goes fullscreen
@@ -69,6 +70,7 @@ main(List args, SendPort ui) {
           foeAlive[n] = true;
         } else {
           var f = foeDef.place(x, y);
+          f.scale = 2.0;                     // 6x6 art -> 12x12, proportionate
           f.animate(4 + wave);
           foes.add(f);
           foeAlive.add(true);
@@ -88,15 +90,36 @@ main(List args, SendPort ui) {
       g.pal(17, 90, 200, 110);
       g.fill(0, 228, 424, 12, 16);
       for (var x = 0; x < 424; x += 8) g.pset(x, 228, 17);
-      var shipDef = g.sprite('....a..../...aaa.../..abbba../.abbbbba./abbabbbba/aa..a..aa');
-      shipDef.rgb(0xa, 120, 220, 255);
-      shipDef.rgb(0xb, 30, 90, 200);
-      ship = shipDef.place(212, 215);
+      // The ship: 16x12 art at scale 2 = a 32-pixel fighter, so the whole
+      // shape reads — a red twin cannon up top, a bright cockpit, blue hull
+      // with darker wing edges, and two engine flames trailing below. (a hull
+      // edge, b hull, c cockpit, d cannon, e flame — its own 16-colour CLUT.)
+      var shipDef = g.sprite(
+          '.......dd......./'
+          '.......dd......./'
+          '......bccb....../'
+          '......bccb....../'
+          '.....bbccbb...../'
+          '....bbccccbb..../'
+          '...bbbccccbbb.../'
+          '..abbbbccbbbba../'
+          '.aabbbbbbbbbbaa./'
+          'aa.abbbbbbbba.aa/'
+          'a...bb.dd.bb...a/'
+          '....ee....ee....');
+      shipDef.rgb(0xa, 20, 70, 160);        // wing edge, dark blue
+      shipDef.rgb(0xb, 70, 140, 235);       // hull, blue
+      shipDef.rgb(0xc, 190, 245, 255);      // cockpit, bright cyan
+      shipDef.rgb(0xd, 235, 80, 70);        // twin cannon, red
+      shipDef.rgb(0xe, 255, 190, 60);       // engine flame, orange
+      ship = shipDef.place(212, 210);
+      ship.scale = 2.0;                     // 16x12 art -> 32x24 on screen
       var shotDef = g.sprite('e/e/f');
       shotDef.rgb(0xe, 255, 255, 160);
       shotDef.rgb(0xf, 255, 120, 40);
       for (var i = 0; i < 6; i++) {
         var s = shotDef.place(-20, -20);
+        s.scale = 2.0;
         s.hide();
         shots.add(s);
       }
@@ -134,7 +157,7 @@ main(List args, SendPort ui) {
     if (g.key(Keys.space) && cool == 0) {
       for (var i = 0; i < shots.length; i++) {
         if (shots[i].y < -10 || shots[i].y > 250) {
-          shots[i].moveTo(ship.x, ship.y - 8);
+          shots[i].moveTo(ship.x, ship.y - 16);   // from the cannon tip
           zap.play();
           cool = 8;
           break;
@@ -168,7 +191,7 @@ main(List args, SendPort ui) {
       foes[i].x += speed * dir;
       foes[i].y += drop;
       foes[i].update();
-      if (foes[i].y > 205) {                 // reached the ship line
+      if (foes[i].y > 198) {                 // reached the ship line
         lives--;
         hurt2.play();
         spawnWave(g, foeDef);
@@ -182,7 +205,7 @@ main(List args, SendPort ui) {
       if (s.y < -10 || s.y > 250) continue;
       for (var i = 0; i < foes.length; i++) {
         if (!foeAlive[i]) continue;
-        if (s.hits(foes[i], 2, 4, 9, 9)) {
+        if (s.hits(foes[i], 2, 4, 7, 7)) {   // shot half-box vs foe half-box (12px)
           foeAlive[i] = false;
           foes[i].hide();
           s.y = -20; s.hide();

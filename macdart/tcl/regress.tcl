@@ -254,6 +254,20 @@ ui appclick k*
 ui appclick k3
 ui appclick k=
 check "and multiplies"       [ui appget d] 45
+# The pane is a surface, not a fixed canvas. An app lays out in top-left
+# coordinates, so growing the window has to RE-RUN build(): autoresizing masks
+# cannot know what a layout means, and without this the widgets kept their
+# AppKit frames and slid away from the top edge.
+ui resize 900 640
+after 1200
+set appSmall [lindex [split [ui apptree] \n] 0]
+ui resize 1300 860
+after 1800
+check "app re-lays out when the pane grows" \
+    [expr {$appSmall ne [lindex [split [ui apptree] \n] 0]}] 1
+ui resize 900 640
+after 1800
+check "and comes back when it shrinks" [lindex [split [ui apptree] \n] 0] $appSmall
 ui appstop
 
 section "searchable Dart V1 help"
@@ -274,6 +288,27 @@ check "detail has the signature" \
 check "detail cites its source" \
     [expr {[string match {*sdk/lib/core/string.dart:*} [ui helptext]]}] 1
 check "gui alive after search" [ui ping] pong
+
+# TYPING must search, not just the verbs. An NSTextField sends
+# controlTextDidChange: to its delegate and never textDidChange: — wiring only
+# the latter left every keystroke unheard while the socket verbs worked fine,
+# which is this project's classic socket-works/mouse-fails signature. Driven
+# through the field editor, the object AppKit routes real keystrokes through.
+proc helpType {text} {
+    set iso $::dartui::uiIsolate
+    set info [obs getIsolate isolateId $iso]
+    set lib [dict get [dict get $info rootLib] id]
+    obs evaluate targetId $lib isolateId $iso expression \
+        "(){ gWindow.makeFirstResponder(gHelpField);\
+             var fe = gWindow.fieldEditor(true, forObject: gHelpField);\
+             fe.setString(''); fe.insertText('$text'); return 'ok'; }()"
+}
+ui tab 2
+helpType substring
+after 1200
+check "typing in the box searches" \
+    [expr {[string match {*String.substring*} [ui helptext]]}] 1
+check "alive after typing"     [ui ping] pong
 
 section "cleanup"
 ui remove TclOk

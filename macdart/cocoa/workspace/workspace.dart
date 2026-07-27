@@ -430,7 +430,10 @@ void updateMetrics() {
 // ~4 Hz, like MACVM. Skips while a sample is outstanding, and while the
 // language isolate is restarting.
 void startMetrics() {
-  new Timer.periodic(const Duration(milliseconds: 250), (t) => pollVmStats());
+  new Timer.periodic(const Duration(milliseconds: 250), (t) {
+    appWatchResize();   // a running app re-lays-itself-out when the pane changes
+    pollVmStats();
+  });
 }
 
 void pollVmStats() {
@@ -3124,8 +3127,13 @@ String gHelpDetail = '';
 
 void buildDocsTab(Cocoa dc) {
   dc.setAutoresizesSubviews(true);
-  label(dc, [8.0, 394.0, 44.0, 18.0]).setStringValue("Search");
-  gHelpField = Cocoa.cls("NSTextField").alloc().initWithFrame([56.0, 390.0, 320.0, 24.0]);
+  // 44pt clipped it to "Searc". A label is not sized to its text by default,
+  // and every control in a resizable tab needs its mask set or it drifts away
+  // from the row it belongs to when the window grows.
+  var lbl = label(dc, [8.0, 394.0, 56.0, 18.0]);
+  lbl.setStringValue("Search");
+  lbl.setAutoresizingMask(kMinYMargin);
+  gHelpField = Cocoa.cls("NSTextField").alloc().initWithFrame([68.0, 390.0, 308.0, 24.0]);
   var hf = _mono(12.0); if (!hf.isNil) gHelpField.setFont(hf);
   dc.addSubview(gHelpField);
   gHelpField.setAutoresizingMask(kMinYMargin);
@@ -3483,6 +3491,30 @@ Future appSettle() async {
   }
 }
 
+// An app lays itself out in TOP-LEFT coordinates against the surface size it
+// was given, so its widgets keep the AppKit frames they were built with and
+// slide away from the top edge when the pane grows. Autoresizing masks cannot
+// fix that — only the app knows what its layout means — so the surface watches
+// its own bounds and re-runs build() once the drag settles.
+double gAppLastW = 0.0, gAppLastH = 0.0;
+int gAppResizedAt = 0;
+
+void appWatchResize() {
+  if (gAppName == null || gAppPane == null) return;
+  var b = gAppPane.bounds();
+  var w = (b[2] as num).toDouble(), h = (b[3] as num).toDouble();
+  var now = new DateTime.now().millisecondsSinceEpoch;
+  if (w != gAppLastW || h != gAppLastH) {
+    gAppLastW = w; gAppLastH = h;
+    gAppResizedAt = now;      // still moving; wait for it to stop
+    return;
+  }
+  if (gAppResizedAt != 0 && now - gAppResizedAt > 300) {
+    gAppResizedAt = 0;
+    appRebuild();
+  }
+}
+
 Future appRun(String name) async {
   switchTab(7);
   appStatus("starting " + name + "…");
@@ -3495,6 +3527,10 @@ Future appRun(String name) async {
     return;
   }
   gAppName = name;
+  var b0 = gAppPane.bounds();
+  gAppLastW = (b0[2] as num).toDouble();
+  gAppLastH = (b0[3] as num).toDouble();
+  gAppResizedAt = 0;
   appStatus("running " + name);
   log("app: " + name);
 }

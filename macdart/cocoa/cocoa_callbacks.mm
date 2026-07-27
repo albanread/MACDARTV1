@@ -59,11 +59,27 @@ static void ActionIMP(id self, SEL _cmd, id sender) {
 }
 
 // -(void)textDidChange:(NSNotification*)note  — NSText/NSTextView delegate.
+//
+// The handler is handed the CONTROL that changed, not the notification. It used
+// to get the notification, which looks the same from Dart until you send it
+// -stringValue: an unknown selector aborts the process, so a field whose
+// handler read its own text was a latent crash. [note object] is the sender, so
+// this now matches the action callback's contract.
 static void TextDidChangeIMP(id self, SEL _cmd, id note) {
   (void)_cmd;
+  id sender = note;
+  if (note != nil && [note respondsToSelector:@selector(object)]) sender = [note object];
   Dart_EnterScope();
-  Dispatch(self, 1, (int64_t)note);
+  Dispatch(self, 1, (int64_t)sender);
   Dart_ExitScope();
+}
+
+// -(void)controlTextDidChange:(NSNotification*)note — the NSControl half of the
+// same idea. An NSTextField is NOT an NSTextView: it never sends
+// textDidChange: to its delegate, so a search box wired with onTextChange sat
+// there doing nothing while every keystroke went unheard.
+static void ControlTextDidChangeIMP(id self, SEL _cmd, id note) {
+  TextDidChangeIMP(self, _cmd, note);
 }
 
 // -(NSInteger)numberOfRowsInTableView:(NSTableView*)tv   [q@:@]
@@ -144,6 +160,8 @@ static void EnsureActionClass() {
   g_action_class = objc_allocateClassPair([NSObject class], "MacdartActionTarget", 0);
   class_addMethod(g_action_class, sel_registerName("macdartInvoke:"), (IMP)ActionIMP, "v@:@");
   class_addMethod(g_action_class, sel_registerName("textDidChange:"), (IMP)TextDidChangeIMP, "v@:@");
+  class_addMethod(g_action_class, sel_registerName("controlTextDidChange:"),
+                  (IMP)ControlTextDidChangeIMP, "v@:@");
   class_addMethod(g_action_class, sel_registerName("numberOfRowsInTableView:"), (IMP)NumRowsIMP, "q@:@");
   class_addMethod(g_action_class, sel_registerName("tableView:objectValueForTableColumn:row:"), (IMP)ObjectValueIMP, "@@:@@q");
   class_addMethod(g_action_class, sel_registerName("tableViewSelectionDidChange:"), (IMP)SelectionChangedIMP, "v@:@");

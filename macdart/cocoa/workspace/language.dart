@@ -756,6 +756,12 @@ String _appBuild(List arg) {
 }
 
 String _appStop() {
+  // An app that owns a Timer has to be told, or it keeps ticking against a
+  // surface nobody can see. `stop()` is optional — most apps have no teardown —
+  // so a missing one is not an error.
+  if (_app != null) {
+    try { _app.stop(); } catch (e) { }
+  }
   if (_surface != null) { _surface.clear(); _surface.flush(); }
   _app = null;
   _surface = null;

@@ -267,9 +267,16 @@ Plus a snapshot on each surface for the visual.
 
 ## 10. Milestones
 
-- **M1 — the loop, end to end.** Surface abstraction, pane surface, push
-  channel, `label`/`field`/`button`, click events, the verbs above, the
-  calculator as the worked example, its suite test.
+- **M1 — the loop, end to end.** ✅ DONE. Pane surface, push channel (the
+  handshake port stays open), `label`/`field`/`button`, click / text / enter
+  events, the verbs above, an Apps menu over `apps/`, four worked examples, and
+  19 suite checks including both teardown paths. Three things it taught:
+  `appclick` has to *wait* for the app to act (three async hops, so a driver
+  that returns on the first one reads the state before the click it just made —
+  hence `settle`, which replaced the suite's guessed sleeps); `NSTextAlignment`
+  uses the UIKit order (centre 1, right 2), not the legacy AppKit one; and the
+  compile gate had silently disabled itself when run from `build-release/`,
+  which is how source that does not compile had got into the image.
 - **M2 — the second surface, early on purpose.** Window surface, Pop Out / Pop
   In with state preserved, `close` and `resize` events, the `rebuildUi` ticket
   fix (§7). Built immediately after M1 rather than last, because an abstraction

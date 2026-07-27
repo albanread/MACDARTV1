@@ -233,6 +233,37 @@ class GpSfx {
   bool started_;
 };
 
+// --- the direct framebuffer (GAMEPANE_PLAN.md §6b) --------------------------
+// A raw-speed escape hatch: N shared MTLBuffers of palette indices, each with a
+// linear R8Uint texture VIEW over it, sampled by a 256-colour palette shader.
+// The game writes indices straight into a buffer (exposed to Dart as external
+// typed data — GPU memory, zero copy), then the pull tick presents it. Triple-
+// buffered so the CPU never writes a buffer the GPU is still reading.
+class GpDirectPane {
+ public:
+  GpDirectPane(id<MTLDevice> device, int w, int h, std::string* err);
+  ~GpDirectPane();
+  void* backbuffer_ptr();               // contents() of the current write buffer
+  size_t buffer_size() const { return (size_t)stride_ * h_; }
+  int stride() const { return stride_; }   // bytesPerRow (>= w, alignment-padded)
+  int w() const { return w_; }
+  int h() const { return h_; }
+  void set_pal(int i, uint8_t r, uint8_t g, uint8_t b);
+  // Render the buffer the game just wrote, then advance the write index.
+  void present_render(id<MTLCommandBuffer> cb, id<MTLTexture> target);
+
+ private:
+  static const int kBuffers = 3;
+  int w_, h_, stride_;
+  id<MTLBuffer> buffers_[kBuffers];
+  id<MTLTexture> textures_[kBuffers];
+  volatile int write_;                  // rotated on thread 0; read by writers
+  std::vector<float> pal_;              // 256 * float4
+  id<MTLBuffer> pal_buf_;
+  bool pal_dirty_;
+  id<MTLRenderPipelineState> pipeline_;
+};
+
 // --- the engine --------------------------------------------------------------
 // One per process, owned by the UI isolate. open() (re)builds the panes at a
 // logical resolution and returns the NSView to embed; apply-time helpers are
@@ -242,15 +273,20 @@ class GpEngine {
  public:
   static GpEngine* instance();     // created on first use; never destroyed
 
-  NSView* open(int w, int h, int world_w, int world_h, std::string* err);
+  // direct: build the raw-framebuffer pane (§6b) instead of the retained
+  // sprite/indexed stack. Both share the view, offscreen, present, and gpsnap.
+  NSView* open(int w, int h, int world_w, int world_h, bool direct,
+               std::string* err);
   void close();                    // free panes; keep device/queue/view
   bool is_open() const { return open_; }
+  bool is_direct() const { return direct_; }
 
   GpIndexedPane* pane() { return pane_; }
   GpSprites* sprites() { return sprites_; }
   GpBlitter* blitter() { return blitter_; }
   GpTextOverlay* text() { return text_; }
   GpShaderPane* shader() { return shader_; }
+  GpDirectPane* direct_pane() { return direct_pane_; }
   GpSfx* sfx();                    // lazily started
   GpMusic* music();                // lazily created
 
@@ -285,9 +321,11 @@ class GpEngine {
   GpBlitter* blitter_;
   GpTextOverlay* text_;
   GpShaderPane* shader_;
+  GpDirectPane* direct_pane_;
   GpSfx* sfx_;
   GpMusic* music_;
   bool fullscreen_;
+  bool direct_;
   bool open_;
   int logical_w_, logical_h_;
   int frames_;

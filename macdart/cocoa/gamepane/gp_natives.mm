@@ -92,13 +92,14 @@ static bool DecodeB64(const char* s, std::vector<uint8_t>* out) {
 
 // --- the natives -------------------------------------------------------------
 
-// _gpOpen(w, h, worldW, worldH) -> NSView handle (int)
+// _gpOpen(w, h, worldW, worldH, mode) -> NSView handle. mode 1 = direct (§6b).
 void Cocoa_gpOpen(Dart_NativeArguments args) {
-  int64_t w = 0, h = 0, ww = 0, wh = 0;
+  int64_t w = 0, h = 0, ww = 0, wh = 0, mode = 0;
   Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &w);
   Dart_IntegerToInt64(Dart_GetNativeArgument(args, 1), &h);
   Dart_IntegerToInt64(Dart_GetNativeArgument(args, 2), &ww);
   Dart_IntegerToInt64(Dart_GetNativeArgument(args, 3), &wh);
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 4), &mode);
   if (w < 32 || h < 32 || w > 2048 || h > 2048) {
     Dart_ThrowException(Dart_NewStringFromCString(
         "gamepane: viewport must be 32..2048"));
@@ -111,7 +112,7 @@ void Cocoa_gpOpen(Dart_NativeArguments args) {
   }
   std::string err;
   NSView* view = GpEngine::instance()->open((int)w, (int)h,
-                                            (int)ww, (int)wh, &err);
+                                            (int)ww, (int)wh, mode != 0, &err);
   if (view == nil) {
     Dart_ThrowException(Dart_NewStringFromCString(
         err.empty() ? "gamepane: open failed" : err.c_str()));
@@ -157,6 +158,35 @@ void Cocoa_gpApply(Dart_NativeArguments args) {
       const char* op = ElStr(c, 0);
       if (op == NULL) continue;
       std::string verr;
+
+      // Direct-framebuffer mode (§6b) has no retained panes: the game writes
+      // pixels itself. Only its own verbs apply here; anything pane/sprite/
+      // shader-shaped is skipped so a stray one cannot deref a NULL pane.
+      if (eng->is_direct()) {
+        if (strcmp(op, "gpdpal") == 0 && cn >= 5) {
+          int64_t i = ElInt(c, 1);
+          if (i < 0 || i > 255) verr = "gpdpal: index 0..255";
+          else eng->direct_pane()->set_pal((int)i, ClampByte(ElInt(c, 2)),
+                   ClampByte(ElInt(c, 3)), ClampByte(ElInt(c, 4)));
+        } else if (strcmp(op, "gptextclear") == 0) {
+          eng->text()->clear();
+        } else if (strcmp(op, "gptext") == 0 && cn >= 7) {
+          const char* s = ElStr(c, 3);
+          if (s != NULL) eng->text()->draw_text(ElInt(c, 1), ElInt(c, 2), s,
+              ClampByte(ElInt(c, 4)), ClampByte(ElInt(c, 5)), ClampByte(ElInt(c, 6)));
+        } else if (strcmp(op, "gpfull") == 0 && cn >= 2) {
+          eng->set_fullscreen(ElInt(c, 1) != 0);
+        } else if (strcmp(op, "gpsound") != 0 && strcmp(op, "gpplay") != 0 &&
+                   strcmp(op, "gptune") != 0 && strcmp(op, "gpmusic") != 0 &&
+                   strcmp(op, "gpopen") != 0) {
+          // silently ignore retained verbs; audio verbs fall through below
+        }
+        if (strcmp(op, "gpsound") != 0 && strcmp(op, "gpplay") != 0 &&
+            strcmp(op, "gptune") != 0 && strcmp(op, "gpmusic") != 0) {
+          if (!verr.empty() && first_err.empty()) first_err = verr;
+          continue;                            // audio verbs share the code below
+        }
+      }
 
       if (strcmp(op, "gppal") == 0 && cn >= 5) {
         int64_t i = ElInt(c, 1);
@@ -386,16 +416,38 @@ void Cocoa_gpSnap(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, Dart_NewStringFromCString(""));
 }
 
-// _gpStat() -> [open, framesPresented, logicalW, logicalH, fullscreen]
+// _gpStat() -> [open, framesPresented, logicalW, logicalH, fullscreen,
+//               direct, stride]  (stride = the direct framebuffer's bytesPerRow)
 void Cocoa_gpStat(Dart_NativeArguments args) {
   GpEngine* eng = GpEngine::instance();
-  Dart_Handle l = Dart_NewList(5);
+  int stride = (eng->is_direct() && eng->direct_pane() != NULL)
+                   ? eng->direct_pane()->stride() : 0;
+  Dart_Handle l = Dart_NewList(7);
   Dart_ListSetAt(l, 0, Dart_NewInteger(eng->is_open() ? 1 : 0));
   Dart_ListSetAt(l, 1, Dart_NewInteger(eng->frames_presented()));
   Dart_ListSetAt(l, 2, Dart_NewInteger(eng->logical_w()));
   Dart_ListSetAt(l, 3, Dart_NewInteger(eng->logical_h()));
   Dart_ListSetAt(l, 4, Dart_NewInteger(eng->fullscreen() ? 1 : 0));
+  Dart_ListSetAt(l, 5, Dart_NewInteger(eng->is_direct() ? 1 : 0));
+  Dart_ListSetAt(l, 6, Dart_NewInteger(stride));
   Dart_SetReturnValue(args, l);
+}
+
+// _gpBackbuffer() -> a Uint8List backed by the current direct write buffer's
+// GPU memory (external typed data — no copy, no finalizer; thread 0 owns it),
+// or null when not in direct mode. Each caller/isolate gets its own view of
+// the same buffer (§6b). Length is stride*h; address as fb[y*stride + x].
+void Cocoa_gpBackbuffer(Dart_NativeArguments args) {
+  GpEngine* eng = GpEngine::instance();
+  if (!eng->is_open() || !eng->is_direct() || eng->direct_pane() == NULL) {
+    Dart_SetReturnValue(args, Dart_Null());
+    return;
+  }
+  void* p = eng->direct_pane()->backbuffer_ptr();
+  intptr_t len = (intptr_t)eng->direct_pane()->buffer_size();
+  if (p == NULL || len <= 0) { Dart_SetReturnValue(args, Dart_Null()); return; }
+  Dart_SetReturnValue(args,
+      Dart_NewExternalTypedData(Dart_TypedData_kUint8, p, len));
 }
 
 // _gpFullscreen(on) — the workspace-side handle on the same switch the

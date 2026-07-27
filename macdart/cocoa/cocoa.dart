@@ -223,7 +223,7 @@ void keyCapture(bool on) => _keyCapture(on ? 1 : 0);
 List keyState() => _keyState();
 
 // --- game pane (GAMEPANE_PLAN.md) --------------------------------------------
-int _gpOpen(int w, int h, int worldW, int worldH) native "Cocoa_gpOpen";
+int _gpOpen(int w, int h, int worldW, int worldH, int mode) native "Cocoa_gpOpen";
 void _gpClose() native "Cocoa_gpClose";
 dynamic _gpApply(List cmds) native "Cocoa_gpApply";
 String _gpSnap(String path) native "Cocoa_gpSnap";
@@ -231,9 +231,10 @@ List _gpStat() native "Cocoa_gpStat";
 
 /// Open (or re-open at a new size) the Metal game pane and return its NSView
 /// to embed. Logical resolution [w]x[h] (the layer upscales, nearest); the
-/// indexed world is [worldW]x[worldH] (clamped up to the viewport).
-Cocoa gpOpen(int w, int h, int worldW, int worldH) =>
-    new Cocoa._adopt(_gpOpen(w, h, worldW, worldH));
+/// indexed world is [worldW]x[worldH] (clamped up to the viewport). [mode] 1
+/// builds the direct framebuffer (§6b) instead of the retained sprite stack.
+Cocoa gpOpen(int w, int h, int worldW, int worldH, [int mode = 0]) =>
+    new Cocoa._adopt(_gpOpen(w, h, worldW, worldH, mode));
 
 /// Tear the engine's panes down (the view survives for reuse).
 void gpClose() => _gpClose();
@@ -246,8 +247,16 @@ dynamic gpApply(List cmds) => _gpApply(cmds);
 /// a window snapshot cannot see) as a PNG. "" on success, else the error.
 String gpSnap(String path) => _gpSnap(path);
 
-/// `[open, framesPresented, logicalW, logicalH, fullscreen]`.
+/// `[open, framesPresented, logicalW, logicalH, fullscreen, direct, stride]`.
 List gpStat() => _gpStat();
+
+dynamic _gpBackbuffer() native "Cocoa_gpBackbuffer";
+
+/// The direct framebuffer's current write buffer as a `Uint8List` backed by GPU
+/// memory (§6b) — write indices into it, present with a pull frame. Null unless
+/// the pane was opened in direct mode. Call it fresh each frame (the buffer
+/// rotates); address as `fb[y * stride + x]` with the stride from [gpStat].
+dynamic gpBackbuffer() => _gpBackbuffer();
 
 void _gpFullscreen(int on) native "Cocoa_gpFullscreen";
 

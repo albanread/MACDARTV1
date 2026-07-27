@@ -292,6 +292,52 @@ backing-scale handling in `viewDidChangeBackingProperties`).
   the same menu, stopped by the same button. A first shipped game
   (`12_scroller.dart` or similar) is the M2 capstone.
 
+## 6b. The direct framebuffer path — a raw-speed escape hatch
+
+Retained mode ships tiny per-frame deltas: perfect for sprite games, useless
+for **full-frame CPU rendering** (plasma, fire, a raycaster, a live Julia set),
+where every pixel changes every frame and there is nothing small to send. For
+those, `gpDirect(w, h)` hands the game a framebuffer **in GPU memory it writes
+directly** — no command protocol, no upload, no copy.
+
+Why it works: Apple Silicon is unified memory, so a `MTLStorageModeShared`
+buffer's `contents()` is CPU-writable memory the GPU samples. Dart 1.24 has no
+`dart:ffi`, but `Dart_NewExternalTypedData(kUint8, ptr, len)` wraps that pointer
+as a `Uint8List` with no finalizer (the VM never frees it — thread 0 owns it).
+The game writes palette indices into the list; the bytes ARE in GPU memory. A
+linear `R8Uint` texture view over the buffer
+(`newTextureWithDescriptor:offset:bytesPerRow:`) is sampled by a 256-colour
+palette shader, so index→colour and palette-cycling come along for free.
+
+The three asterisks from the design discussion, resolved:
+
+- **The handle is per-isolate.** External typed data cannot cross a SendPort and
+  stay backed by the same memory, so each writer obtains its own view via the
+  `gpBackbuffer()` native — every view aliases the one buffer. That is the
+  feature, not the limit: several worker isolates can compute disjoint bands
+  straight into one GPU buffer, no copy between them.
+- **Present stays on thread 0.** Writes are off-thread; the pull tick still
+  carries the present to the UI isolate, which renders and flips. It composes
+  with the pacer unchanged.
+- **We now own the sync.** THREE rotating buffers: the game writes buffer W
+  while the GPU reads the one presented last; present renders W, then advances
+  the write index (an atomic). Three-deep plus pull pacing means the buffer the
+  game writes is always ≥2 frames past its last GPU read — no fence needed (a
+  completion-handler fence is the belt-and-braces upgrade).
+
+Lifetime is the single footgun, designed out: the buffers are freed only in
+`gpClose`, and `stopDemo` kills the game isolate *first*, so no live `Uint8List`
+ever views freed memory. The safety upside is real — external typed data is
+length-bounded by the VM, so a game physically cannot scribble past its
+framebuffer (a raw pointer would).
+
+Wire: `['gpopen', w, h, w, h, 1]` (mode 1 = direct) swaps the Metal view as
+usual; `['gpdpal', i, r, g, b]` sets a palette entry (0–255); each frame the
+game calls `gpBackbuffer()`, fills it, and sends its pull frame (a HUD `gptext`,
+or an empty list) to present. `gpstat` reports the row STRIDE (bytesPerRow,
+rounded to Metal's linear-texture alignment) so the game addresses
+`fb[y*stride + x]`. It coexists with retained mode — one engine, two front ends.
+
 ## 7. Milestones
 
 - **M0 — pane + proof of pixels.** CMake wiring; CAMetalLayer view embedded
@@ -308,6 +354,11 @@ backing-scale handling in `viewDidChangeBackingProperties`).
   discovered again); `coin.play()` in the M2 game.
 - **M4 — dressing.** Shader background layer, text overlay HUD; ABC tunes
   if and only if the audio survey showed the boundary trivial.
+- **M6 — the direct framebuffer (§6b).** `gpDirect`: a shared-buffer indexed
+  framebuffer the game writes as external typed data, triple-buffered, sampled
+  by a palette shader; `gpBackbuffer()` + `gpdpal` + a stride-aware `gpstat`.
+  A live Julia set is the one-screen proof that CPU→GPU is a memory write, not
+  a protocol.
 
 Each milestone: builds in `build-release`, drivable from the control plane,
 `gpsnap` evidence in the transcript, committed.

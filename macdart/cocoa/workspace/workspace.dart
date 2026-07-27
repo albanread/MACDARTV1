@@ -1416,6 +1416,27 @@ List formatDecls(List decls) {
   return out;
 }
 
+// Outstanding work a driver can wait on: requests in flight (gAskPending) and
+// long UI-initiated jobs that are not yet requests (gBusy — a compile check
+// runs a whole `dart --compile_all` before the accept it gates). See `settle`.
+int gAskPending = 0;
+int gBusy = 0;
+
+/// Return when the workspace has finished what it is doing. Scripts used fixed
+/// sleeps before, which is guesswork that silently rots: when the compile gate
+/// came back the accepts got slower and every `after 4000` in the suite became
+/// a coin toss.
+Future workSettle([int maxMs = 30000]) async {
+  // The click that started the work is a queued message that has not run yet.
+  await new Future.delayed(const Duration(milliseconds: 5));
+  var waited = 0;
+  while ((gAskPending > 0 || gBusy > 0 || gAppPending > 0) && waited < maxMs) {
+    await new Future.delayed(const Duration(milliseconds: 20));
+    waited += 20;
+  }
+  return waited < maxMs;
+}
+
 Future ask(String cmd, var arg) async {   // arg/result may be a String or a List
   if (gLang == null) return "ERR: language isolate restarting…";
   // A message sent now would QUEUE against the stopped isolate, invisibly, and
@@ -1433,6 +1454,15 @@ Future ask(String cmd, var arg) async {   // arg/result may be a String or a Lis
     arg = formatDecls(<dynamic>[arg])[0];
   }
   var gen = gLangGen;   // which isolate this was sent to
+  gAskPending++;
+  try {
+    return await _ask(cmd, arg, gen);
+  } finally {
+    gAskPending--;
+  }
+}
+
+Future _ask(String cmd, var arg, int gen) async {
   var rp = new ReceivePort();
   gLang.send([cmd, arg, rp.sendPort]);
 
@@ -1633,6 +1663,10 @@ Future<String> handle(String line) async {
     case 'dbgclear': await dbgClearBreaks(); return "ok";
     case 'dbghold': debugHold(); return "held (watchdog paused), depth " + gDebugHold.toString();
     case 'dbgrelease': debugRelease(); return "released, depth " + gDebugHold.toString();
+    case 'settle': {  // wait for in-flight work instead of guessing with sleep
+      var ok = await workSettle();
+      return ok ? "idle" : "ERR: still busy after 30s";
+    }
     case 'sleep': {   // a pacing aid for scripts; does not block the isolate
       var ms = int.parse(arg.trim(), onError: (_) => 0);
       if (ms > 0) await new Future.delayed(new Duration(milliseconds: ms));
@@ -1715,6 +1749,7 @@ Future<String> handle(String line) async {
       var v = gAppViews[arg.trim()];
       if (v == null) return "ERR: no widget " + arg.trim();
       v.performClick(null);              // the real click path, as `click` does
+      await appSettle();                 // ...and answer once the app has acted
       return "clicked " + arg.trim();
     }
     case 'appset': {
@@ -1725,6 +1760,7 @@ Future<String> handle(String line) async {
       if (v == null) return "ERR: no widget " + id;
       v.setStringValue(text);
       appFire(id, 'text', text);         // as typing into it would
+      await appSettle();
       return "ok";
     }
     case 'appget': {
@@ -2723,7 +2759,7 @@ void gpEnter(List cmds) {
   int gi(int i, int dflt) =>
       (o.length > i && o[i] is num) ? (o[i] as num).toInt() : dflt;
   var w = gi(1, 424), h = gi(2, 240);
-  gGpView = gpOpen(w, h, gi(3, w), gi(4, h));
+  gGpView = gpOpen(w, h, gi(3, w), gi(4, h), gi(5, 0));   // gi(5)=mode: 1 direct
   if (gDemoView != null) {
     gGpView.setFrame(gDemoView.frame());
     gGpView.setAutoresizingMask(kWidthSizable + kHeightSizable);
@@ -3109,11 +3145,13 @@ List _appFrame(var f) {
   return [x, appPaneHeight() - y - h, w, h];
 }
 
-// macOS keeps the legacy NSTextAlignment order: left 0, right 1, center 2.
+// NSTextAlignment took the UIKit values years ago: left 0, CENTER 1, RIGHT 2.
+// The legacy AppKit order (right 1, center 2) is the one everyone remembers and
+// it is wrong here — it silently centred the calculator's display.
 int _appAlign(var a) {
   var s = (a == null) ? 'left' : a.toString();
-  if (s == 'right') return 1;
-  if (s == 'center') return 2;
+  if (s == 'center') return 1;
+  if (s == 'right') return 2;
   return 0;
 }
 
@@ -3231,12 +3269,32 @@ String appValueOf(String id) {
 /// Deliver an event to the app. Deliberately an ordinary ask(): that inherits
 /// the watchdog (a runaway handler is killed, not left hanging), the debugger's
 /// pause guard, and generation checking.
+int gAppPending = 0;              // events in flight, so a driver can wait
+
 void appFire(String id, String kind, String value) {
   if (gAppName == null) return;
+  gAppPending++;
   ask('appevent', <dynamic>[id, kind, value]).then((r) {
+    gAppPending--;
     var s = r.toString();
     if (s.startsWith('ERR')) appStatus(s);
   });
+}
+
+/// Wait until every event raised so far has been handled and its widget updates
+/// applied. A click is three hops — deferred callback, request to the language
+/// isolate, pushed update back — so a verb that returned on the first hop would
+/// make a script read the state BEFORE the click it just made. Every driven
+/// click funnels through here, which is why the suite needs no sleeps.
+Future appSettle() async {
+  // The click's own handler is a queued message that has not run yet; one turn
+  // of the event loop lets it through and registers the event.
+  await new Future.delayed(const Duration(milliseconds: 1));
+  var spins = 0;
+  while (gAppPending > 0 && spins < 300) {
+    await new Future.delayed(const Duration(milliseconds: 10));
+    spins++;
+  }
 }
 
 Future appRun(String name) async {
@@ -3323,6 +3381,15 @@ List<List<String>> scanApps() {
 /// File an example app into the image (through the same compile gate as every
 /// other route in), then run it.
 Future installApp(String title, String path) async {
+  gBusy++;                      // so `settle` covers the whole install + run
+  try {
+    await _installApp(title, path);
+  } finally {
+    gBusy--;
+  }
+}
+
+Future _installApp(String title, String path) async {
   var src;
   try { src = new File(path).readAsStringSync(); }
   catch (e) { log("✗ app — cannot read " + path); return; }
@@ -3644,7 +3711,10 @@ int _countLines(String s) {
 Future<CheckResult> compileCheck(String src,
     {bool standalone: false, List<String> replacing: null}) async {
   var bin = _analyzeBinary();
-  if (bin == null) return new CheckResult(true, "", 0);   // no checker: don't block work
+  if (bin == null) {         // no checker: don't block work, but never silently
+    _warnNoChecker();
+    return new CheckResult(true, "", 0);
+  }
 
   var probe, offset = 0;
   if (standalone) {
@@ -3733,7 +3803,13 @@ Future guardedAccept(List decls, String what, void commit()) async {
     log("✗ " + what + " refused — the language isolate is stopped in the debugger; Continue first");
     return;
   }
-  var r = await checkDecls(decls);
+  gBusy++;                    // the compile check is not a request; count it
+  var r;
+  try {
+    r = await checkDecls(decls);
+  } finally {
+    gBusy--;
+  }
   if (!r.ok) {
     log("✗ " + what + " refused — " + r.message);
     if (r.line > 0) _selectLine(r.line);
@@ -3755,12 +3831,30 @@ Future guardedAccept(List decls, String what, void commit()) async {
 //     it, and any main() with side effects ran every time Analyze was pressed.
 //     So a top-level main is renamed out of the way first and we supply an empty
 //     one. Pressing Analyze must never execute the user's program.
+// Look in BOTH build directories, not just this one's sibling. Running from
+// build-release/ used to collapse the two candidates onto the same missing path
+// (build-release/../build-release/dart), so no checker was found, compileCheck
+// quietly returned "ok", and the Accept gate disabled itself in silence — which
+// is exactly how source that does not compile got into the image.
 String _analyzeBinary() {
   var dir = new File(Platform.resolvedExecutable).parent.path;
-  for (var c in <String>[dir + "/../build-release/dart", dir + "/dart"]) {
+  for (var c in <String>[dir + "/dart",
+                         dir + "/../build-release/dart",
+                         dir + "/../build/dart"]) {
     if (new File(c).existsSync()) return c;
   }
   return null;
+}
+
+// A safety gate that turns itself off has to say so, every time it matters:
+// silence here reads as "checked and fine".
+bool _warnedNoChecker = false;
+void _warnNoChecker() {
+  if (_warnedNoChecker) return;
+  _warnedNoChecker = true;
+  log("⚠ no dart binary beside dartui — Accept is NOT compile-checked, so "
+      "source that does not compile can reach the image "
+      "(build one: ninja -C macdart/build dart)");
 }
 
 // Rename a TOP-LEVEL `main` so the trial cannot execute it. Literal-aware (via
@@ -3881,6 +3975,13 @@ TABS (View menu, Cmd-1..7)
              go as ['rect'|'oval'|'line'|'text', ...] lists; whole images go as
              a Pixmap (demos/pixmap.dart), which crosses as ONE blit command.
              Only files with a "// Demo:" header line are listed in the menu.
+  App        your own Cocoa app, running on real controls. An app is an ordinary
+             image class with a build(ui) method; it runs in the LANGUAGE
+             isolate and never imports dart:cocoa - it describes widgets and
+             this isolate materialises them. Edit build() and press Accept and
+             the layout changes while the app KEEPS ITS STATE, because the
+             reload morphs the live instance. Examples are in apps/ (Apps menu);
+             see APP_PANE_PLAN.md.
 
 THE IMAGE AND THE WORLD
   The world is the VM snapshot (dart:core and friends) - read-only. Your app is

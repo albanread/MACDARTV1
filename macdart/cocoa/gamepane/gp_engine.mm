@@ -1114,6 +1114,103 @@ void GpSfx::play(int slot) {
       completionHandler:nil];
 }
 
+// --- GpDirectPane (GAMEPANE_PLAN.md §6b) ------------------------------------
+
+// A 256-colour palette shader: read the linear index texture, look up the
+// colour. Opaque — the direct framebuffer is the whole picture.
+static const char* kDirectMsl =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "struct VOut { float4 pos [[position]]; float2 uv; };\n"
+    "struct U { float w; float h; };\n"
+    "vertex VOut vmain(uint vid [[vertex_id]]) {\n"
+    "    float2 p[3] = { float2(-1,-1), float2(3,-1), float2(-1,3) };\n"
+    "    VOut o; o.pos = float4(p[vid], 0, 1);\n"
+    "    o.uv = float2((p[vid].x + 1) * 0.5, 1.0 - (p[vid].y + 1) * 0.5);\n"
+    "    return o;\n"
+    "}\n"
+    "fragment float4 fmain(VOut in [[stage_in]], constant U& u [[buffer(0)]],\n"
+    "                      texture2d<uint> idx [[texture(0)]],\n"
+    "                      constant float4* pal [[buffer(1)]]) {\n"
+    "    uint x = uint(in.uv.x * u.w), y = uint(in.uv.y * u.h);\n"
+    "    if (x >= uint(u.w)) x = uint(u.w) - 1;\n"
+    "    if (y >= uint(u.h)) y = uint(u.h) - 1;\n"
+    "    return pal[idx.read(uint2(x, y)).r];\n"
+    "}\n";
+
+GpDirectPane::GpDirectPane(id<MTLDevice> device, int w, int h, std::string* err)
+    : w_(w), h_(h), write_(0), pal_buf_(nil), pal_dirty_(true), pipeline_(nil) {
+  // bytesPerRow of a buffer-backed texture must be a multiple of the format's
+  // linear alignment; round the stride up so the game can address fb[y*stride+x].
+  NSUInteger align =
+      [device minimumLinearTextureAlignmentForPixelFormat:MTLPixelFormatR8Uint];
+  if (align < 1) align = 1;
+  stride_ = (int)(((NSUInteger)w + align - 1) / align * align);
+  MTLTextureDescriptor* td = [MTLTextureDescriptor
+      texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Uint
+                                   width:(NSUInteger)w
+                                  height:(NSUInteger)h
+                               mipmapped:NO];
+  td.usage = MTLTextureUsageShaderRead;
+  td.storageMode = MTLStorageModeShared;
+  for (int i = 0; i < kBuffers; i++) {
+    buffers_[i] = [device newBufferWithLength:(NSUInteger)stride_ * h
+                                      options:MTLResourceStorageModeShared];
+    memset([buffers_[i] contents], 0, (size_t)stride_ * h);
+    textures_[i] = [buffers_[i] newTextureWithDescriptor:td
+                                                  offset:0
+                                             bytesPerRow:(NSUInteger)stride_];
+  }
+  pal_.assign(256 * 4, 0.0f);
+  for (int i = 0; i < 256; i++) pal_[i * 4 + 3] = 1.0f;   // opaque
+  pal_buf_ = [device newBufferWithLength:256 * 16
+                                 options:MTLResourceStorageModeShared];
+  pipeline_ = MakeRenderPipeline(device, kDirectMsl, false, err);
+}
+
+GpDirectPane::~GpDirectPane() {
+  for (int i = 0; i < kBuffers; i++) {
+    if (textures_[i]) [textures_[i] release];
+    if (buffers_[i]) [buffers_[i] release];
+  }
+  if (pal_buf_) [pal_buf_ release];
+  if (pipeline_) [pipeline_ release];
+}
+
+void* GpDirectPane::backbuffer_ptr() { return [buffers_[write_] contents]; }
+
+void GpDirectPane::set_pal(int i, uint8_t r, uint8_t g, uint8_t b) {
+  if (i < 0 || i > 255) return;
+  pal_[i * 4] = r / 255.0f;
+  pal_[i * 4 + 1] = g / 255.0f;
+  pal_[i * 4 + 2] = b / 255.0f;
+  pal_[i * 4 + 3] = 1.0f;
+  pal_dirty_ = true;
+}
+
+void GpDirectPane::present_render(id<MTLCommandBuffer> cb, id<MTLTexture> target) {
+  if (pipeline_ == nil) return;
+  if (pal_dirty_) {
+    memcpy([pal_buf_ contents], pal_.data(), pal_.size() * sizeof(float));
+    pal_dirty_ = false;
+  }
+  int idx = write_;                          // the buffer the game just wrote
+  MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
+  rp.colorAttachments[0].texture = target;
+  rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+  rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+  rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+  id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
+  [enc setRenderPipelineState:pipeline_];
+  float u[2] = { (float)w_, (float)h_ };
+  [enc setFragmentBytes:u length:sizeof(u) atIndex:0];
+  [enc setFragmentTexture:textures_[idx] atIndex:0];
+  [enc setFragmentBuffer:pal_buf_ offset:0 atIndex:1];
+  [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+  [enc endEncoding];
+  write_ = (idx + 1) % kBuffers;             // next backbuffer is ≥2 frames free
+}
+
 // --- GpEngine ----------------------------------------------------------------
 
 GpEngine* GpEngine::instance() {
@@ -1125,8 +1222,8 @@ GpEngine* GpEngine::instance() {
 GpEngine::GpEngine()
     : device_(nil), queue_(nil), view_(nil), layer_(nil), offscreen_(nil),
       frame_cb_(nil), pane_(NULL), sprites_(NULL), blitter_(NULL),
-      text_(NULL), shader_(NULL), sfx_(NULL), music_(NULL),
-      fullscreen_(false), open_(false),
+      text_(NULL), shader_(NULL), direct_pane_(NULL), sfx_(NULL), music_(NULL),
+      fullscreen_(false), direct_(false), open_(false),
       logical_w_(0), logical_h_(0), frames_(0), last_tick_time_(0.0) {}
 
 bool GpEngine::ensure_device(std::string* err) {
@@ -1148,12 +1245,13 @@ bool GpEngine::ensure_device(std::string* err) {
   return true;
 }
 
-NSView* GpEngine::open(int w, int h, int world_w, int world_h,
+NSView* GpEngine::open(int w, int h, int world_w, int world_h, bool direct,
                        std::string* err) {
   if (!ensure_device(err)) return nil;
   close();                                  // panes free; device/view reused
   if (world_w < w) world_w = w;             // world >= viewport, always
   if (world_h < h) world_h = h;
+  direct_ = direct;
   logical_w_ = w;
   logical_h_ = h;
   layer_.drawableSize = CGSizeMake(w, h);   // logical pixels; layer upscales
@@ -1167,11 +1265,16 @@ NSView* GpEngine::open(int w, int h, int world_w, int world_h,
   td.storageMode = MTLStorageModeShared;    // gpsnap reads it back
   offscreen_ = [device_ newTextureWithDescriptor:td];
 
-  pane_ = new GpIndexedPane(device_, world_w, world_h, w, h, err);
-  sprites_ = new GpSprites(device_, err);
-  blitter_ = new GpBlitter(device_, err);
-  text_ = new GpTextOverlay(device_, w, h, err);
-  shader_ = new GpShaderPane(device_);
+  if (direct_) {
+    direct_pane_ = new GpDirectPane(device_, w, h, err);
+    text_ = new GpTextOverlay(device_, w, h, err);   // a HUD over the framebuffer
+  } else {
+    pane_ = new GpIndexedPane(device_, world_w, world_h, w, h, err);
+    sprites_ = new GpSprites(device_, err);
+    blitter_ = new GpBlitter(device_, err);
+    text_ = new GpTextOverlay(device_, w, h, err);
+    shader_ = new GpShaderPane(device_);
+  }
   open_ = true;
   frames_ = 0;
   last_tick_time_ = 0.0;
@@ -1190,8 +1293,10 @@ void GpEngine::close() {
   delete blitter_; blitter_ = NULL;
   delete text_; text_ = NULL;
   delete shader_; shader_ = NULL;
+  delete direct_pane_; direct_pane_ = NULL;   // the game isolate is dead by now
   if (offscreen_) { [offscreen_ release]; offscreen_ = nil; }
   frame_cb_ = nil;
+  direct_ = false;
   open_ = false;
 }
 
@@ -1231,18 +1336,26 @@ void GpEngine::render_present() {
   double dt = last_tick_time_ == 0.0 ? 0.0 : now - last_tick_time_;
   if (dt > 0.1) dt = 0.1;
   last_tick_time_ = now;
-  sprites_->tick(dt);
-  pane_->upload();
-  text_->upload();
 
-  bool has_shader = shader_->ready();
-  if (has_shader) shader_->render(frame_cb_, offscreen_);
-  pane_->render(frame_cb_, offscreen_,
-                has_shader ? MTLLoadActionLoad : MTLLoadActionClear);
-  sprites_->render(frame_cb_, offscreen_,
-                   (double)pane_->scroll_x(), (double)pane_->scroll_y(),
-                   (double)logical_w_, (double)logical_h_);
-  text_->render(frame_cb_, offscreen_);
+  if (direct_) {
+    // The game already wrote the backbuffer straight into GPU memory; just
+    // sample it through the palette, then the HUD.
+    text_->upload();
+    direct_pane_->present_render(frame_cb_, offscreen_);
+    text_->render(frame_cb_, offscreen_);
+  } else {
+    sprites_->tick(dt);
+    pane_->upload();
+    text_->upload();
+    bool has_shader = shader_->ready();
+    if (has_shader) shader_->render(frame_cb_, offscreen_);
+    pane_->render(frame_cb_, offscreen_,
+                  has_shader ? MTLLoadActionLoad : MTLLoadActionClear);
+    sprites_->render(frame_cb_, offscreen_,
+                     (double)pane_->scroll_x(), (double)pane_->scroll_y(),
+                     (double)logical_w_, (double)logical_h_);
+    text_->render(frame_cb_, offscreen_);
+  }
 
   id<CAMetalDrawable> drawable = [layer_ nextDrawable];
   if (drawable != nil) {

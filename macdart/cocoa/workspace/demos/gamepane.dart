@@ -21,11 +21,13 @@ library gamepane;
 
 import 'dart:isolate';
 
+import 'abc.dart';
+
 /// macOS virtual keycodes the tick payload carries.
 class Keys {
   static const int left = 123, right = 124, down = 125, up = 126;
   static const int space = 49, esc = 53;
-  static const int a = 0, s = 1, d = 2, w = 13;
+  static const int a = 0, s = 1, d = 2, w = 13, f = 3;
 }
 
 class GamePane {
@@ -121,6 +123,21 @@ class GamePane {
     _cmds.add(<dynamic>['gpsound', slot, preset, a1, a2]);
     return new Sound._(this, slot);
   }
+
+  /// Compile [abc] (ABC notation — see abc.dart for the subset) HERE in the
+  /// game isolate and ship the flat event list; the native side wraps it in
+  /// a Standard MIDI File and plays it through the Mac's built-in GM synth.
+  Tune tune(String abc) {
+    var slot = _nextTune++;
+    var t = parseAbc(abc);
+    _cmds.add(<dynamic>['gptune', slot, t.bpm, t.events]);
+    return new Tune._(this, slot);
+  }
+  int _nextTune = 0;
+
+  /// The pane takes the whole screen (Esc — or the workspace — brings it
+  /// back; the logical resolution is unchanged, just upscaled crisp).
+  void fullscreen(bool on) => _cmds.add(<dynamic>['gpfull', on ? 1 : 0]);
 }
 
 /// A sprite DEFINITION: hex-row art ('0'-'f', '.' = transparent, rows split
@@ -171,4 +188,15 @@ class Sound {
   final int slot;
   Sound._(this.gp, this.slot);
   void play() => gp._cmds.add(<dynamic>['gpplay', slot]);
+}
+
+/// A compiled tune (see GamePane.tune). Looping restarts engine-side the
+/// frame after it ends; stop() silences it.
+class Tune {
+  final GamePane gp;
+  final int slot;
+  Tune._(this.gp, this.slot);
+  void play() => gp._cmds.add(<dynamic>['gpmusic', slot, 1]);
+  void loop() => gp._cmds.add(<dynamic>['gpmusic', slot, 2]);
+  void stop() => gp._cmds.add(<dynamic>['gpmusic', slot, 0]);
 }

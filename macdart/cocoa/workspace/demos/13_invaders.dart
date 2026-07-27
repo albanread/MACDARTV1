@@ -6,7 +6,9 @@
 // descending rank of invaders — all 16-colour sprites with their own
 // palettes. Layer 3: seven-segment score. Keys ride the pull tick
 // (← → or A/D move, space fires), sounds are synth presets (zap, explode,
-// hurt). Lose all three lives and space restarts.
+// hurt), and the looping theme is ABC notation compiled IN THIS ISOLATE
+// (demos/abc.dart), played through the Mac's GM synth. F goes fullscreen
+// (Esc comes back). Lose all three lives and space restarts.
 import 'dart:isolate';
 import 'dart:math';
 
@@ -29,6 +31,18 @@ const String kSky =
     '    }\n'
     '    return float4(col, 1.0);\n'
     '}\n';
+
+// An original little theme: Am–G–F–E arpeggios on a square lead, eighths at
+// a marching 140. Written for this demo; loops seamlessly.
+const String kTheme = 'X:1\n'
+    'T:march of the sprites\n'
+    'M:4/4\n'
+    'L:1/8\n'
+    'Q:1/4=140\n'
+    '%%MIDI program 80\n'
+    'K:Am\n'
+    '|: A,CEA cAEC | G,B,DG BGDB, | F,ACF AFCA, | E,^G,B,E ^G,B,E2 :|\n'
+    'A,2 E,2 A,,4 |\n';
 
 main(List args, SendPort ui) {
   var gp = new GamePane(ui, 424, 240);
@@ -93,9 +107,12 @@ main(List args, SendPort ui) {
       zap = g.sound('zap');
       boom = g.sound('explode');
       hurt2 = g.sound('hurt');
+      g.tune(kTheme).loop();               // the theme, compiled here, looping
       spawnWave(g, foeDef);
-      g.status('← → (A/D) move, space fires — the whole engine, playable');
+      g.status('← → (A/D) move, space fires, F fullscreen (Esc back)');
     }
+
+    if (g.key(Keys.f)) g.fullscreen(true); // engine no-ops when already on
 
     if (lives <= 0) {                        // game over: space restarts
       g.textClear();

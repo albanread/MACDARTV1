@@ -1747,6 +1747,7 @@ Future<String> handle(String line) async {
       return e.isEmpty ? "ok " + (arg.isEmpty ? "/tmp/gp.png" : arg) : "ERR: " + e;
     }
     case 'gpstat': return gpStat().toString();
+    case 'gpfull': gpFullscreen(arg.trim() == '1'); return "ok";
     case 'tab': switchTab(int.parse(arg)); return "ok";
     case 'brcat': selectCategory(int.parse(arg)); return "ok";
     case 'brclass': selectClass(int.parse(arg)); return "ok";
@@ -2750,8 +2751,14 @@ void gpLeave() {
 
 void buildDemosTab(Cocoa dm) {
   button(dm, "Stop", [8.0, 392.0, 64.0, 24.0], (s) => stopDemo("stopped"));
-  pinTop(<String>["Stop"]);
-  gDemoStatusLbl = label(dm, [82.0, 396.0, 778.0, 16.0]);
+  // Fullscreen for the game pane only (Esc brings it back); the classic
+  // NSImage canvas has no fullscreen story and the button says so by doing
+  // nothing when no game is up.
+  button(dm, "Full", [76.0, 392.0, 56.0, 24.0], (s) {
+    if (gGpMode) gpFullscreen(true);
+  });
+  pinTop(<String>["Stop", "Full"]);
+  gDemoStatusLbl = label(dm, [140.0, 396.0, 720.0, 16.0]);
   gDemoStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
   // The image survives a chrome rebuild on purpose: a demo that is mid-flight
   // keeps drawing into it while the views around it are torn down and rebuilt.
@@ -3007,7 +3014,14 @@ void _onDemoMsg(msg) {
           // The tick carries the GAMESTATE: [downKeycodes, modifierFlags] at
           // this instant. Non-games ignore the payload; games read their input
           // exactly once per frame with no event queue to drain.
-          if (identical(gDemoCtl, p)) p.send(keyState());
+          if (!identical(gDemoCtl, p)) return;
+          var ks = keyState();
+          // Esc while the game pane is fullscreen: the workspace comes back.
+          // (The keypress still reaches the game in this same tick.)
+          if (gGpMode && ks[0] is List && (ks[0] as List).contains(53)) {
+            gpFullscreen(false);
+          }
+          p.send(ks);
         });
       }
     }

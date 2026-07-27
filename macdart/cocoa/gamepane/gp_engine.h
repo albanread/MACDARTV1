@@ -193,6 +193,28 @@ class GpShaderPane {
   float aspect_;
 };
 
+// --- music: compiled tunes through the built-in GM synth ---------------------
+// The game isolate compiles ABC to a flat event list (demos/abc.dart); here
+// it becomes an in-memory Standard MIDI File wrapped by an AVMIDIPlayer per
+// slot. Looping is a per-frame poll (render_present), not a completion block
+// — main-thread, MRC-safe, no block gymnastics.
+const int kMaxTunes = 8;
+
+class GpMusic {
+ public:
+  GpMusic();
+  ~GpMusic();
+  // events: [timeMs, status, d1, d2]*n — status carries the channel already.
+  bool define(int slot, int bpm, const std::vector<int32_t>& events);
+  void control(int slot, int mode);  // 0 stop, 1 play once, 2 loop
+  void poll();                       // restart looping slots that finished
+  void stop_all();
+
+ private:
+  id players_[kMaxTunes];            // AVMIDIPlayer, typed in the .mm
+  bool looping_[kMaxTunes];
+};
+
 // --- SFX playback ------------------------------------------------------------
 // ONE AVAudioEngine per process (two concurrent starts abort uncatchably —
 // the engine's own documented hazard), created lazily on first use. 64 fixed
@@ -230,6 +252,12 @@ class GpEngine {
   GpTextOverlay* text() { return text_; }
   GpShaderPane* shader() { return shader_; }
   GpSfx* sfx();                    // lazily started
+  GpMusic* music();                // lazily created
+
+  // Fullscreen: the pane view takes the whole screen (logical resolution
+  // unchanged — the layer upscales, nearest). Exit restores it to the tab.
+  void set_fullscreen(bool on);
+  bool fullscreen() const { return fullscreen_; }
 
   // Frame flow: begin() opens the command buffer (blit verbs encode into
   // it mid-apply), render_present() composites + presents + commits.
@@ -258,6 +286,8 @@ class GpEngine {
   GpTextOverlay* text_;
   GpShaderPane* shader_;
   GpSfx* sfx_;
+  GpMusic* music_;
+  bool fullscreen_;
   bool open_;
   int logical_w_, logical_h_;
   int frames_;

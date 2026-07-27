@@ -227,8 +227,14 @@ dynamic gpApply(List cmds) => _gpApply(cmds);
 /// a window snapshot cannot see) as a PNG. "" on success, else the error.
 String gpSnap(String path) => _gpSnap(path);
 
-/// `[open, framesPresented, logicalW, logicalH]`.
+/// `[open, framesPresented, logicalW, logicalH, fullscreen]`.
 List gpStat() => _gpStat();
+
+void _gpFullscreen(int on) native "Cocoa_gpFullscreen";
+
+/// The pane view takes (or leaves) the whole screen; logical resolution
+/// unchanged, upscaled crisp. No-op when the pane is closed.
+void gpFullscreen(bool on) => _gpFullscreen(on ? 1 : 0);
 
 void _setSplitMinSize(int splitView, double minSize) native "Cocoa_setSplitMinSize";
 

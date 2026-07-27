@@ -328,6 +328,30 @@ void Cocoa_gpApply(Dart_NativeArguments args) {
         }
       } else if (strcmp(op, "gpplay") == 0 && cn >= 2) {
         eng->sfx()->play((int)ElInt(c, 1));
+      } else if (strcmp(op, "gptune") == 0 && cn >= 4) {
+        // ['gptune', slot, bpm, [timeMs, status, d1, d2, ...]]
+        int64_t slot = ElInt(c, 1);
+        Dart_Handle flat = Dart_ListGetAt(c, 3);
+        intptr_t fn = 0;
+        if (slot < 0 || slot >= kMaxTunes) verr = "gptune: slot 0..7";
+        else if (!Dart_IsList(flat) ||
+                 Dart_IsError(Dart_ListLength(flat, &fn)) || fn < 4) {
+          verr = "gptune: events must be a flat int list";
+        } else {
+          std::vector<int32_t> events;
+          events.reserve((size_t)fn);
+          for (intptr_t k = 0; k < fn; k++) {
+            events.push_back((int32_t)ElInt(flat, k));
+          }
+          if (!eng->music()->define((int)slot, (int)ElInt(c, 2), events)) {
+            verr = "gptune: define failed";
+          }
+        }
+      } else if (strcmp(op, "gpmusic") == 0 && cn >= 3) {
+        // mode: 0 stop, 1 play once, 2 loop
+        eng->music()->control((int)ElInt(c, 1), (int)ElInt(c, 2));
+      } else if (strcmp(op, "gpfull") == 0 && cn >= 2) {
+        eng->set_fullscreen(ElInt(c, 1) != 0);
       } else if (strcmp(op, "gpopen") == 0) {
         // Consumed Dart-side before apply; seeing it here is harmless.
       } else {
@@ -362,15 +386,25 @@ void Cocoa_gpSnap(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, Dart_NewStringFromCString(""));
 }
 
-// _gpStat() -> [open, framesPresented, logicalW, logicalH]
+// _gpStat() -> [open, framesPresented, logicalW, logicalH, fullscreen]
 void Cocoa_gpStat(Dart_NativeArguments args) {
   GpEngine* eng = GpEngine::instance();
-  Dart_Handle l = Dart_NewList(4);
+  Dart_Handle l = Dart_NewList(5);
   Dart_ListSetAt(l, 0, Dart_NewInteger(eng->is_open() ? 1 : 0));
   Dart_ListSetAt(l, 1, Dart_NewInteger(eng->frames_presented()));
   Dart_ListSetAt(l, 2, Dart_NewInteger(eng->logical_w()));
   Dart_ListSetAt(l, 3, Dart_NewInteger(eng->logical_h()));
+  Dart_ListSetAt(l, 4, Dart_NewInteger(eng->fullscreen() ? 1 : 0));
   Dart_SetReturnValue(args, l);
+}
+
+// _gpFullscreen(on) — the workspace-side handle on the same switch the
+// 'gpfull' verb flips (the Full button, and Esc bringing the screen back).
+void Cocoa_gpFullscreen(Dart_NativeArguments args) {
+  int64_t on = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &on);
+  GpEngine::instance()->set_fullscreen(on != 0);
+  Dart_SetReturnValue(args, Dart_Null());
 }
 
 }  // namespace bin

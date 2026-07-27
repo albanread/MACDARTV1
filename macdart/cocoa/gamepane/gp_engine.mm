@@ -913,6 +913,130 @@ void GpShaderPane::render(id<MTLCommandBuffer> cb, id<MTLTexture> target) {
   [enc endEncoding];
 }
 
+// --- GpMusic -----------------------------------------------------------------
+
+// A format-0 Standard MIDI File in memory (the layout smf.rs writes):
+// MThd(fmt 0, 1 track, 480 ppq), one Set-Tempo meta, delta-time events with
+// running ms->tick conversion, End-of-Track. All big-endian.
+static void SmfU32(std::vector<uint8_t>* out, uint32_t v) {
+  out->push_back((uint8_t)(v >> 24)); out->push_back((uint8_t)(v >> 16));
+  out->push_back((uint8_t)(v >> 8)); out->push_back((uint8_t)v);
+}
+static void SmfU16(std::vector<uint8_t>* out, uint16_t v) {
+  out->push_back((uint8_t)(v >> 8)); out->push_back((uint8_t)v);
+}
+static void SmfVlq(std::vector<uint8_t>* out, uint32_t v) {
+  uint8_t stack[5]; int n = 0;
+  stack[n++] = (uint8_t)(v & 0x7F);
+  v >>= 7;
+  while (v != 0) { stack[n++] = (uint8_t)((v & 0x7F) | 0x80); v >>= 7; }
+  while (n > 0) out->push_back(stack[--n]);
+}
+
+static std::vector<uint8_t> BuildSmf(int bpm,
+                                     const std::vector<int32_t>& ev) {
+  if (bpm <= 0) bpm = 120;
+  std::vector<uint8_t> out;
+  out.push_back('M'); out.push_back('T'); out.push_back('h'); out.push_back('d');
+  SmfU32(&out, 6);
+  SmfU16(&out, 0);                    // format 0
+  SmfU16(&out, 1);                    // one track
+  SmfU16(&out, 480);                  // ppq
+  out.push_back('M'); out.push_back('T'); out.push_back('r'); out.push_back('k');
+  size_t len_at = out.size();
+  SmfU32(&out, 0);                    // backpatched
+  size_t body = out.size();
+  SmfVlq(&out, 0);                    // tempo meta at t=0
+  out.push_back(0xFF); out.push_back(0x51); out.push_back(0x03);
+  uint32_t mpq = 60000000u / (uint32_t)bpm;
+  out.push_back((uint8_t)(mpq >> 16)); out.push_back((uint8_t)(mpq >> 8));
+  out.push_back((uint8_t)mpq);
+  uint32_t last_tick = 0;
+  for (size_t i = 0; i + 3 < ev.size(); i += 4) {
+    int32_t ms = ev[i];
+    if (ms < 0) ms = 0;
+    // tick = ms * bpm / 125 (a quarter lands on 480), rounded
+    uint32_t tick = (uint32_t)(((int64_t)ms * bpm + 62) / 125);
+    uint32_t delta = tick >= last_tick ? tick - last_tick : 0;
+    last_tick = tick;
+    uint8_t status = (uint8_t)ev[i + 1];
+    SmfVlq(&out, delta);
+    out.push_back(status);
+    out.push_back((uint8_t)(ev[i + 2] & 0x7F));
+    if ((status & 0xF0) != 0xC0) out.push_back((uint8_t)(ev[i + 3] & 0x7F));
+  }
+  SmfVlq(&out, 0);                    // end of track
+  out.push_back(0xFF); out.push_back(0x2F); out.push_back(0x00);
+  uint32_t track_len = (uint32_t)(out.size() - body);
+  out[len_at] = (uint8_t)(track_len >> 24);
+  out[len_at + 1] = (uint8_t)(track_len >> 16);
+  out[len_at + 2] = (uint8_t)(track_len >> 8);
+  out[len_at + 3] = (uint8_t)track_len;
+  return out;
+}
+
+GpMusic::GpMusic() {
+  for (int i = 0; i < kMaxTunes; i++) { players_[i] = nil; looping_[i] = false; }
+}
+
+GpMusic::~GpMusic() {
+  stop_all();
+  for (int i = 0; i < kMaxTunes; i++) {
+    if (players_[i]) [players_[i] release];
+  }
+}
+
+bool GpMusic::define(int slot, int bpm, const std::vector<int32_t>& events) {
+  if (slot < 0 || slot >= kMaxTunes || events.empty()) return false;
+  std::vector<uint8_t> smf = BuildSmf(bpm, events);
+  NSData* data = [NSData dataWithBytes:smf.data() length:smf.size()];
+  NSError* err = nil;
+  AVMIDIPlayer* p = [[AVMIDIPlayer alloc] initWithData:data
+                                          soundBankURL:nil
+                                                 error:&err];
+  if (p == nil) return false;
+  [p prepareToPlay];
+  if (players_[slot]) {
+    [(AVMIDIPlayer*)players_[slot] stop];
+    [players_[slot] release];
+  }
+  players_[slot] = p;
+  looping_[slot] = false;
+  return true;
+}
+
+void GpMusic::control(int slot, int mode) {
+  if (slot < 0 || slot >= kMaxTunes || players_[slot] == nil) return;
+  AVMIDIPlayer* p = (AVMIDIPlayer*)players_[slot];
+  if (mode == 0) {
+    looping_[slot] = false;
+    [p stop];
+  } else {
+    looping_[slot] = (mode == 2);
+    [p stop];
+    p.currentPosition = 0;
+    [p play:nil];
+  }
+}
+
+void GpMusic::poll() {
+  for (int i = 0; i < kMaxTunes; i++) {
+    if (!looping_[i] || players_[i] == nil) continue;
+    AVMIDIPlayer* p = (AVMIDIPlayer*)players_[i];
+    if (![p isPlaying]) {
+      p.currentPosition = 0;
+      [p play:nil];
+    }
+  }
+}
+
+void GpMusic::stop_all() {
+  for (int i = 0; i < kMaxTunes; i++) {
+    looping_[i] = false;
+    if (players_[i]) [(AVMIDIPlayer*)players_[i] stop];
+  }
+}
+
 // --- GpSfx -------------------------------------------------------------------
 
 GpSfx::GpSfx() : engine_(nil), player_(nil), format_(nil), started_(false) {
@@ -1001,7 +1125,8 @@ GpEngine* GpEngine::instance() {
 GpEngine::GpEngine()
     : device_(nil), queue_(nil), view_(nil), layer_(nil), offscreen_(nil),
       frame_cb_(nil), pane_(NULL), sprites_(NULL), blitter_(NULL),
-      text_(NULL), shader_(NULL), sfx_(NULL), open_(false),
+      text_(NULL), shader_(NULL), sfx_(NULL), music_(NULL),
+      fullscreen_(false), open_(false),
       logical_w_(0), logical_h_(0), frames_(0), last_tick_time_(0.0) {}
 
 bool GpEngine::ensure_device(std::string* err) {
@@ -1058,6 +1183,8 @@ NSView* GpEngine::open(int w, int h, int world_w, int world_h,
 }
 
 void GpEngine::close() {
+  set_fullscreen(false);                    // never leave a dead fullscreen up
+  if (music_ != NULL) music_->stop_all();   // the players persist; the tune stops
   delete pane_; pane_ = NULL;
   delete sprites_; sprites_ = NULL;
   delete blitter_; blitter_ = NULL;
@@ -1074,6 +1201,23 @@ GpSfx* GpEngine::sfx() {
     sfx_->start();                          // one engine per process, lazily
   }
   return sfx_;
+}
+
+GpMusic* GpEngine::music() {
+  if (music_ == NULL) music_ = new GpMusic();
+  return music_;
+}
+
+void GpEngine::set_fullscreen(bool on) {
+  if (view_ == nil || on == fullscreen_) return;
+  if (on) {
+    // The view is lifted into its own fullscreen window; the layer keeps its
+    // logical drawableSize, so the whole screen is one crisp nearest upscale.
+    [view_ enterFullScreenMode:[NSScreen mainScreen] withOptions:nil];
+  } else {
+    [view_ exitFullScreenModeWithOptions:nil];
+  }
+  fullscreen_ = [view_ isInFullScreenMode];
 }
 
 void GpEngine::begin_frame() {
@@ -1119,6 +1263,7 @@ void GpEngine::render_present() {
   [frame_cb_ commit];
   frame_cb_ = nil;
   frames_++;
+  if (music_ != NULL) music_->poll();       // restart looping tunes that ended
 }
 
 bool GpEngine::snap(const char* path, std::string* err) {

@@ -390,6 +390,7 @@ void Cocoa_gpClose(Dart_NativeArguments args);
 void Cocoa_gpApply(Dart_NativeArguments args);
 void Cocoa_gpSnap(Dart_NativeArguments args);
 void Cocoa_gpStat(Dart_NativeArguments args);
+void Cocoa_gpFullscreen(Dart_NativeArguments args);
 
 // SQLite image store (defined in sqlite_natives.cc).
 void Sqlite_open(Dart_NativeArguments args);
@@ -429,6 +430,7 @@ void Sqlite_query(Dart_NativeArguments args);
   V(Cocoa_gpApply, 1)                                                          \
   V(Cocoa_gpSnap, 1)                                                           \
   V(Cocoa_gpStat, 0)                                                           \
+  V(Cocoa_gpFullscreen, 1)                                                     \
   V(Sqlite_open, 1)                                                            \
   V(Sqlite_close, 1)                                                           \
   V(Sqlite_exec, 3)                                                            \

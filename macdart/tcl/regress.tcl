@@ -268,6 +268,26 @@ check "app re-lays out when the pane grows" \
 ui resize 900 640
 after 1800
 check "and comes back when it shrinks" [lindex [split [ui apptree] \n] 0] $appSmall
+
+# Edit opens the RUNNING app's own source in the Editor, and committing it there
+# goes through the same gate as everything else — so the round trip a user
+# actually does (edit the layout, save, watch it change) is covered end to end.
+check "edit opens the app"   [ui appedit] "editing Calculator"
+check "editor holds its source" \
+    [expr {[string match {*class Calculator*} [ui edtext]]}] 1
+# A class whose source opens with a doc comment is still a class. It used to be
+# classified as a 'variable', which removed every documented class — including
+# all the apps/ examples — from the class list without saying so.
+ui settle
+check "a documented class is listed" \
+    [expr {[string match {*Calculator*} [ui edclasses]]}] 1
+set edited [string map {"'C'" "'AC'"} [ui edtext]]
+ui edsettext [string map [list "\n" "\\n"] $edited]
+ui click "Save to Image"
+ui settle
+after 800
+check "committed from the editor" [expr {[string match {*AC*} [ui apptree]]}] 1
+check "and the total survived"    [ui appget d] 45
 ui appstop
 
 section "searchable Dart V1 help"

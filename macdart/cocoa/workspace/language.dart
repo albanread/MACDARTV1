@@ -307,7 +307,11 @@ List _memberList(String className) {
 }
 
 String _kindOf(String s) {
-  s = s.trim();
+  // Past the doc comment first — same trap as _declName. A documented class
+  // was classified as a 'variable', which quietly removed it from the Editor's
+  // class picker and the Browser's class list: the apps/ examples ship with a
+  // header comment, so every one of them was invisible.
+  s = _afterLeadingComments(s).trim();
   if (new RegExp(r'^(?:abstract\s+)?class\b').hasMatch(s)) return 'class';
   if (s.startsWith('enum ')) return 'enum';
   if (s.startsWith('typedef ')) return 'typedef';

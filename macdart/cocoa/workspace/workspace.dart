@@ -1752,6 +1752,10 @@ Future<String> handle(String line) async {
           : "running " + gAppName;
     }
     case 'appstop': await appStop(); return "ok";
+    case 'appedit': {
+      await appEdit();
+      return gEdClass == null ? "ERR: nothing to edit" : "editing " + gEdClass;
+    }
     case 'appstatus': return gAppName == null ? "idle" : "running " + gAppName;
     case 'apptree': {
       if (gAppName == null) return "(no app running)";
@@ -3301,8 +3305,12 @@ void buildAppTab(Cocoa ap) {
     appRun(gAppPicker.titleOfSelectedItem().UTF8String());
   });
   button(ap, "Stop App", [298.0, 390.0, 84.0, 26.0], (s) => appStop());
-  pinTop(<String>["Run", "Stop App"]);
-  gAppTitleLbl = label(ap, [392.0, 394.0, 200.0, 16.0]);
+  // The point of the pane: change the app that is running in it. Editing goes
+  // through the Editor tab like any other class, and Save to Image commits it —
+  // which hot-reloads and re-runs build(), so the app keeps its state.
+  button(ap, "Edit", [386.0, 390.0, 60.0, 26.0], (s) => appEdit());
+  pinTop(<String>["Run", "Stop App", "Edit"]);
+  gAppTitleLbl = label(ap, [452.0, 394.0, 200.0, 16.0]);
   gAppTitleLbl.setAutoresizingMask(kMinYMargin);
   gAppStatusLbl = label(ap, [8.0, 366.0, 852.0, 16.0]);
   gAppStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
@@ -3533,6 +3541,34 @@ Future appRun(String name) async {
   gAppResizedAt = 0;
   appStatus("running " + name);
   log("app: " + name);
+}
+
+/// Open the app's own source in the Editor. The running app if there is one,
+/// otherwise whatever is selected in the picker — so it also works as "show me
+/// what I am about to run".
+Future appEdit() async {
+  var name = gAppName;
+  if (name == null && gAppPicker != null && gAppPicker.numberOfItems() > 0) {
+    name = gAppPicker.titleOfSelectedItem().UTF8String();
+  }
+  if (name == null) {
+    appStatus("nothing to edit — pick an app first");
+    return;
+  }
+  var src = (await ask('classsrc', name)).toString();
+  if (src.isEmpty || src.startsWith('ERR')) {
+    appStatus("could not read " + name + " from the image");
+    return;
+  }
+  // Set the class BEFORE switching: the Editor repopulates its picker on the
+  // way in and restores the selection from gEdClass.
+  gEdClass = name;
+  gEdFile = null;
+  switchTab(4);
+  edSetText(src);
+  edStatus(name + "  ·  the running app  ·  Save to Image = live + saved, and "
+           "the app rebuilds keeping its state");
+  log("editing " + name);
 }
 
 Future appStop() async {
@@ -4399,6 +4435,9 @@ MENUS
   Demos  one item per file in demos/ - picking one spawns it as an isolate and
          switches to the Demos tab. Stop Demo is Cmd-. and kills the isolate.
          Drop a new .dart in the folder and Rescan.
+  Apps   install an example from apps/ into the image and run it. In the App
+         pane, Edit opens the running app's own source in the Editor; Save to
+         Image commits it, and the app rebuilds while keeping its state.
   View   the tabs, and Clear Transcript (Cmd-K).
 
 EDITOR

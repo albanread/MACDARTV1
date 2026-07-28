@@ -1663,6 +1663,33 @@ Future<String> handle(String line) async {
       var lbl = _dbgIsoLabel(target[1].toString(), target[0].toString());
       return "profiled " + lbl + " over ~" + ms.toString() + "ms\n" + profReport(15);
     }
+    case 'proftree': {
+      // Like prof, but renders the inclusive CALL TREE (the path to hot code)
+      // instead of the flat self-time list. Paths below 2% are pruned.
+      var toks = arg.trim().isEmpty ? <String>[] : arg.trim().split(new RegExp(r'\s+'));
+      var ms = 1000;
+      var want = '';
+      if (toks.isNotEmpty) {
+        var m = int.parse(toks[0], onError: (_) => -1);
+        if (m > 0) { ms = m; toks = toks.sublist(1); }
+        want = toks.join(' ');
+      }
+      var list = await profListIsolates();
+      if (list.isEmpty) return "ERR: no isolates (vm-service down?)";
+      var target = profPickDefault(list, want);
+      if (target == null) return "ERR: no isolate matching '" + want + "'";
+      if (!await profSample(target[0].toString(), ms)) return "ERR: no profile (is --profiler on?)";
+      var tree = profTreeReport(2.0);
+      if (gProfSrc != null) gProfSrc.setString(tree);
+      if (gProfStatusLbl != null) {
+        gProfStatusLbl.setStringValue(gProfSamples == 0
+            ? "0 samples — the isolate was idle"
+            : (gProfSamples.toString() + " samples — inclusive call tree (paths >= 2%)"));
+      }
+      repaint();
+      return "call tree of " + _dbgIsoLabel(target[1].toString(), target[0].toString()) +
+             " over ~" + ms.toString() + "ms\n" + tree;
+    }
     case 'profisolates': {                 // every isolate (UI included — read-only)
       var list = await profListIsolates();
       var o = <String>[];
@@ -2615,20 +2642,72 @@ Future<bool> profSample(String isolateId, int ms) async {
   if (p == null) { gProfRows = <dynamic>[]; gProfSamples = 0; return false; }
   gProfSamples = (p['sampleCount'] is int)
       ? p['sampleCount'] : int.parse(p['sampleCount'].toString());
-  var rows = <dynamic>[];
   var funcs = p['functions'];
+  // Resolve every function-table name once, in ORIGINAL order — the call trie
+  // indexes into this, so it must not be the filtered/sorted flat list.
+  var names = <dynamic>[];
+  if (funcs != null) for (var f in funcs) names.add(_profFnName(f['function']));
+  gProfFuncNames = names;
+  gProfTrie = p['inclusiveFunctionTrie'];      // top-down: root (entry) → callees
+  var rows = <dynamic>[];
   if (funcs != null) {
-    for (var f in funcs) {
+    for (var idx = 0; idx < funcs.length; idx++) {
+      var f = funcs[idx];
       // exclusive/inclusiveTicks are JSON STRINGS (AddPropertyF formats them).
       var excl = int.parse(f['exclusiveTicks'].toString());
       var incl = int.parse(f['inclusiveTicks'].toString());
       if (excl == 0 && incl == 0) continue;
-      rows.add(<dynamic>[excl, incl, _profFnName(f['function'])]);
+      rows.add(<dynamic>[excl, incl, names[idx]]);
     }
   }
   rows.sort((a, b) => b[0].compareTo(a[0]));
   gProfRows = rows;
   return true;
+}
+
+int _asInt(dynamic v) => v is int ? v : int.parse(v.toString());
+
+/// The inclusive call tree, top-down, indented, pruned to paths >= minPct so a
+/// deep stack stays readable. Shows the PATH to hot code — what the flat view
+/// can't: e.g. _handleMessage → the frame closure → the pixel loop. Consumes
+/// the whole preorder subtree from the flat array regardless of pruning so the
+/// cursor stays aligned; only emits shown nodes.
+void _profTreeWalk(List trie, List pos, int depth, bool emit,
+                   double minPct, List<String> out) {
+  // Node layout (profiler_service.cc ProfileFunctionTrieNode::PrintToJSONArray):
+  //   idx, count, inclAllocs, exclAllocs, codeCount, (codeIdx,codeTicks)*N,
+  //   childCount, <children preorder>
+  var i = pos[0];
+  var tableIndex = _asInt(trie[i]);
+  var count = _asInt(trie[i + 1]);
+  var codeCount = _asInt(trie[i + 4]);
+  var childCountPos = i + 5 + 2 * codeCount;
+  var childCount = _asInt(trie[childCountPos]);
+  pos[0] = childCountPos + 1;
+  var show = emit && (depth == 0 || count * 100.0 / gProfSamples >= minPct) &&
+             out.length < 120;                 // hard cap: never flood the pane
+  if (show) {
+    var sb = new StringBuffer(_profPct(count, gProfSamples));
+    sb.write(' ');
+    for (var k = 0; k < depth; k++) sb.write('  ');
+    sb.write((tableIndex >= 0 && tableIndex < gProfFuncNames.length)
+        ? gProfFuncNames[tableIndex].toString() : '?');
+    out.add(sb.toString());
+  }
+  for (var c = 0; c < childCount; c++) {
+    _profTreeWalk(trie, pos, depth + 1, show, minPct, out);   // pruned parent → pruned subtree
+  }
+}
+
+String profTreeReport(double minPct) {
+  if (gProfSamples == 0 || gProfTrie == null || gProfTrie is! List || gProfTrie.isEmpty) {
+    return profReport(0);   // fall back to the idle/flat message
+  }
+  var out = <String>[];
+  out.add(gProfSamples.toString() + " samples — inclusive call tree (paths >= " +
+          minPct.toStringAsFixed(0) + "%)   total%  path");
+  _profTreeWalk(gProfTrie, <int>[0], 0, true, minPct, out);
+  return out.join('\n');
 }
 
 Future profRefreshIsolates() async {
@@ -2670,6 +2749,27 @@ Future profSampleButton() async {
   repaint();
   await profSample(t[0].toString(), ms);
   profShowRows();
+}
+
+// Same sample, rendered as the inclusive call tree instead of the flat list.
+Future profTreeButton() async {
+  if (gProfStatusLbl == null) return;
+  if (!await vmsConnect()) { gProfStatusLbl.setStringValue("no vm-service"); return; }
+  if (gProfIsoList.isEmpty) await profRefreshIsolates();
+  if (gProfIsoList.isEmpty) { gProfStatusLbl.setStringValue("no isolates to profile"); return; }
+  var idx = gProfIsoPicker.indexOfSelectedItem();
+  if (idx < 0 || idx >= gProfIsoList.length) idx = 0;
+  var t = gProfIsoList[idx];
+  var ms = int.parse(gProfMsField.stringValue().UTF8String().trim(), onError: (_) => 1000);
+  gProfStatusLbl.setStringValue("sampling " + _dbgIsoLabel(t[1].toString(), t[0].toString()) +
+      " for " + ms.toString() + "ms (call tree)…");
+  repaint();
+  await profSample(t[0].toString(), ms);
+  if (gProfSrc != null) gProfSrc.setString(profTreeReport(2.0));
+  gProfStatusLbl.setStringValue(gProfSamples == 0
+      ? "0 samples — the isolate was idle (profile a CPU-bound workload)"
+      : (gProfSamples.toString() + " samples — inclusive call tree (paths >= 2%)"));
+  repaint();
 }
 
 Future profClearButton() async {
@@ -2832,6 +2932,8 @@ Cocoa gProfStatusLbl;
 Cocoa gProfMsField;                   // sample window, ms
 List gProfRows = <dynamic>[];         // [ selfTicks, totalTicks, name ], self-desc
 int gProfSamples = 0;                 // sampleCount of the last profile
+List gProfFuncNames = <dynamic>[];    // resolved name per functions[] table index (for the trie)
+dynamic gProfTrie;                    // inclusiveFunctionTrie: flat [idx,count,childCount,…] preorder
 bool gDbgQuiet = false;               // 1: a pause does not yank the GUI to tab 5
 
 // A vm-service value comes back as an @Instance: primitives carry
@@ -2944,9 +3046,10 @@ void buildProfileTab(Cocoa pf) {
   gProfMsField.setStringValue("1000");
   pf.addSubview(gProfMsField);
   gProfMsField.setAutoresizingMask(kMinYMargin);
-  button(pf, "Sample", [346.0, 392.0, 80.0, 24.0], (s) => profSampleButton());
-  button(pf, "Clear", [430.0, 392.0, 64.0, 24.0], (s) => profClearButton());
-  pinTop(<String>["Sample", "Clear"]);
+  button(pf, "Sample", [346.0, 392.0, 78.0, 24.0], (s) => profSampleButton());
+  button(pf, "Tree", [428.0, 392.0, 60.0, 24.0], (s) => profTreeButton());
+  button(pf, "Clear", [492.0, 392.0, 60.0, 24.0], (s) => profClearButton());
+  pinTop(<String>["Sample", "Tree", "Clear"]);
 
   gProfStatusLbl = label(pf, [8.0, 372.0, 852.0, 16.0]);
   gProfStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
@@ -5088,6 +5191,11 @@ PROFILER — CONTROL VERBS (surfaces the VM's sampling CPU profiler; read-only)
                           "<K> samples ... self% total% function" then rows
                           "<self%>  <total%>  <function>" by self-desc. Self% is
                           time IN the function; total% includes what it called.
+  proftree [ms] [id|name] same sample, rendered as the inclusive CALL TREE
+                          (top-down: entry → callees), indented, paths < 2%
+                          pruned. Shows the PATH to hot code the flat view
+                          can't — e.g. _handleMessage → the frame closure →
+                          the pixel loop. GUI: the Tree button.
   profclear [id|name]     drop the target's samples.
   LAW: the profiler only sees ON-CPU time. A frame-paced demo that sleeps
   between frames shows FEW samples ("0 samples — idle" is normal); profile a

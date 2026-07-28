@@ -2526,6 +2526,28 @@ String _profPct(int ticks, int total) {
   return s;
 }
 
+/// A profile function name, with anonymous closures QUALIFIED by their
+/// enclosing function/class — the ref already carries the owner chain, so a
+/// bare "<anonymous closure>" (useless: which one?) becomes e.g.
+/// "JuliaDemo.render.<closure>". Regular functions and [Stub] rows pass through.
+String _profFnName(dynamic fn) {
+  if (fn is! Map) return '?';
+  var name = fn['name'] != null ? fn['name'].toString() : '?';
+  if (!name.contains('closure')) return name;
+  var chain = <String>[];                         // owner chain: innermost first
+  var o = fn['owner'];
+  for (var guard = 0; o is Map && o['name'] != null && guard < 6; guard++) {
+    var on = o['name'].toString();
+    if (on.isNotEmpty) chain.add(on);             // skip synthetic empty-named owners
+    o = o['owner'];
+  }
+  if (chain.isEmpty) return name;
+  var q = new StringBuffer();                      // reverse to Class.method order
+  for (var i = chain.length - 1; i >= 0; i--) { q.write(chain[i]); q.write('.'); }
+  q.write('<closure>');
+  return q.toString();
+}
+
 /// The formatted hot-function report from the last sample: self% (time IN the
 /// function) and total% (time in it or anything it called), by self-desc.
 String profReport(int topN) {
@@ -2601,9 +2623,7 @@ Future<bool> profSample(String isolateId, int ms) async {
       var excl = int.parse(f['exclusiveTicks'].toString());
       var incl = int.parse(f['inclusiveTicks'].toString());
       if (excl == 0 && incl == 0) continue;
-      var fn = f['function'];
-      var name = (fn is Map && fn['name'] != null) ? fn['name'].toString() : '?';
-      rows.add(<dynamic>[excl, incl, name]);
+      rows.add(<dynamic>[excl, incl, _profFnName(f['function'])]);
     }
   }
   rows.sort((a, b) => b[0].compareTo(a[0]));

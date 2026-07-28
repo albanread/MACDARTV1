@@ -1651,7 +1651,10 @@ Future<String> handle(String line) async {
       var want = arg.trim();
       if (want.isNotEmpty && gDbgIsoPicker != null) {
         for (var i = 0; i < gDbgIsoList.length; i++) {
-          if (i.toString() == want || gDbgIsoList[i][1].toString().contains(want)) {
+          // Full isolate id first (stable across list churn), then a name
+          // fragment; a bare index works but can race a changing list.
+          if (gDbgIsoList[i][0].toString() == want || i.toString() == want ||
+              gDbgIsoList[i][1].toString().contains(want)) {
             gDbgIsoPicker.selectItemAtIndex(i); break;
           }
         }
@@ -1680,17 +1683,68 @@ Future<String> handle(String line) async {
              " (line " + ln.toString() + ") resolved=" + r['resolved'].toString();
     }
     case 'dbgvars': {
+      // One per line: values render with commas (_GrowableList(14), maps…),
+      // so a comma join is ambiguous for the scripts that parse this.
       var o = <String>[];
       for (var v in gDbgVars) o.add(v[0].toString() + "=" + v[1].toString());
-      return o.isEmpty ? "(none)" : o.join(", ");
+      return o.isEmpty ? "(none)" : o.join('\n');
     }
     case 'dbgframe': { dbgSelectFrame(int.parse(arg.trim(), onError: (_) => 0)); return "ok"; }
     case 'dbgeval': { await dbgEval(arg); return gDbgStatusLbl.stringValue().UTF8String(); }
     case 'dbgsource': return gDbgSrc == null ? "" : gDbgSrc.string().UTF8String();
-    case 'dbgstate': return gDbgPaused
-        ? ("paused, " + gDbgFrames.length.toString() + " frames, top=" +
-           (gDbgFrames.isEmpty ? "?" : gDbgFrames[0][0].toString()))
-        : "running";
+    // "paused at <fn>:<line>, K frames" — the line is what lets a stepping
+    // agent VERIFY the step moved (top-frame names rarely change mid-function).
+    case 'dbgstate': {
+      if (!gDbgPaused) return "running";
+      var at = gDbgFrames.isEmpty ? "?" : gDbgFrames[0][0].toString();
+      if (gDbgFrameLines.isNotEmpty && gDbgFrameLines[0] > 0) {
+        at += ":" + gDbgFrameLines[0].toString();
+      }
+      return "paused at " + at + ", " + gDbgFrames.length.toString() + " frames";
+    }
+    case 'dbgpause': {                     // the frame-loop-friendly way in:
+      if (gLangIsolateId == null) return "ERR: attach first";
+      await dbgPause();                    // stop wherever it is — no re-break trap
+      return "pause requested — poll dbgstate";
+    }
+    case 'dbgstack': {                     // "N  fn:line" per frame, for dbgframe N
+      if (!gDbgPaused) return "(not paused)";
+      var o = <String>[];
+      for (var i = 0; i < gDbgFrames.length; i++) {
+        var ln = (i < gDbgFrameLines.length && gDbgFrameLines[i] > 0)
+            ? ":" + gDbgFrameLines[i].toString() : "";
+        o.add(i.toString() + "  " + gDbgFrames[i][0].toString() + ln);
+      }
+      return o.isEmpty ? "(no frames)" : o.join('\n');
+    }
+    case 'dbgbreaks': {                    // what is armed, one per line
+      var o = <String>[];
+      for (var b in gDbgBreaks) {
+        o.add("L" + b.line.toString() +
+              (b.decl.isEmpty ? "" : "  (" + b.decl + " +" + b.offset.toString() + ")"));
+      }
+      return o.isEmpty ? "(none)" : o.join('\n');
+    }
+    case 'dbgunbreak': {                   // remove ONE breakpoint, by its line
+      var ln = int.parse(arg.trim(), onError: (_) => 0);
+      var kept = <DbgBreak>[];
+      var removed = 0;
+      for (var b in gDbgBreaks) {
+        if (b.line == ln) {
+          removed++;
+          if (b.vmId != null) {
+            await vmsCall('removeBreakpoint', <String, dynamic>{
+                'isolateId': gLangIsolateId, 'breakpointId': b.vmId});
+          }
+        } else {
+          kept.add(b);
+        }
+      }
+      gDbgBreaks = kept;
+      dbgLoadSource();
+      return removed == 0 ? "ERR: no breakpoint at line " + ln.toString()
+                          : "removed " + removed.toString() + " at line " + ln.toString();
+    }
     case 'dbgstep': await dbgResume(arg.trim().isEmpty ? null : arg.trim()); return "ok";
     case 'dbgclear': await dbgClearBreaks(); return "ok";
     case 'dbghold': debugHold(); return "held (watchdog paused), depth " + gDebugHold.toString();
@@ -2525,6 +2579,8 @@ Future dbgReResolve() async {
 // here are the numbers the VM uses, which is why they are displayed.
 Cocoa gDbgSrc, gDbgStack, gDbgLocals, gDbgStatusLbl, gDbgEvalField;
 List gDbgFrames = <dynamic>[];        // [functionName, frameJson]
+List<int> gDbgFrameLines = <int>[];   // per-frame source line (0 = unknown)
+Map gDbgTokenTables = <String, dynamic>{};   // scriptId -> tokenPosTable, per attach
 List gDbgVars = <dynamic>[];          // [name, renderedValue] for the chosen frame
 int gDbgFrame = 0;                    // which frame locals and eval apply to
 // (breakpoints are anchored to a declaration — see DbgBreak below)
@@ -2635,6 +2691,7 @@ Future dbgAttach() async {
   if (!await vmsResolveTargetId(chosen[0].toString(), chosen[1].toString())) return;
   await vmsCall('streamListen', <String, dynamic>{'streamId': 'Debug'});
   gDbgBreaks = <DbgBreak>[];                              // breakpoints belonged to the old target
+  gDbgTokenTables = <String, dynamic>{};                  // and so did its scripts
   dbgLoadSource();
   dbgStatus("attached to " + _dbgIsoLabel(chosen[1].toString(), chosen[0].toString()) +
       (gDbgIsLang ? "  (language isolate)" : "  — raw-line breakpoints") +
@@ -2779,6 +2836,39 @@ void dbgForgetPause(String why) {
   dbgStatus(why);
 }
 
+// A tokenPosTable row is [lineNumber, tokenPos, col, tokenPos, col, …]; a
+// frame's location carries an exact tokenPos, so an exact match finds its line.
+int _dbgLineForToken(List table, int tokenPos) {
+  for (var row in table) {
+    if (row is! List || row.length < 2) continue;
+    for (var i = 1; i + 1 < row.length; i += 2) {
+      if (row[i] == tokenPos) return row[0];
+    }
+  }
+  return 0;
+}
+
+/// The source line of one stack frame — via its script's tokenPosTable,
+/// fetched once per script per attach (stepping pauses constantly; the table
+/// never changes). 0 when unknown; a failed fetch caches empty so it is
+/// asked exactly once.
+Future<int> _dbgFrameLine(Map frame) async {
+  var loc = frame['location'];
+  if (loc == null || loc['script'] == null || loc['tokenPos'] == null) return 0;
+  var sid = loc['script']['id'].toString();
+  var table = gDbgTokenTables[sid];
+  if (table == null) {
+    var sc = await vmsCall('getObject', <String, dynamic>{
+        'isolateId': gLangIsolateId, 'objectId': sid});
+    table = (sc != null && sc['tokenPosTable'] != null)
+        ? sc['tokenPosTable'] : <dynamic>[];
+    gDbgTokenTables[sid] = table;
+  }
+  if (table is! List || table.isEmpty) return 0;
+  var t = loc['tokenPos'];
+  return _dbgLineForToken(table, t is int ? t : 0);
+}
+
 Future dbgOnPaused(String kind) async {
   var stk = await vmsCall('getStack', <String, dynamic>{'isolateId': gLangIsolateId});
   gDbgFrames = <dynamic>[];
@@ -2788,13 +2878,21 @@ Future dbgOnPaused(String kind) async {
       gDbgFrames.add(<dynamic>[name, f]);
     }
   }
+  gDbgFrameLines = <int>[];
+  for (var f in gDbgFrames) {
+    gDbgFrameLines.add(await _dbgFrameLine(f[1]));
+  }
   gDbgStack.reloadData();
   gDbgFrame = 0;
   dbgShowVars(0);
   switchTab(5);
-  dbgStatus(kind + " — " + gDbgFrames.length.toString() +
+  var at = gDbgFrames.isEmpty ? "?" : gDbgFrames[0][0].toString();
+  if (gDbgFrameLines.isNotEmpty && gDbgFrameLines[0] > 0) {
+    at += ":" + gDbgFrameLines[0].toString();
+  }
+  dbgStatus(kind + " at " + at + " — " + gDbgFrames.length.toString() +
             " frames; the window stays live because this is a different isolate");
-  log("debugger: " + kind);
+  log("debugger: " + kind + " at " + at);
   repaint();
 }
 

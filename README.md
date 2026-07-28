@@ -126,6 +126,52 @@ loaded over the VM snapshot at boot, so an Accept is live *and* survives a
 restart — and thanks to this VM's `become`, existing instances morph in place
 across a class-structure change. See [`WORKSPACE_PLAN.md`](WORKSPACE_PLAN.md).
 
+## Demos, and a native 2D game engine
+
+The workspace's Demos tab spawns each `macdart/cocoa/workspace/demos/*.dart`
+file into its own isolate, which computes and sends draw commands to the UI
+isolate — a runaway or crashing demo costs its isolate, never the window.
+Fifteen ship today: a Mandelbrot zoom (warm-JIT frame times printed live),
+Conway's Game of Life, a de Jong strange attractor, flocking boids, a
+wireframe globe, and more, alongside three playable games.
+
+The graphical ones render onto a real **Metal game pane** — a from-scratch
+C++/Objective-C++ engine (ported from the design of a sibling project,
+[MacGamePane](https://github.com/albanread/MacGamePane)) built directly into
+`dart:cocoa`: an 8-bit indexed framebuffer with **per-scanline palettes**
+(classic raster-bar tricks) and overscan/scroll, GPU-compute sprite
+blitting, a text overlay, runtime-compiled shader backgrounds, and an SFX
+synthesizer plus ABC-notation chiptune playback over `AVAudioEngine`. A
+frame is a *retained-scene delta* — sprite transforms, palette pokes, a
+scroll offset — never raw pixels, applied atomically so there is no
+mid-frame tearing. For workloads that want the pixels anyway (a live Julia
+set, a software rasterizer), a direct-framebuffer mode hands a Dart isolate a
+`Uint8List` that *is* the GPU's own shared memory — writes land with no copy
+and no protocol. Full design in [`GAMEPANE_PLAN.md`](GAMEPANE_PLAN.md).
+
+Pong is the minimal worked example (← → or A/D, space to serve). Sprite
+Invaders and Brickout are the two full games: sprites, a destructible
+indexed-pane wall/bunkers erased cell-by-cell through the GPU blitter,
+row-pitched SFX, a looping original theme, screen shake, fullscreen, and an
+attract mode that serves and plays itself when left alone — which doubles as
+an engine test, verified headlessly over the control plane (a `gpsnap` reads
+the Metal layer's actual pixels back to PNG, since a window snapshot cannot
+see a `CAMetalLayer`).
+
+The **debugger** (a Debugger tab, breakpoints, stepping, frame-local eval)
+attaches to any isolate except the UI one — an isolate lookup sits to its
+left, so pausing a demo or a game never freezes the interface that's
+debugging it. Breakpoints can be conditional (`if EXPR`, evaluated
+client-side in the top frame on each hit — this VM has no server-side
+condition), which is also the fix for a per-frame breakpoint re-triggering on
+every tick. And because `dart:cocoa`'s dynamic `objc_msgSend` bridge trusted
+every selector string at runtime, an Accept-time lint now checks class and
+selector names against the *loaded Objective-C runtime itself* — the one
+Cocoa database that's always exactly right for this binary — catching a
+typo'd selector, an unknown class, or a call that would overflow the
+bridge's 8-register float-argument limit, before the code ever runs. Design
+in [`COCOA_STATIC_CHECK_PLAN.md`](COCOA_STATIC_CHECK_PLAN.md).
+
 ## Licensing
 
 The Dart VM and core libraries this project ports are **BSD-3-Clause**:

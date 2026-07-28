@@ -18,7 +18,13 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DARTUI="$ROOT/macdart/build/dartui"
+# The OPTIMIZED binary, deliberately: macdart/build/ is configured with no
+# CMAKE_BUILD_TYPE, and an unoptimized VM cannot hold 30fps on the heavier
+# vector demos — the render overruns the frame budget, the message pump never
+# goes idle, and the window freezes (display() only reaches the screen from an
+# idle run loop). Fall back to build/ only if no release build exists yet.
+DARTUI="$ROOT/macdart/build-release/dartui"
+[ -x "$DARTUI" ] || DARTUI="$ROOT/macdart/build/dartui"
 UI_SCRIPT="$ROOT/macdart/cocoa/workspace/workspace.dart"
 IMAGE="$HOME/.macdart/workspace.sqlite"
 LOG=/tmp/macdart-gui.log
@@ -58,12 +64,13 @@ if [ "$restore" = 1 ]; then
 fi
 
 if [ "$rebuild" = 1 ]; then
-  if [ ! -f "$ROOT/macdart/build/build.ninja" ]; then
-    echo "start-gui.sh: $ROOT/macdart/build is not configured; run cmake there first" >&2
+  BUILD_DIR="$(dirname "$DARTUI")"
+  if [ ! -f "$BUILD_DIR/build.ninja" ]; then
+    echo "start-gui.sh: $BUILD_DIR is not configured; run cmake there first" >&2
     exit 1
   fi
-  echo "building dartui…"
-  ninja -C "$ROOT/macdart/build" dartui
+  echo "building dartui ($BUILD_DIR)…"
+  ninja -C "$BUILD_DIR" dartui
 fi
 
 if [ ! -x "$DARTUI" ]; then
@@ -82,7 +89,7 @@ if [ "$observe" = 1 ] && lsof -nP -iTCP:"$obsport" -sTCP:LISTEN >/dev/null 2>&1;
   echo "  'ui quit' from a tclsh with macdart/tcl/dartui.tcl loaded)" >&2
   exit 1
 fi
-if pgrep -f "build/dartui .*workspace.dart" >/dev/null 2>&1; then
+if pgrep -f "/dartui .*workspace.dart" >/dev/null 2>&1; then
   echo "start-gui.sh: a dartui workspace process is already running — quit it first" >&2
   exit 1
 fi
@@ -123,24 +130,34 @@ echo "image:   $IMAGE"
 if [ "$supervise" = 1 ]; then
   fails=0
   window=$(date +%s)
+  stamp="$(mktemp /tmp/macdart-gui.stamp.XXXXXX)"
   while true; do
+    touch "$stamp"
     "$DARTUI" "${ARGS[@]}" "$UI_SCRIPT" || rc=$?
     rc=${rc:-0}
-    [ "$rc" = 0 ] && { echo "workspace exited cleanly"; exit 0; }
+    [ "$rc" = 0 ] && { rm -f "$stamp"; echo "workspace exited cleanly"; exit 0; }
     if [ "$rc" = 70 ]; then
       echo "start-gui.sh: the UI source does not load — not retrying." >&2
       echo "  recover it with: ./start-gui.sh --restore" >&2
       exit 1
     fi
+    # Say WHY, not just that it died: name the signal, and surface the crash
+    # report macOS just wrote — a fault must be communicated, never silent.
+    why="exit $rc"
+    [ "$rc" -gt 128 ] && why="signal $((rc - 128)) ($(kill -l $((rc - 128)) 2>/dev/null || echo '?'))"
+    report="$(find "$HOME/Library/Logs/DiagnosticReports" -name 'dartui-*.ips' \
+              -newer "$stamp" 2>/dev/null | head -1)"
+    echo "workspace died — $why" >&2
+    [ -n "$report" ] && echo "  crash report: $report" >&2
     now=$(date +%s)
     [ $((now - window)) -gt 60 ] && { fails=0; window=$now; }
     fails=$((fails + 1))
     if [ "$fails" -ge 3 ]; then
-      echo "start-gui.sh: died $fails times in under a minute (last exit $rc)." >&2
+      echo "start-gui.sh: died $fails times in under a minute (last: $why)." >&2
       echo "  not restarting again. Try: ./start-gui.sh --restore" >&2
       exit 1
     fi
-    echo "workspace died (exit $rc) — restarting [$fails/3]…" >&2
+    echo "restarting [$fails/3]…" >&2
     rc=0
     sleep 1
   done

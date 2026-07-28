@@ -5,6 +5,7 @@
 // Serves the browser's data (classes / members / source) from the image, and a
 // read-only view of the world via dart:mirrors. Talks to the UI over SendPort.
 import 'dart:cocoa';       // wsEval / wsReload / Db
+import 'dart:async';       // scheduleMicrotask — the app surface's auto-flush
 import 'dart:isolate';
 import 'dart:io';
 import 'dart:mirrors';
@@ -18,7 +19,19 @@ String _scratch;                    // this isolate's own rewritable root file
 Db _db;                             // the SQLite image (user-app source)
 var _decls = <String, String>{};    // name -> source (a mirror of the image)
 
+// --- the running user app (APP_PANE_PLAN.md) --------------------------------
+// One app at a time, on one surface. `_app` is a top-level of THIS library, so
+// wsEval can construct into it (an expression compiles in this library's scope,
+// so a private top-level is in scope) and everything afterwards is plain
+// dynamic dispatch — no mirrors, whose class metadata goes stale after a reload.
+SendPort _ui;                       // the UI isolate, for surface pushes
+var _app;                           // the app instance, null when none runs
+AppSurface _surface;                // where its widgets currently live
+String _appClass;                   // the class it was built from
+int _appGen = 0;                    // stale pushes from a stopped app are dropped
+
 main(List args, SendPort uiPort) {
+  _ui = uiPort;
   _scratch = args[0];
   if (args.length > 1 && args[1] != null && (args[1] as String).length > 0) {
     _db = new Db.open(args[1]);
@@ -57,11 +70,19 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'senders') out = _senders(arg);
       else if (cmd == 'alldecls') out = _allDecls();
       else if (cmd == 'vmstats') out = wsVmStats();
+      else if (cmd == 'apps') out = _appClasses();
+      else if (cmd == 'apprun') out = _appRun(arg);
+      else if (cmd == 'appstop') out = _appStop();
+      else if (cmd == 'appbuild') out = _appBuild(arg);
+      else if (cmd == 'appevent') out = _appEvent(arg);
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();
     } catch (e) {
       out = 'ERR: ' + e.toString();
     }
+    // Whatever the command did to the surface goes out as one batch, before the
+    // reply — so a click's visible effect never lags its acknowledgement.
+    if (_surface != null) _surface.flush();
     reply.send(out);
   });
 }
@@ -286,7 +307,11 @@ List _memberList(String className) {
 }
 
 String _kindOf(String s) {
-  s = s.trim();
+  // Past the doc comment first — same trap as _declName. A documented class
+  // was classified as a 'variable', which quietly removed it from the Editor's
+  // class picker and the Browser's class list: the apps/ examples ship with a
+  // header comment, so every one of them was invisible.
+  s = _afterLeadingComments(s).trim();
   if (new RegExp(r'^(?:abstract\s+)?class\b').hasMatch(s)) return 'class';
   if (s.startsWith('enum ')) return 'enum';
   if (s.startsWith('typedef ')) return 'typedef';
@@ -294,8 +319,35 @@ String _kindOf(String s) {
   return 'variable';
 }
 
+/// A declaration's text minus any comments in front of it — a documented class
+/// otherwise matches none of the patterns below and gets named from its own
+/// prose by the fallback.
+String _afterLeadingComments(String s) {
+  var i = 0;
+  while (i < s.length) {
+    var c = s.codeUnitAt(i);
+    if (c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D) { i++; continue; }
+    if (c == 0x2F && i + 1 < s.length) {
+      var d = s.codeUnitAt(i + 1);
+      if (d == 0x2F) {
+        while (i < s.length && s.codeUnitAt(i) != 0x0A) i++;
+        continue;
+      }
+      if (d == 0x2A) {
+        i += 2;
+        while (i + 1 < s.length &&
+               !(s.codeUnitAt(i) == 0x2A && s.codeUnitAt(i + 1) == 0x2F)) i++;
+        i = (i + 1 < s.length) ? i + 2 : s.length;
+        continue;
+      }
+    }
+    break;
+  }
+  return s.substring(i);
+}
+
 String _declName(String d) {
-  d = d.trim();
+  d = _afterLeadingComments(d).trim();
   var m = new RegExp(r'^(?:abstract\s+)?(?:class|enum|typedef)\s+(\w+)').firstMatch(d);
   if (m != null) return m.group(1);
   m = new RegExp(r'(\w+)\s*[=(]').firstMatch(d);
@@ -559,4 +611,176 @@ List _senders(String term) {
 
 String _reEscape(String s) {
   return s.replaceAllMapped(new RegExp(r'[.*+?^${}()|[\]\\]'), (m) => '\\' + m.group(0));
+}
+
+// --- the app surface (APP_PANE_PLAN.md §3-§4) --------------------------------
+// What a user app is handed as `ui`. It never touches dart:cocoa: it appends
+// draw-nothing COMMANDS to a batch, and the UI isolate — the only one allowed
+// near AppKit — materialises real NSViews from them. Handlers stay here as
+// closures keyed by widget id; the UI isolate only ever sends (id, kind, value)
+// back, and holds no handle belonging to the app.
+//
+// Coordinates are TOP-LEFT (the UI isolate flips them): nobody should have to
+// learn AppKit's origin to put one button under another. Frames are absolute;
+// laying out a keypad is an ordinary Dart loop, which is the point — layout is
+// the app's code, not a framework's.
+class AppSurface {
+  final String name;                 // 'pane' — the host it currently lives on
+  final int gen;
+  final SendPort _out;
+  double width, height;              // the surface's size, for the app's layout
+
+  List _batch = <dynamic>[];
+  Map<String, Function> _handlers = <String, Function>{};
+  bool _flushPending = false;
+
+  AppSurface(this.name, this.gen, this._out, this.width, this.height);
+
+  void _cmd(List c) {
+    _batch.add(c);
+    // An app that updates from a Timer has no command to ride out on, so a
+    // mutation schedules its own flush. Microtasks drain after every message
+    // AND every timer callback, so this covers both without an explicit call.
+    if (!_flushPending) {
+      _flushPending = true;
+      scheduleMicrotask(flush);
+    }
+  }
+
+  void _on(String id, String kind, Function fn) {
+    if (fn != null) _handlers[id + '/' + kind] = fn;
+  }
+
+  Function handlerFor(String id, String kind) {
+    var h = _handlers[id + '/' + kind];
+    return h;
+  }
+
+  /// Send everything queued as one message. Idempotent.
+  void flush() {
+    _flushPending = false;
+    if (_batch.isEmpty) return;
+    var b = _batch;
+    _batch = <dynamic>[];
+    _out.send(<dynamic>['appui', name, gen, b]);
+  }
+
+  // -- the widget vocabulary (M1: title, label, field, button) ---------------
+
+  /// The surface's title — the window title once popped out.
+  void title(String text) { _cmd(<dynamic>['title', text]); }
+
+  /// Remove every widget. `build()` starts from here.
+  void clear() {
+    _handlers.clear();
+    _cmd(<dynamic>['clear']);
+  }
+
+  void label(String id, {String text: '', List frame, String align: 'left'}) {
+    _cmd(<dynamic>['add', 'label', id,
+        <String, dynamic>{'text': text, 'frame': frame, 'align': align}]);
+  }
+
+  void field(String id, {String text: '', List frame, String align: 'left',
+                         bool readOnly: false, Function onText, Function onEnter}) {
+    _on(id, 'text', onText);
+    _on(id, 'enter', onEnter);
+    _cmd(<dynamic>['add', 'field', id,
+        <String, dynamic>{'text': text, 'frame': frame, 'align': align,
+                          'readOnly': readOnly}]);
+  }
+
+  void button(String id, {String title: '', List frame, bool enabled: true,
+                          Function onClick}) {
+    _on(id, 'click', onClick);
+    _cmd(<dynamic>['add', 'button', id,
+        <String, dynamic>{'title': title, 'frame': frame, 'enabled': enabled}]);
+  }
+
+  /// Change a live widget without rebuilding — the fast path a keystroke takes.
+  void set(String id, {String text, String title, bool enabled}) {
+    var p = <String, dynamic>{};
+    if (text != null) p['text'] = text;
+    if (title != null) p['title'] = title;
+    if (enabled != null) p['enabled'] = enabled;
+    _cmd(<dynamic>['set', id, p]);
+  }
+
+  void remove(String id) { _cmd(<dynamic>['remove', id]); }
+  void focus(String id) { _cmd(<dynamic>['focus', id]); }
+}
+
+/// Image classes that look like apps: anything declaring a `build` method.
+List _appClasses() {
+  var out = <String>[];
+  // Anchored to a line, so a class whose COMMENT mentions build(ui) — this
+  // project's own example does — is not mistaken for an app.
+  var re = new RegExp(r'^\s*\w*\s*build\s*\(', multiLine: true);
+  _decls.forEach((name, src) { if (re.hasMatch(src)) out.add(name); });
+  out.sort();
+  return out;
+}
+
+// A name, not an expression: this is the one string that reaches wsEval, so it
+// is checked to be an identifier before it gets there.
+final RegExp _identRe = new RegExp(r'^[A-Za-z_]\w*$');
+
+/// arg: [className, width, height]
+String _appRun(List arg) {
+  var name = arg[0].toString();
+  if (!_identRe.hasMatch(name)) return 'ERR: not a class name: ' + name;
+  if (!_decls.containsKey(name)) return 'ERR: no class ' + name + ' in the image';
+  _appStop();
+  var r = wsEval('_app = new ' + name + '()');
+  if (r.startsWith('ERR:')) return 'ERR: could not create ' + name + ' — ' + r;
+  _appClass = name;
+  _appGen++;
+  _surface = new AppSurface('pane', _appGen, _ui,
+      (arg[1] as num).toDouble(), (arg[2] as num).toDouble());
+  var b = _appBuild(arg);
+  return b.startsWith('ERR:') ? b : 'running ' + name;
+}
+
+/// (Re)run the app's build() against the current surface — after a start, and
+/// after an Accept that changed its class. The INSTANCE is untouched, so a hot
+/// reload that morphs it leaves its state intact and only the layout changes.
+String _appBuild(List arg) {
+  if (_app == null || _surface == null) return 'ERR: no app running';
+  if (arg is List && arg.length > 2) {
+    _surface.width = (arg[1] as num).toDouble();
+    _surface.height = (arg[2] as num).toDouble();
+  }
+  _surface.clear();
+  try {
+    _app.build(_surface);
+  } catch (e) {
+    return 'ERR: ' + _appClass + '.build() threw — ' + e.toString();
+  }
+  return 'built ' + _appClass;
+}
+
+String _appStop() {
+  // An app that owns a Timer has to be told, or it keeps ticking against a
+  // surface nobody can see. `stop()` is optional — most apps have no teardown —
+  // so a missing one is not an error.
+  if (_app != null) {
+    try { _app.stop(); } catch (e) { }
+  }
+  if (_surface != null) { _surface.clear(); _surface.flush(); }
+  _app = null;
+  _surface = null;
+  _appClass = null;
+  return 'ok';
+}
+
+/// arg: [id, kind, value] — delivered as an ordinary request, so the watchdog
+/// covers a runaway handler and the debugger's pause guard covers a click made
+/// while user code is stopped.
+String _appEvent(List arg) {
+  if (_surface == null) return 'ERR: no app running';
+  var id = arg[0].toString(), kind = arg[1].toString();
+  var fn = _surface.handlerFor(id, kind);
+  if (fn == null) return 'ignored';
+  fn(arg.length > 2 ? arg[2] : null);
+  return 'ok';
 }

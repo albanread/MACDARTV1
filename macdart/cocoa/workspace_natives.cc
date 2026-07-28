@@ -11,11 +11,17 @@
 #include "include/dart_api.h"
 #include "include/dart_tools_api.h"
 
-// Implemented by the GUI host (macdart/cocoa/cocoa_host.mm); absent in the
-// plain `dart` build, which never links this path.
-extern "C" void macdart_request_ui_reload(void);
-extern "C" void macdart_ui_ready(void);
-extern "C" const char* macdart_take_ui_reload_status(void);
+// Implemented by the GUI host (macdart/cocoa/cocoa_host.mm), which is linked
+// only into `dartui`. Every other binary (dart, gen_snapshot, dart_bootstrap)
+// still pulls this object via the dart:cocoa native resolver table, so it needs
+// SOME definition to link — these WEAK no-op fallbacks. In dartui the host's
+// strong definitions override them; nowhere else is the UI-reload path ever
+// reached, so the fallbacks are inert.
+extern "C" __attribute__((weak)) void macdart_request_ui_reload(void) {}
+extern "C" __attribute__((weak)) void macdart_ui_ready(void) {}
+extern "C" __attribute__((weak)) const char* macdart_take_ui_reload_status(void) {
+  return "";
+}
 
 namespace dart {
 namespace bin {

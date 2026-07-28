@@ -57,6 +57,25 @@ int _nsStringLength(int handle) native "Cocoa_nsStringLength";
 String _nsStringUtf8(int handle) native "Cocoa_nsStringUtf8";
 
 int _getClass(String name) native "Cocoa_getClass";
+
+// --- checking sends against the runtime (COCOA_STATIC_CHECK_PLAN.md) ---------
+bool _cocoaClassExists(String name) native "Cocoa_classExists";
+List _cocoaSelectorInfo(String cls, String sel) native "Cocoa_selectorInfo";
+List _cocoaNearestSelectors(String cls, String typo) native "Cocoa_nearestSelectors";
+
+/// True if [name] is an Objective-C class loaded in THIS binary (the linked
+/// frameworks on this OS) — the authoritative Cocoa database we own.
+bool cocoaClassExists(String name) => _cocoaClassExists(name);
+
+/// `[1, msgArgc, "@encode"]` if [cls] responds to [sel] (instance or class
+/// method), else null. `msgArgc` is the number of keyword arguments (colons);
+/// the encoding string carries the argument and return types.
+List cocoaSelectorInfo(String cls, String sel) => _cocoaSelectorInfo(cls, sel);
+
+/// Up to five real selectors on [cls] nearest (edit distance) to a mistyped
+/// [typo] — the "did you mean" list for the Accept-time lint.
+List cocoaNearestSelectors(String cls, String typo) =>
+    _cocoaNearestSelectors(cls, typo);
 /// The general dynamic send: [receiver] a Cocoa, [selector] like
 /// "colorWithRed:...:", [args] the ordered arguments. Returns a Cocoa (for an
 /// object result — retained, released on GC), a String (char*), an int
@@ -183,6 +202,67 @@ void _setSelectorAction(int control, String selector, int target)
 void setSelectorAction(Cocoa control, String selector, [Cocoa target]) {
   _setSelectorAction(control.handle, selector, target == null ? 0 : target.handle);
 }
+
+// --- gamestate key poller ----------------------------------------------------
+void _keyWatch() native "Cocoa_keyWatch";
+void _keyCapture(int on) native "Cocoa_keyCapture";
+List _keyState() native "Cocoa_keyState";
+
+/// Install the app-wide key monitor (idempotent; call once at boot). From then
+/// on [keyState] answers with what is held down RIGHT NOW.
+void keyWatch() => _keyWatch();
+
+/// While on, plain key events are consumed (no beep, no typing into views) so
+/// a game owns the keyboard; Command shortcuts always pass through. Toggling
+/// clears the held-key board.
+void keyCapture(bool on) => _keyCapture(on ? 1 : 0);
+
+/// `[downKeycodes, modifierFlags]` — the gamestate at the instant of the call:
+/// a `List<int>` of macOS virtual keycodes currently held (left 123, right 124,
+/// down 125, up 126, space 49, A 0, D 2, …) and the NSEvent modifier mask.
+List keyState() => _keyState();
+
+// --- game pane (GAMEPANE_PLAN.md) --------------------------------------------
+int _gpOpen(int w, int h, int worldW, int worldH, int mode) native "Cocoa_gpOpen";
+void _gpClose() native "Cocoa_gpClose";
+dynamic _gpApply(List cmds) native "Cocoa_gpApply";
+String _gpSnap(String path) native "Cocoa_gpSnap";
+List _gpStat() native "Cocoa_gpStat";
+
+/// Open (or re-open at a new size) the Metal game pane and return its NSView
+/// to embed. Logical resolution [w]x[h] (the layer upscales, nearest); the
+/// indexed world is [worldW]x[worldH] (clamped up to the viewport). [mode] 1
+/// builds the direct framebuffer (§6b) instead of the retained sprite stack.
+Cocoa gpOpen(int w, int h, int worldW, int worldH, [int mode = 0]) =>
+    new Cocoa._adopt(_gpOpen(w, h, worldW, worldH, mode));
+
+/// Tear the engine's panes down (the view survives for reuse).
+void gpClose() => _gpClose();
+
+/// Apply one frame's gp* command list and present it. Returns null, or the
+/// first error as a String (the frame is still applied best-effort).
+dynamic gpApply(List cmds) => _gpApply(cmds);
+
+/// Write the last-rendered frame (the offscreen texture — the honest pixels
+/// a window snapshot cannot see) as a PNG. "" on success, else the error.
+String gpSnap(String path) => _gpSnap(path);
+
+/// `[open, framesPresented, logicalW, logicalH, fullscreen, direct, stride]`.
+List gpStat() => _gpStat();
+
+dynamic _gpBackbuffer() native "Cocoa_gpBackbuffer";
+
+/// The direct framebuffer's current write buffer as a `Uint8List` backed by GPU
+/// memory (§6b) — write indices into it, present with a pull frame. Null unless
+/// the pane was opened in direct mode. Call it fresh each frame (the buffer
+/// rotates); address as `fb[y * stride + x]` with the stride from [gpStat].
+dynamic gpBackbuffer() => _gpBackbuffer();
+
+void _gpFullscreen(int on) native "Cocoa_gpFullscreen";
+
+/// The pane view takes (or leaves) the whole screen; logical resolution
+/// unchanged, upscaled crisp. No-op when the pane is closed.
+void gpFullscreen(bool on) => _gpFullscreen(on ? 1 : 0);
 
 void _setSplitMinSize(int splitView, double minSize) native "Cocoa_setSplitMinSize";
 

@@ -292,7 +292,13 @@ void switchTab(int i) {
   if (focus != null) gWindow.makeFirstResponder(focus);
   if (i == 1) openBrowser();
   if (i == 4) editorRefreshClasses();
+  if (i == 5) dbgRefreshIsolates();    // fresh isolate list on entering the tab
   if (i == 5 && gLangIsolateId != null) dbgLoadSource();
+  if (i == 7) appRefreshList();
+  if (i == 2) helpStart();   // index on first use, not at startup
+  // The keyboard belongs to a game only while the user is watching it: leaving
+  // the Demos tab returns every key to the workspace, coming back re-arms.
+  keyCapture(i == 6 && gDemoTitle != null);
   updateMetrics();
   repaint();
 }
@@ -337,7 +343,8 @@ void buildChrome() {
   alias("tab:Find", iconButton(bar, "Find", "open", [128.0, 6.0, 36.0, 32.0], (s) => switchTab(3)));
   iconButton(bar, "Debug", "goForward", [168.0, 6.0, 36.0, 32.0], (s) => switchTab(5));
   iconButton(bar, "Demos", "canvas", [208.0, 6.0, 36.0, 32.0], (s) => switchTab(6));
-  iconButton(bar, "Docs", "documentation", [248.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
+  iconButton(bar, "App", "home", [248.0, 6.0, 36.0, 32.0], (s) => switchTab(7));
+  iconButton(bar, "Docs", "documentation", [288.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
   buildMetricsCluster(bar, 900.0);
 
   // Tabless content host (the toolbar buttons are the tab bar). It absorbs all
@@ -361,11 +368,8 @@ void buildChrome() {
   // Browser tab: a Smalltalk-style class browser (World / User App).
   buildBrowserTab(addTab(gTabView, "browser", 868.0, 420.0));
 
-  // Docs tab.
-  var dc = addTab(gTabView, "docs", 868.0, 420.0);
-  var docs = scrolledTextView(dc, [8.0, 8.0, 852.0, 404.0], false);
-  docs.setString(_docsText);
-  anchorScroll(docs, kWidthSizable + kHeightSizable);
+  // Docs tab: the workspace guide, and searchable Dart V1 help beside it.
+  buildDocsTab(addTab(gTabView, "docs", 868.0, 420.0));
 
   // Find tab.
   buildFindTab(addTab(gTabView, "find", 868.0, 420.0));
@@ -378,6 +382,9 @@ void buildChrome() {
 
   // Demos tab: a canvas that demo isolates draw on, through this isolate.
   buildDemosTab(addTab(gTabView, "demos", 868.0, 420.0));
+
+  // App tab: the surface a user's own Cocoa app runs on.
+  buildAppTab(addTab(gTabView, "app", 868.0, 420.0));
 
   // Transcript dock (shared across tabs): docked to the bottom at a fixed
   // height, widening with the window.
@@ -424,12 +431,15 @@ void updateMetrics() {
 // ~4 Hz, like MACVM. Skips while a sample is outstanding, and while the
 // language isolate is restarting.
 void startMetrics() {
-  new Timer.periodic(const Duration(milliseconds: 250), (t) => pollVmStats());
+  new Timer.periodic(const Duration(milliseconds: 250), (t) {
+    appWatchResize();   // a running app re-lays-itself-out when the pane changes
+    pollVmStats();
+  });
 }
 
 void pollVmStats() {
   pollUiReload();   // the host leaves its reload result for us to report
-  if (gDbgPaused) return;   // a poll now would just queue against the stopped isolate
+  if (gDbgPaused && gDbgIsLang) return;   // stats poll targets the language isolate
   if (gPolling || gLang == null || gMetricVals.isEmpty) return;
   gPolling = true;
   askQuiet('vmstats', '', const Duration(seconds: 2)).then((r) {
@@ -838,8 +848,38 @@ void _reloadClassList() {
 
 /// The name a declaration defines, or null if it isn't a class/enum.
 String _classNameOf(String d) {
-  var m = new RegExp(r'^\s*(?:abstract\s+)?(?:class|enum)\s+(\w+)').firstMatch(d);
+  var m = new RegExp(r'^\s*(?:abstract\s+)?(?:class|enum)\s+(\w+)')
+      .firstMatch(afterLeadingComments(d));
   return m != null ? m.group(1) : null;
+}
+
+/// A declaration's text minus any comments in front of it. splitTopLevel keeps
+/// a leading doc comment attached to the declaration it documents (rightly —
+/// the comment belongs with the class), so every name matcher has to step over
+/// it. Without this a documented class is not recognised as a class at all, and
+/// the image stores it under whatever the fallback matcher finds in the prose.
+String afterLeadingComments(String s) {
+  var i = 0;
+  while (i < s.length) {
+    var c = s.codeUnitAt(i);
+    if (c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D) { i++; continue; }
+    if (c == 0x2F && i + 1 < s.length) {
+      var d = s.codeUnitAt(i + 1);
+      if (d == 0x2F) {                                  // // to end of line
+        while (i < s.length && s.codeUnitAt(i) != 0x0A) i++;
+        continue;
+      }
+      if (d == 0x2A) {                                  // /* … */
+        i += 2;
+        while (i + 1 < s.length &&
+               !(s.codeUnitAt(i) == 0x2A && s.codeUnitAt(i + 1) == 0x2F)) i++;
+        i = (i + 1 < s.length) ? i + 2 : s.length;
+        continue;
+      }
+    }
+    break;
+  }
+  return s.substring(i);
 }
 
 // Mirror gBrSelClass into the Classes pane, so the highlighted row always agrees
@@ -1271,6 +1311,25 @@ void buildMenu() {
     log("demos rescanned — " + scanDemos().length.toString() + " found");
   });
 
+  // Apps: your own Cocoa apps, running on the App pane. The examples in apps/
+  // are filed into the image (through the usual compile gate) and then run —
+  // after that they are ordinary image classes you edit in the Browser.
+  var apps = subMenu(mainMenu, "Apps");
+  var examples = scanApps();
+  for (var a in examples) {
+    var title = a[0], path = a[1];
+    menuItem(apps, "Install " + title, "", (s) => installApp(title, path));
+  }
+  if (examples.isNotEmpty) menuSep(apps);
+  menuItem(apps, "Run Selected", "", (s) {
+    if (gAppPicker == null || gAppPicker.numberOfItems() == 0) {
+      log("no app classes in the image (an app is a class with a build(ui) method)");
+      return;
+    }
+    appRun(gAppPicker.titleOfSelectedItem().UTF8String());
+  });
+  menuItem(apps, "Stop App", "", (s) => appStop());
+
   var view = subMenu(mainMenu, "View");
   menuItem(view, "Workspace", "1", (s) => switchTab(0));
   menuItem(view, "Browser", "2", (s) => switchTab(1));
@@ -1279,6 +1338,7 @@ void buildMenu() {
   menuItem(view, "Docs", "5", (s) => switchTab(2));
   menuItem(view, "Debugger", "6", (s) => switchTab(5));
   menuItem(view, "Demos", "7", (s) => switchTab(6));
+  menuItem(view, "App", "8", (s) => switchTab(7));
   menuSep(view);
   menuItem(view, "Clear Transcript", "k", (s) {
     gLog.clear(); gTranscript.setString(""); repaint();
@@ -1358,12 +1418,33 @@ List formatDecls(List decls) {
   return out;
 }
 
+// Outstanding work a driver can wait on: requests in flight (gAskPending) and
+// long UI-initiated jobs that are not yet requests (gBusy — a compile check
+// runs a whole `dart --compile_all` before the accept it gates). See `settle`.
+int gAskPending = 0;
+int gBusy = 0;
+
+/// Return when the workspace has finished what it is doing. Scripts used fixed
+/// sleeps before, which is guesswork that silently rots: when the compile gate
+/// came back the accepts got slower and every `after 4000` in the suite became
+/// a coin toss.
+Future workSettle([int maxMs = 30000]) async {
+  // The click that started the work is a queued message that has not run yet.
+  await new Future.delayed(const Duration(milliseconds: 5));
+  var waited = 0;
+  while ((gAskPending > 0 || gBusy > 0 || gAppPending > 0) && waited < maxMs) {
+    await new Future.delayed(const Duration(milliseconds: 20));
+    waited += 20;
+  }
+  return waited < maxMs;
+}
+
 Future ask(String cmd, var arg) async {   // arg/result may be a String or a List
   if (gLang == null) return "ERR: language isolate restarting…";
   // A message sent now would QUEUE against the stopped isolate, invisibly, and
   // all fire the moment you press Continue — and with the watchdog rightly
   // suspended while paused, nothing would ever time it out. Refuse loudly.
-  if (gDbgPaused) {
+  if (gDbgPaused && gDbgIsLang) {   // a paused DEMO must not block this channel
     return "ERR: the language isolate is stopped in the debugger — press "
            "Continue first ('" + cmd + "' was not sent; Evaluate works while paused)";
   }
@@ -1375,6 +1456,15 @@ Future ask(String cmd, var arg) async {   // arg/result may be a String or a Lis
     arg = formatDecls(<dynamic>[arg])[0];
   }
   var gen = gLangGen;   // which isolate this was sent to
+  gAskPending++;
+  try {
+    return await _ask(cmd, arg, gen);
+  } finally {
+    gAskPending--;
+  }
+}
+
+Future _ask(String cmd, var arg, int gen) async {
   var rp = new ReceivePort();
   gLang.send([cmd, arg, rp.sendPort]);
 
@@ -1413,6 +1503,12 @@ Future ask(String cmd, var arg) async {   // arg/result may be a String or a Lis
        cmd == 'remove') &&
       gLangIsolateId != null) {
     await dbgReResolve();
+  }
+  // An Accept morphed the running app's instance; re-running build() puts the
+  // new layout on screen with the app's state intact.
+  if (!identical(result, _kTimeout) && gLangGen == gen && gAppName != null &&
+      (cmd == 'acceptMany' || cmd == 'acceptLive' || cmd == 'accept')) {
+    await appRebuild();
   }
   if (identical(result, _kTimeout)) {
     await respawnLanguage("'" + cmd + "' timed out — killed runaway code");
@@ -1454,16 +1550,31 @@ Future<String> askDeferrable(String cmd, var arg) async {
 }
 
 // Spawn the language isolate from the scratch file, with error/exit monitoring.
+//
+// The port STAYS OPEN after the handshake. It used to be `await fromLang.first`
+// then close, which left the language isolate unable to speak first — and a
+// user app that repaints on a Timer has no request to answer, so it needs to.
+// The first SendPort to arrive is the handshake; everything after is a push.
+ReceivePort gFromLang;
+
 Future spawnLanguage() async {
   var gen = ++gLangGen;
-  var fromLang = new ReceivePort();
+  if (gFromLang != null) gFromLang.close();     // never leak the old generation
+  gFromLang = new ReceivePort();
+  var handshake = new Completer();
+  gFromLang.listen((msg) {
+    if (msg is SendPort) {
+      if (!handshake.isCompleted) handshake.complete(msg);
+      return;
+    }
+    if (msg is List && msg.length > 3 && msg[0] == 'appui') onAppPush(msg);
+  });
   var errPort = new ReceivePort();
   var exitPort = new ReceivePort();
   gLangIsolate = await Isolate.spawnUri(
-      Uri.parse('file://' + gScratch), <String>[gScratch, gDbPath], fromLang.sendPort,
+      Uri.parse('file://' + gScratch), <String>[gScratch, gDbPath], gFromLang.sendPort,
       onError: errPort.sendPort, onExit: exitPort.sendPort, errorsAreFatal: false);
-  gLang = await fromLang.first;
-  fromLang.close();
+  gLang = await handshake.future;
   errPort.listen((e) {
     var m = (e is List && e.length > 0) ? e[0].toString() : e.toString();
     log("⚠ language error: " + m);
@@ -1491,12 +1602,14 @@ Future respawnLanguage(String why) async {
   // with "press Continue first" — a ghost pause over a corpse, which reads as
   // the whole app hanging. The pause died with its isolate; say so.
   dbgForgetPause("the stopped isolate was restarted — nothing is paused now");
+  appOnRespawn();   // the user app's instance died with it too
   await spawnLanguage();   // boots from the image
   gRespawning = false;
   log("language isolate restarted (declarations reloaded from the image)");
   guiEvent('languageRestarted', <String, String>{'why': why});
-  if (gLangIsolateId != null) {          // the debugger was attached: re-target
-    if (await vmsResolveTarget()) {
+  if (gLangIsolateId != null && gDbgIsLang) {   // the debugger was ON the language
+    if (await vmsResolveTarget()) {              // isolate: follow it to the new one.
+      gDbgScratch = gScratch;                    // (a demo session is left alone)
       await vmsCall('streamListen', <String, dynamic>{'streamId': 'Debug'});
       await dbgReResolve();
     }
@@ -1523,36 +1636,128 @@ Future<String> handle(String line) async {
   var arg = sp < 0 ? "" : line.substring(sp + 1);
   switch (cmd) {
     case 'ping': return "pong";
-    case 'dbgattach': await dbgAttach(); return gLangIsolateId == null ? "ERR: not attached" : gLangIsolateId;
+    case 'dbgisolates': {                  // the attachable isolates (UI excluded)
+      await dbgRefreshIsolates();
+      var o = <String>[];
+      for (var e in gDbgIsoList) {
+        o.add(e[1].toString() + "  " + e[0].toString() + (e[2] == true ? "  [lang]" : ""));
+      }
+      return o.isEmpty ? "(none)" : o.join('\n');
+    }
+    case 'dbgattach': {
+      // Optional arg selects the isolate by index or name substring (for
+      // scripted attach); with none, the picker's current selection is used.
+      await dbgRefreshIsolates();
+      var want = arg.trim();
+      if (want.isNotEmpty && gDbgIsoPicker != null) {
+        for (var i = 0; i < gDbgIsoList.length; i++) {
+          // Full isolate id first (stable across list churn), then a name
+          // fragment; a bare index works but can race a changing list.
+          if (gDbgIsoList[i][0].toString() == want || i.toString() == want ||
+              gDbgIsoList[i][1].toString().contains(want)) {
+            gDbgIsoPicker.selectItemAtIndex(i); break;
+          }
+        }
+      }
+      await dbgAttach();
+      return gLangIsolateId == null ? "ERR: not attached"
+          : (gLangIsolateId + (gDbgIsLang ? " [lang]" : " [raw]"));
+    }
     case 'dbgbreak': {
-      if (gLangIsolateId == null) return "ERR: attach first";
-      var ln = int.parse(arg.trim(), onError: (_) => 0);
-      var r = await vmsCall('addBreakpoint', <String, dynamic>{
-          'isolateId': gLangIsolateId, 'scriptId': gLangScriptId, 'line': ln});
-      if (r == null) return "ERR: no breakpoint at line " + ln.toString();
-      var anchor = _anchorFor(_scratchLines(), ln);
-      if (anchor == null) return "ERR: line " + ln.toString() + " is outside any declaration";
-      gDbgBreaks.add(new DbgBreak(anchor[0], anchor[1], ln, r['id']));
-      dbgLoadSource();
-      return "breakpoint in " + anchor[0] + " +" + anchor[1].toString() +
-             " (line " + ln.toString() + ") resolved=" + r['resolved'].toString();
+      // "dbgbreak L" or "dbgbreak L if EXPR" — one shared path with the UI.
+      var a = arg.trim();
+      var cond = '';
+      var sp = a.indexOf(' ');
+      if (sp > 0) {
+        var rest = a.substring(sp + 1).trim();
+        a = a.substring(0, sp);
+        if (rest.startsWith('if ')) cond = rest.substring(3).trim();
+        else if (rest.isNotEmpty) return "ERR: dbgbreak L [if EXPR]";
+      }
+      var ln = int.parse(a, onError: (_) => 0);
+      if (ln <= 0) return "ERR: dbgbreak L [if EXPR]";
+      return await dbgAddBreak(ln, cond);
     }
     case 'dbgvars': {
+      // One per line: values render with commas (_GrowableList(14), maps…),
+      // so a comma join is ambiguous for the scripts that parse this.
       var o = <String>[];
       for (var v in gDbgVars) o.add(v[0].toString() + "=" + v[1].toString());
-      return o.isEmpty ? "(none)" : o.join(", ");
+      return o.isEmpty ? "(none)" : o.join('\n');
     }
     case 'dbgframe': { dbgSelectFrame(int.parse(arg.trim(), onError: (_) => 0)); return "ok"; }
-    case 'dbgeval': { await dbgEval(arg); return gDbgStatusLbl.stringValue().UTF8String(); }
+    case 'dbgeval': return await dbgEval(arg);   // the VALUE, not the status label
+    case 'dbgquiet': {                 // 1: pauses stop yanking the GUI to tab 5
+      gDbgQuiet = arg.trim() == '1';
+      return gDbgQuiet ? "quiet (pauses leave the current tab)" : "surfacing";
+    }
     case 'dbgsource': return gDbgSrc == null ? "" : gDbgSrc.string().UTF8String();
-    case 'dbgstate': return gDbgPaused
-        ? ("paused, " + gDbgFrames.length.toString() + " frames, top=" +
-           (gDbgFrames.isEmpty ? "?" : gDbgFrames[0][0].toString()))
-        : "running";
+    // "paused at <fn>:<line>, K frames" — the line is what lets a stepping
+    // agent VERIFY the step moved (top-frame names rarely change mid-function).
+    case 'dbgstate': {
+      if (!gDbgPaused) return "running";
+      var at = gDbgFrames.isEmpty ? "?" : gDbgFrames[0][0].toString();
+      if (gDbgFrameLines.isNotEmpty && gDbgFrameLines[0] > 0) {
+        at += ":" + gDbgFrameLines[0].toString();
+      }
+      return "paused at " + at + ", " + gDbgFrames.length.toString() + " frames";
+    }
+    case 'dbgpause': {                     // the frame-loop-friendly way in:
+      if (gLangIsolateId == null) return "ERR: attach first";
+      await dbgPause();                    // stop wherever it is — no re-break trap
+      return "pause requested — poll dbgstate";
+    }
+    case 'dbgstack': {                     // "N  fn:line" per frame, for dbgframe N
+      if (!gDbgPaused) return "(not paused)";
+      var o = <String>[];
+      for (var i = 0; i < gDbgFrames.length; i++) {
+        var ln = (i < gDbgFrameLines.length && gDbgFrameLines[i] > 0)
+            ? ":" + gDbgFrameLines[i].toString() : "";
+        o.add(i.toString() + "  " + gDbgFrames[i][0].toString() + ln);
+      }
+      return o.isEmpty ? "(no frames)" : o.join('\n');
+    }
+    case 'dbgbreaks': {                    // what is armed, one per line
+      var o = <String>[];
+      for (var b in gDbgBreaks) {
+        var s = "L" + b.line.toString() +
+            (b.decl.isEmpty ? "" : "  (" + b.decl + " +" + b.offset.toString() + ")");
+        if (b.condition.isNotEmpty) {
+          s += "  if " + b.condition +
+               "  hits " + b.hits.toString() + " skips " + b.skips.toString();
+        }
+        o.add(s);
+      }
+      return o.isEmpty ? "(none)" : o.join('\n');
+    }
+    case 'dbgunbreak': {                   // remove ONE breakpoint, by its line
+      var ln = int.parse(arg.trim(), onError: (_) => 0);
+      var kept = <DbgBreak>[];
+      var removed = 0;
+      for (var b in gDbgBreaks) {
+        if (b.line == ln) {
+          removed++;
+          if (b.vmId != null) {
+            await vmsCall('removeBreakpoint', <String, dynamic>{
+                'isolateId': gLangIsolateId, 'breakpointId': b.vmId});
+          }
+        } else {
+          kept.add(b);
+        }
+      }
+      gDbgBreaks = kept;
+      dbgLoadSource();
+      return removed == 0 ? "ERR: no breakpoint at line " + ln.toString()
+                          : "removed " + removed.toString() + " at line " + ln.toString();
+    }
     case 'dbgstep': await dbgResume(arg.trim().isEmpty ? null : arg.trim()); return "ok";
     case 'dbgclear': await dbgClearBreaks(); return "ok";
     case 'dbghold': debugHold(); return "held (watchdog paused), depth " + gDebugHold.toString();
     case 'dbgrelease': debugRelease(); return "released, depth " + gDebugHold.toString();
+    case 'settle': {  // wait for in-flight work instead of guessing with sleep
+      var ok = await workSettle();
+      return ok ? "idle" : "ERR: still busy after 30s";
+    }
     case 'sleep': {   // a pacing aid for scripts; does not block the isolate
       var ms = int.parse(arg.trim(), onError: (_) => 0);
       if (ms > 0) await new Future.delayed(new Duration(milliseconds: ms));
@@ -1600,13 +1805,112 @@ Future<String> handle(String line) async {
       }
       return "ERR: no demo matching " + arg;
     }
+    case 'helpsearch': {
+      await helpStart();
+      if (!await helpSettle()) return "ERR: the help index is not up";
+      helpSearch(arg);
+      await new Future.delayed(const Duration(milliseconds: 250));
+      var o = <String>[];
+      for (var r in gHelpRows) {
+        o.add(r[1].toString().padRight(10) + r[2].toString().padRight(17) + " " +
+              r[3].toString());
+      }
+      return o.isEmpty ? "(nothing matches " + arg + ")" : o.join('\n');
+    }
+    case 'helpsel': {
+      helpSelect(int.parse(arg.trim(), onError: (_) => 0));
+      await new Future.delayed(const Duration(milliseconds: 250));
+      return gHelpDetail.isEmpty ? "(nothing selected)" : _firstLine(gHelpDetail);
+    }
+    case 'helptext': return gHelpDetail;
+    case 'helpcount': {
+      await helpStart();
+      await helpSettle();
+      return gHelpCount.toString();
+    }
+    case 'apps': {
+      var r = await ask('apps', '');
+      var names = _dl(r);
+      return names.isEmpty ? "(none)" : names.join('\n');
+    }
+    case 'apprun': {
+      var name = arg.trim();
+      if (name.isEmpty) return "ERR: apprun <ClassName>";
+      await appRun(name);
+      return gAppName == null
+          ? gAppStatusLbl.stringValue().UTF8String()
+          : "running " + gAppName;
+    }
+    case 'appstop': await appStop(); return "ok";
+    case 'appedit': {
+      await appEdit();
+      return gEdClass == null ? "ERR: nothing to edit" : "editing " + gEdClass;
+    }
+    case 'appstatus': return gAppName == null ? "idle" : "running " + gAppName;
+    case 'apptree': {
+      if (gAppName == null) return "(no app running)";
+      var o = <String>[];
+      for (var id in gAppOrder) {
+        var v = gAppViews[id];
+        if (v == null) continue;
+        var f = v.frame();
+        o.add(id.padRight(10) + gAppKinds[id].padRight(8) +
+              '"' + appValueOf(id) + '"  ' +
+              "x=" + (f[0] as num).toStringAsFixed(0) +
+              " y=" + (f[1] as num).toStringAsFixed(0) +
+              " w=" + (f[2] as num).toStringAsFixed(0) +
+              " h=" + (f[3] as num).toStringAsFixed(0));
+      }
+      return o.isEmpty ? "(no widgets)" : o.join('\n');
+    }
+    case 'appclick': {
+      var v = gAppViews[arg.trim()];
+      if (v == null) return "ERR: no widget " + arg.trim();
+      v.performClick(null);              // the real click path, as `click` does
+      await appSettle();                 // ...and answer once the app has acted
+      return "clicked " + arg.trim();
+    }
+    case 'appset': {
+      var sp2 = arg.indexOf(' ');
+      if (sp2 < 0) return "ERR: appset <id> <text>";
+      var id = arg.substring(0, sp2), text = arg.substring(sp2 + 1);
+      var v = gAppViews[id];
+      if (v == null) return "ERR: no widget " + id;
+      v.setStringValue(text);
+      appFire(id, 'text', text);         // as typing into it would
+      await appSettle();
+      return "ok";
+    }
+    case 'appget': {
+      var s = appValueOf(arg.trim());
+      return s == null ? "ERR: no widget " + arg.trim() : s;
+    }
     case 'demostop': stopDemo("stopped"); return "ok";
+    // received vs painted: if painted stalls while received climbs, the pacer
+    // is dropping every frame — the screen is NOT showing what the demo sends.
     case 'demostatus': return gDemoTitle == null
         ? "idle"
         : (gDemoIso == null ? "finished " : "running ") + gDemoTitle +
-          " — " + gDemoFrames.toString() + " frames";
+          " — " + gDemoFrames.toString() + " frames, " +
+          gDemoPaints.toString() + " painted";
     case 'snap': return await snapshot(arg.isEmpty ? "/tmp/dartui.png" : arg);
-    case 'tab': switchTab(int.parse(arg)); return "ok";
+    // The game pane's honest pixels: the offscreen texture, not the window
+    // (cacheDisplayInRect cannot see a CAMetalLayer).
+    case 'gpsnap': {
+      var e = gpSnap(arg.isEmpty ? "/tmp/gp.png" : arg);
+      return e.isEmpty ? "ok " + (arg.isEmpty ? "/tmp/gp.png" : arg) : "ERR: " + e;
+    }
+    case 'colint': {                       // COCOA_STATIC_CHECK_PLAN.md §2
+      var f = cocoaLint(arg);
+      return f.isEmpty ? "clean" : f.join('\n');
+    }
+    case 'gpstat': return gpStat().toString();
+    case 'gpfull': gpFullscreen(arg.trim() == '1'); return "ok";
+    case 'tab': {
+      if (arg.trim().isEmpty) return gTab.toString();   // read the current tab
+      switchTab(int.parse(arg));
+      return "ok";
+    }
     case 'brcat': selectCategory(int.parse(arg)); return "ok";
     case 'brclass': selectClass(int.parse(arg)); return "ok";
     // Mirror the real click path, which tags the owning pane (see gSelPane) —
@@ -1818,11 +2122,19 @@ void editorNew() {
 // the pump is idle when the panel takes over. (MACVM hit the same hazard —
 // cocoa_gui/src/panels.rs runs its panels from a drain pass, never in a callback.)
 void _panel(String kind, void done(String path)) {
-  new Timer.run(() {
+  // Timer.run is a STATIC method, not a named constructor: `new Timer.run(…)`
+  // threw NoSuchMethodError on every click, defer's catch ate it, and the
+  // panel simply never appeared. The deferral itself is still wanted — the
+  // modal session should start from a fresh message, not nested inside the
+  // AppKit action callout.
+  Timer.run(() {
     var p = (kind == 'open')
         ? Cocoa.cls("NSOpenPanel").openPanel()
         : Cocoa.cls("NSSavePanel").savePanel();
-    p.setAllowedFileTypes(["dart"]);
+    // A Dart List is a STRUCT to this bridge (NSRect and friends); for an id
+    // argument it marshals to nil, which silently removes the filter. Build a
+    // real NSArray through the bridge instead.
+    p.setAllowedFileTypes(Cocoa.cls("NSArray").arrayWithObject("dart"));
     if (kind == 'open') {
       p.setCanChooseFiles(true);
       p.setAllowsMultipleSelection(false);
@@ -2115,6 +2427,67 @@ Future<bool> vmsResolveTarget() async {
   return false;
 }
 
+String _dbgIsoLabel(String name, String id) {
+  var n = name;
+  var d = n.indexOf('.dart');
+  if (d > 0) n = n.substring(0, d);                       // "06_boids" ← "…dart$main"
+  var slash = id.lastIndexOf('/');
+  return n + "  #" + (slash >= 0 ? id.substring(slash + 1) : id);   // id keeps it unique
+}
+
+/// Populate the isolate picker with every attachable isolate — ALL of them
+/// except the UI isolate, which is the one that registered `ext.dartui.send`.
+/// Pausing that isolate would freeze the debugger and the whole window, so it is
+/// never offered. The language isolate is flagged (its breakpoints stay anchored
+/// across reloads) and pre-selected, so the default Attach behaves as before.
+Future dbgRefreshIsolates() async {
+  if (gDbgIsoPicker == null) return;
+  if (!await vmsConnect()) return;
+  var vm = await vmsCall('getVM');
+  if (vm == null) return;
+  var list = <dynamic>[];
+  for (var iso in vm['isolates']) {
+    var info = await vmsCall('getIsolate', <String, dynamic>{'isolateId': iso['id']});
+    if (info == null) continue;
+    var exts = info['extensionRPCs'];
+    if (exts != null && exts.contains('ext.dartui.send')) continue;   // the UI isolate — never
+    var name = iso['name'].toString();
+    list.add(<dynamic>[iso['id'], name, name.contains('macdart_ws_lang')]);
+  }
+  gDbgIsoList = list;
+  gDbgIsoPicker.removeAllItems();
+  var sel = 0;
+  for (var i = 0; i < list.length; i++) {
+    gDbgIsoPicker.addItemWithTitle(_dbgIsoLabel(list[i][1].toString(), list[i][0].toString()));
+    if (list[i][2] == true && sel == 0) sel = i;          // default to the language isolate
+  }
+  if (list.isNotEmpty) gDbgIsoPicker.selectItemAtIndex(sel);
+  repaint();
+}
+
+/// Resolve a CHOSEN isolate: its root script (for breakpoints) and its source
+/// file (for the source pane, read from the script's file:// URI — every
+/// MACDART isolate is spawned from a file). Sets `gDbgIsLang` so breakpoints are
+/// anchored to declarations only for the reloadable language isolate; elsewhere
+/// the file is stable, so a raw line is enough.
+Future<bool> vmsResolveTargetId(String isolateId, String name) async {
+  gLangIsolateId = isolateId;
+  gDbgIsLang = name.contains('macdart_ws_lang');
+  var info = await vmsCall('getIsolate', <String, dynamic>{'isolateId': isolateId});
+  if (info == null || info['rootLib'] == null) return false;
+  var lib = await vmsCall('getObject', <String, dynamic>{
+    'isolateId': isolateId, 'objectId': info['rootLib']['id']});
+  if (lib == null || lib['scripts'] == null || lib['scripts'].isEmpty) return false;
+  gLangScriptId = lib['scripts'][0]['id'];
+  var sc = await vmsCall('getObject', <String, dynamic>{
+    'isolateId': isolateId, 'objectId': gLangScriptId});
+  if (sc != null && sc['uri'] != null) {
+    try { gDbgScratch = Uri.parse(sc['uri'].toString()).toFilePath(); }
+    catch (e) { gDbgScratch = gScratch; }                 // fall back to the language scratch
+  }
+  return true;
+}
+
 // A breakpoint remembered by WHERE IT IS IN YOUR CODE, not by a line number in
 // the generated file. The language isolate's scratch file is rewritten from the
 // image on every accept and at every boot, so a raw line number goes stale the
@@ -2123,11 +2496,17 @@ Future<bool> vmsResolveTarget() async {
 // (declaration, offset within it) survives that: after each reload the anchor is
 // mapped to the new line and re-armed.
 class DbgBreak {
-  String decl;      // the declaration it lives in
+  String decl;      // the declaration it lives in ('' = raw-line breakpoint)
   int offset;       // lines from that declaration's first line
   int line;         // where it currently sits in the scratch file
   String vmId;      // the vm-service's id, so it can be removed
-  DbgBreak(this.decl, this.offset, this.line, this.vmId);
+  // Conditional breakpoints are CLIENT-SIDE (this VM's addBreakpoint has no
+  // condition): on hit the expression is evaluated in the top frame; false
+  // resumes silently. hits/skips make the behaviour observable.
+  String condition;
+  int hits = 0, skips = 0;
+  DbgBreak(this.decl, this.offset, this.line, this.vmId,
+           [this.condition = '']);
 }
 
 List<DbgBreak> gDbgBreaks = <DbgBreak>[];
@@ -2170,6 +2549,7 @@ int _lineForAnchor(List<String> lines, String decl, int offset) {
 /// accept (which rewrites it) and after a respawn (which also renumbers, and
 /// gives the isolate a new id).
 Future dbgReResolve() async {
+  if (!gDbgIsLang) return;              // only the language isolate is reloaded/renumbered
   if (gLangIsolateId == null || gDbgBreaks.isEmpty) return;
   // A reload recompiles the library, and the SCRIPT gets a new id — re-arming
   // against the one captured at attach time fails with nothing but a null, which
@@ -2214,11 +2594,17 @@ Future dbgReResolve() async {
 // here are the numbers the VM uses, which is why they are displayed.
 Cocoa gDbgSrc, gDbgStack, gDbgLocals, gDbgStatusLbl, gDbgEvalField;
 List gDbgFrames = <dynamic>[];        // [functionName, frameJson]
+List<int> gDbgFrameLines = <int>[];   // per-frame source line (0 = unknown)
+Map gDbgTokenTables = <String, dynamic>{};   // scriptId -> tokenPosTable, per attach
 List gDbgVars = <dynamic>[];          // [name, renderedValue] for the chosen frame
 int gDbgFrame = 0;                    // which frame locals and eval apply to
 // (breakpoints are anchored to a declaration — see DbgBreak below)
 bool gDbgPaused = false;
-String gDbgScratch;                   // the scratch path, for the source pane
+String gDbgScratch;                   // the source file of the attached isolate
+Cocoa gDbgIsoPicker;                  // the isolate lookup, to the left of Attach
+List gDbgIsoList = <dynamic>[];       // [ [id, name, isLang], … ] matching picker rows
+bool gDbgIsLang = true;               // is the target the reloadable language isolate?
+bool gDbgQuiet = false;               // 1: a pause does not yank the GUI to tab 5
 
 // A vm-service value comes back as an @Instance: primitives carry
 // valueAsString, everything else is identified by its class. Show the value when
@@ -2250,27 +2636,37 @@ void dbgStatus(String s) {
 
 void buildDebugTab(Cocoa db) {
   db.setAutoresizesSubviews(true);
-  button(db, "Attach", [8.0, 392.0, 72.0, 24.0], (s) => dbgAttach());
-  button(db, "Pause", [84.0, 392.0, 62.0, 24.0], (s) => dbgPause());
-  button(db, "Continue", [150.0, 392.0, 80.0, 24.0], (s) => dbgResume(null));
-  button(db, "Step Over", [234.0, 392.0, 84.0, 24.0], (s) => dbgResume('Over'));
-  button(db, "Step In", [322.0, 392.0, 72.0, 24.0], (s) => dbgResume('Into'));
-  button(db, "Step Out", [398.0, 392.0, 78.0, 24.0], (s) => dbgResume('Out'));
-  button(db, "Break Here", [480.0, 392.0, 92.0, 24.0], (s) => dbgToggleBreak());
-  button(db, "Clear Breaks", [576.0, 392.0, 100.0, 24.0], (s) => dbgClearBreaks());
+  // The isolate to debug, chosen BEFORE Attach. It lists every isolate except
+  // the UI one — pausing that would freeze the debugger (and the window) itself.
+  // Populated on entering this tab (switchTab) and on the first Attach.
+  gDbgIsoPicker = Cocoa.cls("NSPopUpButton").alloc()
+      .initWithFrame([8.0, 392.0, 148.0, 24.0], pullsDown: false);
+  db.addSubview(gDbgIsoPicker);
+  gDbgIsoPicker.setAutoresizingMask(kMinYMargin);
+  button(db, "Attach", [162.0, 392.0, 72.0, 24.0], (s) => dbgAttach());
+  button(db, "Pause", [238.0, 392.0, 62.0, 24.0], (s) => dbgPause());
+  button(db, "Continue", [304.0, 392.0, 80.0, 24.0], (s) => dbgResume(null));
+  button(db, "Step Over", [388.0, 392.0, 84.0, 24.0], (s) => dbgResume('Over'));
+  button(db, "Step In", [476.0, 392.0, 72.0, 24.0], (s) => dbgResume('Into'));
+  button(db, "Step Out", [552.0, 392.0, 78.0, 24.0], (s) => dbgResume('Out'));
+  button(db, "Break Here", [634.0, 392.0, 92.0, 24.0], (s) => dbgToggleBreak());
+  button(db, "Clear Breaks", [730.0, 392.0, 100.0, 24.0], (s) => dbgClearBreaks());
   pinTop(<String>["Attach", "Pause", "Continue", "Step Over", "Step In",
                   "Step Out", "Break Here", "Clear Breaks"]);
 
   gDbgStatusLbl = label(db, [8.0, 372.0, 852.0, 16.0]);
   gDbgStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
 
-  gDbgEvalField = Cocoa.cls("NSTextField").alloc().initWithFrame([8.0, 344.0, 700.0, 24.0]);
+  gDbgEvalField = Cocoa.cls("NSTextField").alloc().initWithFrame([8.0, 344.0, 640.0, 24.0]);
   gDbgEvalField.setStringValue("");
   var ef = _mono(12.0); if (!ef.isNil) gDbgEvalField.setFont(ef);
   db.addSubview(gDbgEvalField);
   gDbgEvalField.setAutoresizingMask(kMinYMargin + kWidthSizable);
-  button(db, "Evaluate", [714.0, 343.0, 84.0, 26.0], (s) => dbgEval());
-  pinTop(<String>["Evaluate"], kMinXMargin);
+  button(db, "Evaluate", [654.0, 343.0, 84.0, 26.0], (s) => dbgEval());
+  // Break If: the field is the condition, the caret is the line — evaluated in
+  // the top frame on each hit; false skips silently (see dbgAddBreak).
+  button(db, "Break If", [742.0, 343.0, 92.0, 26.0], (s) => dbgBreakIf());
+  pinTop(<String>["Evaluate", "Break If"], kMinXMargin);
 
   // source on the left, stack on the right
   var split = splitView([8.0, 8.0, 852.0, 330.0], true);
@@ -2306,11 +2702,19 @@ void buildDebugTab(Cocoa db) {
 
 Future dbgAttach() async {
   if (!await vmsConnect()) return;
-  if (!await vmsResolveTarget()) return;
+  if (gDbgIsoList.isEmpty) await dbgRefreshIsolates();    // first Attach with no tab visit
+  if (gDbgIsoList.isEmpty) { dbgStatus("no attachable isolate (only the UI is running)"); return; }
+  var idx = gDbgIsoPicker.indexOfSelectedItem();
+  if (idx < 0 || idx >= gDbgIsoList.length) idx = 0;
+  var chosen = gDbgIsoList[idx];
+  if (!await vmsResolveTargetId(chosen[0].toString(), chosen[1].toString())) return;
   await vmsCall('streamListen', <String, dynamic>{'streamId': 'Debug'});
-  gDbgScratch = gScratch;
+  gDbgBreaks = <DbgBreak>[];                              // breakpoints belonged to the old target
+  gDbgTokenTables = <String, dynamic>{};                  // and so did its scripts
   dbgLoadSource();
-  dbgStatus("attached to the language isolate — click a line, then Break Here");
+  dbgStatus("attached to " + _dbgIsoLabel(chosen[1].toString(), chosen[0].toString()) +
+      (gDbgIsLang ? "  (language isolate)" : "  — raw-line breakpoints") +
+      " — click a line, then Break Here");
   log("debugger attached (" + gLangIsolateId + ")");
 }
 
@@ -2347,26 +2751,58 @@ int dbgCaretLine() {
   return line;
 }
 
-Future dbgToggleBreak() async {
-  if (gLangIsolateId == null) { dbgStatus("attach first"); return; }
-  var line = dbgCaretLine();
+/// Arm a breakpoint at [line], optionally guarded by [condition] (evaluated
+/// client-side in the top frame on each hit — see _dbgMaybeConditionalPause).
+/// Returns the status message it also shows; "ERR: …" on failure.
+Future<String> dbgAddBreak(int line, String condition) async {
+  if (gLangIsolateId == null) { dbgStatus("attach first"); return "ERR: attach first"; }
   var r = await vmsCall('addBreakpoint', <String, dynamic>{
     'isolateId': gLangIsolateId, 'scriptId': gLangScriptId, 'line': line});
   if (r == null) {
-    dbgStatus("line " + line.toString() + ": no breakpoint there "
-              "(a one-line class has no body line to stop on — Format it)");
-    return;
+    var m = "line " + line.toString() + ": no breakpoint there "
+            "(a one-line class has no body line to stop on — Format it)";
+    dbgStatus(m);
+    return "ERR: " + m;
   }
-  var anchor = _anchorFor(_scratchLines(), line);
-  if (anchor == null) {
-    dbgStatus("line " + line.toString() + " is outside any declaration");
-    return;
+  var suffix = (condition.isEmpty ? "" : "  if " + condition) +
+               (r['resolved'] == true ? " — resolved" : " — pending");
+  var m;
+  if (gDbgIsLang) {
+    // The language isolate's file is rewritten on every accept, so a raw line
+    // goes stale — anchor to (declaration, offset) and re-map after each reload.
+    var anchor = _anchorFor(_scratchLines(), line);
+    if (anchor == null) {
+      m = "line " + line.toString() + " is outside any declaration";
+      dbgStatus(m);
+      return "ERR: " + m;
+    }
+    gDbgBreaks.add(new DbgBreak(anchor[0], anchor[1], line, r['id'], condition));
+    m = "breakpoint in " + anchor[0] + " +" + anchor[1].toString() +
+        " (line " + line.toString() + ")" + suffix;
+  } else {
+    // Any other isolate is spawned from a stable file — a raw line is enough.
+    gDbgBreaks.add(new DbgBreak('', 0, line, r['id'], condition));
+    m = "breakpoint at line " + line.toString() + suffix;
   }
-  gDbgBreaks.add(new DbgBreak(anchor[0], anchor[1], line, r['id']));
   dbgLoadSource();
-  dbgStatus("breakpoint in " + anchor[0] + " +" + anchor[1].toString() +
-            " (line " + line.toString() + ")" +
-            (r['resolved'] == true ? " resolved" : " pending"));
+  dbgStatus(m);
+  return m;
+}
+
+Future dbgToggleBreak() async {
+  await dbgAddBreak(dbgCaretLine(), '');
+}
+
+/// The Break If button: the condition is whatever is typed in the eval field,
+/// the line is the caret's — the two things already on screen.
+Future dbgBreakIf() async {
+  var cond = gDbgEvalField.stringValue().UTF8String().trim();
+  if (cond.isEmpty) {
+    dbgStatus("Break If: type the condition in the field first (it is "
+              "evaluated in the top frame on each hit; false skips silently)");
+    return;
+  }
+  await dbgAddBreak(dbgCaretLine(), cond);
 }
 
 bool _dbgHasBreakAt(int line) {
@@ -2419,13 +2855,63 @@ void onVmsEvent(Map params) {
   if (gLangIsolateId == null || iso != gLangIsolateId) return;
   var kind = e['kind'].toString();
   if (kind.startsWith('Pause')) {
-    if (!gDbgPaused) { gDbgPaused = true; debugHold(); }
-    _tripPauseGates();
-    dbgOnPaused(kind);
+    // The watchdog hold and the ask-gates belong to the LANGUAGE isolate; a
+    // paused demo pauses only itself — the workspace channel stays live.
+    if (!gDbgPaused) { gDbgPaused = true; if (gDbgIsLang) debugHold(); }
+    _dbgMaybeConditionalPause(kind, e);
   } else if (kind == 'Resume') {
-    if (gDbgPaused) { gDbgPaused = false; debugRelease(); }
+    if (gDbgPaused) { gDbgPaused = false; if (gDbgIsLang) debugRelease(); }
     dbgStatus("running");
   }
+}
+
+/// The breakpoint (ours) this pause event names, or null.
+DbgBreak _dbgBreakForEvent(Map e) {
+  var ids = <String>[];
+  if (e['pauseBreakpoints'] is List) {
+    for (var pb in e['pauseBreakpoints']) {
+      if (pb is Map && pb['id'] != null) ids.add(pb['id'].toString());
+    }
+  }
+  if (e['breakpoint'] is Map && e['breakpoint']['id'] != null) {
+    ids.add(e['breakpoint']['id'].toString());
+  }
+  for (var b in gDbgBreaks) {
+    if (b.vmId != null && ids.contains(b.vmId)) return b;
+  }
+  return null;
+}
+
+/// Conditional breakpoints, client-side: on PauseBreakpoint, evaluate the
+/// breakpoint's condition in the TOP frame. Exactly 'false' resumes silently
+/// (counted as a skip — the ask-gates are never tripped, so nothing else in
+/// the workspace notices). 'true' pauses normally. Anything else — an eval
+/// error, a non-bool — PAUSES with the reason: resuming would leave a broken
+/// condition as a silently dead breakpoint.
+Future _dbgMaybeConditionalPause(String kind, Map e) async {
+  var b = (kind == 'PauseBreakpoint') ? _dbgBreakForEvent(e) : null;
+  if (b != null && b.condition.isNotEmpty) {
+    var v = await vmsCall('evaluateInFrame', <String, dynamic>{
+      'isolateId': gLangIsolateId, 'frameIndex': 0, 'expression': b.condition});
+    var truth = (v != null && v['valueAsString'] != null)
+        ? v['valueAsString'].toString() : null;
+    if (truth == 'false') {
+      b.skips++;
+      gDbgPaused = false;
+      if (gDbgIsLang) debugRelease();
+      await vmsCall('resume', <String, dynamic>{'isolateId': gLangIsolateId});
+      return;
+    }
+    if (truth != 'true') {
+      dbgStatus("condition '" + b.condition +
+                "' did not answer true/false — pausing so you can see why");
+    }
+    b.hits++;
+  } else if (b != null) {
+    b.hits++;
+  }
+  if (gDbgIsLang) _tripPauseGates();
+  dbgOnPaused(kind);
 }
 
 /// Forget a pause whose isolate no longer exists (it was killed or restarted).
@@ -2439,6 +2925,39 @@ void dbgForgetPause(String why) {
   dbgStatus(why);
 }
 
+// A tokenPosTable row is [lineNumber, tokenPos, col, tokenPos, col, …]; a
+// frame's location carries an exact tokenPos, so an exact match finds its line.
+int _dbgLineForToken(List table, int tokenPos) {
+  for (var row in table) {
+    if (row is! List || row.length < 2) continue;
+    for (var i = 1; i + 1 < row.length; i += 2) {
+      if (row[i] == tokenPos) return row[0];
+    }
+  }
+  return 0;
+}
+
+/// The source line of one stack frame — via its script's tokenPosTable,
+/// fetched once per script per attach (stepping pauses constantly; the table
+/// never changes). 0 when unknown; a failed fetch caches empty so it is
+/// asked exactly once.
+Future<int> _dbgFrameLine(Map frame) async {
+  var loc = frame['location'];
+  if (loc == null || loc['script'] == null || loc['tokenPos'] == null) return 0;
+  var sid = loc['script']['id'].toString();
+  var table = gDbgTokenTables[sid];
+  if (table == null) {
+    var sc = await vmsCall('getObject', <String, dynamic>{
+        'isolateId': gLangIsolateId, 'objectId': sid});
+    table = (sc != null && sc['tokenPosTable'] != null)
+        ? sc['tokenPosTable'] : <dynamic>[];
+    gDbgTokenTables[sid] = table;
+  }
+  if (table is! List || table.isEmpty) return 0;
+  var t = loc['tokenPos'];
+  return _dbgLineForToken(table, t is int ? t : 0);
+}
+
 Future dbgOnPaused(String kind) async {
   var stk = await vmsCall('getStack', <String, dynamic>{'isolateId': gLangIsolateId});
   gDbgFrames = <dynamic>[];
@@ -2448,13 +2967,24 @@ Future dbgOnPaused(String kind) async {
       gDbgFrames.add(<dynamic>[name, f]);
     }
   }
+  gDbgFrameLines = <int>[];
+  for (var f in gDbgFrames) {
+    gDbgFrameLines.add(await _dbgFrameLine(f[1]));
+  }
   gDbgStack.reloadData();
   gDbgFrame = 0;
   dbgShowVars(0);
-  switchTab(5);
-  dbgStatus(kind + " — " + gDbgFrames.length.toString() +
+  // Surface the debugger for a human, but not when an agent asked for quiet
+  // (dbgquiet 1) — scripted stepping would otherwise yank the screen per step.
+  // Already on tab 5: skip the redundant switch (it re-refreshes the picker).
+  if (!gDbgQuiet && gTab != 5) switchTab(5);
+  var at = gDbgFrames.isEmpty ? "?" : gDbgFrames[0][0].toString();
+  if (gDbgFrameLines.isNotEmpty && gDbgFrameLines[0] > 0) {
+    at += ":" + gDbgFrameLines[0].toString();
+  }
+  dbgStatus(kind + " at " + at + " — " + gDbgFrames.length.toString() +
             " frames; the window stays live because this is a different isolate");
-  log("debugger: " + kind);
+  log("debugger: " + kind + " at " + at);
   repaint();
 }
 
@@ -2482,14 +3012,20 @@ void dbgShowVars(int row) {
 }
 
 /// Run an expression IN the selected frame, so it sees that frame's locals.
-Future dbgEval([String expr]) async {
-  if (gLangIsolateId == null) { dbgStatus("attach first"); return; }
-  if (!gDbgPaused) { dbgStatus("evaluate needs the isolate stopped"); return; }
+/// Evaluate in the selected frame. RETURNS the rendered value (or "ERR: …" /
+/// "error: …") — the control-plane verb hands it straight to the caller, so
+/// an agent gets the value itself, not a race against the shared status label.
+Future<String> dbgEval([String expr]) async {
+  if (gLangIsolateId == null) { dbgStatus("attach first"); return "ERR: attach first"; }
+  if (!gDbgPaused) {
+    dbgStatus("evaluate needs the isolate stopped");
+    return "ERR: evaluate needs the isolate stopped";
+  }
   var src = expr != null ? expr : gDbgEvalField.stringValue().UTF8String();
-  if (src.trim().isEmpty) return;
+  if (src.trim().isEmpty) return "";
   var r = await vmsCall('evaluateInFrame', <String, dynamic>{
     'isolateId': gLangIsolateId, 'frameIndex': gDbgFrame, 'expression': src});
-  if (r == null) { dbgStatus("evaluate failed"); return; }
+  if (r == null) { dbgStatus("evaluate failed"); return "ERR: evaluate failed"; }
   // A failed evaluate carries the VM's whole stack trace; the first line is the
   // part that says what went wrong.
   var shown = (r['kind'] == 'Error' || r['message'] != null)
@@ -2497,6 +3033,7 @@ Future dbgEval([String expr]) async {
       : dbgValue(r);
   dbgStatus(src + "  =>  " + shown);
   log("debug eval: " + src + " => " + shown);
+  return shown;
 }
 
 // --- Demos tab ---------------------------------------------------------------
@@ -2513,6 +3050,20 @@ Future dbgEval([String expr]) async {
 //   ['draw', cmds]     replay a draw list onto the canvas (see below)
 //   ['status', text]   one line under the canvas
 //   ['done', text]     the demo is finished (logged; the isolate may then exit)
+//   ['port', ctl]      opt into PULL pacing: the UI sends a tick on [ctl] to
+//                      invite each frame; the demo answers one tick with one
+//                      ['draw', …] and needs no Timer of its own. Preferred for
+//                      anything heavy — the demo then can never outrun the
+//                      renderer, and a slow machine degrades to fewer fps with
+//                      no frame ever computed just to be dropped. (Demos that
+//                      just push at their own rate still work; the pacer below
+//                      drops what the machine can't show.)
+//                      Each tick's payload is the GAMESTATE at that instant:
+//                      [downKeycodes, modifierFlags] from dart:cocoa keyState()
+//                      (left 123, right 124, down 125, up 126, space 49, A 0,
+//                      D 2). While a demo runs on this tab, plain keys are
+//                      captured for it — Cmd shortcuts stay with the app. So an
+//                      interactive game is just a pull demo that reads its tick.
 // Draw commands, coordinates TOP-LEFT (the renderer flips into AppKit's
 // bottom-left; demos should never have to know):
 //   ['clear', r,g,b]
@@ -2530,10 +3081,71 @@ int gDemoFrames = 0;
 bool gDemoFinished = false;            // saw 'done' (so exit is not news)
 const double kDemoW = 848.0, kDemoH = 352.0;
 
+// A demo whose Timer enqueues draw lists faster than the renderer can paint
+// them would let HandleAllMessages drain an ever-growing queue, pegging the
+// main thread and starving AppKit — the frozen window a sampler caught. So the
+// paint is PACED to what the machine sustains: render inline (as the message
+// pump always has — repaint() is a synchronous gWindow.display(), so it only
+// reaches the screen from this context, NOT from a Timer), then refuse to paint
+// again until at least that paint's own COST has elapsed. Frames arriving inside
+// that gap are dropped cheaply, so the queue can't grow. A demo heavier than the
+// paint rate degrades to fewer fps; it never hangs.
+var gDrawClock = new Stopwatch()..start();
+int gDrawNextDueMs = 0;                 // earliest clock time the next paint may run
+int gDemoPaints = 0;                    // frames actually painted (vs received)
+const int kMinDrawGapMs = 15;           // idle floor between paints
+SendPort gDemoCtl;                      // pull-mode demo's tick port (null = push)
+const int kPullPeriodMs = 30;           // invite pull frames at ~33fps when cheap
+
+// The game pane (GAMEPANE_PLAN.md): a demo whose first frame opens with
+// ['gpopen', …] gets the Metal engine instead of the NSImage canvas. Its
+// whole frame list goes to the native in ONE call (gpApply) — applied
+// atomically, presented at the end, so MACVM's mid-frame flicker class
+// cannot exist here. The NSView is engine-owned and reused across games.
+bool gGpMode = false;
+Cocoa gGpView;
+
+void gpEnter(List cmds) {
+  var o = cmds[0];
+  int gi(int i, int dflt) =>
+      (o.length > i && o[i] is num) ? (o[i] as num).toInt() : dflt;
+  var w = gi(1, 424), h = gi(2, 240);
+  gGpView = gpOpen(w, h, gi(3, w), gi(4, h), gi(5, 0));   // gi(5)=mode: 1 direct
+  if (gDemoView != null) {
+    gGpView.setFrame(gDemoView.frame());
+    gGpView.setAutoresizingMask(kWidthSizable + kHeightSizable);
+    gDemoView.superview().addSubview(gGpView);
+    gDemoView.setHidden(true);
+  }
+  gGpMode = true;
+  var rest = cmds.sublist(1);
+  if (rest.isNotEmpty) {
+    var e = gpApply(rest);
+    if (e != null) log("⚠ gp: " + e.toString());
+  }
+}
+
+void gpLeave() {
+  if (!gGpMode) return;
+  gpClose();
+  if (gGpView != null) {
+    try { gGpView.removeFromSuperview(); } catch (e) {}
+  }
+  gGpView = null;                       // the native keeps the NSView for reuse
+  if (gDemoView != null) gDemoView.setHidden(false);
+  gGpMode = false;
+}
+
 void buildDemosTab(Cocoa dm) {
   button(dm, "Stop", [8.0, 392.0, 64.0, 24.0], (s) => stopDemo("stopped"));
-  pinTop(<String>["Stop"]);
-  gDemoStatusLbl = label(dm, [82.0, 396.0, 778.0, 16.0]);
+  // Fullscreen for the game pane only (Esc brings it back); the classic
+  // NSImage canvas has no fullscreen story and the button says so by doing
+  // nothing when no game is up.
+  button(dm, "Full", [76.0, 392.0, 56.0, 24.0], (s) {
+    if (gGpMode) gpFullscreen(true);
+  });
+  pinTop(<String>["Stop", "Full"]);
+  gDemoStatusLbl = label(dm, [140.0, 396.0, 720.0, 16.0]);
   gDemoStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
   // The image survives a chrome rebuild on purpose: a demo that is mid-flight
   // keeps drawing into it while the views around it are torn down and rebuilt.
@@ -2551,6 +3163,14 @@ void buildDemosTab(Cocoa dm) {
   gDemoView.setImage(gDemoImage);
   gDemoView.setAutoresizingMask(kWidthSizable + kHeightSizable);
   dm.addSubview(gDemoView);
+  // A chrome rebuild mid-game: the engine-owned Metal view survives the
+  // teardown (it is not ours to destroy); re-seat it over the fresh canvas.
+  if (gGpMode && gGpView != null) {
+    gGpView.setFrame(gDemoView.frame());
+    gGpView.setAutoresizingMask(kWidthSizable + kHeightSizable);
+    dm.addSubview(gGpView);
+    gDemoView.setHidden(true);
+  }
   demoStatus(gDemoTitle == null
       ? "idle — pick something from the Demos menu"
       : "running " + gDemoTitle);
@@ -2676,6 +3296,7 @@ List<List<String>> scanDemos() {
 Future runDemoAt(String title, String path) async {
   stopDemo(null);
   gDemoFrames = 0;
+  gDemoPaints = 0;
   gDemoFinished = false;
   gDemoTitle = title;
   switchTab(6);
@@ -2717,6 +3338,10 @@ void stopDemo(String why) {
   if (gDemoErrPort != null) gDemoErrPort.close();
   if (gDemoExitPort != null) gDemoExitPort.close();
   gDemoPort = null; gDemoErrPort = null; gDemoExitPort = null;
+  gDemoCtl = null;                      // orphan any scheduled pull tick
+  gDrawNextDueMs = 0;                   // let the next demo paint immediately
+  keyCapture(false);                    // the keyboard back to the workspace
+  gpLeave();                            // Metal pane down, NSImage canvas back
   if (gDemoTitle != null && why != null) {
     demoStatus(gDemoTitle + " — " + why);
     log("demo " + why + " — " + gDemoTitle);
@@ -2736,10 +3361,65 @@ void _onDemoMsg(msg) {
   var kind = msg[0];
   if (kind == 'draw') {
     gDemoFrames++;
-    renderDemo(msg[1]);
+    var cmds = msg[1];
+    // gpopen is SETUP, not a frame: it must neither consume the paint budget
+    // nor schedule a tick — the game's first real frame follows immediately
+    // behind it (answering the 'port' tick), and the pacer dropping THAT
+    // frame silently eats the game's one-time scene definitions.
+    if (!gGpMode && cmds is List && cmds.isNotEmpty && cmds[0] is List &&
+        (cmds[0] as List).isNotEmpty && cmds[0][0] == 'gpopen') {
+      gpEnter(cmds);                                   // Metal pane takes over
+      return;
+    }
+    var t = gDrawClock.elapsedMilliseconds;
+    if (t >= gDrawNextDueMs) {
+      if (gGpMode) {
+        var e = gpApply(cmds);                         // one native call/frame
+        if (e != null) log("⚠ gp: " + e.toString());
+      } else {
+        renderDemo(cmds);                              // inline: display() works
+      }
+      gDemoPaints++;
+      var end = gDrawClock.elapsedMilliseconds;
+      var cost = end - t;
+      // Due time counts from the END of this paint, and the gap is at least
+      // the paint's own cost: display() only reaches the glass when the run
+      // loop goes IDLE, so every paint must buy an equal breath of idle after
+      // it. (start+cost was tried and is wrong: a queued frame is already due
+      // the moment the paint ends — back-to-back paints, no idle, frozen glass.)
+      var gap = cost > kMinDrawGapMs ? cost : kMinDrawGapMs;
+      gDrawNextDueMs = end + gap;
+      if (gDemoCtl != null) {
+        // Pull mode: invite the next frame so it lands at ~kPullPeriodMs pace
+        // when paints are cheap, and no sooner than the idle debt when they
+        // are not. The port is captured: a tick must never reach a demo that
+        // replaced the one it was scheduled for.
+        var wait = kPullPeriodMs - cost;
+        if (wait < gap) wait = gap;
+        var p = gDemoCtl;
+        new Timer(new Duration(milliseconds: wait), () {
+          // The tick carries the GAMESTATE: [downKeycodes, modifierFlags] at
+          // this instant. Non-games ignore the payload; games read their input
+          // exactly once per frame with no event queue to drain.
+          if (!identical(gDemoCtl, p)) return;
+          var ks = keyState();
+          // Esc while the game pane is fullscreen: the workspace comes back.
+          // (The keypress still reaches the game in this same tick.)
+          if (gGpMode && ks[0] is List && (ks[0] as List).contains(53)) {
+            gpFullscreen(false);
+          }
+          p.send(ks);
+        });
+      }
+    }
+    // else: behind — drop this frame cheaply so the message queue can't grow
+    // (an honest pull demo is never early, so never dropped)
     if (gDemoFrames % 30 == 1 && gDemoTitle != null) {
       demoStatus(gDemoTitle + " — frame " + gDemoFrames.toString());
     }
+  } else if (kind == 'port') {
+    gDemoCtl = msg[1];
+    gDemoCtl.send(keyState());           // the first invitation starts the loop
   } else if (kind == 'status') {
     demoStatus((gDemoTitle != null ? gDemoTitle + " — " : "") + msg[1].toString());
   } else if (kind == 'done') {
@@ -2747,6 +3427,563 @@ void _onDemoMsg(msg) {
     demoStatus((gDemoTitle != null ? gDemoTitle + " — " : "") + msg[1].toString());
     log("demo done — " + msg[1].toString());
   }
+}
+
+// --- Help: searchable Dart V1 reference --------------------------------------
+// The Docs tab is the workspace guide PLUS a search over the Dart V1 language
+// itself: every documented declaration in the SDK libraries this VM was built
+// from, the language specification, and dart:cocoa. Nothing is transcribed —
+// see help/indexer.dart — so the help cannot describe a language other than the
+// one you are running.
+//
+// The index lives in its own isolate: parsing ~9MB of source on thread 0 would
+// stall the window, and this isolate is the one that must never stall. Spawned
+// on first use, so startup pays nothing.
+Cocoa gHelpField, gHelpTable, gHelpText, gHelpStatusLbl;
+SendPort gHelpPort;                    // the indexer, once it is up
+ReceivePort gHelpFrom;
+List gHelpRows = <dynamic>[];          // [id, kind, where, name, summary]
+int gHelpCount = 0;
+bool gHelpStarting = false;
+String gHelpQuery = '';
+String gHelpDetail = '';
+
+void buildDocsTab(Cocoa dc) {
+  dc.setAutoresizesSubviews(true);
+  // 44pt clipped it to "Searc". A label is not sized to its text by default,
+  // and every control in a resizable tab needs its mask set or it drifts away
+  // from the row it belongs to when the window grows.
+  var lbl = label(dc, [8.0, 394.0, 56.0, 18.0]);
+  lbl.setStringValue("Search");
+  lbl.setAutoresizingMask(kMinYMargin);
+  gHelpField = Cocoa.cls("NSTextField").alloc().initWithFrame([68.0, 390.0, 308.0, 24.0]);
+  var hf = _mono(12.0); if (!hf.isNil) gHelpField.setFont(hf);
+  dc.addSubview(gHelpField);
+  gHelpField.setAutoresizingMask(kMinYMargin);
+  gTargets.add(onTextChange(gHelpField, (s) =>
+      defer(() => helpSearch(s.stringValue().UTF8String()))));
+  button(dc, "Guide", [384.0, 389.0, 68.0, 26.0], (s) => helpShowGuide());
+  pinTop(<String>["Guide"]);
+  gHelpStatusLbl = label(dc, [460.0, 394.0, 400.0, 18.0]);
+  gHelpStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
+
+  // results on the left, the entry itself on the right
+  var split = splitView([8.0, 8.0, 852.0, 374.0], true);
+  var listPane = browserPane(split, 300.0, 374.0);
+  gHelpTable = tableIn(listPane, [0.0, 0.0, 300.0, 374.0]);
+  gTargets.add(onTable(gHelpTable, () => gHelpRows.length,
+      (r) => gHelpRows[r][3].toString(), sel(helpSelect)));
+  var textPane = browserPane(split, 544.0, 374.0);
+  gHelpText = scrolledTextView(textPane, [0.0, 0.0, 544.0, 374.0], false);
+  var mf = _mono(12.0);
+  if (!mf.isNil) gHelpText.setFont(mf);
+  anchorScroll(gHelpText, kWidthSizable + kHeightSizable);
+  split.adjustSubviews();
+  split.setPosition(300.0, ofDividerAtIndex: 0);
+  setSplitMinSize(split, 140.0);
+  dc.addSubview(split);
+
+  gHelpText.setString(gHelpDetail.isEmpty ? _docsText : gHelpDetail);
+  helpStatus(gHelpCount > 0
+      ? (gHelpCount.toString() + " entries — search the language, the libraries and dart:cocoa")
+      : "type to search the Dart V1 language and libraries");
+}
+
+void helpStatus(String s) {
+  if (gHelpStatusLbl != null) gHelpStatusLbl.setStringValue(s);
+  repaint();
+}
+
+void helpShowGuide() {
+  gHelpDetail = _docsText;
+  if (gHelpText != null) gHelpText.setString(_docsText);
+  repaint();
+}
+
+/// Bring the indexer up. Spawned once, on first use.
+Future helpStart() async {
+  if (gHelpPort != null || gHelpStarting) return;
+  gHelpStarting = true;
+  gHelpFrom = new ReceivePort();
+  gHelpFrom.listen(onHelpMsg);
+  var here = Platform.script;
+  var sdkLib = here.resolve('../../../sdk/sdk/lib').toFilePath();
+  var spec = here.resolve('../../../sdk/docs/language/dartLangSpec.tex').toFilePath();
+  var cocoa = here.resolve('../cocoa.dart').toFilePath();
+  helpStatus("indexing the SDK and the language spec…");
+  try {
+    await Isolate.spawnUri(here.resolve('help/indexer.dart'),
+        <String>[sdkLib, spec, cocoa], gHelpFrom.sendPort);
+  } catch (e) {
+    gHelpStarting = false;
+    helpStatus("help: could not start the indexer — " + _firstLine(e.toString()));
+  }
+}
+
+void onHelpMsg(msg) {
+  try {
+    if (msg is! List || msg.isEmpty) return;
+    var kind = msg[0];
+    if (kind == 'port') {
+      gHelpPort = msg[1];
+      gHelpStarting = false;
+      if (gHelpQuery.isNotEmpty) gHelpPort.send(<dynamic>['q', gHelpQuery]);
+    } else if (kind == 'ready') {
+      gHelpCount = msg[1];
+      helpStatus(gHelpCount.toString() +
+          " entries — the SDK this VM was built from, the language spec, dart:cocoa");
+    } else if (kind == 'status') {
+      helpStatus(msg[1].toString());
+    } else if (kind == 'results') {
+      if (msg[1].toString() != gHelpQuery) return;   // a stale query's answer
+      gHelpRows = msg[2];
+      gHelpTable.reloadData();
+      helpStatus(gHelpRows.isEmpty
+          ? ("nothing matches '" + gHelpQuery + "'")
+          : (gHelpRows.length.toString() + " for '" + gHelpQuery + "'"));
+      if (gHelpRows.isNotEmpty) helpSelect(0);
+    } else if (kind == 'detail') {
+      gHelpDetail = msg[2].toString();
+      gHelpText.setString(gHelpDetail);
+      gHelpText.scrollRangeToVisible([0, 0]);
+      repaint();
+    }
+  } catch (e) {
+    log("⚠ help message dropped — " + _firstLine(e.toString()));
+  }
+}
+
+void helpSearch(String q) {
+  gHelpQuery = q.trim();
+  if (gHelpPort == null) { helpStart(); return; }
+  if (gHelpQuery.isEmpty) {
+    gHelpRows = <dynamic>[];
+    gHelpTable.reloadData();
+    helpShowGuide();
+    helpStatus(gHelpCount.toString() + " entries — type to search");
+    return;
+  }
+  gHelpPort.send(<dynamic>['q', gHelpQuery]);
+}
+
+void helpSelect(int row) {
+  if (row < 0 || row >= gHelpRows.length) return;
+  // selectRowIndexes:, not the deprecated selectRow: — an unknown selector
+  // aborts the process, so only the form already proven here is used.
+  if (gHelpTable != null) {
+    gHelpTable.selectRowIndexes(
+        Cocoa.cls("NSIndexSet").indexSetWithIndex(row), byExtendingSelection: false);
+    gHelpTable.scrollRowToVisible(row);
+  }
+  if (gHelpPort == null) return;
+  gHelpPort.send(<dynamic>['get', gHelpRows[row][0]]);
+}
+
+/// Wait for the index and a query to settle — `settle` cannot see this work
+/// because it happens in another isolate.
+Future helpSettle([int maxMs = 60000]) async {
+  var waited = 0;
+  while (gHelpPort == null && waited < maxMs) {
+    await new Future.delayed(const Duration(milliseconds: 50));
+    waited += 50;
+  }
+  while (gHelpCount == 0 && waited < maxMs) {
+    await new Future.delayed(const Duration(milliseconds: 50));
+    waited += 50;
+  }
+  await new Future.delayed(const Duration(milliseconds: 120));
+  return gHelpCount > 0;
+}
+
+// --- App surface (APP_PANE_PLAN.md) ------------------------------------------
+// Where a user's own Cocoa app runs. The app itself lives in the LANGUAGE
+// isolate — that is where the image, morphing hot reload, the debugger and the
+// watchdog are — and it never touches AppKit, because only this isolate may.
+// It sends widget commands; this materialises real NSViews from them and sends
+// events back. One app at a time, on one surface (M2 adds the window).
+//
+// Commands, all top-left coordinates (flipped here, so apps never meet AppKit's
+// origin):  ['clear'] ['add', kind, id, props] ['set', id, props]
+//           ['remove', id] ['title', text] ['focus', id]
+Cocoa gAppPane, gAppPicker, gAppStatusLbl, gAppTitleLbl;
+Map<String, Cocoa> gAppViews = <String, Cocoa>{};
+Map<String, String> gAppKinds = <String, String>{};
+List<String> gAppOrder = <String>[];
+List gAppSpec = <dynamic>[];      // commands since the last clear, for a rebuild
+String gAppName;                  // the running app's class, null when idle
+const double kAppW = 852.0;
+
+void buildAppTab(Cocoa ap) {
+  ap.setAutoresizesSubviews(true);
+  gAppPicker = Cocoa.cls("NSPopUpButton").alloc()
+      .initWithFrame([8.0, 390.0, 220.0, 26.0], pullsDown: false);
+  ap.addSubview(gAppPicker);
+  gAppPicker.setAutoresizingMask(kMinYMargin);
+  button(ap, "Run", [234.0, 390.0, 60.0, 26.0], (s) {
+    if (gAppPicker.numberOfItems() == 0) { appStatus("no app classes in the image"); return; }
+    appRun(gAppPicker.titleOfSelectedItem().UTF8String());
+  });
+  button(ap, "Stop App", [298.0, 390.0, 84.0, 26.0], (s) => appStop());
+  // The point of the pane: change the app that is running in it. Editing goes
+  // through the Editor tab like any other class, and Save to Image commits it —
+  // which hot-reloads and re-runs build(), so the app keeps its state.
+  button(ap, "Edit", [386.0, 390.0, 60.0, 26.0], (s) => appEdit());
+  pinTop(<String>["Run", "Stop App", "Edit"]);
+  gAppTitleLbl = label(ap, [452.0, 394.0, 200.0, 16.0]);
+  gAppTitleLbl.setAutoresizingMask(kMinYMargin);
+  gAppStatusLbl = label(ap, [8.0, 366.0, 852.0, 16.0]);
+  gAppStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
+
+  // The app's own canvas: widgets are subviews of THIS, so clearing an app
+  // cannot touch the workspace's chrome.
+  gAppPane = Cocoa.cls("NSView").alloc().initWithFrame([8.0, 8.0, kAppW, 352.0]);
+  gAppPane.setAutoresizingMask(kWidthSizable + kHeightSizable);
+  gAppPane.setAutoresizesSubviews(false);
+  ap.addSubview(gAppPane);
+
+  appRefreshList();
+  appStatus(gAppName == null
+      ? "idle — pick a class with a build(ui) method and press Run"
+      : "running " + gAppName);
+}
+
+void appStatus(String s) {
+  if (gAppStatusLbl != null) gAppStatusLbl.setStringValue(s);
+  repaint();
+}
+
+double appPaneHeight() {
+  if (gAppPane == null) return 352.0;
+  var b = gAppPane.bounds();
+  return (b[3] as num).toDouble();
+}
+
+/// Top-left [x,y,w,h] in the surface -> an AppKit frame in the container.
+List _appFrame(var f) {
+  if (f is! List || f.length < 4) return [0.0, 0.0, 80.0, 20.0];
+  var x = (f[0] as num).toDouble(), y = (f[1] as num).toDouble();
+  var w = (f[2] as num).toDouble(), h = (f[3] as num).toDouble();
+  return [x, appPaneHeight() - y - h, w, h];
+}
+
+// NSTextAlignment took the UIKit values years ago: left 0, CENTER 1, RIGHT 2.
+// The legacy AppKit order (right 1, center 2) is the one everyone remembers and
+// it is wrong here — it silently centred the calculator's display.
+int _appAlign(var a) {
+  var s = (a == null) ? 'left' : a.toString();
+  if (s == 'center') return 1;
+  if (s == 'right') return 2;
+  return 0;
+}
+
+void appRefreshList() {
+  if (gAppPicker == null) return;
+  ask('apps', '').then((r) {
+    if (gAppPicker == null) return;
+    var names = _dl(r);
+    gAppPicker.removeAllItems();
+    for (var n in names) gAppPicker.addItemWithTitle(n.toString());
+    if (gAppName != null) gAppPicker.selectItemWithTitle(gAppName);
+    repaint();
+  });
+}
+
+/// Apply one batch of commands. The batch is retained so the surface can be
+/// rebuilt from it — a UI layout rebuild tears the view tree down under a
+/// running app, and it has to come back exactly as it was.
+void onAppPush(List msg) {
+  try { appApply(msg[3], true); }
+  catch (e) { log("⚠ app command dropped — " + _firstLine(e.toString())); }
+}
+
+void appApply(List cmds, bool retain) {
+  if (gAppPane == null) return;
+  for (var c in cmds) {
+    if (c is! List || c.isEmpty) continue;
+    var op = c[0];
+    if (op == 'clear') {
+      appClearViews();
+      if (retain) gAppSpec = <dynamic>[];
+      continue;
+    }
+    if (retain) gAppSpec.add(c);
+    if (op == 'add') appAdd(c[1].toString(), c[2].toString(), c[3]);
+    else if (op == 'set') appSet(c[1].toString(), c[2]);
+    else if (op == 'remove') appRemove(c[1].toString());
+    else if (op == 'title') {
+      if (gAppTitleLbl != null) gAppTitleLbl.setStringValue(c[1].toString());
+    } else if (op == 'focus') {
+      var v = gAppViews[c[1].toString()];
+      if (v != null) gWindow.makeFirstResponder(v);
+    }
+  }
+  repaint();
+}
+
+void appClearViews() {
+  if (gAppPane != null) {
+    while (gAppPane.subviews().count() > 0) {
+      gAppPane.subviews().objectAtIndex(0).removeFromSuperview();
+    }
+  }
+  gAppViews.clear();
+  gAppKinds.clear();
+  gAppOrder = <String>[];
+}
+
+void appAdd(String kind, String id, Map p) {
+  appRemove(id);                       // rebuilding over an id replaces it
+  var frame = _appFrame(p['frame']);
+  var v;
+  if (kind == 'button') {
+    v = Cocoa.cls("NSButton").alloc().initWithFrame(frame);
+    v.setTitle(p['title'] == null ? '' : p['title'].toString());
+    v.setBezelStyle(1);
+    if (p['enabled'] == false) v.setEnabled(false);
+    gTargets.add(onAction(v, (s) => defer(() => appFire(id, 'click', ''))));
+  } else if (kind == 'field') {
+    v = Cocoa.cls("NSTextField").alloc().initWithFrame(frame);
+    v.setStringValue(p['text'] == null ? '' : p['text'].toString());
+    v.setAlignment(_appAlign(p['align']));
+    if (p['readOnly'] == true) { v.setEditable(false); v.setSelectable(true); }
+    gTargets.add(onTextChange(v, (s) => defer(() =>
+        appFire(id, 'text', s.stringValue().UTF8String()))));
+    gTargets.add(onAction(v, (s) => defer(() =>
+        appFire(id, 'enter', s.stringValue().UTF8String()))));
+  } else {                             // 'label', and anything unknown
+    kind = 'label';
+    v = Cocoa.cls("NSTextField").alloc().initWithFrame(frame);
+    v.setStringValue(p['text'] == null ? '' : p['text'].toString());
+    v.setAlignment(_appAlign(p['align']));
+    v.setBezeled(false); v.setEditable(false); v.setDrawsBackground(false);
+  }
+  gAppPane.addSubview(v);
+  gAppViews[id] = v;
+  gAppKinds[id] = kind;
+  gAppOrder.add(id);
+}
+
+void appSet(String id, Map p) {
+  var v = gAppViews[id];
+  if (v == null) return;
+  if (p['text'] != null) v.setStringValue(p['text'].toString());
+  if (p['title'] != null) v.setTitle(p['title'].toString());
+  if (p['enabled'] != null) v.setEnabled(p['enabled'] == true);
+}
+
+void appRemove(String id) {
+  var v = gAppViews.remove(id);
+  if (v != null) v.removeFromSuperview();
+  gAppKinds.remove(id);
+  gAppOrder.remove(id);
+}
+
+/// A widget's current value, as the user would read it.
+String appValueOf(String id) {
+  var v = gAppViews[id];
+  if (v == null) return null;
+  var kind = gAppKinds[id];
+  if (kind == 'button') return v.title().UTF8String();
+  return v.stringValue().UTF8String();
+}
+
+/// Deliver an event to the app. Deliberately an ordinary ask(): that inherits
+/// the watchdog (a runaway handler is killed, not left hanging), the debugger's
+/// pause guard, and generation checking.
+int gAppPending = 0;              // events in flight, so a driver can wait
+
+void appFire(String id, String kind, String value) {
+  if (gAppName == null) return;
+  gAppPending++;
+  ask('appevent', <dynamic>[id, kind, value]).then((r) {
+    gAppPending--;
+    var s = r.toString();
+    if (s.startsWith('ERR')) appStatus(s);
+  });
+}
+
+/// Wait until every event raised so far has been handled and its widget updates
+/// applied. A click is three hops — deferred callback, request to the language
+/// isolate, pushed update back — so a verb that returned on the first hop would
+/// make a script read the state BEFORE the click it just made. Every driven
+/// click funnels through here, which is why the suite needs no sleeps.
+Future appSettle() async {
+  // The click's own handler is a queued message that has not run yet; one turn
+  // of the event loop lets it through and registers the event.
+  await new Future.delayed(const Duration(milliseconds: 1));
+  var spins = 0;
+  while (gAppPending > 0 && spins < 300) {
+    await new Future.delayed(const Duration(milliseconds: 10));
+    spins++;
+  }
+}
+
+// An app lays itself out in TOP-LEFT coordinates against the surface size it
+// was given, so its widgets keep the AppKit frames they were built with and
+// slide away from the top edge when the pane grows. Autoresizing masks cannot
+// fix that — only the app knows what its layout means — so the surface watches
+// its own bounds and re-runs build() once the drag settles.
+double gAppLastW = 0.0, gAppLastH = 0.0;
+int gAppResizedAt = 0;
+
+void appWatchResize() {
+  if (gAppName == null || gAppPane == null) return;
+  var b = gAppPane.bounds();
+  var w = (b[2] as num).toDouble(), h = (b[3] as num).toDouble();
+  var now = new DateTime.now().millisecondsSinceEpoch;
+  if (w != gAppLastW || h != gAppLastH) {
+    gAppLastW = w; gAppLastH = h;
+    gAppResizedAt = now;      // still moving; wait for it to stop
+    return;
+  }
+  if (gAppResizedAt != 0 && now - gAppResizedAt > 300) {
+    gAppResizedAt = 0;
+    appRebuild();
+  }
+}
+
+Future appRun(String name) async {
+  switchTab(7);
+  appStatus("starting " + name + "…");
+  var r = await ask('apprun', <dynamic>[name, kAppW, appPaneHeight()]);
+  var s = r.toString();
+  if (s.startsWith('ERR')) {
+    gAppName = null;
+    appStatus(s);
+    log("✗ app — " + s);
+    return;
+  }
+  gAppName = name;
+  var b0 = gAppPane.bounds();
+  gAppLastW = (b0[2] as num).toDouble();
+  gAppLastH = (b0[3] as num).toDouble();
+  gAppResizedAt = 0;
+  appStatus("running " + name);
+  log("app: " + name);
+}
+
+/// Open the app's own source in the Editor. The running app if there is one,
+/// otherwise whatever is selected in the picker — so it also works as "show me
+/// what I am about to run".
+Future appEdit() async {
+  var name = gAppName;
+  if (name == null && gAppPicker != null && gAppPicker.numberOfItems() > 0) {
+    name = gAppPicker.titleOfSelectedItem().UTF8String();
+  }
+  if (name == null) {
+    appStatus("nothing to edit — pick an app first");
+    return;
+  }
+  var src = (await ask('classsrc', name)).toString();
+  if (src.isEmpty || src.startsWith('ERR')) {
+    appStatus("could not read " + name + " from the image");
+    return;
+  }
+  // Set the class BEFORE switching: the Editor repopulates its picker on the
+  // way in and restores the selection from gEdClass.
+  gEdClass = name;
+  gEdFile = null;
+  switchTab(4);
+  edSetText(src);
+  edStatus(name + "  ·  the running app  ·  Save to Image = live + saved, and "
+           "the app rebuilds keeping its state");
+  log("editing " + name);
+}
+
+Future appStop() async {
+  if (gAppName == null) { appStatus("no app running"); return; }
+  var was = gAppName;
+  gAppName = null;
+  await ask('appstop', '');
+  appClearViews();
+  gAppSpec = <dynamic>[];
+  if (gAppTitleLbl != null) gAppTitleLbl.setStringValue("");
+  appStatus("stopped " + was);
+}
+
+/// After an Accept that changed the running app's class: the instance was
+/// MORPHED by the reload, so re-running build() changes the layout while the
+/// app's state survives. This is the whole reason the App pane exists.
+Future appRebuild() async {
+  if (gAppName == null) return;
+  var r = await ask('appbuild', <dynamic>[gAppName, kAppW, appPaneHeight()]);
+  var s = r.toString();
+  if (s.startsWith('ERR')) appStatus(s);
+}
+
+/// The language isolate was restarted: its app instance died with it.
+void appOnRespawn() {
+  if (gAppName == null) return;
+  var was = gAppName;
+  gAppName = null;
+  appClearViews();
+  gAppSpec = <dynamic>[];
+  appStatus(was + " stopped — the language isolate restarted; press Run again");
+}
+
+/// Put the surface back after a UI layout rebuild tore the view tree down.
+void appRematerialise() {
+  if (gAppName == null || gAppSpec.isEmpty) return;
+  var spec = gAppSpec;
+  gAppSpec = <dynamic>[];
+  appApply(spec, true);
+}
+
+// The Apps menu is the apps/ folder, exactly like the Demos menu: a file with
+// an "// App:" header is an app you can install into the image and run.
+String appsDir() => Platform.script.resolve('apps/').toFilePath();
+
+List<List<String>> scanApps() {
+  var out = <List<String>>[];
+  try {
+    var files = <String>[];
+    for (var f in new Directory(appsDir()).listSync()) {
+      if (f.path.endsWith('.dart')) files.add(f.path);
+    }
+    files.sort();
+    for (var path in files) {
+      var title;
+      try {
+        for (var line in new File(path).readAsLinesSync().take(5)) {
+          if (line.startsWith('// App:')) { title = line.substring(7).trim(); break; }
+        }
+      } catch (e) {}
+      if (title == null) continue;    // a library the apps import, not an app
+      out.add(<String>[title, path]);
+    }
+  } catch (e) {}
+  return out;
+}
+
+/// File an example app into the image (through the same compile gate as every
+/// other route in), then run it.
+Future installApp(String title, String path) async {
+  gBusy++;                      // so `settle` covers the whole install + run
+  try {
+    await _installApp(title, path);
+  } finally {
+    gBusy--;
+  }
+}
+
+Future _installApp(String title, String path) async {
+  var src;
+  try { src = new File(path).readAsStringSync(); }
+  catch (e) { log("✗ app — cannot read " + path); return; }
+  var decls = splitTopLevel(src);
+  if (decls.isEmpty) { log("✗ app — " + path + " has no declarations"); return; }
+  var name;
+  for (var d in decls) {
+    var n = _classNameOf(d.toString());
+    if (n != null && name == null) name = n;
+  }
+  if (name == null) { log("✗ app — no class in " + path); return; }
+  var r = await checkDecls(decls);
+  if (!r.ok) { log("✗ app refused — " + r.message); return; }
+  var reply = await ask('acceptMany', decls);
+  log("✓ installed " + title + " — " + reply.toString());
+  appRefreshList();
+  await appRun(name);
 }
 
 // --- the vm-service front door (one control plane) ---------------------------
@@ -2859,6 +4096,11 @@ void rebuildUi() {
   // The demo VIEW dies with the tree; the demo IMAGE and its isolate live on —
   // buildDemosTab reattaches them, so a running demo just keeps drawing.
   gDemoView = null; gDemoStatusLbl = null;
+  // Same for the app: its instance is in the language isolate and untouched by
+  // this. The widgets die here and are replayed from the retained spec below.
+  gAppPane = null; gAppPicker = null; gAppStatusLbl = null; gAppTitleLbl = null;
+  gHelpField = null; gHelpTable = null; gHelpText = null; gHelpStatusLbl = null;
+  gAppViews.clear(); gAppKinds.clear(); gAppOrder = <String>[];
   // The ObjC action targets outlive this: AppKit holds them unretained and we
   // never owned a reference. Their tickets are gone, so a stale one now fails
   // closed (dart:cocoa's dispatch returns on an unknown ticket) rather than
@@ -2876,6 +4118,7 @@ void rebuildUi() {
   gTranscript.scrollToEndOfDocument(null);
   if (edBuf != null && edBuf.length > 0) edSetText(edBuf);
   if (edStat != null && edStat.length > 0) edStatus(edStat);
+  appRematerialise();   // a running app's widgets, rebuilt from its spec
   switchTab(tab);
   log("UI layout rebuilt");
   repaint();
@@ -3023,7 +4266,8 @@ void editProjectFile(String which) {
 // OTHER declaration in the image, then the code under test. Reported lines are
 // mapped back to the buffer the user is looking at.
 const String _kProbeImports =
-    "import 'dart:cocoa';\nimport 'dart:isolate';\nimport 'dart:io';\nimport 'dart:mirrors';\n";
+    "import 'dart:cocoa';\nimport 'dart:async';\nimport 'dart:isolate';\n"
+    "import 'dart:io';\nimport 'dart:mirrors';\n";
 
 class CheckResult {
   final bool ok;
@@ -3045,7 +4289,10 @@ int _countLines(String s) {
 Future<CheckResult> compileCheck(String src,
     {bool standalone: false, List<String> replacing: null}) async {
   var bin = _analyzeBinary();
-  if (bin == null) return new CheckResult(true, "", 0);   // no checker: don't block work
+  if (bin == null) {         // no checker: don't block work, but never silently
+    _warnNoChecker();
+    return new CheckResult(true, "", 0);
+  }
 
   var probe, offset = 0;
   if (standalone) {
@@ -3129,16 +4376,185 @@ Future<CheckResult> checkDecls(List decls) async {
   return await compileCheck(decls.join("\n\n"), replacing: names);
 }
 
+// --- Accept-time Cocoa lint (COCOA_STATIC_CHECK_PLAN.md §2) ------------------
+// Best-effort static check of dynamic Cocoa sends against the one database we
+// own — the loaded runtime (the cocoa* query natives). It recognises the two
+// shapes that carry a known class: `Cocoa.cls("X").sel(...)` and a local
+// `var c = Cocoa.cls("X")` then `c.sel(...)`. It rebuilds the ObjC selector the
+// way noSuchMethod does, then flags an unknown class, an unknown selector (with
+// a "did you mean"), or a call that trips the 8-FP-register marshaling limit.
+// Anything it cannot resolve it leaves alone; the louder runtime exceptions are
+// the net for the rest. Findings are WARNINGS — they never block Accept.
+
+class _CTok {                          // 0 ident, 1 string-content, 2 punct
+  final int kind; final String text; final int pos;
+  _CTok(this.kind, this.text, this.pos);
+}
+
+List<_CTok> _cocoaTokens(String s) {
+  var out = <_CTok>[]; var n = s.length, i = 0;
+  while (i < n) {
+    var c = s.codeUnitAt(i);
+    if (c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D) { i++; continue; }
+    if (c == 0x2F && i + 1 < n) {                       // comments
+      var d = s.codeUnitAt(i + 1);
+      if (d == 0x2F) { while (i < n && s.codeUnitAt(i) != 0x0A) i++; continue; }
+      if (d == 0x2A) { i += 2;
+        while (i + 1 < n && !(s.codeUnitAt(i) == 0x2A && s.codeUnitAt(i + 1) == 0x2F)) i++;
+        i = (i + 1 < n) ? i + 2 : n; continue; }
+    }
+    if (c == 0x27 || c == 0x22) {                       // string -> its content
+      var q = c, st = i; i++; var buf = new StringBuffer();
+      var triple = st + 2 < n && s.codeUnitAt(st + 1) == q && s.codeUnitAt(st + 2) == q;
+      if (triple) { i = st + 3;
+        while (i + 2 < n && !(s.codeUnitAt(i) == q && s.codeUnitAt(i + 1) == q && s.codeUnitAt(i + 2) == q)) { buf.writeCharCode(s.codeUnitAt(i)); i++; }
+        i = (i + 2 < n) ? i + 3 : n;
+      } else {
+        while (i < n && s.codeUnitAt(i) != q && s.codeUnitAt(i) != 0x0A) {
+          if (s.codeUnitAt(i) == 0x5C && i + 1 < n) i++;
+          buf.writeCharCode(s.codeUnitAt(i)); i++;
+        }
+        if (i < n && s.codeUnitAt(i) == q) i++;
+      }
+      out.add(new _CTok(1, buf.toString(), st)); continue;
+    }
+    if (_isIdentStart(c)) { var st = i; i++;
+      while (i < n && _isIdentPart(s.codeUnitAt(i))) i++;
+      out.add(new _CTok(0, s.substring(st, i), st)); continue;
+    }
+    out.add(new _CTok(2, new String.fromCharCode(c), i)); i++;   // one punct char
+  }
+  return out;
+}
+
+bool _tokIdent(List<_CTok> t, int i, String name) =>
+    i >= 0 && i < t.length && t[i].kind == 0 && t[i].text == name;
+bool _tokPunct(List<_CTok> t, int i, String ch) =>
+    i >= 0 && i < t.length && t[i].kind == 2 && t[i].text == ch;
+
+int _lineAt(String src, int pos) {
+  var line = 1;
+  for (var i = 0; i < pos && i < src.length; i++) if (src.codeUnitAt(i) == 0x0A) line++;
+  return line;
+}
+
+// Cocoa's OWN Dart members — not ObjC selectors, so never lint them.
+const List<String> _cocoaOwnMembers =
+    const <String>['send', 'toString', 'noSuchMethod', 'hashCode', 'runtimeType', 'cls'];
+
+// Rebuild the selector from a parenthesised call: name + ':' + one 'label:' per
+// named argument (noSuchMethod's own rule); a call with no args is the bare name.
+String _reconSelector(List<_CTok> toks, String method, int open) {
+  // Any content between the parens means at least one arg (numbers tokenise as
+  // punct, so "did we see an identifier" is NOT a reliable has-args test).
+  var first = open + 1;
+  if (first >= toks.length || _tokPunct(toks, first, ')')) return method;   // 0-arg
+  var i = first, depth = 1; var labels = <String>[]; var argStart = true;
+  while (i < toks.length && depth > 0) {
+    var t = toks[i];
+    if (t.kind == 2) {
+      if (t.text == '(' || t.text == '[' || t.text == '{') { depth++; argStart = false; }
+      else if (t.text == ')' || t.text == ']' || t.text == '}') { depth--; if (depth == 0) break; argStart = false; }
+      else if (t.text == ',' && depth == 1) { argStart = true; }
+      else argStart = false;
+    } else {
+      if (depth == 1 && argStart && t.kind == 0 && _tokPunct(toks, i + 1, ':')) labels.add(t.text);
+      argStart = false;
+    }
+    i++;
+  }
+  var sel = new StringBuffer()..write(method)..write(':');
+  for (var l in labels) sel..write(l)..write(':');
+  return sel.toString();
+}
+
+void _lintSend(List<String> out, String src, String cls, List<_CTok> toks, int mi) {
+  var method = toks[mi].text;
+  if (_cocoaOwnMembers.contains(method)) return;
+  if (!_tokPunct(toks, mi + 1, '(')) return;            // only parenthesised calls
+  var sel = _reconSelector(toks, method, mi + 1);
+  var info = cocoaSelectorInfo(cls, sel);
+  var line = _lineAt(src, toks[mi].pos);
+  if (info == null) {
+    var msg = 'L' + line.toString() + ': ' + cls + ' has no selector "' + sel + '"';
+    var near = cocoaNearestSelectors(cls, sel);
+    if (near is List && near.isNotEmpty) msg += ' — did you mean ' + near.take(3).join(', ');
+    out.add(msg);
+  } else {
+    var enc = info.length > 2 ? info[2].toString() : '';
+    var colon = enc.indexOf(':');                       // the _cmd marker; args follow
+    if (colon >= 0) {
+      var fp = 0;
+      for (var k = colon + 1; k < enc.length; k++) {
+        var ch = enc.codeUnitAt(k);
+        if (ch == 0x64 || ch == 0x66) fp++;             // 'd' double / 'f' float
+      }
+      if (fp > 8) out.add('L' + line.toString() + ': ' + cls + '.' + sel +
+          ' passes ' + fp.toString() + ' float args — the bridge marshals only 8 in registers; the rest arrive as garbage');
+    }
+  }
+}
+
+/// Lint [src] for suspect Cocoa sends; returns human-readable findings.
+List<String> cocoaLint(String src) {
+  var out = <String>[];
+  var toks = _cocoaTokens(src);
+  // pass 1: local vars bound directly to a class — `... name = Cocoa.cls("X")`
+  var varClass = <String, String>{};
+  for (var i = 1; i + 5 < toks.length; i++) {
+    if (_tokPunct(toks, i, '=') && _tokIdent(toks, i + 1, 'Cocoa') &&
+        _tokPunct(toks, i + 2, '.') && _tokIdent(toks, i + 3, 'cls') &&
+        _tokPunct(toks, i + 4, '(') && toks[i + 5].kind == 1 &&
+        toks[i - 1].kind == 0) {
+      varClass[toks[i - 1].text] = toks[i + 5].text;
+    }
+  }
+  // pass 2: check the two send shapes
+  for (var i = 0; i < toks.length; i++) {
+    if (_tokIdent(toks, i, 'Cocoa') && _tokPunct(toks, i + 1, '.') &&
+        _tokIdent(toks, i + 2, 'cls') && _tokPunct(toks, i + 3, '(') &&
+        i + 5 < toks.length && toks[i + 4].kind == 1 && _tokPunct(toks, i + 5, ')')) {
+      var cls = toks[i + 4].text;
+      if (!cocoaClassExists(cls)) {
+        out.add('L' + _lineAt(src, toks[i].pos).toString() + ': no such class "' + cls + '"');
+        continue;
+      }
+      if (_tokPunct(toks, i + 6, '.') && i + 7 < toks.length && toks[i + 7].kind == 0) {
+        _lintSend(out, src, cls, toks, i + 7);
+      }
+    } else if (toks[i].kind == 0 && varClass.containsKey(toks[i].text) &&
+               _tokPunct(toks, i + 1, '.') && i + 2 < toks.length && toks[i + 2].kind == 0) {
+      _lintSend(out, src, varClass[toks[i].text], toks, i + 2);
+    }
+  }
+  return out;
+}
+
 Future guardedAccept(List decls, String what, void commit()) async {
-  if (gDbgPaused) {
+  if (gDbgPaused && gDbgIsLang) {   // a paused demo isolate does not block Accept
     log("✗ " + what + " refused — the language isolate is stopped in the debugger; Continue first");
     return;
   }
-  var r = await checkDecls(decls);
+  gBusy++;                    // the compile check is not a request; count it
+  var r;
+  try {
+    r = await checkDecls(decls);
+  } finally {
+    gBusy--;
+  }
   if (!r.ok) {
     log("✗ " + what + " refused — " + r.message);
     if (r.line > 0) _selectLine(r.line);
     return;
+  }
+  // Compiles — now lint the Cocoa sends. Warnings only: they inform, never
+  // block (best-effort static analysis of a dynamic bridge; the runtime net
+  // catches whatever this misses). See COCOA_STATIC_CHECK_PLAN.md §2.
+  var warned = 0;
+  for (var d in decls) {
+    for (var f in cocoaLint(d.toString())) {
+      if (warned++ < 12) log("⚠ cocoa — " + f);
+    }
   }
   commit();
 }
@@ -3156,12 +4572,30 @@ Future guardedAccept(List decls, String what, void commit()) async {
 //     it, and any main() with side effects ran every time Analyze was pressed.
 //     So a top-level main is renamed out of the way first and we supply an empty
 //     one. Pressing Analyze must never execute the user's program.
+// Look in BOTH build directories, not just this one's sibling. Running from
+// build-release/ used to collapse the two candidates onto the same missing path
+// (build-release/../build-release/dart), so no checker was found, compileCheck
+// quietly returned "ok", and the Accept gate disabled itself in silence — which
+// is exactly how source that does not compile got into the image.
 String _analyzeBinary() {
   var dir = new File(Platform.resolvedExecutable).parent.path;
-  for (var c in <String>[dir + "/../build-release/dart", dir + "/dart"]) {
+  for (var c in <String>[dir + "/dart",
+                         dir + "/../build-release/dart",
+                         dir + "/../build/dart"]) {
     if (new File(c).existsSync()) return c;
   }
   return null;
+}
+
+// A safety gate that turns itself off has to say so, every time it matters:
+// silence here reads as "checked and fine".
+bool _warnedNoChecker = false;
+void _warnNoChecker() {
+  if (_warnedNoChecker) return;
+  _warnedNoChecker = true;
+  log("⚠ no dart binary beside dartui — Accept is NOT compile-checked, so "
+      "source that does not compile can reach the image "
+      "(build one: ninja -C macdart/build dart)");
 }
 
 // Rename a TOP-LEVEL `main` so the trial cannot execute it. Literal-aware (via
@@ -3274,7 +4708,16 @@ TABS (View menu, Cmd-1..7)
   Browser    a Smalltalk-style class browser over the image and the world.
   Editor     one whole class as text, with Analyze and Format.
   Find       name search and senders over the image.
-  Docs       this page.
+  Docs       this page, and SEARCHABLE DART V1 HELP beside it. Type in the
+             search box: every documented declaration in the SDK libraries this
+             VM was built from, every section of the Dart 1.24 language
+             specification, and dart:cocoa. Nothing is transcribed - the index
+             is parsed from those files (help/indexer.dart, in its own isolate),
+             so it cannot describe a language other than the one you are
+             running, and every entry cites its own file:line. Search a name
+             (Future, String.substring, spawnUri) or a keyword the libraries
+             cannot explain (await, async*, mixin, cascade). Guide comes back
+             here.
   Debugger   breakpoints, stepping and evaluation in the language isolate.
   Demos      a canvas that demo programs draw on. Each demo in demos/ runs in
              its OWN isolate (some spawn workers of their own) and sends draw
@@ -3282,6 +4725,13 @@ TABS (View menu, Cmd-1..7)
              go as ['rect'|'oval'|'line'|'text', ...] lists; whole images go as
              a Pixmap (demos/pixmap.dart), which crosses as ONE blit command.
              Only files with a "// Demo:" header line are listed in the menu.
+  App        your own Cocoa app, running on real controls. An app is an ordinary
+             image class with a build(ui) method; it runs in the LANGUAGE
+             isolate and never imports dart:cocoa - it describes widgets and
+             this isolate materialises them. Edit build() and press Accept and
+             the layout changes while the app KEEPS ITS STATE, because the
+             reload morphs the live instance. Examples are in apps/ (Apps menu);
+             see APP_PANE_PLAN.md.
 
 THE IMAGE AND THE WORLD
   The world is the VM snapshot (dart:core and friends) - read-only. Your app is
@@ -3304,6 +4754,9 @@ MENUS
   Demos  one item per file in demos/ - picking one spawns it as an isolate and
          switches to the Demos tab. Stop Demo is Cmd-. and kills the isolate.
          Drop a new .dart in the folder and Rescan.
+  Apps   install an example from apps/ into the image and run it. In the App
+         pane, Edit opens the running app's own source in the Editor; Save to
+         Image commits it, and the app rebuilds while keeping its state.
   View   the tabs, and Clear Transcript (Cmd-K).
 
 EDITOR
@@ -3317,6 +4770,47 @@ TOOLBAR
   Live VM counters for the language isolate: MEM used/capacity with a usage bar,
   JIT functions compiled/optimised, CODE generated bytes, GC scavenges/marksweeps.
   A cell shows - when the VM cannot answer it.
+
+DEBUGGER — CONTROL VERBS (the formats below are a CONTRACT; agents parse them)
+  dbgisolates             one per line: "<name>  <isolates/ID>[  [lang]]".
+                          The UI isolate is NEVER listed (pausing it would
+                          freeze this interface).
+  dbgattach [id|name|N]   attach to the picker's selection, or select first by
+                          full isolate id (churn-safe), name fragment, or index.
+                          -> "<isolates/ID> [lang]" | "<isolates/ID> [raw]"
+  dbgstate                "running" | "paused at <fn>:<line>, <K> frames".
+                          The :line is omitted when unknown; an idle-loop pause
+                          is honestly "paused at ?, 0 frames".
+  dbgpause                request a pause wherever it is (the frame-loop-safe
+                          way in; no re-break trap) -> poll dbgstate.
+  dbgbreak L [if EXPR] / dbgunbreak L / dbgbreaks / dbgclear
+                          arm (optionally conditional), disarm one, list, clear.
+                          List format, one per line or "(none)":
+                          "L<line>[  (<decl> +<off>)][  if <expr>  hits H skips S]"
+                          Language-isolate breakpoints are declaration-anchored
+                          and survive Accepts; other isolates use raw lines.
+                          CONDITIONS are client-side (this VM has no server
+                          ones): each hit evaluates EXPR in the TOP frame —
+                          exactly false resumes silently (a skip); true pauses
+                          (a hit); an error or non-bool PAUSES with the reason,
+                          never silently dead. Each hit costs a service round
+                          trip, so a condition on a hot per-frame line slows
+                          that isolate while armed. In the GUI: type the
+                          condition in the eval field, caret the line, Break If.
+  dbgstack                "<N>  <fn>[:<line>]" one per frame; feed N to dbgframe.
+  dbgframe N / dbgvars    select a frame; locals as "name=value" ONE PER LINE
+                          (values may contain commas).
+  dbgeval EXPR            evaluate in the selected frame; returns the VALUE
+                          (or "error: ..." / "ERR: ...").
+  dbgstep [Over|In(to)|Out]   empty = Continue.
+  dbgquiet 0|1            1: a pause no longer switches the GUI to this tab —
+                          set it when stepping programmatically so the human's
+                          screen is not yanked per step. Default 0.
+  tab [N]                 with no argument returns the current tab index.
+  LAW: a per-frame breakpoint in a Timer loop re-breaks every Continue, and
+  Dart 1 periodic timers ACCRUE missed ticks while paused (a long pause bursts
+  them all on resume). Debug frame loops with dbgpause or rare-path breaks,
+  and dbgclear before the final Continue.
 
 ARCHITECTURE
   Two isolates: this UI isolate (pinned to the AppKit thread, builds the views)
@@ -3343,6 +4837,7 @@ main() async {
   new File(gScratch).writeAsStringSync(new File(templatePath).readAsStringSync());
   await spawnLanguage();
   log("language isolate ready — image: " + gDbPath);
+  keyWatch();       // record held keys app-wide; games poll it via pull ticks
   startMetrics();   // ~4 Hz VM counters in the toolbar
   snapshotLastGood();
 

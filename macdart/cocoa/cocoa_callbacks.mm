@@ -59,11 +59,27 @@ static void ActionIMP(id self, SEL _cmd, id sender) {
 }
 
 // -(void)textDidChange:(NSNotification*)note  — NSText/NSTextView delegate.
+//
+// The handler is handed the CONTROL that changed, not the notification. It used
+// to get the notification, which looks the same from Dart until you send it
+// -stringValue: an unknown selector aborts the process, so a field whose
+// handler read its own text was a latent crash. [note object] is the sender, so
+// this now matches the action callback's contract.
 static void TextDidChangeIMP(id self, SEL _cmd, id note) {
   (void)_cmd;
+  id sender = note;
+  if (note != nil && [note respondsToSelector:@selector(object)]) sender = [note object];
   Dart_EnterScope();
-  Dispatch(self, 1, (int64_t)note);
+  Dispatch(self, 1, (int64_t)sender);
   Dart_ExitScope();
+}
+
+// -(void)controlTextDidChange:(NSNotification*)note — the NSControl half of the
+// same idea. An NSTextField is NOT an NSTextView: it never sends
+// textDidChange: to its delegate, so a search box wired with onTextChange sat
+// there doing nothing while every keystroke went unheard.
+static void ControlTextDidChangeIMP(id self, SEL _cmd, id note) {
+  TextDidChangeIMP(self, _cmd, note);
 }
 
 // -(NSInteger)numberOfRowsInTableView:(NSTableView*)tv   [q@:@]
@@ -144,6 +160,8 @@ static void EnsureActionClass() {
   g_action_class = objc_allocateClassPair([NSObject class], "MacdartActionTarget", 0);
   class_addMethod(g_action_class, sel_registerName("macdartInvoke:"), (IMP)ActionIMP, "v@:@");
   class_addMethod(g_action_class, sel_registerName("textDidChange:"), (IMP)TextDidChangeIMP, "v@:@");
+  class_addMethod(g_action_class, sel_registerName("controlTextDidChange:"),
+                  (IMP)ControlTextDidChangeIMP, "v@:@");
   class_addMethod(g_action_class, sel_registerName("numberOfRowsInTableView:"), (IMP)NumRowsIMP, "q@:@");
   class_addMethod(g_action_class, sel_registerName("tableView:objectValueForTableColumn:row:"), (IMP)ObjectValueIMP, "@@:@@q");
   class_addMethod(g_action_class, sel_registerName("tableViewSelectionDidChange:"), (IMP)SelectionChangedIMP, "v@:@");
@@ -265,6 +283,66 @@ void Cocoa_applySpans(Dart_NativeArguments args) {
                range:NSMakeRange((NSUInteger)start, (NSUInteger)rlen)];
   }
   [ts endEditing];
+}
+
+// --- gamestate key poller ----------------------------------------------------
+// Interactive demos need to know which keys are DOWN at frame time — a poller,
+// not an event stream: games read state once per frame (the UI ships it with
+// each pull tick), and no event queue can back up. One NSEvent local monitor
+// records key transitions into a bitset with NO Dart round-trip per event; the
+// UI isolate polls Cocoa_keyState when it invites a frame. While `capture` is
+// on (a demo running on the Demos tab), non-Command key events are swallowed so
+// the game's keys neither beep nor type into the workspace; Cmd shortcuts
+// (quit, tabs) stay live. Everything here runs on thread 0: the monitor fires
+// on the main thread and the natives are called by the UI isolate.
+static bool g_keys_down[128];      // virtual keycode -> currently held
+static uint64_t g_key_mods = 0;    // NSEvent modifierFlags as last seen
+static bool g_key_capture = false;
+static id g_key_monitor = nil;
+
+void Cocoa_keyWatch(Dart_NativeArguments args) {
+  if (g_key_monitor != nil) return;
+  g_key_monitor = [[NSEvent
+      addLocalMonitorForEventsMatchingMask:(NSEventMaskKeyDown |
+                                            NSEventMaskKeyUp |
+                                            NSEventMaskFlagsChanged)
+      handler:^NSEvent*(NSEvent* e) {
+        NSEventType ty = [e type];
+        if (ty == NSEventTypeFlagsChanged) {
+          g_key_mods = (uint64_t)[e modifierFlags];
+          return e;                          // modifiers always pass through
+        }
+        unsigned short kc = [e keyCode];
+        if (kc < 128) g_keys_down[kc] = (ty == NSEventTypeKeyDown);
+        if (g_key_capture &&
+            !([e modifierFlags] & NSEventModifierFlagCommand)) {
+          return nil;                        // consumed by the game
+        }
+        return e;
+      }] retain];
+}
+
+void Cocoa_keyCapture(Dart_NativeArguments args) {
+  int64_t on = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &on);
+  g_key_capture = (on != 0);
+  // Capture edges clear the board: a key held across the toggle would
+  // otherwise stay stuck down if its keyUp lands elsewhere.
+  memset(g_keys_down, 0, sizeof(g_keys_down));
+}
+
+void Cocoa_keyState(Dart_NativeArguments args) {
+  int n = 0;
+  for (int i = 0; i < 128; i++) if (g_keys_down[i]) n++;
+  Dart_Handle down = Dart_NewList(n);
+  int j = 0;
+  for (int i = 0; i < 128; i++) {
+    if (g_keys_down[i]) Dart_ListSetAt(down, j++, Dart_NewInteger(i));
+  }
+  Dart_Handle out = Dart_NewList(2);
+  Dart_ListSetAt(out, 0, down);
+  Dart_ListSetAt(out, 1, Dart_NewInteger((int64_t)g_key_mods));
+  Dart_SetReturnValue(args, out);
 }
 
 }  // namespace bin

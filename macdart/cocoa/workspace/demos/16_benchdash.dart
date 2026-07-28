@@ -22,53 +22,9 @@ import 'dart:isolate';
 
 import 'richards.dart';
 import 'deltablue.dart';
-
-// --- the five microbenchmarks (MACVM 42_benchdash.mst parameters) ----------
-
-int benchArith() {
-  var s = 0;
-  for (var i = 1; i <= 1500000; i++) { s = s + (i * i) - (i * 3); }
-  return s;
-}
-
-int _fib(int n) => n < 2 ? n : _fib(n - 1) + _fib(n - 2);
-int benchFib() => _fib(32);
-
-int _sieveOnce() {
-  const int size = 8190;
-  var flags = new List<bool>(size + 1);
-  for (var x = 1; x <= size; x++) flags[x] = true;
-  var count = 0;
-  for (var i = 1; i <= size; i++) {
-    if (flags[i]) {
-      var prime = i + i + 1;
-      var k = i + prime;
-      while (k <= size) { flags[k] = false; k += prime; }
-      count++;
-    }
-  }
-  return count;
-}
-int benchSieve() {
-  var count = 0;
-  for (var t = 0; t < 4; t++) count = _sieveOnce();
-  return count;
-}
-
-int benchDict() {
-  var d = new Map<int, int>();
-  for (var i = 1; i <= 8000; i++) d[i] = i * i;
-  var sum = 0;
-  for (var i = 1; i <= 8000; i++) sum += d[i];
-  return sum;
-}
-
-class _Assoc { final int key; final _Assoc value; _Assoc(this.key, this.value); }
-int benchAlloc() {
-  _Assoc last;
-  for (var i = 1; i <= 200000; i++) last = new _Assoc(i, last);
-  return last.key;
-}
+import 'microbench.dart';   // arith/fib/sieve/dict/alloc — shared with
+                             // macdart/scripts/cog-bench.dart so the two
+                             // benchmark suites can never silently drift apart
 
 // The two classic OO macro-benchmarks, driven through their own self-check —
 // a wrong answer cannot masquerade as a fast time, in either VM.

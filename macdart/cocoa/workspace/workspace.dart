@@ -1664,23 +1664,19 @@ Future<String> handle(String line) async {
           : (gLangIsolateId + (gDbgIsLang ? " [lang]" : " [raw]"));
     }
     case 'dbgbreak': {
-      if (gLangIsolateId == null) return "ERR: attach first";
-      var ln = int.parse(arg.trim(), onError: (_) => 0);
-      var r = await vmsCall('addBreakpoint', <String, dynamic>{
-          'isolateId': gLangIsolateId, 'scriptId': gLangScriptId, 'line': ln});
-      if (r == null) return "ERR: no breakpoint at line " + ln.toString();
-      if (!gDbgIsLang) {                 // stable file: a raw line is the anchor
-        gDbgBreaks.add(new DbgBreak('', 0, ln, r['id']));
-        dbgLoadSource();
-        return "breakpoint at line " + ln.toString() +
-               " resolved=" + r['resolved'].toString();
+      // "dbgbreak L" or "dbgbreak L if EXPR" — one shared path with the UI.
+      var a = arg.trim();
+      var cond = '';
+      var sp = a.indexOf(' ');
+      if (sp > 0) {
+        var rest = a.substring(sp + 1).trim();
+        a = a.substring(0, sp);
+        if (rest.startsWith('if ')) cond = rest.substring(3).trim();
+        else if (rest.isNotEmpty) return "ERR: dbgbreak L [if EXPR]";
       }
-      var anchor = _anchorFor(_scratchLines(), ln);
-      if (anchor == null) return "ERR: line " + ln.toString() + " is outside any declaration";
-      gDbgBreaks.add(new DbgBreak(anchor[0], anchor[1], ln, r['id']));
-      dbgLoadSource();
-      return "breakpoint in " + anchor[0] + " +" + anchor[1].toString() +
-             " (line " + ln.toString() + ") resolved=" + r['resolved'].toString();
+      var ln = int.parse(a, onError: (_) => 0);
+      if (ln <= 0) return "ERR: dbgbreak L [if EXPR]";
+      return await dbgAddBreak(ln, cond);
     }
     case 'dbgvars': {
       // One per line: values render with commas (_GrowableList(14), maps…),
@@ -1724,8 +1720,13 @@ Future<String> handle(String line) async {
     case 'dbgbreaks': {                    // what is armed, one per line
       var o = <String>[];
       for (var b in gDbgBreaks) {
-        o.add("L" + b.line.toString() +
-              (b.decl.isEmpty ? "" : "  (" + b.decl + " +" + b.offset.toString() + ")"));
+        var s = "L" + b.line.toString() +
+            (b.decl.isEmpty ? "" : "  (" + b.decl + " +" + b.offset.toString() + ")");
+        if (b.condition.isNotEmpty) {
+          s += "  if " + b.condition +
+               "  hits " + b.hits.toString() + " skips " + b.skips.toString();
+        }
+        o.add(s);
       }
       return o.isEmpty ? "(none)" : o.join('\n');
     }
@@ -2495,11 +2496,17 @@ Future<bool> vmsResolveTargetId(String isolateId, String name) async {
 // (declaration, offset within it) survives that: after each reload the anchor is
 // mapped to the new line and re-armed.
 class DbgBreak {
-  String decl;      // the declaration it lives in
+  String decl;      // the declaration it lives in ('' = raw-line breakpoint)
   int offset;       // lines from that declaration's first line
   int line;         // where it currently sits in the scratch file
   String vmId;      // the vm-service's id, so it can be removed
-  DbgBreak(this.decl, this.offset, this.line, this.vmId);
+  // Conditional breakpoints are CLIENT-SIDE (this VM's addBreakpoint has no
+  // condition): on hit the expression is evaluated in the top frame; false
+  // resumes silently. hits/skips make the behaviour observable.
+  String condition;
+  int hits = 0, skips = 0;
+  DbgBreak(this.decl, this.offset, this.line, this.vmId,
+           [this.condition = '']);
 }
 
 List<DbgBreak> gDbgBreaks = <DbgBreak>[];
@@ -2650,13 +2657,16 @@ void buildDebugTab(Cocoa db) {
   gDbgStatusLbl = label(db, [8.0, 372.0, 852.0, 16.0]);
   gDbgStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
 
-  gDbgEvalField = Cocoa.cls("NSTextField").alloc().initWithFrame([8.0, 344.0, 700.0, 24.0]);
+  gDbgEvalField = Cocoa.cls("NSTextField").alloc().initWithFrame([8.0, 344.0, 640.0, 24.0]);
   gDbgEvalField.setStringValue("");
   var ef = _mono(12.0); if (!ef.isNil) gDbgEvalField.setFont(ef);
   db.addSubview(gDbgEvalField);
   gDbgEvalField.setAutoresizingMask(kMinYMargin + kWidthSizable);
-  button(db, "Evaluate", [714.0, 343.0, 84.0, 26.0], (s) => dbgEval());
-  pinTop(<String>["Evaluate"], kMinXMargin);
+  button(db, "Evaluate", [654.0, 343.0, 84.0, 26.0], (s) => dbgEval());
+  // Break If: the field is the condition, the caret is the line — evaluated in
+  // the top frame on each hit; false skips silently (see dbgAddBreak).
+  button(db, "Break If", [742.0, 343.0, 92.0, 26.0], (s) => dbgBreakIf());
+  pinTop(<String>["Evaluate", "Break If"], kMinXMargin);
 
   // source on the left, stack on the right
   var split = splitView([8.0, 8.0, 852.0, 330.0], true);
@@ -2741,36 +2751,58 @@ int dbgCaretLine() {
   return line;
 }
 
-Future dbgToggleBreak() async {
-  if (gLangIsolateId == null) { dbgStatus("attach first"); return; }
-  var line = dbgCaretLine();
+/// Arm a breakpoint at [line], optionally guarded by [condition] (evaluated
+/// client-side in the top frame on each hit — see _dbgMaybeConditionalPause).
+/// Returns the status message it also shows; "ERR: …" on failure.
+Future<String> dbgAddBreak(int line, String condition) async {
+  if (gLangIsolateId == null) { dbgStatus("attach first"); return "ERR: attach first"; }
   var r = await vmsCall('addBreakpoint', <String, dynamic>{
     'isolateId': gLangIsolateId, 'scriptId': gLangScriptId, 'line': line});
   if (r == null) {
-    dbgStatus("line " + line.toString() + ": no breakpoint there "
-              "(a one-line class has no body line to stop on — Format it)");
-    return;
+    var m = "line " + line.toString() + ": no breakpoint there "
+            "(a one-line class has no body line to stop on — Format it)";
+    dbgStatus(m);
+    return "ERR: " + m;
   }
+  var suffix = (condition.isEmpty ? "" : "  if " + condition) +
+               (r['resolved'] == true ? " — resolved" : " — pending");
+  var m;
   if (gDbgIsLang) {
     // The language isolate's file is rewritten on every accept, so a raw line
     // goes stale — anchor to (declaration, offset) and re-map after each reload.
     var anchor = _anchorFor(_scratchLines(), line);
     if (anchor == null) {
-      dbgStatus("line " + line.toString() + " is outside any declaration");
-      return;
+      m = "line " + line.toString() + " is outside any declaration";
+      dbgStatus(m);
+      return "ERR: " + m;
     }
-    gDbgBreaks.add(new DbgBreak(anchor[0], anchor[1], line, r['id']));
-    dbgLoadSource();
-    dbgStatus("breakpoint in " + anchor[0] + " +" + anchor[1].toString() +
-              " (line " + line.toString() + ")" +
-              (r['resolved'] == true ? " resolved" : " pending"));
+    gDbgBreaks.add(new DbgBreak(anchor[0], anchor[1], line, r['id'], condition));
+    m = "breakpoint in " + anchor[0] + " +" + anchor[1].toString() +
+        " (line " + line.toString() + ")" + suffix;
   } else {
     // Any other isolate is spawned from a stable file — a raw line is enough.
-    gDbgBreaks.add(new DbgBreak('', 0, line, r['id']));
-    dbgLoadSource();
-    dbgStatus("breakpoint at line " + line.toString() +
-              (r['resolved'] == true ? " resolved" : " pending"));
+    gDbgBreaks.add(new DbgBreak('', 0, line, r['id'], condition));
+    m = "breakpoint at line " + line.toString() + suffix;
   }
+  dbgLoadSource();
+  dbgStatus(m);
+  return m;
+}
+
+Future dbgToggleBreak() async {
+  await dbgAddBreak(dbgCaretLine(), '');
+}
+
+/// The Break If button: the condition is whatever is typed in the eval field,
+/// the line is the caret's — the two things already on screen.
+Future dbgBreakIf() async {
+  var cond = gDbgEvalField.stringValue().UTF8String().trim();
+  if (cond.isEmpty) {
+    dbgStatus("Break If: type the condition in the field first (it is "
+              "evaluated in the top frame on each hit; false skips silently)");
+    return;
+  }
+  await dbgAddBreak(dbgCaretLine(), cond);
 }
 
 bool _dbgHasBreakAt(int line) {
@@ -2826,12 +2858,60 @@ void onVmsEvent(Map params) {
     // The watchdog hold and the ask-gates belong to the LANGUAGE isolate; a
     // paused demo pauses only itself — the workspace channel stays live.
     if (!gDbgPaused) { gDbgPaused = true; if (gDbgIsLang) debugHold(); }
-    if (gDbgIsLang) _tripPauseGates();
-    dbgOnPaused(kind);
+    _dbgMaybeConditionalPause(kind, e);
   } else if (kind == 'Resume') {
     if (gDbgPaused) { gDbgPaused = false; if (gDbgIsLang) debugRelease(); }
     dbgStatus("running");
   }
+}
+
+/// The breakpoint (ours) this pause event names, or null.
+DbgBreak _dbgBreakForEvent(Map e) {
+  var ids = <String>[];
+  if (e['pauseBreakpoints'] is List) {
+    for (var pb in e['pauseBreakpoints']) {
+      if (pb is Map && pb['id'] != null) ids.add(pb['id'].toString());
+    }
+  }
+  if (e['breakpoint'] is Map && e['breakpoint']['id'] != null) {
+    ids.add(e['breakpoint']['id'].toString());
+  }
+  for (var b in gDbgBreaks) {
+    if (b.vmId != null && ids.contains(b.vmId)) return b;
+  }
+  return null;
+}
+
+/// Conditional breakpoints, client-side: on PauseBreakpoint, evaluate the
+/// breakpoint's condition in the TOP frame. Exactly 'false' resumes silently
+/// (counted as a skip — the ask-gates are never tripped, so nothing else in
+/// the workspace notices). 'true' pauses normally. Anything else — an eval
+/// error, a non-bool — PAUSES with the reason: resuming would leave a broken
+/// condition as a silently dead breakpoint.
+Future _dbgMaybeConditionalPause(String kind, Map e) async {
+  var b = (kind == 'PauseBreakpoint') ? _dbgBreakForEvent(e) : null;
+  if (b != null && b.condition.isNotEmpty) {
+    var v = await vmsCall('evaluateInFrame', <String, dynamic>{
+      'isolateId': gLangIsolateId, 'frameIndex': 0, 'expression': b.condition});
+    var truth = (v != null && v['valueAsString'] != null)
+        ? v['valueAsString'].toString() : null;
+    if (truth == 'false') {
+      b.skips++;
+      gDbgPaused = false;
+      if (gDbgIsLang) debugRelease();
+      await vmsCall('resume', <String, dynamic>{'isolateId': gLangIsolateId});
+      return;
+    }
+    if (truth != 'true') {
+      dbgStatus("condition '" + b.condition +
+                "' did not answer true/false — pausing so you can see why");
+    }
+    b.hits++;
+  } else if (b != null) {
+    b.hits++;
+  }
+  if (gDbgIsLang) _tripPauseGates();
+  dbgOnPaused(kind);
 }
 
 /// Forget a pause whose isolate no longer exists (it was killed or restarted).
@@ -4703,11 +4783,20 @@ DEBUGGER — CONTROL VERBS (the formats below are a CONTRACT; agents parse them)
                           is honestly "paused at ?, 0 frames".
   dbgpause                request a pause wherever it is (the frame-loop-safe
                           way in; no re-break trap) -> poll dbgstate.
-  dbgbreak L / dbgunbreak L / dbgbreaks / dbgclear
-                          arm, disarm one, list ("L<line>[  (<decl> +<off>)]"
-                          one per line, or "(none)"), clear all. Language-
-                          isolate breakpoints are declaration-anchored and
-                          survive Accepts; other isolates use raw lines.
+  dbgbreak L [if EXPR] / dbgunbreak L / dbgbreaks / dbgclear
+                          arm (optionally conditional), disarm one, list, clear.
+                          List format, one per line or "(none)":
+                          "L<line>[  (<decl> +<off>)][  if <expr>  hits H skips S]"
+                          Language-isolate breakpoints are declaration-anchored
+                          and survive Accepts; other isolates use raw lines.
+                          CONDITIONS are client-side (this VM has no server
+                          ones): each hit evaluates EXPR in the TOP frame —
+                          exactly false resumes silently (a skip); true pauses
+                          (a hit); an error or non-bool PAUSES with the reason,
+                          never silently dead. Each hit costs a service round
+                          trip, so a condition on a hot per-frame line slows
+                          that isolate while armed. In the GUI: type the
+                          condition in the eval field, caret the line, Break If.
   dbgstack                "<N>  <fn>[:<line>]" one per frame; feed N to dbgframe.
   dbgframe N / dbgvars    select a frame; locals as "name=value" ONE PER LINE
                           (values may contain commas).

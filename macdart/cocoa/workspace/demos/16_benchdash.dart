@@ -156,11 +156,15 @@ main(List args, SendPort ui) {
       var warmLen = (r[1] * barMaxW / maxUs).clamp(1.0, barMaxW);
       // cold: amber, matching MACVM's rgb(240,150,70)
       cmds.add(<dynamic>['rect', barX0, coldY, coldLen, barH, 0.94, 0.59, 0.27, true]);
-      cmds.add(<dynamic>['text', barX0 + coldLen + 5, coldY + barH - 1,
+      // Text renders DOWNWARD from the y given (top-left convention — the
+      // renderer's own flip already accounts for font ascent), so anchoring
+      // near the bar's BOTTOM (as this used to) pushed the glyphs past it
+      // and into the next row's band. Anchor near the bar's TOP instead.
+      cmds.add(<dynamic>['text', barX0 + coldLen + 5, coldY + 2,
           _fmtMs(r[0]), 11.0, 0.68, 0.71, 0.78]);
       // warm: green, matching MACVM's rgb(80,200,120)
       cmds.add(<dynamic>['rect', barX0, warmY, warmLen, barH, 0.31, 0.78, 0.47, true]);
-      cmds.add(<dynamic>['text', barX0 + warmLen + 5, warmY + barH - 1,
+      cmds.add(<dynamic>['text', barX0 + warmLen + 5, warmY + 2,
           _fmtMs(r[1]), 11.0, 0.68, 0.71, 0.78]);
     }
     ui.send(['draw', cmds]);

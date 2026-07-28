@@ -21,6 +21,12 @@ Dart 2 abandoned that. It became a *soundly* typed language with a separate
 "kernel" front-end, compiled ahead of time; the in-VM parser and the optional-
 types model were removed. That is a different language and a different machine.
 
+A sibling project, [**MACVM**](https://github.com/albanread/MACVM), takes the
+other branch of that lineage directly: a from-scratch Smalltalk VM (not a
+port) with its own moving GC, a JIT that deoptimizes safely on live method
+redefinition, and a Cocoa-hosted image — Strongtalk's ideas pursued on their
+own terms rather than inherited secondhand through Dart.
+
 **This project targets V1 specifically:**
 
 - **Not Dart 2** — no sound null-safety, no kernel front-end. V1's recursive-

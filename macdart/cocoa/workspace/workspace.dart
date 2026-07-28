@@ -292,6 +292,7 @@ void switchTab(int i) {
   if (focus != null) gWindow.makeFirstResponder(focus);
   if (i == 1) openBrowser();
   if (i == 4) editorRefreshClasses();
+  if (i == 5) dbgRefreshIsolates();    // fresh isolate list on entering the tab
   if (i == 5 && gLangIsolateId != null) dbgLoadSource();
   if (i == 7) appRefreshList();
   if (i == 2) helpStart();   // index on first use, not at startup
@@ -438,7 +439,7 @@ void startMetrics() {
 
 void pollVmStats() {
   pollUiReload();   // the host leaves its reload result for us to report
-  if (gDbgPaused) return;   // a poll now would just queue against the stopped isolate
+  if (gDbgPaused && gDbgIsLang) return;   // stats poll targets the language isolate
   if (gPolling || gLang == null || gMetricVals.isEmpty) return;
   gPolling = true;
   askQuiet('vmstats', '', const Duration(seconds: 2)).then((r) {
@@ -1443,7 +1444,7 @@ Future ask(String cmd, var arg) async {   // arg/result may be a String or a Lis
   // A message sent now would QUEUE against the stopped isolate, invisibly, and
   // all fire the moment you press Continue — and with the watchdog rightly
   // suspended while paused, nothing would ever time it out. Refuse loudly.
-  if (gDbgPaused) {
+  if (gDbgPaused && gDbgIsLang) {   // a paused DEMO must not block this channel
     return "ERR: the language isolate is stopped in the debugger — press "
            "Continue first ('" + cmd + "' was not sent; Evaluate works while paused)";
   }
@@ -1606,8 +1607,9 @@ Future respawnLanguage(String why) async {
   gRespawning = false;
   log("language isolate restarted (declarations reloaded from the image)");
   guiEvent('languageRestarted', <String, String>{'why': why});
-  if (gLangIsolateId != null) {          // the debugger was attached: re-target
-    if (await vmsResolveTarget()) {
+  if (gLangIsolateId != null && gDbgIsLang) {   // the debugger was ON the language
+    if (await vmsResolveTarget()) {              // isolate: follow it to the new one.
+      gDbgScratch = gScratch;                    // (a demo session is left alone)
       await vmsCall('streamListen', <String, dynamic>{'streamId': 'Debug'});
       await dbgReResolve();
     }
@@ -1634,13 +1636,42 @@ Future<String> handle(String line) async {
   var arg = sp < 0 ? "" : line.substring(sp + 1);
   switch (cmd) {
     case 'ping': return "pong";
-    case 'dbgattach': await dbgAttach(); return gLangIsolateId == null ? "ERR: not attached" : gLangIsolateId;
+    case 'dbgisolates': {                  // the attachable isolates (UI excluded)
+      await dbgRefreshIsolates();
+      var o = <String>[];
+      for (var e in gDbgIsoList) {
+        o.add(e[1].toString() + "  " + e[0].toString() + (e[2] == true ? "  [lang]" : ""));
+      }
+      return o.isEmpty ? "(none)" : o.join('\n');
+    }
+    case 'dbgattach': {
+      // Optional arg selects the isolate by index or name substring (for
+      // scripted attach); with none, the picker's current selection is used.
+      await dbgRefreshIsolates();
+      var want = arg.trim();
+      if (want.isNotEmpty && gDbgIsoPicker != null) {
+        for (var i = 0; i < gDbgIsoList.length; i++) {
+          if (i.toString() == want || gDbgIsoList[i][1].toString().contains(want)) {
+            gDbgIsoPicker.selectItemAtIndex(i); break;
+          }
+        }
+      }
+      await dbgAttach();
+      return gLangIsolateId == null ? "ERR: not attached"
+          : (gLangIsolateId + (gDbgIsLang ? " [lang]" : " [raw]"));
+    }
     case 'dbgbreak': {
       if (gLangIsolateId == null) return "ERR: attach first";
       var ln = int.parse(arg.trim(), onError: (_) => 0);
       var r = await vmsCall('addBreakpoint', <String, dynamic>{
           'isolateId': gLangIsolateId, 'scriptId': gLangScriptId, 'line': ln});
       if (r == null) return "ERR: no breakpoint at line " + ln.toString();
+      if (!gDbgIsLang) {                 // stable file: a raw line is the anchor
+        gDbgBreaks.add(new DbgBreak('', 0, ln, r['id']));
+        dbgLoadSource();
+        return "breakpoint at line " + ln.toString() +
+               " resolved=" + r['resolved'].toString();
+      }
       var anchor = _anchorFor(_scratchLines(), ln);
       if (anchor == null) return "ERR: line " + ln.toString() + " is outside any declaration";
       gDbgBreaks.add(new DbgBreak(anchor[0], anchor[1], ln, r['id']));
@@ -2333,6 +2364,67 @@ Future<bool> vmsResolveTarget() async {
   return false;
 }
 
+String _dbgIsoLabel(String name, String id) {
+  var n = name;
+  var d = n.indexOf('.dart');
+  if (d > 0) n = n.substring(0, d);                       // "06_boids" ← "…dart$main"
+  var slash = id.lastIndexOf('/');
+  return n + "  #" + (slash >= 0 ? id.substring(slash + 1) : id);   // id keeps it unique
+}
+
+/// Populate the isolate picker with every attachable isolate — ALL of them
+/// except the UI isolate, which is the one that registered `ext.dartui.send`.
+/// Pausing that isolate would freeze the debugger and the whole window, so it is
+/// never offered. The language isolate is flagged (its breakpoints stay anchored
+/// across reloads) and pre-selected, so the default Attach behaves as before.
+Future dbgRefreshIsolates() async {
+  if (gDbgIsoPicker == null) return;
+  if (!await vmsConnect()) return;
+  var vm = await vmsCall('getVM');
+  if (vm == null) return;
+  var list = <dynamic>[];
+  for (var iso in vm['isolates']) {
+    var info = await vmsCall('getIsolate', <String, dynamic>{'isolateId': iso['id']});
+    if (info == null) continue;
+    var exts = info['extensionRPCs'];
+    if (exts != null && exts.contains('ext.dartui.send')) continue;   // the UI isolate — never
+    var name = iso['name'].toString();
+    list.add(<dynamic>[iso['id'], name, name.contains('macdart_ws_lang')]);
+  }
+  gDbgIsoList = list;
+  gDbgIsoPicker.removeAllItems();
+  var sel = 0;
+  for (var i = 0; i < list.length; i++) {
+    gDbgIsoPicker.addItemWithTitle(_dbgIsoLabel(list[i][1].toString(), list[i][0].toString()));
+    if (list[i][2] == true && sel == 0) sel = i;          // default to the language isolate
+  }
+  if (list.isNotEmpty) gDbgIsoPicker.selectItemAtIndex(sel);
+  repaint();
+}
+
+/// Resolve a CHOSEN isolate: its root script (for breakpoints) and its source
+/// file (for the source pane, read from the script's file:// URI — every
+/// MACDART isolate is spawned from a file). Sets `gDbgIsLang` so breakpoints are
+/// anchored to declarations only for the reloadable language isolate; elsewhere
+/// the file is stable, so a raw line is enough.
+Future<bool> vmsResolveTargetId(String isolateId, String name) async {
+  gLangIsolateId = isolateId;
+  gDbgIsLang = name.contains('macdart_ws_lang');
+  var info = await vmsCall('getIsolate', <String, dynamic>{'isolateId': isolateId});
+  if (info == null || info['rootLib'] == null) return false;
+  var lib = await vmsCall('getObject', <String, dynamic>{
+    'isolateId': isolateId, 'objectId': info['rootLib']['id']});
+  if (lib == null || lib['scripts'] == null || lib['scripts'].isEmpty) return false;
+  gLangScriptId = lib['scripts'][0]['id'];
+  var sc = await vmsCall('getObject', <String, dynamic>{
+    'isolateId': isolateId, 'objectId': gLangScriptId});
+  if (sc != null && sc['uri'] != null) {
+    try { gDbgScratch = Uri.parse(sc['uri'].toString()).toFilePath(); }
+    catch (e) { gDbgScratch = gScratch; }                 // fall back to the language scratch
+  }
+  return true;
+}
+
 // A breakpoint remembered by WHERE IT IS IN YOUR CODE, not by a line number in
 // the generated file. The language isolate's scratch file is rewritten from the
 // image on every accept and at every boot, so a raw line number goes stale the
@@ -2388,6 +2480,7 @@ int _lineForAnchor(List<String> lines, String decl, int offset) {
 /// accept (which rewrites it) and after a respawn (which also renumbers, and
 /// gives the isolate a new id).
 Future dbgReResolve() async {
+  if (!gDbgIsLang) return;              // only the language isolate is reloaded/renumbered
   if (gLangIsolateId == null || gDbgBreaks.isEmpty) return;
   // A reload recompiles the library, and the SCRIPT gets a new id — re-arming
   // against the one captured at attach time fails with nothing but a null, which
@@ -2436,7 +2529,10 @@ List gDbgVars = <dynamic>[];          // [name, renderedValue] for the chosen fr
 int gDbgFrame = 0;                    // which frame locals and eval apply to
 // (breakpoints are anchored to a declaration — see DbgBreak below)
 bool gDbgPaused = false;
-String gDbgScratch;                   // the scratch path, for the source pane
+String gDbgScratch;                   // the source file of the attached isolate
+Cocoa gDbgIsoPicker;                  // the isolate lookup, to the left of Attach
+List gDbgIsoList = <dynamic>[];       // [ [id, name, isLang], … ] matching picker rows
+bool gDbgIsLang = true;               // is the target the reloadable language isolate?
 
 // A vm-service value comes back as an @Instance: primitives carry
 // valueAsString, everything else is identified by its class. Show the value when
@@ -2468,14 +2564,21 @@ void dbgStatus(String s) {
 
 void buildDebugTab(Cocoa db) {
   db.setAutoresizesSubviews(true);
-  button(db, "Attach", [8.0, 392.0, 72.0, 24.0], (s) => dbgAttach());
-  button(db, "Pause", [84.0, 392.0, 62.0, 24.0], (s) => dbgPause());
-  button(db, "Continue", [150.0, 392.0, 80.0, 24.0], (s) => dbgResume(null));
-  button(db, "Step Over", [234.0, 392.0, 84.0, 24.0], (s) => dbgResume('Over'));
-  button(db, "Step In", [322.0, 392.0, 72.0, 24.0], (s) => dbgResume('Into'));
-  button(db, "Step Out", [398.0, 392.0, 78.0, 24.0], (s) => dbgResume('Out'));
-  button(db, "Break Here", [480.0, 392.0, 92.0, 24.0], (s) => dbgToggleBreak());
-  button(db, "Clear Breaks", [576.0, 392.0, 100.0, 24.0], (s) => dbgClearBreaks());
+  // The isolate to debug, chosen BEFORE Attach. It lists every isolate except
+  // the UI one — pausing that would freeze the debugger (and the window) itself.
+  // Populated on entering this tab (switchTab) and on the first Attach.
+  gDbgIsoPicker = Cocoa.cls("NSPopUpButton").alloc()
+      .initWithFrame([8.0, 392.0, 148.0, 24.0], pullsDown: false);
+  db.addSubview(gDbgIsoPicker);
+  gDbgIsoPicker.setAutoresizingMask(kMinYMargin);
+  button(db, "Attach", [162.0, 392.0, 72.0, 24.0], (s) => dbgAttach());
+  button(db, "Pause", [238.0, 392.0, 62.0, 24.0], (s) => dbgPause());
+  button(db, "Continue", [304.0, 392.0, 80.0, 24.0], (s) => dbgResume(null));
+  button(db, "Step Over", [388.0, 392.0, 84.0, 24.0], (s) => dbgResume('Over'));
+  button(db, "Step In", [476.0, 392.0, 72.0, 24.0], (s) => dbgResume('Into'));
+  button(db, "Step Out", [552.0, 392.0, 78.0, 24.0], (s) => dbgResume('Out'));
+  button(db, "Break Here", [634.0, 392.0, 92.0, 24.0], (s) => dbgToggleBreak());
+  button(db, "Clear Breaks", [730.0, 392.0, 100.0, 24.0], (s) => dbgClearBreaks());
   pinTop(<String>["Attach", "Pause", "Continue", "Step Over", "Step In",
                   "Step Out", "Break Here", "Clear Breaks"]);
 
@@ -2524,11 +2627,18 @@ void buildDebugTab(Cocoa db) {
 
 Future dbgAttach() async {
   if (!await vmsConnect()) return;
-  if (!await vmsResolveTarget()) return;
+  if (gDbgIsoList.isEmpty) await dbgRefreshIsolates();    // first Attach with no tab visit
+  if (gDbgIsoList.isEmpty) { dbgStatus("no attachable isolate (only the UI is running)"); return; }
+  var idx = gDbgIsoPicker.indexOfSelectedItem();
+  if (idx < 0 || idx >= gDbgIsoList.length) idx = 0;
+  var chosen = gDbgIsoList[idx];
+  if (!await vmsResolveTargetId(chosen[0].toString(), chosen[1].toString())) return;
   await vmsCall('streamListen', <String, dynamic>{'streamId': 'Debug'});
-  gDbgScratch = gScratch;
+  gDbgBreaks = <DbgBreak>[];                              // breakpoints belonged to the old target
   dbgLoadSource();
-  dbgStatus("attached to the language isolate — click a line, then Break Here");
+  dbgStatus("attached to " + _dbgIsoLabel(chosen[1].toString(), chosen[0].toString()) +
+      (gDbgIsLang ? "  (language isolate)" : "  — raw-line breakpoints") +
+      " — click a line, then Break Here");
   log("debugger attached (" + gLangIsolateId + ")");
 }
 
@@ -2575,16 +2685,26 @@ Future dbgToggleBreak() async {
               "(a one-line class has no body line to stop on — Format it)");
     return;
   }
-  var anchor = _anchorFor(_scratchLines(), line);
-  if (anchor == null) {
-    dbgStatus("line " + line.toString() + " is outside any declaration");
-    return;
+  if (gDbgIsLang) {
+    // The language isolate's file is rewritten on every accept, so a raw line
+    // goes stale — anchor to (declaration, offset) and re-map after each reload.
+    var anchor = _anchorFor(_scratchLines(), line);
+    if (anchor == null) {
+      dbgStatus("line " + line.toString() + " is outside any declaration");
+      return;
+    }
+    gDbgBreaks.add(new DbgBreak(anchor[0], anchor[1], line, r['id']));
+    dbgLoadSource();
+    dbgStatus("breakpoint in " + anchor[0] + " +" + anchor[1].toString() +
+              " (line " + line.toString() + ")" +
+              (r['resolved'] == true ? " resolved" : " pending"));
+  } else {
+    // Any other isolate is spawned from a stable file — a raw line is enough.
+    gDbgBreaks.add(new DbgBreak('', 0, line, r['id']));
+    dbgLoadSource();
+    dbgStatus("breakpoint at line " + line.toString() +
+              (r['resolved'] == true ? " resolved" : " pending"));
   }
-  gDbgBreaks.add(new DbgBreak(anchor[0], anchor[1], line, r['id']));
-  dbgLoadSource();
-  dbgStatus("breakpoint in " + anchor[0] + " +" + anchor[1].toString() +
-            " (line " + line.toString() + ")" +
-            (r['resolved'] == true ? " resolved" : " pending"));
 }
 
 bool _dbgHasBreakAt(int line) {
@@ -2637,11 +2757,13 @@ void onVmsEvent(Map params) {
   if (gLangIsolateId == null || iso != gLangIsolateId) return;
   var kind = e['kind'].toString();
   if (kind.startsWith('Pause')) {
-    if (!gDbgPaused) { gDbgPaused = true; debugHold(); }
-    _tripPauseGates();
+    // The watchdog hold and the ask-gates belong to the LANGUAGE isolate; a
+    // paused demo pauses only itself — the workspace channel stays live.
+    if (!gDbgPaused) { gDbgPaused = true; if (gDbgIsLang) debugHold(); }
+    if (gDbgIsLang) _tripPauseGates();
     dbgOnPaused(kind);
   } else if (kind == 'Resume') {
-    if (gDbgPaused) { gDbgPaused = false; debugRelease(); }
+    if (gDbgPaused) { gDbgPaused = false; if (gDbgIsLang) debugRelease(); }
     dbgStatus("running");
   }
 }
@@ -4212,7 +4334,7 @@ List<String> cocoaLint(String src) {
 }
 
 Future guardedAccept(List decls, String what, void commit()) async {
-  if (gDbgPaused) {
+  if (gDbgPaused && gDbgIsLang) {   // a paused demo isolate does not block Accept
     log("✗ " + what + " refused — the language isolate is stopped in the debugger; Continue first");
     return;
   }

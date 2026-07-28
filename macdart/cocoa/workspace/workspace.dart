@@ -288,12 +288,13 @@ void switchTab(int i) {
   // on the tab's text view instead.
   var focus = (i == 0) ? gEditor : (i == 1) ? gBrowserSrc
             : (i == 3) ? gFindField : (i == 4) ? gEdText
-            : (i == 5) ? gDbgSrc : null;
+            : (i == 5) ? gDbgSrc : (i == 8) ? gProfSrc : null;
   if (focus != null) gWindow.makeFirstResponder(focus);
   if (i == 1) openBrowser();
   if (i == 4) editorRefreshClasses();
   if (i == 5) dbgRefreshIsolates();    // fresh isolate list on entering the tab
   if (i == 5 && gLangIsolateId != null) dbgLoadSource();
+  if (i == 8) profRefreshIsolates();   // fresh isolate list for the profiler
   if (i == 7) appRefreshList();
   if (i == 2) helpStart();   // index on first use, not at startup
   // The keyboard belongs to a game only while the user is watching it: leaving
@@ -345,6 +346,7 @@ void buildChrome() {
   iconButton(bar, "Demos", "canvas", [208.0, 6.0, 36.0, 32.0], (s) => switchTab(6));
   iconButton(bar, "App", "home", [248.0, 6.0, 36.0, 32.0], (s) => switchTab(7));
   iconButton(bar, "Docs", "documentation", [288.0, 6.0, 36.0, 32.0], (s) => switchTab(2));
+  iconButton(bar, "Profile", "gauge", [328.0, 6.0, 36.0, 32.0], (s) => switchTab(8));
   buildMetricsCluster(bar, 900.0);
 
   // Tabless content host (the toolbar buttons are the tab bar). It absorbs all
@@ -385,6 +387,9 @@ void buildChrome() {
 
   // App tab: the surface a user's own Cocoa app runs on.
   buildAppTab(addTab(gTabView, "app", 868.0, 420.0));
+
+  // Profiler tab: sample the VM's built-in CPU profiler for any running isolate.
+  buildProfileTab(addTab(gTabView, "profile", 868.0, 420.0));
 
   // Transcript dock (shared across tabs): docked to the bottom at a fixed
   // height, widening with the window.
@@ -1636,6 +1641,47 @@ Future<String> handle(String line) async {
   var arg = sp < 0 ? "" : line.substring(sp + 1);
   switch (cmd) {
     case 'ping': return "pong";
+    case 'prof': {
+      // "prof [ms] [id|name|index]" — sample the target isolate's CPU profile
+      // and return the hottest functions by SELF time. Read-only: the VM's
+      // sampling profiler is always running; this windows and reads it, never
+      // pausing anything. Default target is a running demo/game, else language.
+      var toks = arg.trim().isEmpty ? <String>[] : arg.trim().split(new RegExp(r'\s+'));
+      var ms = 1000;
+      var want = '';
+      if (toks.isNotEmpty) {
+        var m = int.parse(toks[0], onError: (_) => -1);
+        if (m > 0) { ms = m; toks = toks.sublist(1); }
+        want = toks.join(' ');
+      }
+      var list = await profListIsolates();
+      if (list.isEmpty) return "ERR: no isolates (vm-service down? start-gui.sh enables it)";
+      var target = profPickDefault(list, want);
+      if (target == null) return "ERR: no isolate matching '" + want + "'";
+      if (!await profSample(target[0].toString(), ms)) return "ERR: no profile (is --profiler on?)";
+      profShowRows();
+      var lbl = _dbgIsoLabel(target[1].toString(), target[0].toString());
+      return "profiled " + lbl + " over ~" + ms.toString() + "ms\n" + profReport(15);
+    }
+    case 'profisolates': {                 // every isolate (UI included — read-only)
+      var list = await profListIsolates();
+      var o = <String>[];
+      for (var i = 0; i < list.length; i++) {
+        var e = list[i];
+        o.add(i.toString() + "  " + e[1].toString() + "  " + e[0].toString() +
+              (e[2] == true ? "  [ui]" : e[3] == true ? "  [lang]" : ""));
+      }
+      return o.isEmpty ? "(none)" : o.join('\n');
+    }
+    case 'profclear': {
+      var list = await profListIsolates();
+      if (list.isEmpty) return "ERR: no isolates";
+      var t = profPickDefault(list, arg.trim());
+      if (t == null) return "ERR: no isolate matching '" + arg.trim() + "'";
+      await vmsCall('_clearCpuProfile', <String, dynamic>{'isolateId': t[0].toString()});
+      gProfRows = <dynamic>[]; gProfSamples = 0; profShowRows();
+      return "cleared " + _dbgIsoLabel(t[1].toString(), t[0].toString());
+    }
     case 'dbgisolates': {                  // the attachable isolates (UI excluded)
       await dbgRefreshIsolates();
       var o = <String>[];
@@ -2364,7 +2410,13 @@ Future<bool> vmsConnect([String url = 'ws://127.0.0.1:8181/ws']) async {
     var d;
     try { d = JSON.decode(data.toString()); } catch (e) { return; }
     if (d['id'] != null) {
-      var c = gVmsPending.remove(d['id'] is int ? d['id'] : int.parse(d['id'].toString()));
+      // A JSON-RPC reply's id is the integer we sent. Some vm-service messages
+      // are service OBJECTS with their own non-numeric `id` (e.g. an event or
+      // error {type,id,kind,message}) — not replies to us; skip them.
+      var idv = d['id'];
+      var key = (idv is int) ? idv : int.parse(idv.toString(), onError: (_) => -1);
+      if (key == -1) return;
+      var c = gVmsPending.remove(key);
       if (c != null && !c.isCompleted) c.complete(d);
     } else if (d['method'] == 'streamNotify') {
       onVmsEvent(d['params']);
@@ -2463,6 +2515,150 @@ Future dbgRefreshIsolates() async {
   }
   if (list.isNotEmpty) gDbgIsoPicker.selectItemAtIndex(sel);
   repaint();
+}
+
+// ---- Profiler ----------------------------------------------------------------
+
+String _profPct(int ticks, int total) {
+  if (total <= 0) return "  0.0%";
+  var s = (ticks * 100.0 / total).toStringAsFixed(1) + "%";
+  while (s.length < 6) s = " " + s;
+  return s;
+}
+
+/// The formatted hot-function report from the last sample: self% (time IN the
+/// function) and total% (time in it or anything it called), by self-desc.
+String profReport(int topN) {
+  if (gProfSamples == 0) {
+    return "0 samples — the isolate was idle for the whole window.\n"
+        "The profiler only sees ON-CPU time, so a frame-paced demo that sleeps\n"
+        "between frames shows little. Profile a CPU-bound workload.";
+  }
+  var o = <String>[];
+  o.add(gProfSamples.toString() + " samples     self%   total%   function");
+  var n = (topN <= 0 || gProfRows.length < topN) ? gProfRows.length : topN;
+  for (var i = 0; i < n; i++) {
+    o.add("  " + _profPct(gProfRows[i][0], gProfSamples) + "  " +
+          _profPct(gProfRows[i][1], gProfSamples) + "   " + gProfRows[i][2].toString());
+  }
+  return o.join('\n');
+}
+
+/// Every isolate with role flags. Profiling is read-only, so — unlike the
+/// debugger — the UI isolate is offered too (profiling it never freezes it).
+Future<List> profListIsolates() async {
+  if (!await vmsConnect()) return <dynamic>[];
+  var vm = await vmsCall('getVM');
+  if (vm == null) return <dynamic>[];
+  var list = <dynamic>[];
+  for (var iso in vm['isolates']) {
+    var info = await vmsCall('getIsolate', <String, dynamic>{'isolateId': iso['id']});
+    if (info == null) continue;
+    var exts = info['extensionRPCs'];
+    var isUI = exts != null && exts.contains('ext.dartui.send');
+    var name = iso['name'].toString();
+    list.add(<dynamic>[iso['id'], name, isUI, name.contains('macdart_ws_lang')]);
+  }
+  return list;
+}
+
+/// The most interesting default target: a running demo/game (non-UI, non-lang),
+/// then the language isolate, then any non-UI. An explicit id / name-fragment /
+/// index overrides (and a non-matching explicit request is an error, not a
+/// silent fallback).
+dynamic profPickDefault(List list, String want) {
+  want = want.trim();
+  if (want.isNotEmpty) {
+    for (var i = 0; i < list.length; i++) {
+      if (list[i][0].toString() == want || i.toString() == want ||
+          list[i][1].toString().contains(want)) return list[i];
+    }
+    return null;
+  }
+  for (var e in list) { if (e[2] != true && e[3] != true) return e; }   // demo/game
+  for (var e in list) { if (e[3] == true) return e; }                    // language
+  for (var e in list) { if (e[2] != true) return e; }                    // any non-UI
+  return list.isEmpty ? null : list[0];
+}
+
+/// Clear the profiler, let the target run for `ms`, fetch its CPU profile, and
+/// fill gProfRows (functions by SELF ticks). The VM samples continuously; this
+/// just windows and aggregates. Read-only — nothing is paused. tags:None keeps
+/// the attribution to real functions (no VM/user tag pseudo-nodes).
+Future<bool> profSample(String isolateId, int ms) async {
+  await vmsCall('_clearCpuProfile', <String, dynamic>{'isolateId': isolateId});
+  await new Future.delayed(new Duration(milliseconds: ms));
+  var p = await vmsCall('_getCpuProfile', <String, dynamic>{
+    'isolateId': isolateId, 'tags': 'None'});
+  if (p == null) { gProfRows = <dynamic>[]; gProfSamples = 0; return false; }
+  gProfSamples = (p['sampleCount'] is int)
+      ? p['sampleCount'] : int.parse(p['sampleCount'].toString());
+  var rows = <dynamic>[];
+  var funcs = p['functions'];
+  if (funcs != null) {
+    for (var f in funcs) {
+      // exclusive/inclusiveTicks are JSON STRINGS (AddPropertyF formats them).
+      var excl = int.parse(f['exclusiveTicks'].toString());
+      var incl = int.parse(f['inclusiveTicks'].toString());
+      if (excl == 0 && incl == 0) continue;
+      var fn = f['function'];
+      var name = (fn is Map && fn['name'] != null) ? fn['name'].toString() : '?';
+      rows.add(<dynamic>[excl, incl, name]);
+    }
+  }
+  rows.sort((a, b) => b[0].compareTo(a[0]));
+  gProfRows = rows;
+  return true;
+}
+
+Future profRefreshIsolates() async {
+  if (gProfIsoPicker == null) return;
+  gProfIsoList = await profListIsolates();
+  gProfIsoPicker.removeAllItems();
+  var sel = 0;
+  for (var i = 0; i < gProfIsoList.length; i++) {
+    var e = gProfIsoList[i];
+    gProfIsoPicker.addItemWithTitle(_dbgIsoLabel(e[1].toString(), e[0].toString()) +
+        (e[2] == true ? "  [ui]" : e[3] == true ? "  [lang]" : ""));
+    if (e[2] != true && e[3] != true && sel == 0) sel = i;   // default to a demo/game
+  }
+  if (gProfIsoList.isNotEmpty) gProfIsoPicker.selectItemAtIndex(sel);
+  repaint();
+}
+
+void profShowRows() {
+  if (gProfSrc != null) gProfSrc.setString(profReport(60));
+  if (gProfStatusLbl != null) {
+    gProfStatusLbl.setStringValue(gProfSamples == 0
+        ? "0 samples — the isolate was idle (profile a CPU-bound workload)"
+        : (gProfSamples.toString() + " samples — hottest functions by self time"));
+  }
+  repaint();
+}
+
+Future profSampleButton() async {
+  if (gProfStatusLbl == null) return;
+  if (!await vmsConnect()) { gProfStatusLbl.setStringValue("no vm-service (start-gui.sh enables it)"); return; }
+  if (gProfIsoList.isEmpty) await profRefreshIsolates();
+  if (gProfIsoList.isEmpty) { gProfStatusLbl.setStringValue("no isolates to profile"); return; }
+  var idx = gProfIsoPicker.indexOfSelectedItem();
+  if (idx < 0 || idx >= gProfIsoList.length) idx = 0;
+  var t = gProfIsoList[idx];
+  var ms = int.parse(gProfMsField.stringValue().UTF8String().trim(), onError: (_) => 1000);
+  gProfStatusLbl.setStringValue("sampling " + _dbgIsoLabel(t[1].toString(), t[0].toString()) +
+      " for " + ms.toString() + "ms…");
+  repaint();
+  await profSample(t[0].toString(), ms);
+  profShowRows();
+}
+
+Future profClearButton() async {
+  if (gProfIsoList.isEmpty) await profRefreshIsolates();
+  if (gProfIsoList.isEmpty) return;
+  var idx = gProfIsoPicker.indexOfSelectedItem();
+  if (idx < 0 || idx >= gProfIsoList.length) idx = 0;
+  await vmsCall('_clearCpuProfile', <String, dynamic>{'isolateId': gProfIsoList[idx][0].toString()});
+  gProfRows = <dynamic>[]; gProfSamples = 0; profShowRows();
 }
 
 /// Resolve a CHOSEN isolate: its root script (for breakpoints) and its source
@@ -2604,6 +2800,18 @@ String gDbgScratch;                   // the source file of the attached isolate
 Cocoa gDbgIsoPicker;                  // the isolate lookup, to the left of Attach
 List gDbgIsoList = <dynamic>[];       // [ [id, name, isLang], … ] matching picker rows
 bool gDbgIsLang = true;               // is the target the reloadable language isolate?
+
+// --- Profiler: surfaces the VM's built-in sampling CPU profiler (--profiler)
+// over the same vm-service the debugger uses. Unlike the debugger it is
+// READ-ONLY — sampling never pauses an isolate — so any isolate can be
+// profiled (even the UI one) with no freeze risk.
+Cocoa gProfIsoPicker;                 // isolate to profile
+List gProfIsoList = <dynamic>[];      // [ [id, name, isUI, isLang], … ]
+Cocoa gProfSrc;                       // the hot-function report (a mono text view)
+Cocoa gProfStatusLbl;
+Cocoa gProfMsField;                   // sample window, ms
+List gProfRows = <dynamic>[];         // [ selfTicks, totalTicks, name ], self-desc
+int gProfSamples = 0;                 // sampleCount of the last profile
 bool gDbgQuiet = false;               // 1: a pause does not yank the GUI to tab 5
 
 // A vm-service value comes back as an @Instance: primitives carry
@@ -2698,6 +2906,43 @@ void buildDebugTab(Cocoa db) {
   setSplitMinSize(split, 160.0);
   db.addSubview(split);
   dbgStatus("not attached — press Attach (needs the vm-service: start-gui.sh enables it)");
+}
+
+// The Profiler tab: pick an isolate, Sample, read where its time goes. The
+// picker offers ALL isolates (profiling is read-only — no freeze risk); the
+// report is a mono text view of the hottest functions by self time.
+void buildProfileTab(Cocoa pf) {
+  pf.setAutoresizesSubviews(true);
+  gProfIsoPicker = Cocoa.cls("NSPopUpButton").alloc()
+      .initWithFrame([8.0, 392.0, 240.0, 24.0], pullsDown: false);
+  pf.addSubview(gProfIsoPicker);
+  gProfIsoPicker.setAutoresizingMask(kMinYMargin);
+  var mslbl = label(pf, [256.0, 395.0, 22.0, 16.0]);
+  mslbl.setStringValue("ms");
+  mslbl.setAutoresizingMask(kMinYMargin);
+  gProfMsField = Cocoa.cls("NSTextField").alloc().initWithFrame([278.0, 392.0, 60.0, 24.0]);
+  gProfMsField.setStringValue("1000");
+  pf.addSubview(gProfMsField);
+  gProfMsField.setAutoresizingMask(kMinYMargin);
+  button(pf, "Sample", [346.0, 392.0, 80.0, 24.0], (s) => profSampleButton());
+  button(pf, "Clear", [430.0, 392.0, 64.0, 24.0], (s) => profClearButton());
+  pinTop(<String>["Sample", "Clear"]);
+
+  gProfStatusLbl = label(pf, [8.0, 372.0, 852.0, 16.0]);
+  gProfStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
+  gProfStatusLbl.setStringValue(
+      "pick an isolate and Sample — profiling is read-only (never pauses anything)");
+
+  gProfSrc = scrolledTextView(pf, [8.0, 8.0, 852.0, 356.0], false);
+  var mf = _mono(12.0); if (!mf.isNil) gProfSrc.setFont(mf);
+  anchorScroll(gProfSrc, kWidthSizable + kHeightSizable);
+  gProfSrc.setString(
+      "No profile yet.\n\n"
+      "This reads the VM's built-in sampling CPU profiler (--profiler) over the\n"
+      "vm-service — where a running isolate's time actually goes, without\n"
+      "pausing it. Run a CPU-bound demo or game, pick its isolate, and Sample.\n"
+      "(A frame-paced demo that sleeps between frames shows few samples: the\n"
+      "profiler only sees ON-CPU time.)");
 }
 
 Future dbgAttach() async {
@@ -4811,6 +5056,25 @@ DEBUGGER — CONTROL VERBS (the formats below are a CONTRACT; agents parse them)
   Dart 1 periodic timers ACCRUE missed ticks while paused (a long pause bursts
   them all on resume). Debug frame loops with dbgpause or rare-path breaks,
   and dbgclear before the final Continue.
+
+PROFILER — CONTROL VERBS (surfaces the VM's sampling CPU profiler; read-only)
+  profisolates            every isolate, one per line: "<N>  <name>  <id>
+                          [  [ui]|[lang]]". ALL are listed — profiling never
+                          pauses anything, so even the UI isolate is fair game.
+  prof [ms] [id|name|N]   clear the target's profile, let it run `ms` (default
+                          1000), then report the hottest functions by SELF
+                          time. Default target is a running demo/game, else the
+                          language isolate. Output: a header line
+                          "<K> samples ... self% total% function" then rows
+                          "<self%>  <total%>  <function>" by self-desc. Self% is
+                          time IN the function; total% includes what it called.
+  profclear [id|name]     drop the target's samples.
+  LAW: the profiler only sees ON-CPU time. A frame-paced demo that sleeps
+  between frames shows FEW samples ("0 samples — idle" is normal); profile a
+  CPU-bound workload. Sampling is read-only, so nothing is ever paused — this
+  is the safe counterpart to the debugger. In the GUI it is the Profile tab
+  (pick isolate, Sample). [Stub] rows are VM runtime stubs (inline-cache,
+  allocation) the sampled code spent time in.
 
 ARCHITECTURE
   Two isolates: this UI isolate (pinned to the AppKit thread, builds the views)

@@ -501,6 +501,8 @@ void ST_send(Dart_NativeArguments args);
 void ST_classSend(Dart_NativeArguments args);
 void ST_run(Dart_NativeArguments args);
 void ST_classSendTry(Dart_NativeArguments args);
+void ST_extSendTry(Dart_NativeArguments args);
+void ST_classOf(Dart_NativeArguments args);
 void ST_asSymbol(Dart_NativeArguments args);
 void ST_gcScavenge(Dart_NativeArguments args);
 void ST_gcFull(Dart_NativeArguments args);
@@ -566,6 +568,8 @@ void Sqlite_query(Dart_NativeArguments args);
   V(ST_classSend, 3)                                                           \
   V(ST_run, 1)                                                                 \
   V(ST_classSendTry, 3)                                                        \
+  V(ST_extSendTry, 3)                                                          \
+  V(ST_classOf, 1)                                                             \
   V(ST_asSymbol, 1)                                                            \
   V(ST_gcScavenge, 0)                                                          \
   V(ST_gcFull, 0)                                                              \

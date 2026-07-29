@@ -100,6 +100,14 @@ std::unique_ptr<ProgramNode> Parser::ParseProgram(ParseError* err) {
 }
 
 NodePtr Parser::ParseTopLevelItem() {
+  // Sprint 11c: top-level `| a b |` — temporaries for the file's do-it
+  // statements (the loader folds them into STMain>>main's temps).
+  if (Is(Tok::kBar)) {
+    auto d = std::make_unique<VarDeclNode>();
+    d->pos = {Cur().line, Cur().col};
+    ParseTempsOpt(&d->names);
+    return d;
+  }
   // External / extend forms are introduced by a class name identifier.
   if (Is(Tok::kIdent)) {
     const Token& n1 = PeekTok(1);

@@ -650,12 +650,55 @@ loudly). Stages A and C are modest; A is independently shippable.
     difference, not a language gap); library_bench + fib.mst need the WORLD IMAGE
     (they benchmark the corpus's own `world/2x_*.mst` library classes / extend bridged
     Integer). 18/18 feature regression; 86/86 corpus files still load.
-  **Next (Sprint 11c — the world image):** boot `world/*.mst` in order as ONE image:
-  core-class extension (`Integer extend [ fib … ]` → an Object.noSuchMethod hook, same
-  VMLibraryHooks pattern as class values — or direct method injection into
-  _Smi/_Double/_OneByteString for speed), cross-load `extend` of already-loaded
-  classes, top-level `| tmp |` declarations, `#(…)` literal arrays. That unlocks
-  library_bench, fib, and the app-tier world files as one system.
+- **Sprint 11c ✓ — THE WORLD IMAGE BOOTS.** All `world/*.mst` files (01_object
+  through 75_dns — kernel, library, apps, GUI tier) load IN ORDER as one image in one
+  isolate, their top-level do-its running at load; **`library_bench.mst` completes all
+  11 suites against the world's own classes** (OrderedCollection, Dictionary, Set, Bag,
+  SortedCollection insertion 980ms, exact Fraction arithmetic 1288ms, WriteStream
+  string building, Symbol interning, Random LCG, Point — total 4024ms Debug) and
+  `fib.mst` answers 75025 via a `fib` method added to Integer by Smalltalk source,
+  dispatching on native Dart ints. The machinery:
+  - **Extension holders.** A kernel class whose instances here are Dart natives
+    (`nil subclass: Object`, Integer, String, Boolean, Array, …) registers as
+    `<Name> ext`: its pure-ST methods dispatch on native receivers via the
+    **Object.noSuchMethod hook** (`VMLibraryHooks.stObjNSM` → `ST_extSendTry`:
+    per-kind candidate chains — int → SmallInteger ext → Integer ext → … — walking
+    real super links; zero cost until a send has already missed), while its
+    `<primitive:>`-backed methods are exactly the operations Dart never misses on.
+    The prelude is exempt (it IS the bridge); class-NAME sends prefer the bridge
+    table, then the holder's class side (`Character initTable`).
+  - **Cross-load reopen.** A later `Foo subclass:`/`extend` with NO ivars APPENDS
+    methods/classVars to the already-loaded class (19_printing reopens 20 classes);
+    an ivar-carrying redefinition is a fresh replacement (the world's own
+    OrderedCollection shadows the prelude's). Forward-referenced supers
+    **auto-vivify** as stubs (ArrayedCollection: used in file 10, declared in 40) and
+    the real declaration later ADOPTS the true superclass (safe: stub is field-less,
+    Object-rooted, never instantiated).
+  - **Globals** (`Transcript := TranscriptStream new`, CharacterTable): static Fields
+    on a prelude STGlobals holder, created at first compile-time reference; class
+    names win reads (the GUI Transcript bridge stays authoritative), assignments
+    target the global. **Top-level `| tmp |`** parses into STMain's temps;
+    **`#(…)`/`#[…]`/`{…}` literals** build Dart Lists via a pure stack chain.
+  - **`x class` is real**: canonical Types (ST instance → its class's Type; natives →
+    their holder's Type), so `self class multiplier` reaches class-side methods
+    through the Type-NSM machinery and `x class == Point` compares identically.
+    Holder class-values allocate NATIVES for new/new: (the world WriteStream's
+    `collection class new: 20` growth path). NSM-delivered selectors arrive
+    pre-mangled — ST_classSend normalizes before its new/basicNew/signal fallbacks.
+  - **Exact `/`**: int/int divides evenly to int, else answers a world Fraction
+    (presence-cached; plain double before 23_fraction loads). Numeric conversions
+    (asDouble/truncated/rounded/floor/ceiling/negated/sqrt) are universal helpers —
+    the holder's ignored-pragma bodies would otherwise implicit-return self.
+    STWriteBuffer (Dart-side, mangled-selector method names incl. operator<<) makes
+    printString independent of whichever WriteStream class is loaded.
+  Verified: world 01-75 boots clean; library_bench 11/11 suites; fib 75025; 18/18
+  regression; richards/deltablue standalone still exact; 86/86 corpus loads. VM
+  surface: three patch-file hunks (type_patch, internal_patch, object_patch) in
+  `patches/macdart-port.patch`, dry-run verified against pristine 1.24.3.
+  **Next:** MACVM display/GUI primitive bridge (the 36_pixmap/43_gamepane tier
+  currently loads but cannot draw), `Smalltalk at:put:` system-dictionary protocol,
+  Behavior/reflection surface (`name`, `superclass`), performance pass on the NSM
+  dispatch path (direct method injection into _Smi/_Double/_OneByteString).
 
   **Resumable exceptions (`resume:`) — deferred by choice, not impossibility.** It does
   NOT need continuations: the classic implementation calls the handler *before*

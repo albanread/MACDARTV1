@@ -460,13 +460,38 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
       const Class& cls = Class::Handle(zone, type.type_class());
       const String& cname = String::Handle(zone, cls.Name());
       const std::string cls_name(cname.ToCString());
+      // The selector may arrive RAW (builder stClassSendN sites) or already
+      // MANGLED (the NSM hooks pass the missed method name) — normalize once
+      // and compare canonical forms below.
+      const std::string msel = ::st::MangleSelector(selector);
+      // Sprint 11c: allocation on an ARRAY-LIKE extension holder's class
+      // value (`aCollection class new: 20` in the world's WriteStream) makes
+      // the NATIVE thing — the holder's own <primitive:>-stub new: must
+      // never run (its ignored-pragma body would answer the Type itself).
+      if (cls_name == "Array ext" || cls_name == "ByteArray ext" ||
+          cls_name == "String ext") {
+        intptr_t len = -1;
+        if ((msel == "new_" || msel == "basicNew_") && n == 1) {
+          const Object& arg =
+              Object::Handle(zone, Api::UnwrapHandle(elems[0]));
+          if (arg.IsSmi()) len = Smi::Cast(arg).Value();
+        } else if ((msel == "new" || msel == "basicNew") && n == 0) {
+          len = 0;
+        }
+        if (len >= 0) {
+          const Array& made = Array::Handle(zone, Array::New(len));
+          result_handle = Api::NewHandle(thread, made.raw());
+          hit = true;
+        }
+      }
       const String& sel =
-          String::Handle(zone, Symbols::New(thread, ::st::MangleSelector(selector).c_str()));
+          String::Handle(zone, Symbols::New(thread, msel.c_str()));
       // The metaclass-shadow chain holds class-side methods.
       Function& fn = Function::Handle(zone);
-      Class& c = Class::Handle(
-          zone,
-          ::st::FindStClassByName(thread, (cls_name + " class").c_str()));
+      Class& c = Class::Handle(zone);
+      if (!hit) {
+        c = ::st::FindStClassByName(thread, (cls_name + " class").c_str());
+      }
       while (!c.IsNull()) {
         if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
         fn ^= c.LookupStaticFunction(sel);
@@ -484,13 +509,13 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
             Object::Handle(zone, DartEntry::InvokeFunction(fn, arr));
         result_handle = Api::NewHandle(thread, result.raw());
         hit = true;
-      } else if ((selector == "new" || selector == "basicNew") && n == 0) {
+      } else if ((msel == "new" || msel == "basicNew") && n == 0) {
         if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
         const Instance& inst = Instance::Handle(zone, Instance::New(cls));
         result_handle = Api::NewHandle(thread, inst.raw());
         hit = true;
-      } else if ((selector == "signal" && n == 0) ||
-                 (selector == "signal:" && n == 1)) {
+      } else if ((msel == "signal" && n == 0) ||
+                 (msel == "signal_" && n == 1)) {
         if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
         const Instance& inst = Instance::Handle(zone, Instance::New(cls));
         // Instance-side signal/signal: up the chain (prelude Exception).
@@ -549,6 +574,170 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
 void ST_classSend(Dart_NativeArguments args) { STClassSendCommon(args, false); }
 void ST_classSendTry(Dart_NativeArguments args) {
   STClassSendCommon(args, true);
+}
+
+// stExtSendTry(receiver, selector, args) -> [result] | null.  Sprint 11c:
+// core-class EXTENSION dispatch — Object.noSuchMethod's ST hook. Maps the
+// receiver's runtime kind to its extension-holder chain ("SmallInteger ext"
+// -> "Integer ext" -> "Number ext" -> ... wired by the loader from the world
+// files' own declared supers), finds the method, invokes it with the
+// receiver as arg 0. Null on a genuine miss.
+void ST_extSendTry(Dart_NativeArguments args) {
+  Dart_Handle recv_h = Dart_GetNativeArgument(args, 0);
+  Dart_Handle sel_h = Dart_GetNativeArgument(args, 1);
+  Dart_Handle list_h = Dart_GetNativeArgument(args, 2);
+  const char* sel_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(sel_h, &sel_c)) || sel_c == NULL) {
+    Dart_SetReturnValue(args, Dart_Null());
+    return;
+  }
+  intptr_t n = 0;
+  if (Dart_IsError(Dart_ListLength(list_h, &n))) {
+    Dart_SetReturnValue(args, Dart_Null());
+    return;
+  }
+  std::vector<Dart_Handle> elems(n);
+  for (intptr_t i = 0; i < n; i++) {
+    elems[i] = Dart_ListGetAt(list_h, i);
+  }
+  const std::string selector(sel_c);
+  Thread* thread = Thread::Current();
+  Dart_Handle result_handle = Dart_Null();
+  bool hit = false;
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Object& recv = Object::Handle(zone, Api::UnwrapHandle(recv_h));
+    // Candidate holders in hierarchy order — probed individually, because a
+    // standalone file may load only ONE of them (fib.mst loads just
+    // "Integer ext"); each found candidate's own super chain is also walked
+    // (in a full world boot the chain covers the rest by itself).
+    static const char* kIntC[] = {"SmallInteger ext", "LargeInteger ext",
+                                  "Integer ext", "Number ext",
+                                  "Magnitude ext", "Object ext", NULL};
+    static const char* kDblC[] = {"Double ext", "Float ext", "Number ext",
+                                  "Magnitude ext", "Object ext", NULL};
+    static const char* kStrC[] = {"String ext", "Object ext", NULL};
+    static const char* kTrueC[] = {"True ext", "Boolean ext", "Object ext",
+                                   NULL};
+    static const char* kFalseC[] = {"False ext", "Boolean ext", "Object ext",
+                                    NULL};
+    static const char* kNilC[] = {"UndefinedObject ext", "Object ext", NULL};
+    static const char* kArrC[] = {"Array ext", "Object ext", NULL};
+    static const char* kClosC[] = {"BlockClosure ext", "BlockContext ext",
+                                   "Object ext", NULL};
+    static const char* kTypeC[] = {"Behavior ext", "ClassDescription ext",
+                                   "Class ext", "Object ext", NULL};
+    static const char* kObjC[] = {"Object ext", NULL};
+    const char** candidates = kObjC;
+    if (recv.IsSmi() || recv.IsMint() || recv.IsBigint()) {
+      candidates = kIntC;
+    } else if (recv.IsDouble()) {
+      candidates = kDblC;
+    } else if (recv.IsString()) {
+      candidates = kStrC;
+    } else if (recv.IsBool()) {
+      candidates = Bool::Cast(recv).value() ? kTrueC : kFalseC;
+    } else if (recv.IsNull()) {
+      candidates = kNilC;
+    } else if (recv.IsArray() || recv.IsGrowableObjectArray()) {
+      candidates = kArrC;
+    } else if (recv.IsClosure()) {
+      candidates = kClosC;
+    } else if (recv.IsType()) {
+      candidates = kTypeC;
+    }
+    const String& sel = String::Handle(
+        zone, Symbols::New(thread, ::st::MangleSelector(selector).c_str()));
+    Function& fn = Function::Handle(zone);
+    Class& c = Class::Handle(zone);
+    for (const char** name = candidates; *name != NULL && fn.IsNull();
+         name++) {
+      c = ::st::FindStClassByName(thread, *name);
+      while (!c.IsNull()) {
+        if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+        fn ^= c.LookupDynamicFunction(sel);
+        if (!fn.IsNull()) break;
+        c ^= c.SuperClass();
+      }
+    }
+    if (!fn.IsNull()) {
+      const Array& arr = Array::Handle(zone, Array::New(n + 1, Heap::kOld));
+      arr.SetAt(0, recv);
+      for (intptr_t i = 0; i < n; i++) {
+        arr.SetAt(i + 1, Object::Handle(zone, Api::UnwrapHandle(elems[i])));
+      }
+      const Object& result =
+          Object::Handle(zone, DartEntry::InvokeFunction(fn, arr));
+      result_handle = Api::NewHandle(thread, result.raw());
+      hit = true;
+    }
+  }
+  if (!hit) {
+    Dart_SetReturnValue(args, Dart_Null());
+    return;
+  }
+  if (Dart_IsError(result_handle)) {
+    Dart_SetReturnValue(args, result_handle);  // ST signal propagates
+    return;
+  }
+  Dart_Handle box = Dart_NewList(1);
+  Dart_ListSetAt(box, 0, result_handle);
+  Dart_SetReturnValue(args, box);
+}
+
+// stClassOf(x) -> the receiver's CLASS VALUE (a canonical Type). ST instances
+// answer their own class's Type (so `x class == Point` holds against class
+// literals, and `self class multiplier` reaches class-side methods through
+// the Type-NSM machinery); Dart natives answer their extension HOLDER's Type
+// when the world image is loaded, else their runtime class's Type.
+void ST_classOf(Dart_NativeArguments args) {
+  Dart_Handle recv_h = Dart_GetNativeArgument(args, 0);
+  Thread* thread = Thread::Current();
+  Dart_Handle result = Dart_Null();
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Object& recv = Object::Handle(zone, Api::UnwrapHandle(recv_h));
+    static const char* kIntC[] = {"SmallInteger ext", "Integer ext", NULL};
+    static const char* kDblC[] = {"Double ext", "Float ext", NULL};
+    static const char* kStrC[] = {"String ext", NULL};
+    static const char* kTrueC[] = {"True ext", "Boolean ext", NULL};
+    static const char* kFalseC[] = {"False ext", "Boolean ext", NULL};
+    static const char* kNilC[] = {"UndefinedObject ext", NULL};
+    static const char* kArrC[] = {"Array ext", NULL};
+    static const char* kClosC[] = {"BlockClosure ext", NULL};
+    const char** candidates = NULL;
+    if (recv.IsSmi() || recv.IsMint() || recv.IsBigint()) {
+      candidates = kIntC;
+    } else if (recv.IsDouble()) {
+      candidates = kDblC;
+    } else if (recv.IsString()) {
+      candidates = kStrC;
+    } else if (recv.IsBool()) {
+      candidates = Bool::Cast(recv).value() ? kTrueC : kFalseC;
+    } else if (recv.IsNull()) {
+      candidates = kNilC;
+    } else if (recv.IsArray() || recv.IsGrowableObjectArray()) {
+      candidates = kArrC;
+    } else if (recv.IsClosure()) {
+      candidates = kClosC;
+    }
+    Class& cls = Class::Handle(zone);
+    if (candidates != NULL) {
+      for (const char** name = candidates; *name != NULL && cls.IsNull();
+           name++) {
+        cls = ::st::FindStClassByName(thread, *name);
+      }
+    }
+    if (cls.IsNull()) cls = recv.clazz();  // ST instance / no holder loaded
+    const Type& type =
+        Type::Handle(zone, Type::NewNonParameterizedType(cls));
+    result = Api::NewHandle(thread, type.raw());
+  }
+  Dart_SetReturnValue(args, result);
 }
 
 // stAsSymbol(String) -> the canonical VM-symbol String: `'foo' asSymbol` is

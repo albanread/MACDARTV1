@@ -432,8 +432,8 @@
  // Equivalent of RawTypeRef.
  class _TypeRef extends _AbstractType {}
 --- a/runtime/lib/internal_patch.dart	2026-07-25 09:31:56.888181484 +0100
-+++ b/runtime/lib/internal_patch.dart	2026-07-29 21:49:37.389093297 +0100
-@@ -13,6 +13,11 @@
++++ b/runtime/lib/internal_patch.dart	2026-07-29 22:37:53.551539175 +0100
+@@ -13,6 +13,16 @@
      native "Internal_makeFixedListUnmodifiable";
  
  class VMLibraryHooks {
@@ -442,6 +442,35 @@
 +  // Set by dart:cocoa; (type, String selector, List args) -> [result] | null.
 +  static var stTypeNSM;
 +
++  // MACDART ST front-end (Sprint 11c): tried by Object.noSuchMethod so the
++  // world image's core-class extensions (Integer>>fib, ...) dispatch on Dart
++  // native receivers. Same contract as stTypeNSM.
++  static var stObjNSM;
++
    // Example: "dart:isolate _Timer._factory"
    static var timerFactory;
  
+--- a/runtime/lib/object_patch.dart	2026-07-25 09:31:56.889502489 +0100
++++ b/runtime/lib/object_patch.dart	2026-07-29 22:37:38.534235152 +0100
+@@ -44,6 +44,21 @@
+ 
+   @patch
+   dynamic noSuchMethod(Invocation invocation) {
++    // MACDART ST front-end (Sprint 11c): the world image extends core classes
++    // (`Number subclass: Integer [ fib [...] ]`) whose instances here are
++    // Dart natives — a genuine miss on any receiver first tries the ST
++    // extension-holder chain for the receiver's kind. The hook (set by
++    // dart:cocoa when the ST runtime initializes) answers [result] on a hit,
++    // null on a miss (then the normal NSM error proceeds). Zero cost until a
++    // send has already missed.
++    var stHook = internal.VMLibraryHooks.stObjNSM;
++    if (stHook != null &&
++        invocation.isMethod &&
++        invocation.namedArguments.isEmpty) {
++      var r = stHook(this, internal.Symbol.getName(invocation.memberName),
++          invocation.positionalArguments);
++      if (r != null) return r[0];
++    }
+     return _noSuchMethod(
+         invocation.isMethod,
+         internal.Symbol.getName(invocation.memberName),

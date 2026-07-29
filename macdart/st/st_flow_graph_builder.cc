@@ -444,6 +444,39 @@ class StGraphBuilder {
     return Field::null();
   }
 
+  // Sprint 11c: a GLOBAL — a static Field on the prelude's STGlobals holder,
+  // CREATED on first compile-time reference (reads of an unassigned global
+  // answer nil, the ST convention). Only capitalized names reach here.
+  RawField* GlobalField(const std::string& name) {
+    const Class& holder =
+        Class::Handle(zone_, FindStClassByName(thread_, "STGlobals"));
+    if (holder.IsNull()) return Field::null();
+    // Member-finalize the holder (ClassFinalizer::FinalizeClass, NOT
+    // EnsureIsFinalized — the latter routes to the Dart parser, which
+    // crashes on a TokenStream-less ST class).
+    if (!holder.is_finalized()) ClassFinalizer::FinalizeClass(holder);
+    const String& sym =
+        String::Handle(zone_, Symbols::New(thread_, name.c_str()));
+    Field& field = Field::Handle(zone_, holder.LookupStaticField(sym));
+    if (!field.IsNull()) return field.raw();
+    // Append a fresh nil-valued static Field to the holder.
+    const GrowableObjectArray& grow = GrowableObjectArray::Handle(
+        zone_, GrowableObjectArray::New(Heap::kOld));
+    const Array& old_fields = Array::Handle(zone_, holder.fields());
+    Field& f = Field::Handle(zone_);
+    for (intptr_t j = 0; j < old_fields.Length(); j++) {
+      f ^= old_fields.At(j);
+      grow.Add(f, Heap::kOld);
+    }
+    field = Field::New(sym, /*is_static=*/true, /*is_final=*/false,
+                       /*is_const=*/false, /*is_reflectable=*/true, holder,
+                       Object::dynamic_type(), TokenPosition::kNoSource);
+    field.SetStaticValue(Object::null_instance(), /*save_initial=*/true);
+    grow.Add(field, Heap::kOld);
+    holder.SetFields(Array::Handle(zone_, Array::MakeArray(grow)));
+    return field.raw();
+  }
+
   // Byte offset of an instance variable of the receiver's class — INCLUDING
   // inherited ivars (Sprint 11: walk the super chain; finalization has laid
   // fields out hierarchy-wide, so each Field's Offset() is absolute). -1 if
@@ -680,6 +713,22 @@ Fragment StGraphBuilder::TranslateExpression(Node* node) {
     }
     return TranslateMessage(n);
   }
+  if (DynArrayNode* n = dynamic_cast<DynArrayNode*>(node)) {
+    // `{ e. e. e }` — same stack chain as a literal array, elements are
+    // full expressions (Sprint 11c).
+    const Function& new_list =
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stNewList"));
+    const Function& append =
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stListAppend"));
+    Fragment instructions = StaticCall(new_list, 0);
+    for (size_t i = 0; i < n->elements.size(); i++) {
+      instructions += PushArgument();
+      instructions += TranslateExpression(n->elements[i].get());
+      instructions += PushArgument();
+      instructions += StaticCall(append, 2);
+    }
+    return instructions;
+  }
   return Unsupported(node, "expression");
 }
 
@@ -705,8 +754,35 @@ Fragment StGraphBuilder::TranslateLiteral(LiteralNode* node) {
       // identity everywhere (StrictCompare ==, Dictionary keys, ...).
       return Constant(String::ZoneHandle(
           zone_, Symbols::New(thread_, node->text.c_str())));
+    case LiteralNode::Kind::kChar:
+      // A Character is a 1-char string (the stCharValue convention).
+      return Constant(String::ZoneHandle(
+          zone_, String::New(node->text.c_str(), Heap::kOld)));
+    case LiteralNode::Kind::kArray:
+    case LiteralNode::Kind::kByteArray: {
+      // Sprint 11c: `#(...)` / `#[...]` build a Dart List by a pure stack
+      // chain — stNewList() then stListAppend(list, elem) per element (the
+      // helper returns the list, so no temp is needed).
+      const Function& new_list =
+          Function::ZoneHandle(zone_, LookupCocoaFunction("stNewList"));
+      const Function& append =
+          Function::ZoneHandle(zone_, LookupCocoaFunction("stListAppend"));
+      Fragment instructions = StaticCall(new_list, 0);
+      for (size_t i = 0; i < node->elements.size(); i++) {
+        instructions += PushArgument();  // the list so far
+        LiteralNode* elem = dynamic_cast<LiteralNode*>(node->elements[i].get());
+        if (elem != NULL) {
+          instructions += TranslateLiteral(elem);
+        } else {
+          instructions += TranslateExpression(node->elements[i].get());
+        }
+        instructions += PushArgument();
+        instructions += StaticCall(append, 2);
+      }
+      return instructions;
+    }
     default:
-      return Unsupported(node, "literal (char/array)");
+      return Unsupported(node, "literal");
   }
 }
 
@@ -746,6 +822,21 @@ Fragment StGraphBuilder::TranslateVariable(VariableNode* node) {
           Type::ZoneHandle(zone_, Type::NewNonParameterizedType(cls)));
     }
   }
+  // Sprint 11c: a bridged core name in value position is its HOLDER's class
+  // value (`aClass == Character`, `x isKindOf: Integer`).
+  if (!node->name.empty() && node->name[0] >= 'A' && node->name[0] <= 'Z') {
+    const Class& holder = Class::Handle(
+        zone_, FindStClassByName(thread_, (node->name + " ext").c_str()));
+    if (!holder.IsNull()) {
+      return Constant(
+          Type::ZoneHandle(zone_, Type::NewNonParameterizedType(holder)));
+    }
+  }
+  // Sprint 11c: a capitalized non-class name is a GLOBAL (created nil).
+  if (!node->name.empty() && node->name[0] >= 'A' && node->name[0] <= 'Z') {
+    const Field& field = Field::ZoneHandle(zone_, GlobalField(node->name));
+    if (!field.IsNull()) return LoadStaticField(field);
+  }
   return Unsupported(node, "variable (global)");
 }
 
@@ -783,6 +874,20 @@ Fragment StGraphBuilder::TranslateAssign(AssignNode* node) {
       instructions += LoadLocal(value_temp_);
       instructions += StoreStaticField(field);   // pops the value
       instructions += LoadLocal(value_temp_);    // the assignment's value
+      return instructions;
+    }
+  }
+  // Sprint 11c: a capitalized name is a GLOBAL (created on first store —
+  // `Transcript := TranscriptStream new`, CharacterTable, ...).
+  if (!node->name.empty() && node->name[0] >= 'A' && node->name[0] <= 'Z') {
+    const Field& field = Field::ZoneHandle(zone_, GlobalField(node->name));
+    if (!field.IsNull()) {
+      Fragment instructions = TranslateExpression(node->value.get());
+      instructions += StoreLocal(value_temp_);
+      instructions += Drop();
+      instructions += LoadLocal(value_temp_);
+      instructions += StoreStaticField(field);
+      instructions += LoadLocal(value_temp_);
       return instructions;
     }
   }
@@ -838,6 +943,17 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
                   zone_, LookupCocoaFunction(kBridgedClassSends[i].helper)),
               static_cast<intptr_t>(node->args.size()));
           return instructions;
+        }
+        // Sprint 11c: the world kernel's class-side methods for a bridged
+        // name live on its extension holder ("Character ext class" — e.g.
+        // `Character initTable`). The bridge table above wins first, so the
+        // prelude's working constructors are never shadowed by a holder's
+        // <primitive:> stub.
+        {
+          const Class& holder = Class::Handle(
+              zone_,
+              FindStClassByName(thread_, (rv->name + " ext").c_str()));
+          if (!holder.IsNull()) return TranslateClassSend(holder, node);
         }
       }
     }
@@ -937,6 +1053,13 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
             {"displayString", "stDisplayOf", 0},
             {"asString", "stDisplayOf", 0},
             {"printOn:", "stPrintOn", 1},
+            {"class", "stClassOf", 0},
+            {"/", "stDivide", 1},
+            {"asDouble", "stAsDouble", 0}, {"asFloat", "stAsDouble", 0},
+            {"asInteger", "stTruncated", 0}, {"truncated", "stTruncated", 0},
+            {"rounded", "stRounded", 0},   {"floor", "stFloorU", 0},
+            {"ceiling", "stCeilingU", 0},  {"negated", "stNegated", 0},
+            {"sqrt", "stSqrt", 0},
         };
     for (size_t i = 0; i < sizeof(kHelperRewrites) / sizeof(kHelperRewrites[0]);
          i++) {

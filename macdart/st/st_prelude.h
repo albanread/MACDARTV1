@@ -58,6 +58,13 @@ Object subclass: WriteStream [
     contents [ ^ STSystem joinList: buf ]
 ]
 
+"── Global variables (Sprint 11c) ────────────────────────────────────
+ The world image's globals (Transcript := TranscriptStream new,
+ CharacterTable, ...) live as static Fields on this holder, created by
+ the compiler on first reference. Class names win READS, so the prelude
+ bridge classes stay authoritative."
+Object subclass: STGlobals [ ]
+
 "── System utilities: the VM's Become, exposed ───────────────────────"
 Object subclass: STSystem [
     STSystem class >> forward: a to: b [ <stprim: stBecomeForward> ]

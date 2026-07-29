@@ -90,6 +90,30 @@ void AggregateIvars(ClassAgg* agg,
   }
 }
 
+// Sprint 11c: the WORLD-IMAGE bridge. Kernel classes whose instances on this
+// VM are Dart natives (int, double, String, bool, nil, List, closures, class
+// values) cannot be instantiated as ST classes — their definitions become
+// EXTENSION HOLDERS named "<Name> ext": pure-ST methods dispatchable on the
+// native receivers via the Object-NSM hook, while <primitive:>-backed methods
+// are exactly the operations Dart provides natively and are never missed.
+// Class-NAME sends (`Array new: 5`) keep resolving to the prelude bridge.
+bool IsBridgedCoreName(const std::string& n) {
+  static const char* kNames[] = {
+      "Object", "UndefinedObject", "Boolean", "True", "False",
+      "Behavior", "ClassDescription", "Class", "Metaclass",
+      "BlockClosure", "BlockContext",
+      "Magnitude", "Number", "Integer", "SmallInteger",
+      "LargeInteger", "LargePositiveInteger", "LargeNegativeInteger",
+      "Double", "Float", "Character",
+      "Array", "ByteArray", "String", "Symbol",
+      "Transcript", "Smalltalk",
+  };
+  for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]); i++) {
+    if (n == kNames[i]) return true;
+  }
+  return false;
+}
+
 // Sprint 11b: `<classVars: A B C>` — whitespace-separated names after the
 // keyword become class variables (static Fields on the metaclass shadow,
 // visible from both metalevels of the class and its subclasses).
@@ -275,18 +299,27 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
   // program, so markers stay valid for the isolate's lifetime.
   {
     std::vector<NodePtr> toplevel;
+    std::vector<std::string> toplevel_temps;
     for (auto& item : program->items) {
       Node* n = item.get();
       if (n == nullptr) continue;
       if (dynamic_cast<ClassDefNode*>(n) != nullptr) continue;
       if (dynamic_cast<ExtendNode*>(n) != nullptr) continue;
       if (dynamic_cast<ExtMethodNode*>(n) != nullptr) continue;
+      if (VarDeclNode* vd = dynamic_cast<VarDeclNode*>(n)) {
+        // Top-level `| a b |` -> STMain>>main temporaries (Sprint 11c).
+        for (size_t j = 0; j < vd->names.size(); j++) {
+          toplevel_temps.push_back(vd->names[j]);
+        }
+        continue;
+      }
       toplevel.push_back(std::move(item));
     }
     if (!toplevel.empty()) {
       std::unique_ptr<MethodNode> main_m(new MethodNode());
       main_m->is_class_side = true;
       main_m->selector = "main";
+      main_m->temps = toplevel_temps;
       main_m->statements = std::move(toplevel);
       std::unique_ptr<ClassDefNode> cd(new ClassDefNode());
       cd->name = "STMain";
@@ -308,6 +341,85 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
   Thread* thread = Thread::Current();
   Zone* zone = thread->zone();
   Isolate* isolate = thread->isolate();
+
+  // Sprint 11c: holder-ize bridged core names — a world `Number subclass:
+  // Integer [...]` registers as "Integer ext". Supers map to their holders
+  // only when that holder is resolvable (in this load, or already loaded), so
+  // a standalone `Object subclass: Bench` still roots at Dart's Object while
+  // world classes chain through the kernel's Object-holder protocol.
+  // The PRELUDE is exempt: it IS the bridge — its Transcript/Array/Smalltalk
+  // must keep their canonical names.
+  if (url_override == 0) {
+    std::map<std::string, bool> in_load;
+    for (size_t i = 0; i < entries.size(); i++) {
+      if (IsBridgedCoreName(entries[i].name)) {
+        in_load[entries[i].name] = true;
+      }
+    }
+    for (size_t i = 0; i < entries.size(); i++) {
+      ClassAgg& e = entries[i];
+      if (IsBridgedCoreName(e.name)) e.name += " ext";
+      if (e.has_super && IsBridgedCoreName(e.super)) {
+        const std::string holder = e.super + " ext";
+        if (in_load.count(e.super) != 0 ||
+            FindStClassByName(thread, holder.c_str()) != Class::null()) {
+          e.super = holder;
+        }
+      }
+    }
+  }
+
+  // Sprint 11c: AUTO-VIVIFY forward-referenced supers — the world uses
+  // ArrayedCollection as a super in file 10 and only declares it in file 40.
+  // Any super name that resolves neither in this load nor in an earlier
+  // library gets a stub entry (method-less, Object-rooted, abstract); the
+  // later real declaration REOPENS it and adopts the true superclass.
+  {
+    std::map<std::string, bool> names_in_load;
+    for (size_t i = 0; i < entries.size(); i++) {
+      names_in_load[entries[i].name] = true;
+    }
+    const size_t n_orig = entries.size();
+    for (size_t i = 0; i < n_orig; i++) {
+      if (!entries[i].has_super) continue;
+      // By VALUE: GetOrAdd may reallocate the entries vector this refers into.
+      const std::string s = entries[i].super;
+      if (s.empty() || s == "Object" || s == "nil") continue;
+      if (names_in_load.count(s) != 0) continue;
+      if (FindStClassByName(thread, s.c_str()) != Class::null()) continue;
+      ClassAgg& stub = table.GetOrAdd(s);
+      stub.super = "Object";
+      stub.has_super = true;
+      names_in_load[s] = true;
+    }
+  }
+
+  // Sprint 11c: cross-load REOPEN — a later file adding methods to an
+  // already-loaded class (`Number subclass: Integer [ fib [...] ]` in
+  // fib.mst, 19_printing's 20 reopens). Reopen iff a prior class of that
+  // name exists in an EARLIER st: library and this definition declares NO
+  // ivars (an ivar-carrying same-name definition is a fresh REPLACEMENT —
+  // the world's own OrderedCollection shadowing the prelude's). Methods
+  // (and classVars) APPEND to the prior class/shadow. A reopen of a
+  // forward-reference STUB (Object-rooted, field-less) also ADOPTS the
+  // declared superclass — completing chains like Array ext ->
+  // ArrayedCollection -> SequenceableCollection once file 40 declares it.
+  std::vector<bool> reopen(entries.size(), false);
+  std::vector<const dart::Class*> prior_cls(entries.size(), NULL);
+  std::vector<const dart::Class*> prior_shadow(entries.size(), NULL);
+  for (size_t i = 0; i < entries.size(); i++) {
+    if (!entries[i].ivars.empty()) continue;
+    if (entries[i].name == "STMain") continue;  // per-load driver, never merged
+    Class& prior = Class::ZoneHandle(
+        zone, FindStClassByName(thread, entries[i].name.c_str()));
+    if (prior.IsNull()) continue;
+    Class& pshadow = Class::ZoneHandle(
+        zone, FindStClassByName(thread,
+                                (entries[i].name + " class").c_str()));
+    reopen[i] = true;
+    prior_cls[i] = &prior;
+    prior_shadow[i] = &pshadow;
+  }
 
   // --- the library (imports dart:core so ST classes can later call it) ------
   const String& url = String::Handle(
@@ -354,6 +466,12 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
   std::vector<const Class*> klasses(entries.size());
   std::vector<const Class*> shadows(entries.size());
   for (size_t i = 0; i < entries.size(); i++) {
+    if (reopen[i]) {
+      // Reopened classes live in their ORIGINAL library; nothing to create.
+      klasses[i] = prior_cls[i];
+      shadows[i] = prior_shadow[i];
+      continue;
+    }
     const String& cname =
         String::Handle(zone, Symbols::New(thread, entries[i].name.c_str()));
     Class& k = Class::ZoneHandle(
@@ -372,6 +490,103 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
   for (size_t i = 0; i < entries.size(); i++) {
     const Class& k = *klasses[i];
     const ClassAgg& e = entries[i];
+
+    if (reopen[i]) {
+      // A reopen of a forward-reference STUB adopts the declared superclass:
+      // safe only when the prior chain is the default Object root and no
+      // layout exists (field-less, abstract, never instantiated).
+      if (e.has_super && e.super != "Object" && e.super != "nil") {
+        const Class& cur_super = Class::Handle(zone, k.SuperClass());
+        const String& cur_name =
+            String::Handle(zone, cur_super.IsNull() ? String::null()
+                                                    : cur_super.Name());
+        const Array& cur_fields = Array::Handle(zone, k.fields());
+        if (!cur_name.IsNull() && cur_name.Equals("Object") &&
+            cur_fields.Length() == 0) {
+          Class& new_super = Class::Handle(
+              zone, FindStClassByName(thread, e.super.c_str()));
+          if (new_super.IsNull()) {
+            const String& sn = String::Handle(
+                zone, Symbols::New(thread, e.super.c_str()));
+            new_super = library.LookupLocalClass(sn);
+          }
+          if (!new_super.IsNull() && new_super.raw() != k.raw()) {
+            k.set_super_type(Type::Handle(
+                zone, Type::New(new_super, Object::null_type_arguments(),
+                                TokenPosition::kNoSource)));
+            // Mirror on the metaclass shadow.
+            if (prior_shadow[i] != NULL && !prior_shadow[i]->IsNull()) {
+              Class& new_sshadow = Class::Handle(
+                  zone, FindStClassByName(
+                            thread, (e.super + " class").c_str()));
+              if (!new_sshadow.IsNull()) {
+                prior_shadow[i]->set_super_type(Type::Handle(
+                    zone,
+                    Type::New(new_sshadow, Object::null_type_arguments(),
+                              TokenPosition::kNoSource)));
+              }
+            }
+          }
+        }
+      }
+      // APPEND methods (and classVars) to the prior class + its shadow;
+      // ivars and finalization state stay untouched.
+      GrowableObjectArray& grow = GrowableObjectArray::Handle(
+          zone, GrowableObjectArray::New(Heap::kOld));
+      Array& old_funcs = Array::Handle(zone, k.functions());
+      Function& fh2 = Function::Handle(zone);
+      for (intptr_t j = 0; j < old_funcs.Length(); j++) {
+        fh2 ^= old_funcs.At(j);
+        grow.Add(fh2, Heap::kOld);
+      }
+      for (size_t j = 0; j < e.methods.size(); j++) {
+        if (e.methods[j].is_static) continue;
+        fh2 = MakeStFunction(thread, k, e.methods[j].node,
+                             /*is_static=*/false);
+        grow.Add(fh2, Heap::kOld);
+      }
+      k.SetFunctions(Array::Handle(zone, Array::MakeArray(grow)));
+
+      if (prior_shadow[i] != NULL && !prior_shadow[i]->IsNull()) {
+        const Class& sh = *prior_shadow[i];
+        GrowableObjectArray& sgrow = GrowableObjectArray::Handle(
+            zone, GrowableObjectArray::New(Heap::kOld));
+        Array& old_sfuncs = Array::Handle(zone, sh.functions());
+        for (intptr_t j = 0; j < old_sfuncs.Length(); j++) {
+          fh2 ^= old_sfuncs.At(j);
+          sgrow.Add(fh2, Heap::kOld);
+        }
+        for (size_t j = 0; j < e.methods.size(); j++) {
+          if (!e.methods[j].is_static) continue;
+          fh2 = MakeStFunction(thread, sh, e.methods[j].node,
+                               /*is_static=*/true);
+          sgrow.Add(fh2, Heap::kOld);
+        }
+        sh.SetFunctions(Array::Handle(zone, Array::MakeArray(sgrow)));
+
+        if (!e.class_vars.empty()) {
+          GrowableObjectArray& fgrow = GrowableObjectArray::Handle(
+              zone, GrowableObjectArray::New(Heap::kOld));
+          Array& old_fields = Array::Handle(zone, sh.fields());
+          Field& fld = Field::Handle(zone);
+          for (intptr_t j = 0; j < old_fields.Length(); j++) {
+            fld ^= old_fields.At(j);
+            fgrow.Add(fld, Heap::kOld);
+          }
+          for (size_t j = 0; j < e.class_vars.size(); j++) {
+            const String& fname = String::Handle(
+                zone, Symbols::New(thread, e.class_vars[j].c_str()));
+            fld = Field::New(fname, /*is_static=*/true, /*is_final=*/false,
+                             /*is_const=*/false, /*is_reflectable=*/true, sh,
+                             Object::dynamic_type(), TokenPosition::kNoSource);
+            fld.SetStaticValue(Object::null_instance(), /*save_initial=*/true);
+            fgrow.Add(fld, Heap::kOld);
+          }
+          sh.SetFields(Array::Handle(zone, Array::MakeArray(fgrow)));
+        }
+      }
+      continue;
+    }
 
     const Type& super_type = Type::Handle(
         zone, ResolveSuper(thread, library, e.has_super ? e.super

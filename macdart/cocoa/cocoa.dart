@@ -8,6 +8,7 @@
 library dart.cocoa;
 
 import 'dart:_internal' as internal show VMLibraryHooks;
+import 'dart:math' as math show sqrt;
 import 'dart:mirrors' show MirrorSystem;
 
 /// The process id — a POSIX FFI smoke test (getpid()).
@@ -72,15 +73,33 @@ String stRun(String src) { _stEnsureHooks(); return _stRunRaw(src); }
 /// masking ST exceptions raised inside a found method (they propagate).
 _stClassSendTry(type, String sel, List args) native "ST_classSendTry";
 
+/// Probe-mode EXTENSION dispatch (Sprint 11c): the world image's core-class
+/// extensions, tried by Object.noSuchMethod on any genuine miss.
+_stExtSendTry(recv, String sel, List args) native "ST_extSendTry";
+
+/// `x class` — the receiver's class VALUE (canonical Type; natives answer
+/// their extension holder's Type when the world image is loaded).
+stClassOf(r) native "ST_classOf";
+
 bool _stHooked = false;
 
 /// Installed once, before the first ST load: lets _Type.noSuchMethod route a
-/// send to a CLASS VALUE held in a variable into ST class-side dispatch.
+/// send to a CLASS VALUE held in a variable into ST class-side dispatch, and
+/// Object.noSuchMethod route misses on native receivers into the world
+/// image's extension holders (Integer>>fib, ...).
 void _stEnsureHooks() {
   if (_stHooked) return;
   _stHooked = true;
-  internal.VMLibraryHooks.stTypeNSM =
-      (t, String sel, List args) => _stClassSendTry(t, sel, args);
+  // A class value first tries class-side dispatch; a miss then tries the
+  // Behavior/Object extension holders (the world's reflective protocol)
+  // with the Type itself as receiver.
+  internal.VMLibraryHooks.stTypeNSM = (t, String sel, List args) {
+    var r = _stClassSendTry(t, sel, args);
+    if (r != null) return r;
+    return _stExtSendTry(t, sel, args);
+  };
+  internal.VMLibraryHooks.stObjNSM =
+      (r, String sel, List args) => _stExtSendTry(r, sel, args);
 }
 
 /// Invoke a class-side (static) method [selector] on a loaded ST class
@@ -227,6 +246,7 @@ stBoolOr(a, b) {
 stAt1(c, k) {
   if (c is List) return c[k - 1]; // Smalltalk indexes from 1
   if (c is Map) return c[k];
+  if (c is String) return c[k - 1]; // a Character = a 1-char string
   return stSend(c, 'at:', [k]);
 }
 
@@ -267,6 +287,43 @@ stError(recv, msg) {
 /// `Smalltalk millisecondClock` — the corpus benchmark clock.
 stMillisecondClock() => new DateTime.now().millisecondsSinceEpoch;
 
+/// ST `/` is EXACT: int/int divides evenly to an int, else answers a world
+/// Fraction (when 23_fraction is loaded; a plain double otherwise). The
+/// world-presence probe is cached — no per-divide exception cost.
+bool _stFractionKnown = false;
+bool _stFractionPresent = false;
+stDivide(a, b) {
+  if (a is int && b is int && b != 0) {
+    if (a % b == 0) return a ~/ b;
+    if (!_stFractionKnown) {
+      _stFractionKnown = true;
+      try {
+        stInvokeStatic('Fraction', 'numerator:denominator:', [1, 2]);
+        _stFractionPresent = true;
+      } catch (_) {
+        _stFractionPresent = false;
+      }
+    }
+    if (_stFractionPresent) {
+      return stInvokeStatic('Fraction', 'numerator:denominator:', [a, b]);
+    }
+    return a / b;
+  }
+  if (a is num && b is num) return a / b;
+  return stSend(a, '/', [b]);
+}
+
+// Numeric conversions/negation: Dart-num fast paths (the world kernel's
+// versions are <primitive:>-backed and must never be reached via the NSM
+// hook, whose ignored-pragma bodies would answer self).
+stAsDouble(r) => r is num ? r.toDouble() : stSend(r, 'asDouble', []);
+stTruncated(r) => r is num ? r.truncate() : stSend(r, 'truncated', []);
+stRounded(r) => r is num ? r.round() : stSend(r, 'rounded', []);
+stFloorU(r) => r is num ? r.floor() : stSend(r, 'floor', []);
+stCeilingU(r) => r is num ? r.ceil() : stSend(r, 'ceiling', []);
+stNegated(r) => r is num ? -r : stSend(r, 'negated', []);
+stSqrt(r) => r is num ? math.sqrt(r) : stSend(r, 'sqrt', []);
+
 stMax(a, b) {
   if (a is num && b is num) return a > b ? a : b;
   return stSend(a, 'max:', [b]);
@@ -290,21 +347,37 @@ stSortedOf(l) { var c = new List.from(l); c.sort(); return c; }
 
 stJoinList(l) => l.join('');
 
+/// A Dart-side stream for the print protocol: its method names ARE the
+/// mangled ST selectors, so an ST `printOn:` body drives it directly via
+/// ordinary dispatch (`nextPutAll:` -> nextPutAll_, `<<` -> operator<<) —
+/// independent of whichever WriteStream class (prelude or world) is loaded.
+class STWriteBuffer {
+  final StringBuffer _b = new StringBuffer();
+  nextPutAll_(s) { _b.write(s is String ? s : stDisplayOf(s)); return s; }
+  nextPut_(c) { _b.write(c is String ? c : c.toString()); return c; }
+  space() { _b.write(' '); return this; }
+  tab() { _b.write('\t'); return this; }
+  cr() { _b.write('\n'); return this; }
+  show_(x) { _b.write(stDisplayOf(x)); return this; }
+  print_(x) { _b.write(stPrintOf(x)); return x; }
+  operator <<(x) { _b.write(stDisplayOf(x)); return this; }
+  contents() => _b.toString();
+}
+
 /// The print protocol. printString of a string is QUOTED (ST convention);
 /// displayString is the bare text. An ST object prints via its printOn:
-/// through a prelude WriteStream; one without printOn: falls back to the
-/// VM default text. (The catch intentionally narrows only the no-method
-/// case in spirit — a printOn: that itself signals is pathological.)
+/// into an STWriteBuffer; one without printOn: falls back to the VM default
+/// text. (The catch intentionally narrows only the no-method case in
+/// spirit — a printOn: that itself signals is pathological.)
 stPrintOf(x) {
   if (x is String) return "'" + x + "'";
   if (x is num || x is bool || x == null || x is List || x is Map) {
     return x.toString();
   }
   if (x is Function) return 'a Block';
-  var ws = stNew('WriteStream');
-  stSend(ws, 'initWS', []);
+  var ws = new STWriteBuffer();
   try { stSend(x, 'printOn:', [ws]); } catch (_) { return x.toString(); }
-  return stSend(ws, 'contents', []);
+  return ws.contents();
 }
 
 stDisplayOf(x) => x is String ? x : stPrintOf(x);
@@ -346,6 +419,7 @@ stListRemoveFirst(l) => l.removeAt(0);
 stListInsertFirst(l, x) { l.insert(0, x); return x; }
 stListRemove(l, x) { l.remove(x); return x; }
 stListIncludes(l, x) => l.contains(x);
+stListAppend(l, x) { l.add(x); return l; }  // literal-array build chain
 
 /// Parse-check `.mst` source WITHOUT loading it: returns '' when it parses,
 /// else "ERR: line:col: message" — the editor's cheap pre-Accept validation.

@@ -593,8 +593,69 @@ loudly). Stages A and C are modest; A is independently shippable.
   expression using both languages → 42. All CLI regressions + the 86-file corpus green.
   (Daily use: rebuild the GUI once — `./start-gui.sh --rebuild` — so `build-release`
   gains the ST engine.)
-  **Next:** corpus/base-library breadth, nested-closure-own-local capture, the
-  metaclass tower.
+
+- **Sprint 11 ✓ — corpus breadth: real MACVM files run via their own drivers.** The
+  unmodified `bench/richards.mst` (502 lines, 14 classes) and `bench/deltablue.mst`
+  (the two canonical OO benchmarks) **load and run verbatim** — `stRun(src)` executes a
+  file's bare top-level statements (its own `Bench run: …` driver line) exactly as
+  MACVM does at load; `stLoad` stays registration-only (the workspace image reload must
+  never fire do-its). What it took, in dependency order:
+  - **The metaclass tower (skeleton).** Each ST class `Foo` gets a shadow class
+    `Foo class` holding its class-side methods, super chain mirroring the instance
+    chain. Both metalevels of one selector coexist (`TaskState running` ×2 was the
+    corpus wall). All lookups (builder, `stInvokeStatic`, `stSend`) walk the right
+    chain, member-finalizing on demand.
+  - **thisCls.** Every class-side method takes implicit param 0 = the RECEIVING class
+    (a Type value) bound as an ordinary capturable local named `self` — so
+    `IdleTask link:…` running TaskControlBlock's inherited constructor allocates an
+    IdleTask. Class-name sends push it at compile time; `self <sel>` class-side
+    dispatches at runtime via `ST_classSend` (shadow-chain walk; new/basicNew and
+    signal/signal: fallbacks).
+  - **Selector mangle.** ST method names register as `':'→'_'` (`at:put:`→`at_put_`):
+    valid Dart names, `signal` vs `signal:` distinct; ONE shared `MangleSelector` for
+    loader + builder + every native.
+  - **Class values are receivers.** `benchClass runOne` (a class value in a variable)
+    IC-misses into `_Type.noSuchMethod` → `VMLibraryHooks.stTypeNSM` (set by
+    dart:cocoa) → `ST_classSendTry` probe (hit = `[result]`, miss = null → normal NSM).
+    The ONLY new VM-source surface: two patch-file hunks (`type_patch.dart`,
+    `internal_patch.dart`) captured in `patches/macdart-port.patch`.
+  - **Class variables.** `<classVars: A B C>` → static Fields on the shadow,
+    initialized to nil at load (no sentinel); visible from both metalevels and
+    subclasses (`ClassVarField` walks the shadow chain); Load/StoreStaticField IL.
+  - **Implicit self-return.** A method falling off its end returns SELF (receiver /
+    thisCls), not nil — `^self basicNew init…` chains depend on it.
+  - **Universal helpers** (Dart-receiver fast path + ST-dispatch fallback, one
+    canonical list in the builder's rewrite table): 1-based `at:`/`at:put:`,
+    `size`/`isEmpty`, `add:`/`do:`, `not`, `error:`, Boolean `&`/`|`, `max:`/`min:`,
+    `asSymbol` (VM-interned — identical to `#sym` literals), the whole `value` family
+    (`stValueN`: closures invoke on an inlinable fast path, so DeltaBlue's
+    `Variable>>value` and closure calls coexist), and the PRINT PROTOCOL:
+    `printString`/`displayString` via `stPrintOf`/`stDisplayOf`, `printOn:` bridging
+    both directions (ST `printOn:` drives formatting; bridged receivers write their
+    text into the ST stream).
+  - **Prelude growth**: `Smalltalk` (millisecondClock, gcScavenge, gcFull, gcStats in
+    the MACVM SPEC 8-slot order), `Array` (`new:`/`with:`×1–4), `OrderedCollection`
+    (+ remove:/includes:/copy/asSortedCollection), `Dictionary` (a Dart Map),
+    `WriteStream` (nextPutAll:/space/`<<`/print:/contents). Symbol literals `#foo` =
+    canonical `Symbols::New` strings (identity-stable). Bridged class-name sends:
+    `String new: n` (mutable char buffer = Dart List), `Character value:`.
+    `timesRepeat:` inlines; inherited ivars resolve (IvarOffset walks supers);
+    class-side `self` captures into closures.
+  - **Scorecard** (Debug build, each file in a fresh VM, via `stRun`):
+    richards ✓ (`Richards 1 4`, checksum exact), deltablue ✓ (`deltablue 10 …`, every
+    run checked), sieve ✓ (1899 primes), arith ✓, dispatch ✓, churn ✓, ctxloop ✓,
+    soak ✓ (100 cycles clean, live gcStats), Bench ✓ — **10/12 run clean**;
+    alloc_churn runs fully but fails its MACVM-GC-tuned drift assertion (Dart's
+    scavenger promotes ~17KB in steady churn where MACVM promotes 0 — a heap-behavior
+    difference, not a language gap); library_bench + fib.mst need the WORLD IMAGE
+    (they benchmark the corpus's own `world/2x_*.mst` library classes / extend bridged
+    Integer). 18/18 feature regression; 86/86 corpus files still load.
+  **Next (Sprint 11c — the world image):** boot `world/*.mst` in order as ONE image:
+  core-class extension (`Integer extend [ fib … ]` → an Object.noSuchMethod hook, same
+  VMLibraryHooks pattern as class values — or direct method injection into
+  _Smi/_Double/_OneByteString for speed), cross-load `extend` of already-loaded
+  classes, top-level `| tmp |` declarations, `#(…)` literal arrays. That unlocks
+  library_bench, fib, and the app-tier world files as one system.
 
   **Resumable exceptions (`resume:`) — deferred by choice, not impossibility.** It does
   NOT need continuations: the classic implementation calls the handler *before*

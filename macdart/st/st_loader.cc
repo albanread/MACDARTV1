@@ -51,6 +51,7 @@ struct ClassAgg {
   std::string super;         // superclass name from the `subclass:` form
   bool has_super = false;    // a ClassDef supplied `super`; extends do not
   std::vector<std::string> ivars;
+  std::vector<std::string> class_vars;  // <classVars: A B C> pragma names
   std::vector<MethodEntry> methods;
 };
 
@@ -89,6 +90,28 @@ void AggregateIvars(ClassAgg* agg,
   }
 }
 
+// Sprint 11b: `<classVars: A B C>` — whitespace-separated names after the
+// keyword become class variables (static Fields on the metaclass shadow,
+// visible from both metalevels of the class and its subclasses).
+void AggregateClassVars(ClassAgg* agg, const std::vector<Pragma>& pragmas) {
+  for (const Pragma& p : pragmas) {
+    const std::string& text = p.text;
+    static const char kKey[] = "classVars: ";
+    if (text.compare(0, sizeof(kKey) - 1, kKey) != 0) continue;
+    std::string rest = text.substr(sizeof(kKey) - 1);
+    std::string cur;
+    for (size_t i = 0; i <= rest.size(); i++) {
+      const char c = (i < rest.size()) ? rest[i] : ' ';
+      if (c == ' ' || c == '\t' || c == '\n') {
+        if (!cur.empty()) agg->class_vars.push_back(cur);
+        cur.clear();
+      } else {
+        cur.push_back(c);
+      }
+    }
+  }
+}
+
 // Walk the top-level items and fold them into the class table. Do-it statements
 // and anything that is not a class/extension are ignored (Sprint 2 registers
 // declarations only).
@@ -102,10 +125,12 @@ void Aggregate(ProgramNode* program, ClassTable* table) {
         agg.has_super = true;
       }
       AggregateIvars(&agg, &cd->ivars);
+      AggregateClassVars(&agg, cd->pragmas);
       AggregateMethods(&agg, &cd->methods, /*force_static=*/false);
     } else if (auto* ex = dynamic_cast<ExtendNode*>(n)) {
       ClassAgg& agg = table->GetOrAdd(ex->class_name);
       AggregateIvars(&agg, &ex->ivars);
+      AggregateClassVars(&agg, ex->pragmas);
       AggregateMethods(&agg, &ex->methods, /*force_static=*/ex->is_class_side);
     } else if (auto* em = dynamic_cast<ExtMethodNode*>(n)) {
       ClassAgg& agg = table->GetOrAdd(em->class_name);
@@ -230,7 +255,8 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
                   const std::string& source,
                   std::string* summary,
                   std::string* error,
-                  const char* url_override) {
+                  const char* url_override,
+                  bool* has_toplevel) {
   using namespace dart;
 
   // Retain the AST for the isolate's lifetime BEFORE stamping any marker into
@@ -240,6 +266,43 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
 
   ClassTable table;
   Aggregate(program, &table);
+
+  // Sprint 11b: bare top-level statements (MACVM "do-its" — e.g. the file's
+  // own benchmark driver line) are collected IN ORDER into a synthesized
+  // `STMain class >> main`, registered like any other class-side method.
+  // ST_load invokes it after a successful load (do-its run at load time —
+  // MACVM semantics). The synthesized nodes are appended to the retained
+  // program, so markers stay valid for the isolate's lifetime.
+  {
+    std::vector<NodePtr> toplevel;
+    for (auto& item : program->items) {
+      Node* n = item.get();
+      if (n == nullptr) continue;
+      if (dynamic_cast<ClassDefNode*>(n) != nullptr) continue;
+      if (dynamic_cast<ExtendNode*>(n) != nullptr) continue;
+      if (dynamic_cast<ExtMethodNode*>(n) != nullptr) continue;
+      toplevel.push_back(std::move(item));
+    }
+    if (!toplevel.empty()) {
+      std::unique_ptr<MethodNode> main_m(new MethodNode());
+      main_m->is_class_side = true;
+      main_m->selector = "main";
+      main_m->statements = std::move(toplevel);
+      std::unique_ptr<ClassDefNode> cd(new ClassDefNode());
+      cd->name = "STMain";
+      cd->superclass = "Object";
+      cd->methods.push_back(std::move(main_m));
+      ClassAgg& agg = table.GetOrAdd("STMain");
+      if (!agg.has_super) {
+        agg.super = "Object";
+        agg.has_super = true;
+      }
+      agg.methods.push_back(MethodEntry{cd->methods[0].get(), true});
+      program->items.push_back(std::move(cd));
+      if (has_toplevel != 0) *has_toplevel = true;
+    }
+  }
+
   std::vector<ClassAgg>& entries = table.entries();
 
   Thread* thread = Thread::Current();
@@ -371,7 +434,23 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
       sfuncs.SetAt(j, fh);
     }
     shadow.SetFunctions(sfuncs);
-    shadow.SetFields(Object::empty_array());
+    // Class variables (Sprint 11b): static Fields on the shadow, initialized
+    // to nil NOW so a direct LoadStaticField never sees the lazy-init
+    // sentinel. Visible from both metalevels via the builder's resolver.
+    const Array& sfields = Array::Handle(
+        zone, Array::New(static_cast<intptr_t>(e.class_vars.size()),
+                         Heap::kOld));
+    for (size_t j = 0; j < e.class_vars.size(); j++) {
+      const String& fname =
+          String::Handle(zone, Symbols::New(thread, e.class_vars[j].c_str()));
+      const Field& f = Field::Handle(
+          zone, Field::New(fname, /*is_static=*/true, /*is_final=*/false,
+                           /*is_const=*/false, /*is_reflectable=*/true, shadow,
+                           Object::dynamic_type(), TokenPosition::kNoSource));
+      f.SetStaticValue(Object::null_instance(), /*save_initial=*/true);
+      sfields.SetAt(j, f);
+    }
+    shadow.SetFields(sfields);
 
     // A concrete class must carry >=1 function or FinalizeClass asserts
     // (class_finalizer.cc:2667, "at least a constructor"). Method-less classes

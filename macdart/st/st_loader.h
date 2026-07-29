@@ -46,11 +46,15 @@ class Loader {
  public:
   // url_override names the library (default: a fresh "st:mst/N"); the prelude
   // loads as "st:prelude".
+  // has_toplevel (optional) is set true when bare top-level statements were
+  // collected into a synthesized `STMain class >> main` (Sprint 11b); the
+  // caller decides whether to invoke it (ST_load does, right after loading).
   static bool Load(std::unique_ptr<ProgramNode> program,
                    const std::string& source,
                    std::string* summary,
                    std::string* error,
-                   const char* url_override = 0);
+                   const char* url_override = 0,
+                   bool* has_toplevel = 0);
 };
 
 // Find a loaded ST class by name across EVERY st: library (newest first) —

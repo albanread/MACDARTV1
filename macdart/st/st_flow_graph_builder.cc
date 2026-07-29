@@ -306,6 +306,23 @@ class StGraphBuilder {
         offset, Pop(), value, barrier, TokenPosition::kNoSource);
     return Fragment(store);  // a store produces no value (no Push)
   }
+  // Sprint 11b: class variables. LoadStaticField consumes a pushed Field
+  // CONSTANT (kernel_to_il.cc:2666 shape); StoreStaticField takes the Field
+  // directly and pops the value (produces none). Fields are zone handles —
+  // the instructions outlive this HANDLESCOPE.
+  Fragment LoadStaticField(const Field& field) {
+    Fragment instructions = Constant(field);
+    LoadStaticFieldInstr* load =
+        new (zone_) LoadStaticFieldInstr(Pop(), TokenPosition::kNoSource);
+    Push(load);
+    instructions += Fragment(load);
+    return instructions;
+  }
+  Fragment StoreStaticField(const Field& field) {
+    StoreStaticFieldInstr* store = new (zone_)
+        StoreStaticFieldInstr(field, Pop(), TokenPosition::kNoSource);
+    return Fragment(store);  // a store produces no value (no Push)
+  }
   Fragment PushArgument() {
     PushArgumentInstr* argument = new (zone_) PushArgumentInstr(Pop());
     Push(argument);
@@ -404,6 +421,29 @@ class StGraphBuilder {
                                      TokenPosition::kNoSource, sym,
                                      Object::dynamic_type());
   }
+  // Sprint 11b: resolve `name` as a CLASS VARIABLE — a static Field on the
+  // owner's metaclass shadow (or an ancestor's; class vars are inherited).
+  // Works from both metalevels: an instance method's owner is Foo (find its
+  // shadow), a class-side method's owner IS the shadow.
+  RawField* ClassVarField(const std::string& name) {
+    const Class& owner = Class::Handle(zone_, pf_->function().Owner());
+    if (owner.IsNull()) return Field::null();
+    Class& inst = Class::Handle(zone_);
+    Class& shadow = Class::Handle(zone_);
+    MetaSplit(owner, inst, shadow);
+    if (shadow.IsNull()) return Field::null();
+    const String& sym =
+        String::Handle(zone_, Symbols::New(thread_, name.c_str()));
+    Field& field = Field::Handle(zone_);
+    Class& c = Class::Handle(zone_, shadow.raw());
+    while (!c.IsNull()) {
+      field = c.LookupStaticField(sym);
+      if (!field.IsNull()) return field.raw();
+      c = c.SuperClass();
+    }
+    return Field::null();
+  }
+
   // Byte offset of an instance variable of the receiver's class — INCLUDING
   // inherited ivars (Sprint 11: walk the super chain; finalization has laid
   // fields out hierarchy-wide, so each Field's Offset() is absolute). -1 if
@@ -659,8 +699,14 @@ Fragment StGraphBuilder::TranslateLiteral(LiteralNode* node) {
     case LiteralNode::Kind::kFloat:
       return Constant(Double::ZoneHandle(
           zone_, Double::New(strtod(node->text.c_str(), NULL), Heap::kOld)));
+    case LiteralNode::Kind::kSymbol:
+      // Sprint 11b: a Symbol is an INTERNED string — the VM symbol table
+      // gives one canonical object per spelling, so `#foo == #foo` holds by
+      // identity everywhere (StrictCompare ==, Dictionary keys, ...).
+      return Constant(String::ZoneHandle(
+          zone_, Symbols::New(thread_, node->text.c_str())));
     default:
-      return Unsupported(node, "literal (symbol/char/array)");
+      return Unsupported(node, "literal (char/array)");
   }
 }
 
@@ -683,6 +729,13 @@ Fragment StGraphBuilder::TranslateVariable(VariableNode* node) {
       instructions += LoadField(offset);             // pop self, push the field
       return instructions;
     }
+  }
+  // Sprint 11b: a class variable (a static Field on the metaclass shadow),
+  // visible from both metalevels. Checked BEFORE class-name resolution so a
+  // classVar shadowing a class name follows Smalltalk scoping.
+  {
+    const Field& field = Field::ZoneHandle(zone_, ClassVarField(node->name));
+    if (!field.IsNull()) return LoadStaticField(field);
   }
   // Sprint 9: a capitalized name resolving to an ST class is a CLASS VALUE —
   // its Type object — so classes flow as arguments (`[..] on: Error do: ..`).
@@ -719,6 +772,20 @@ Fragment StGraphBuilder::TranslateAssign(AssignNode* node) {
       return instructions;
     }
   }
+  // Sprint 11b: a class variable — store to the shadow's static Field,
+  // leaving the value on the stack (assignment is an expression).
+  {
+    const Field& field = Field::ZoneHandle(zone_, ClassVarField(node->name));
+    if (!field.IsNull()) {
+      Fragment instructions = TranslateExpression(node->value.get());
+      instructions += StoreLocal(value_temp_);
+      instructions += Drop();
+      instructions += LoadLocal(value_temp_);
+      instructions += StoreStaticField(field);   // pops the value
+      instructions += LoadLocal(value_temp_);    // the assignment's value
+      return instructions;
+    }
+  }
   return Unsupported(node, "assignment to non-local");
 }
 
@@ -742,6 +809,37 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
         LookupLocal(rv->name) == NULL) {
       const Class& cls = Class::Handle(zone_, ResolveClassName(rv->name));
       if (!cls.IsNull()) return TranslateClassSend(cls, node);
+      // Sprint 11b: BRIDGED class-name sends — sealed core classes that can't
+      // be ST-registered. `String new: n` answers a mutable char buffer (a
+      // Dart List — Dart strings are immutable; at:put:/size work through the
+      // universal helpers); `Character value: c` answers a 1-char string.
+      if (!rv->name.empty() && rv->name[0] >= 'A' && rv->name[0] <= 'Z' &&
+          ClassVarField(rv->name) == Field::null()) {
+        static const struct {
+          const char* cls; const char* sel; const char* helper; size_t argc;
+        } kBridgedClassSends[] = {
+            {"String", "new:", "stStringNew", 1},
+            {"String", "new", "stStringNew0", 0},
+            {"Character", "value:", "stCharValue", 1},
+        };
+        for (size_t i = 0;
+             i < sizeof(kBridgedClassSends) / sizeof(kBridgedClassSends[0]);
+             i++) {
+          if (rv->name != kBridgedClassSends[i].cls) continue;
+          if (node->selector != kBridgedClassSends[i].sel) continue;
+          if (node->args.size() != kBridgedClassSends[i].argc) continue;
+          Fragment instructions;
+          for (size_t a = 0; a < node->args.size(); a++) {
+            instructions += TranslateExpression(node->args[a].get());
+            instructions += PushArgument();
+          }
+          instructions += StaticCall(
+              Function::ZoneHandle(
+                  zone_, LookupCocoaFunction(kBridgedClassSends[i].helper)),
+              static_cast<intptr_t>(node->args.size()));
+          return instructions;
+        }
+      }
     }
   }
 
@@ -829,6 +927,16 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
             {"not", "stNot", 0},        {"error:", "stError", 1},
             {"&", "stBoolAnd", 1},      {"|", "stBoolOr", 1},
             {"add:", "stAddU", 1},      {"do:", "stDo", 1},
+            {"value", "stValue0", 0},   {"value:", "stValue1", 1},
+            {"value:value:", "stValue2", 2},
+            {"value:value:value:", "stValue3", 3},
+            {"value:value:value:value:", "stValue4", 4},
+            {"max:", "stMax", 1},       {"min:", "stMin", 1},
+            {"asSymbol", "stAsSymbol", 0},
+            {"printString", "stPrintOf", 0},
+            {"displayString", "stDisplayOf", 0},
+            {"asString", "stDisplayOf", 0},
+            {"printOn:", "stPrintOn", 1},
         };
     for (size_t i = 0; i < sizeof(kHelperRewrites) / sizeof(kHelperRewrites[0]);
          i++) {
@@ -1037,20 +1145,13 @@ Fragment StGraphBuilder::TranslateSuperSend(MessageNode* node) {
 // ST selector -> dart:core selector, where they differ. Selectors that already
 // match (+, -, <, abs, ...) pass through. The long tail is filled as needed.
 std::string StGraphBuilder::DartSelector(const std::string& s) {
-  // Closure invocation: the runtime's IC-miss path invokes a closure receiver
-  // sent `call` (runtime_entry.cc:1575), so the whole value* family lowers to
-  // one selector. KNOWN CONFLICT: an ST class defining its own `value`/`value:`
-  // method is unreachable via these selectors (the send becomes `call`); the
-  // fix — dual-registering such methods under `call` in the loader — is
-  // deferred until corpus code needs it.
-  if (s == "value" || s == "value:" || s == "value:value:" ||
-      s == "value:value:value:" || s == "value:value:value:value:") {
-    return "call";
-  }
+  // (Sprint 11b: the value* family no longer aliases to `call` here — it goes
+  // through the stValueN universal helpers in the rewrite table, so an ST
+  // class defining its own `value`/`value:` — DeltaBlue's Variable — works,
+  // and closures still invoke on the inlined fast path.)
   if (s == "=") return "==";
-  if (s == "printString" || s == "displayString" || s == "asString") {
-    return "toString";
-  }
+  // (printString/displayString/asString route through stPrintOf/stDisplayOf
+  // helpers — Sprint 11b — so ST-defined printOn: drives them.)
   if (s == ",") return "+";
   if (s == "bitAnd:") return "&";   // Dart int operator methods
   if (s == "bitOr:") return "|";
@@ -1292,7 +1393,15 @@ void StGraphBuilder::MarkFreeNames(Node* node) {
   if (node == NULL) return;
   if (VariableNode* v = dynamic_cast<VariableNode*>(node)) {
     if (v->name == "self" || v->name == "super") {
-      if (this_var_ != NULL) this_var_->set_is_captured();
+      if (this_var_ != NULL) {
+        this_var_->set_is_captured();
+      } else {
+        // Class-side (Sprint 11b): `self` is the thisCls LOCAL — capture it
+        // like any other local so class-side closures can send to self.
+        std::map<std::string, LocalVariable*>::iterator it =
+            locals_.find("self");
+        if (it != locals_.end()) it->second->set_is_captured();
+      }
     } else {
       std::map<std::string, LocalVariable*>::iterator it =
           locals_.find(v->name);
@@ -2033,10 +2142,19 @@ FlowGraph* StGraphBuilder::Build(MethodNode* method) {
 
   body += TranslateStatements(method->statements);
 
-  // Guarantee the body is closed on every path (invariant #1): a method with no
-  // explicit `^` returns null (self-return desugaring is Sprint 5).
+  // Guarantee the body is closed on every path (invariant #1): a method that
+  // falls off the end returns SELF (Smalltalk's implicit return — the corpus
+  // constructor idiom `^self basicNew init...` depends on it). Instance side:
+  // the receiver; class side: thisCls. LoadLocal routes captured self via the
+  // context automatically.
   if (body.is_open()) {
-    body += NullConstant();
+    if (this_var_ != NULL) {
+      body += LoadLocal(this_var_);
+    } else if (locals_.count("self") != 0) {
+      body += LoadLocal(locals_["self"]);
+    } else {
+      body += NullConstant();
+    }
     body += Return();
   }
 

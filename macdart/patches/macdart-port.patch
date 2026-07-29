@@ -405,3 +405,43 @@
      kernel::TreeNode* node = static_cast<kernel::TreeNode*>(
          parsed_function->function().kernel_function());
      kernel::FlowGraphBuilder builder(node, parsed_function, ic_data_array, NULL,
+--- a/runtime/lib/type_patch.dart	2026-07-25 09:31:56.890865745 +0100
++++ b/runtime/lib/type_patch.dart	2026-07-29 21:49:46.423514394 +0100
+@@ -10,7 +10,22 @@
+ }
+ 
+ // Equivalent of RawType.
+-class _Type extends _AbstractType {}
++class _Type extends _AbstractType {
++  // MACDART ST front-end (Sprint 11b): a Smalltalk class VALUE is a Type, so
++  // a send to one held in a variable (`benchClass runOne`) IC-misses to here.
++  // The hook — set by dart:cocoa when the ST runtime initializes — tries
++  // class-side dispatch on the metaclass shadow chain and answers [result],
++  // or null for a genuine miss (which then follows the normal NSM path).
++  noSuchMethod(Invocation inv) {
++    var hook = internal.VMLibraryHooks.stTypeNSM;
++    if (hook != null && inv.isMethod && inv.namedArguments.isEmpty) {
++      var r = hook(this, internal.Symbol.getName(inv.memberName),
++                   inv.positionalArguments);
++      if (r != null) return r[0];
++    }
++    return super.noSuchMethod(inv);
++  }
++}
+ 
+ // Equivalent of RawTypeRef.
+ class _TypeRef extends _AbstractType {}
+--- a/runtime/lib/internal_patch.dart	2026-07-25 09:31:56.888181484 +0100
++++ b/runtime/lib/internal_patch.dart	2026-07-29 21:49:37.389093297 +0100
+@@ -13,6 +13,11 @@
+     native "Internal_makeFixedListUnmodifiable";
+ 
+ class VMLibraryHooks {
++  // MACDART ST front-end (Sprint 11b): tried by _Type.noSuchMethod so a
++  // Smalltalk class VALUE held in a variable is a first-class receiver.
++  // Set by dart:cocoa; (type, String selector, List args) -> [result] | null.
++  static var stTypeNSM;
++
+   // Example: "dart:isolate _Timer._factory"
+   static var timerFactory;
+ 

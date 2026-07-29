@@ -499,6 +499,12 @@ void ST_invokeStatic(Dart_NativeArguments args);
 void ST_new(Dart_NativeArguments args);
 void ST_send(Dart_NativeArguments args);
 void ST_classSend(Dart_NativeArguments args);
+void ST_run(Dart_NativeArguments args);
+void ST_classSendTry(Dart_NativeArguments args);
+void ST_asSymbol(Dart_NativeArguments args);
+void ST_gcScavenge(Dart_NativeArguments args);
+void ST_gcFull(Dart_NativeArguments args);
+void ST_gcStats(Dart_NativeArguments args);
 void ST_isKindOf(Dart_NativeArguments args);
 void ST_check(Dart_NativeArguments args);
 void ST_becomeForward(Dart_NativeArguments args);
@@ -558,6 +564,12 @@ void Sqlite_query(Dart_NativeArguments args);
   V(ST_new, 1)                                                                 \
   V(ST_send, 3)                                                                \
   V(ST_classSend, 3)                                                           \
+  V(ST_run, 1)                                                                 \
+  V(ST_classSendTry, 3)                                                        \
+  V(ST_asSymbol, 1)                                                            \
+  V(ST_gcScavenge, 0)                                                          \
+  V(ST_gcFull, 0)                                                              \
+  V(ST_gcStats, 0)                                                             \
   V(ST_isKindOf, 2)                                                            \
   V(ST_check, 1)                                                               \
   V(ST_becomeForward, 2)                                                       \

@@ -31,6 +31,33 @@ Object subclass: Exception [
  would collide with the instance member under Dart's rules."
 Exception subclass: Error [ ]
 
+"── The system object (corpus surface: Smalltalk millisecondClock) ──"
+Object subclass: Smalltalk [
+    Smalltalk class >> millisecondClock [ <stprim: stMillisecondClock> ]
+    Smalltalk class >> gcScavenge [ <stprim: stGcScavenge> ]
+    Smalltalk class >> gcFull [ <stprim: stGcFull> ]
+    Smalltalk class >> gcStats [ <stprim: stGcStats> ]
+]
+
+"── WriteStream (the print protocol's other half) ────────────────────
+ Buffers string pieces in a Dart List; contents joins. printOn: methods
+ drive it via nextPutAll:/space/<<; `x printString` (the stPrintOf
+ helper) builds one, sends printOn:, and answers the contents."
+Object subclass: WriteStream [
+    | buf |
+    WriteStream class >> on: aCollection [ | s | s := self basicNew. s initWS. ^s ]
+    WriteStream class >> new [ | s | s := self basicNew. s initWS. ^s ]
+    initWS [ buf := STSystem newList ]
+    nextPutAll: aString [ buf add: aString. ^aString ]
+    nextPut: aChar [ buf add: aChar. ^aChar ]
+    space [ ^self nextPutAll: ' ' ]
+    tab [ ^self nextPutAll: '	' ]
+    << x [ ^ self nextPutAll: (STSystem displayOf: x) ]
+    print: x [ ^ self nextPutAll: (STSystem printOf: x) ]
+    show: x [ ^ self nextPutAll: (STSystem displayOf: x) ]
+    contents [ ^ STSystem joinList: buf ]
+]
+
 "── System utilities: the VM's Become, exposed ───────────────────────"
 Object subclass: STSystem [
     STSystem class >> forward: a to: b [ <stprim: stBecomeForward> ]
@@ -39,6 +66,12 @@ Object subclass: STSystem [
     STSystem class >> sizeOf: c [ <stprim: stSizeOf> ]
     STSystem class >> removeFirst: l [ <stprim: stListRemoveFirst> ]
     STSystem class >> insertFirst: l value: x [ <stprim: stListInsertFirst> ]
+    STSystem class >> remove: l value: x [ <stprim: stListRemove> ]
+    STSystem class >> includes: l value: x [ <stprim: stListIncludes> ]
+    STSystem class >> sortedOf: l [ <stprim: stSortedOf> ]
+    STSystem class >> joinList: l [ <stprim: stJoinList> ]
+    STSystem class >> displayOf: x [ <stprim: stDisplayOf> ]
+    STSystem class >> printOf: x [ <stprim: stPrintOf> ]
 ]
 
 "── The collection bridge (Sprint 11: corpus breadth) ────────────────
@@ -47,6 +80,10 @@ Object subclass: STSystem [
  Enough protocol for the app-tier corpus; grown as files demand."
 Object subclass: Array [
     Array class >> new: n [ <stprim: stNewListSized> ]
+    Array class >> with: a [ <stprim: stList1> ]
+    Array class >> with: a with: b [ <stprim: stList2> ]
+    Array class >> with: a with: b with: c [ <stprim: stList3> ]
+    Array class >> with: a with: b with: c with: d [ <stprim: stList4> ]
 ]
 
 Object subclass: OrderedCollection [
@@ -65,7 +102,19 @@ Object subclass: OrderedCollection [
     at: i put: v [ ^ l at: i put: v ]
     first [ ^ l at: 1 ]
     last [ ^ l at: (STSystem sizeOf: l) ]
+    remove: x [ ^ STSystem remove: l value: x ]
+    includes: x [ ^ STSystem includes: l value: x ]
+    copy [ | c | c := OrderedCollection new. l do: [:e | c add: e]. ^c ]
+    asSortedCollection [ | c | c := OrderedCollection new.
+        (STSystem sortedOf: l) do: [:e | c add: e]. ^c ]
     asOrderedCollection [ ^self ]
+]
+
+"A Dictionary IS a Dart Map: at:/at:put:/size/isEmpty/do: flow through the
+ universal helpers, so the class supplies only construction and the
+ Map-specific probes."
+Object subclass: Dictionary [
+    Dictionary class >> new [ <stprim: stNewMap> ]
 ]
 
 "── The Transcript ───────────────────────────────────────────────────

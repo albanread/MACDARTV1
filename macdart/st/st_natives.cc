@@ -68,7 +68,10 @@ static bool EnsurePrelude(Thread* thread, std::string* err) {
                             "st:prelude");
 }
 
-void ST_load(Dart_NativeArguments args) {
+// Shared by ST_load (register only — the workspace image reload must never
+// fire do-its) and ST_run (register + execute top-level statements, the
+// MACVM file semantics).
+static void STLoadCommon(Dart_NativeArguments args, bool run_toplevel) {
   // --- 1) read the source argument (public API; native execution state) -----
   Dart_Handle src_h = Dart_GetNativeArgument(args, 0);
   const char* src_c = NULL;
@@ -106,6 +109,7 @@ void ST_load(Dart_NativeArguments args) {
   std::string summary;
   std::string load_err;
   bool ok = false;
+  bool has_toplevel = false;
   {
     Thread* thread = Thread::Current();
     TransitionNativeToVM transition(thread);
@@ -114,7 +118,8 @@ void ST_load(Dart_NativeArguments args) {
     // isolate, so user code can subclass and reference it.
     ok = EnsurePrelude(thread, &load_err);
     if (ok) {
-      ok = ::st::Loader::Load(std::move(program), source, &summary, &load_err);
+      ok = ::st::Loader::Load(std::move(program), source, &summary, &load_err,
+                              /*url_override=*/0, &has_toplevel);
     }
   }
 
@@ -122,8 +127,57 @@ void ST_load(Dart_NativeArguments args) {
     Dart_SetReturnValue(args, Dart_NewStringFromCString(load_err.c_str()));
     return;
   }
+
+  // Sprint 11b: bare top-level statements ran at load in MACVM — invoke the
+  // synthesized STMain>>main now. A signal/compile failure comes back as an
+  // "ERR: toplevel: ..." string (the load itself stays registered).
+  if (run_toplevel && has_toplevel) {
+    Thread* thread = Thread::Current();
+    std::string run_err;
+    {
+      TransitionNativeToVM transition(thread);
+      HANDLESCOPE(thread);
+      Zone* zone = thread->zone();
+      Class& cls =
+          Class::Handle(zone, ::st::FindStClassByName(thread, "STMain"));
+      Class& meta = Class::Handle(
+          zone, ::st::FindStClassByName(thread, "STMain class"));
+      const String& sel =
+          String::Handle(zone, Symbols::New(thread, "main"));
+      Function& fn = Function::Handle(zone);
+      Class& c = Class::Handle(zone, meta.IsNull() ? cls.raw() : meta.raw());
+      while (!c.IsNull()) {
+        if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+        fn ^= c.LookupStaticFunction(sel);
+        if (!fn.IsNull()) break;
+        c ^= c.SuperClass();
+      }
+      if (fn.IsNull() || cls.IsNull()) {
+        run_err = "ERR: toplevel: STMain>>main not registered";
+      } else {
+        if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
+        const Type& type =
+            Type::Handle(zone, Type::NewNonParameterizedType(cls));
+        const Array& argv = Array::Handle(zone, Array::New(1, Heap::kOld));
+        argv.SetAt(0, type);
+        const Object& result =
+            Object::Handle(zone, DartEntry::InvokeFunction(fn, argv));
+        if (result.IsError()) {
+          run_err = "ERR: toplevel: ";
+          run_err += Error::Cast(result).ToErrorCString();
+        }
+      }
+    }
+    if (!run_err.empty()) {
+      Dart_SetReturnValue(args, Dart_NewStringFromCString(run_err.c_str()));
+      return;
+    }
+  }
   Dart_SetReturnValue(args, Dart_NewStringFromCString(summary.c_str()));
 }
+
+void ST_load(Dart_NativeArguments args) { STLoadCommon(args, false); }
+void ST_run(Dart_NativeArguments args) { STLoadCommon(args, true); }
 
 // stInvokeStatic(String className, String selector, List args) -> result
 //
@@ -365,7 +419,7 @@ void ST_send(Dart_NativeArguments args) {
 // constructor sees self = the class the message was sent to. Falls back to
 // allocation for new/basicNew and create-and-signal for signal/signal:
 // (mirroring TranslateClassSend's compile-time fallbacks).
-void ST_classSend(Dart_NativeArguments args) {
+static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
   Dart_Handle type_h = Dart_GetNativeArgument(args, 0);
   Dart_Handle sel_h = Dart_GetNativeArgument(args, 1);
   Dart_Handle list_h = Dart_GetNativeArgument(args, 2);
@@ -392,6 +446,7 @@ void ST_classSend(Dart_NativeArguments args) {
   const std::string selector(sel_c);
   Thread* thread = Thread::Current();
   Dart_Handle result_handle = Dart_Null();
+  bool hit = false;
   std::string err;
   {
     TransitionNativeToVM transition(thread);
@@ -399,7 +454,7 @@ void ST_classSend(Dart_NativeArguments args) {
     Zone* zone = thread->zone();
     const Object& type_obj = Object::Handle(zone, Api::UnwrapHandle(type_h));
     if (!type_obj.IsType()) {
-      err = "stClassSend: receiver is not a class value";
+      if (!probe) err = "stClassSend: receiver is not a class value";
     } else {
       const Type& type = Type::Cast(type_obj);
       const Class& cls = Class::Handle(zone, type.type_class());
@@ -428,10 +483,12 @@ void ST_classSend(Dart_NativeArguments args) {
         const Object& result =
             Object::Handle(zone, DartEntry::InvokeFunction(fn, arr));
         result_handle = Api::NewHandle(thread, result.raw());
+        hit = true;
       } else if ((selector == "new" || selector == "basicNew") && n == 0) {
         if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
         const Instance& inst = Instance::Handle(zone, Instance::New(cls));
         result_handle = Api::NewHandle(thread, inst.raw());
+        hit = true;
       } else if ((selector == "signal" && n == 0) ||
                  (selector == "signal:" && n == 1)) {
         if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
@@ -458,8 +515,9 @@ void ST_classSend(Dart_NativeArguments args) {
           const Object& result =
               Object::Handle(zone, DartEntry::InvokeFunction(sfn, arr));
           result_handle = Api::NewHandle(thread, result.raw());
+          hit = true;
         }
-      } else {
+      } else if (!probe) {
         err = "stClassSend: class '" + cls_name +
               "' has no class-side method '" + selector + "'";
       }
@@ -469,7 +527,97 @@ void ST_classSend(Dart_NativeArguments args) {
     Dart_SetReturnValue(args, Dart_NewApiError(err.c_str()));
     return;
   }
+  if (probe) {
+    if (!hit) {
+      Dart_SetReturnValue(args, Dart_Null());  // genuine miss
+      return;
+    }
+    // An error result (an ST signal from inside the found method) must
+    // PROPAGATE, not read as a miss.
+    if (Dart_IsError(result_handle)) {
+      Dart_SetReturnValue(args, result_handle);
+      return;
+    }
+    Dart_Handle box = Dart_NewList(1);
+    Dart_ListSetAt(box, 0, result_handle);
+    Dart_SetReturnValue(args, box);
+    return;
+  }
   Dart_SetReturnValue(args, result_handle);
+}
+
+void ST_classSend(Dart_NativeArguments args) { STClassSendCommon(args, false); }
+void ST_classSendTry(Dart_NativeArguments args) {
+  STClassSendCommon(args, true);
+}
+
+// stAsSymbol(String) -> the canonical VM-symbol String: `'foo' asSymbol` is
+// IDENTICAL to the `#foo` literal (both come from Symbols::New).
+void ST_asSymbol(Dart_NativeArguments args) {
+  Dart_Handle s_h = Dart_GetNativeArgument(args, 0);
+  const char* s_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(s_h, &s_c)) || s_c == NULL) {
+    Dart_SetReturnValue(args, Dart_NewApiError("stAsSymbol: bad argument"));
+    return;
+  }
+  const std::string text(s_c);
+  Thread* thread = Thread::Current();
+  Dart_Handle result = Dart_Null();
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const String& sym =
+        String::Handle(zone, Symbols::New(thread, text.c_str()));
+    result = Api::NewHandle(thread, sym.raw());
+  }
+  Dart_SetReturnValue(args, result);
+}
+
+// Smalltalk gcScavenge — force a new-space collection.
+void ST_gcScavenge(Dart_NativeArguments args) {
+  Thread* thread = Thread::Current();
+  {
+    TransitionNativeToVM transition(thread);
+    thread->isolate()->heap()->CollectGarbage(Heap::kNew);
+  }
+  Dart_SetReturnValue(args, Dart_Null());
+}
+
+// Smalltalk gcFull — force an old-space (full) collection.
+void ST_gcFull(Dart_NativeArguments args) {
+  Thread* thread = Thread::Current();
+  {
+    TransitionNativeToVM transition(thread);
+    thread->isolate()->heap()->CollectGarbage(Heap::kOld);
+  }
+  Dart_SetReturnValue(args, Dart_Null());
+}
+
+// Smalltalk gcStats — the MACVM SPEC 8-element order: (scavengeCount
+// fullGcCount edenUsed oldUsed oldCommitted bytesPromoted markedBytesLast
+// contextAllocs). Sizes are real (bytes); counters V1's Heap doesn't expose
+// publicly answer 0.
+void ST_gcStats(Dart_NativeArguments args) {
+  int64_t eden_used = 0, old_used = 0, old_committed = 0;
+  Thread* thread = Thread::Current();
+  {
+    TransitionNativeToVM transition(thread);
+    Heap* heap = thread->isolate()->heap();
+    eden_used = heap->UsedInWords(Heap::kNew) * kWordSize;
+    old_used = heap->UsedInWords(Heap::kOld) * kWordSize;
+    old_committed = heap->CapacityInWords(Heap::kOld) * kWordSize;
+  }
+  Dart_Handle list = Dart_NewList(8);
+  Dart_ListSetAt(list, 0, Dart_NewInteger(0));             // scavengeCount
+  Dart_ListSetAt(list, 1, Dart_NewInteger(0));             // fullGcCount
+  Dart_ListSetAt(list, 2, Dart_NewInteger(eden_used));     // edenUsed
+  Dart_ListSetAt(list, 3, Dart_NewInteger(old_used));      // oldUsed
+  Dart_ListSetAt(list, 4, Dart_NewInteger(old_committed)); // oldCommitted
+  Dart_ListSetAt(list, 5, Dart_NewInteger(0));             // bytesPromoted
+  Dart_ListSetAt(list, 6, Dart_NewInteger(0));             // markedBytesLast
+  Dart_ListSetAt(list, 7, Dart_NewInteger(0));             // contextAllocs
+  Dart_SetReturnValue(args, list);
 }
 
 // stCheck(src) -> ''.  Parse-only validation (Sprint 10: the editor's cheap

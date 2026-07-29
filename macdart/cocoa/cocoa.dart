@@ -7,6 +7,7 @@
 // @encode. See MACDART/COCOA_PLAN.md.
 library dart.cocoa;
 
+import 'dart:_internal' as internal show VMLibraryHooks;
 import 'dart:mirrors' show MirrorSystem;
 
 /// The process id — a POSIX FFI smoke test (getpid()).
@@ -57,7 +58,30 @@ String wsUiReady() native "Workspace_uiReady";
 /// human-readable summary of what was registered, or an `"ERR: ..."` string on
 /// a lex/parse/finalize failure (never throws). Verification surface only:
 /// registered ST methods must not be invoked until the Sprint 3 compiler hook.
-String stLoad(String src) native "ST_load";
+String _stLoadRaw(String src) native "ST_load";
+String _stRunRaw(String src) native "ST_run";
+
+String stLoad(String src) { _stEnsureHooks(); return _stLoadRaw(src); }
+
+/// Load AND run: like [stLoad], then execute the file's bare top-level
+/// statements (MACVM do-it semantics — a corpus file's own driver lines).
+String stRun(String src) { _stEnsureHooks(); return _stRunRaw(src); }
+
+/// Probe-mode class-side dispatch: answers [result] on a hit (even a nil
+/// result), or null when the class has no such class-side method — WITHOUT
+/// masking ST exceptions raised inside a found method (they propagate).
+_stClassSendTry(type, String sel, List args) native "ST_classSendTry";
+
+bool _stHooked = false;
+
+/// Installed once, before the first ST load: lets _Type.noSuchMethod route a
+/// send to a CLASS VALUE held in a variable into ST class-side dispatch.
+void _stEnsureHooks() {
+  if (_stHooked) return;
+  _stHooked = true;
+  internal.VMLibraryHooks.stTypeNSM =
+      (t, String sel, List args) => _stClassSendTry(t, sel, args);
+}
 
 /// Invoke a class-side (static) method [selector] on a loaded ST class
 /// [className], passing [args], and return the result. The first call JIT-
@@ -177,6 +201,15 @@ stClassSend5(t, sel, a, b, c, d, e) => _stClassSend(t, sel, [a, b, c, d, e]);
 // its own at:/size keeps working through the same selectors.
 stNot(b) => b == true ? false : true;
 
+/// value-family sends: a real closure invokes directly (the optimizer inlines
+/// these helpers, restoring per-site monomorphic ICs); anything else — e.g. a
+/// DeltaBlue Variable with its own `value` method — goes to ST dispatch.
+stValue0(r) { if (r is Function) return r(); return stSend(r, 'value', []); }
+stValue1(r, a) { if (r is Function) return r(a); return stSend(r, 'value:', [a]); }
+stValue2(r, a, b) { if (r is Function) return r(a, b); return stSend(r, 'value:value:', [a, b]); }
+stValue3(r, a, b, c) { if (r is Function) return r(a, b, c); return stSend(r, 'value:value:value:', [a, b, c]); }
+stValue4(r, a, b, c, d) { if (r is Function) return r(a, b, c, d); return stSend(r, 'value:value:value:value:', [a, b, c, d]); }
+
 /// ST `&`/`|`: Boolean non-short-circuit and/or (Dart 1.24 bool has no
 /// operator&). Ints keep bitwise semantics; anything else -> ST dispatch.
 stBoolAnd(a, b) {
@@ -231,11 +264,88 @@ stError(recv, msg) {
   return stSignal(e);
 }
 
+/// `Smalltalk millisecondClock` — the corpus benchmark clock.
+stMillisecondClock() => new DateTime.now().millisecondsSinceEpoch;
+
+stMax(a, b) {
+  if (a is num && b is num) return a > b ? a : b;
+  return stSend(a, 'max:', [b]);
+}
+
+stMin(a, b) {
+  if (a is num && b is num) return a < b ? a : b;
+  return stSend(a, 'min:', [b]);
+}
+
+/// `'foo' asSymbol` — canonicalize through the VM symbol table, so runtime
+/// symbols are IDENTICAL to `#foo` literals (which are Symbols::New strings).
+_stInternNative(String s) native "ST_asSymbol";
+stAsSymbol(s) {
+  if (s is String) return _stInternNative(s);
+  return stSend(s, 'asSymbol', []);
+}
+
+/// Sorted copy of a Dart list (prelude asSortedCollection plumbing).
+stSortedOf(l) { var c = new List.from(l); c.sort(); return c; }
+
+stJoinList(l) => l.join('');
+
+/// The print protocol. printString of a string is QUOTED (ST convention);
+/// displayString is the bare text. An ST object prints via its printOn:
+/// through a prelude WriteStream; one without printOn: falls back to the
+/// VM default text. (The catch intentionally narrows only the no-method
+/// case in spirit — a printOn: that itself signals is pathological.)
+stPrintOf(x) {
+  if (x is String) return "'" + x + "'";
+  if (x is num || x is bool || x == null || x is List || x is Map) {
+    return x.toString();
+  }
+  if (x is Function) return 'a Block';
+  var ws = stNew('WriteStream');
+  stSend(ws, 'initWS', []);
+  try { stSend(x, 'printOn:', [ws]); } catch (_) { return x.toString(); }
+  return stSend(ws, 'contents', []);
+}
+
+stDisplayOf(x) => x is String ? x : stPrintOf(x);
+
+/// `x printOn: aStream` with a bridged x: write its text into the stream.
+stPrintOn(r, s) {
+  if (r is num || r is String || r is bool || r == null || r is List ||
+      r is Map || r is Function) {
+    return stSend(s, 'nextPutAll:', [stPrintOf(r)]);
+  }
+  return stSend(r, 'printOn:', [s]);
+}
+
+stGcFull() native "ST_gcFull";
+
+// Bridged String/Character constructors: a "new" ST String is a MUTABLE char
+// buffer (Dart strings are immutable) — a List speaking at:put:/size through
+// the universal helpers; a Character is a 1-char string.
+stStringNew(n) => new List(n);
+stStringNew0() => [];
+stCharValue(c) => new String.fromCharCode(c);
+
+// Array with:* constructors.
+stList1(a) => [a];
+stList2(a, b) => [a, b];
+stList3(a, b, c) => [a, b, c];
+stList4(a, b, c, d) => [a, b, c, d];
+
+// GC introspection (`Smalltalk gcScavenge` / `gcStats` — the MACVM SPEC
+// 8-element order; counters the Dart heap doesn't expose stay 0).
+stGcScavenge() native "ST_gcScavenge";
+stGcStats() native "ST_gcStats";
+
 // List plumbing for the prelude's OrderedCollection/Array (via <stprim:>).
 stNewList() => new List();
 stNewListSized(n) => new List(n);
+stNewMap() => new Map();
 stListRemoveFirst(l) => l.removeAt(0);
 stListInsertFirst(l, x) { l.insert(0, x); return x; }
+stListRemove(l, x) { l.remove(x); return x; }
+stListIncludes(l, x) => l.contains(x);
 
 /// Parse-check `.mst` source WITHOUT loading it: returns '' when it parses,
 /// else "ERR: line:col: message" — the editor's cheap pre-Accept validation.

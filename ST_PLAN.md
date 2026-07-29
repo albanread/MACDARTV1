@@ -373,8 +373,21 @@ st_lexer.cc st_parser.cc st_natives.cc)` then add `dart_st` to each
 
 ## 8. Status
 
-- **Sprint 0:** in progress — the standalone `.mst` reader (`macdart/st/`).
-- Everything else: planned as above.
-
-Next after Sprint 0 lands: run it over the MACVM corpus (Sprint 1), then start the
-loader (Sprint 2) — the first step that links against the VM.
+- **Sprint 0 ✓** — the standalone `.mst` reader (`macdart/st/`), builds clean.
+- **Sprint 1 ✓** — parses all 86 MACVM `world/*.mst` (inline `<Type>` annotations handled).
+- **Sprint 2 ✓** — the loader registers `.mst` classes/methods/fields into the VM
+  class table; all 86 files register (258 classes) via `stLoad`.
+- **Sprint 3 ✓ — the headline milestone reached.** A Smalltalk method body is
+  JIT-compiled by the Dart VM and returns the right value. `st_flow_graph_builder`
+  turns the ST AST into Dart IL (the `Fragment` API); a guarded `compiler.cc` hook
+  (in `patches/macdart-port.patch`) routes `kernel_function_`-marked ST functions to
+  it; `stInvokeStatic` calls one. `Calc class >> answer [ ^40 + 2 ]` → **42**, and
+  `double: n [ ^ n + n ]` → correct through the *optimizing* compiler (40k calls, no
+  Debug-assert failures). Ordinary Dart and the 86-file corpus load are unaffected.
+  Finalization is lazy at load + on-demand (`FinalizeClass`) per invoked class, so a
+  method-less base class never trips the "class needs ≥1 function" assert.
+- **Next — Sprint 4:** blocks/closures (`ClosureCall`), inlined control flow
+  (`ifTrue:ifFalse:`, `whileTrue:`, `to:do:`), and cascades — all in `dart_st`, no
+  new VM patch. Then instance methods (needs `FinalizeClass` layout + `AllocateObject`),
+  the two desugarings (Sprint 5), interop (Sprint 6), the GUI (Sprint 7), and the
+  MACVM A/B benchmark (Sprint 8).

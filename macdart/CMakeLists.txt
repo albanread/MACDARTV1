@@ -252,7 +252,8 @@ add_library(dart_cocoa STATIC
   ${MACDART_ROOT}/st/st_lexer.cc   # MACVM Smalltalk (.mst) reader: tokenizer
   ${MACDART_ROOT}/st/st_parser.cc  # MACVM Smalltalk (.mst) reader: parser
   ${MACDART_ROOT}/st/st_loader.cc  # ST -> VM object model registration (Sprint 2)
-  ${MACDART_ROOT}/st/st_natives.cc # stLoad native (ST_load) — verification surface
+  ${MACDART_ROOT}/st/st_flow_graph_builder.cc # ST AST -> Dart IL (Sprint 3)
+  ${MACDART_ROOT}/st/st_natives.cc # stLoad + stInvokeStatic natives
   ${COCOA}/gamepane/gp_synth.cc   # game pane: SFX synth (pure C++)
   ${COCOA}/gamepane/gp_engine.mm  # game pane: layered Metal engine
   ${COCOA}/gamepane/gp_natives.mm # game pane: the Dart boundary

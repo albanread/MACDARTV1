@@ -59,6 +59,13 @@ String wsUiReady() native "Workspace_uiReady";
 /// registered ST methods must not be invoked until the Sprint 3 compiler hook.
 String stLoad(String src) native "ST_load";
 
+/// Invoke a class-side (static) method [selector] on a loaded ST class
+/// [className], passing [args], and return the result. The first call JIT-
+/// compiles the ST method body through the Sprint 3 IL builder
+/// (`st::BuildGraph`). E.g. `stInvokeStatic("Calc", "double:", [21])` → 42.
+dynamic stInvokeStatic(String className, String selector, List args)
+    native "ST_invokeStatic";
+
 // --- Low-level natives ------------------------------------------------------
 int _nsStringFromCString(String s) native "Cocoa_nsStringFromCString";
 int _nsStringLength(int handle) native "Cocoa_nsStringLength";

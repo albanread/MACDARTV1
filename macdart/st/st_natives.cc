@@ -11,6 +11,7 @@
 // method (their bodies are not compiled until Sprint 3).
 
 #include <stdio.h>
+#include <string.h>
 
 #include <memory>
 #include <string>
@@ -18,7 +19,13 @@
 
 #include "include/dart_api.h"
 
-#include "vm/dart_api_impl.h"  // DARTSCOPE / TransitionNativeToVM / HANDLESCOPE
+#include "vm/class_finalizer.h"  // ClassFinalizer::FinalizeClass (on-demand)
+#include "vm/dart_api_impl.h"  // DARTSCOPE / TransitionNativeToVM / HANDLESCOPE / Api
+#include "vm/dart_entry.h"     // DartEntry::InvokeFunction (Sprint 3 invoke)
+#include "vm/isolate.h"
+#include "vm/object.h"
+#include "vm/object_store.h"
+#include "vm/symbols.h"
 #include "vm/thread.h"
 
 #include "st_lexer.h"
@@ -78,6 +85,111 @@ void ST_load(Dart_NativeArguments args) {
     return;
   }
   Dart_SetReturnValue(args, Dart_NewStringFromCString(summary.c_str()));
+}
+
+// stInvokeStatic(String className, String selector, List args) -> result
+//
+// Sprint 3 of ST_PLAN.md — THE invocation surface: look up a loaded ST class by
+// name, find its CLASS-SIDE (static) method by selector, and call it via
+// DartEntry::InvokeFunction. That first call triggers lazy compilation, which
+// runs the compiler.cc hook -> st::BuildGraph -> the ARM64 back-end -> the
+// method body, returning the computed value (an int for the milestone). No
+// instance is allocated (static methods only, so no layout finalization).
+void ST_invokeStatic(Dart_NativeArguments args) {
+  // --- 1) read className + selector + args (public API, native state) --------
+  Dart_Handle cls_h = Dart_GetNativeArgument(args, 0);
+  Dart_Handle sel_h = Dart_GetNativeArgument(args, 1);
+  Dart_Handle list_h = Dart_GetNativeArgument(args, 2);
+  const char* cls_c = NULL;
+  const char* sel_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(cls_h, &cls_c)) ||
+      Dart_IsError(Dart_StringToCString(sel_h, &sel_c))) {
+    Dart_SetReturnValue(
+        args, Dart_NewApiError("stInvokeStatic: bad class/selector argument"));
+    return;
+  }
+  intptr_t n = 0;
+  Dart_Handle len_err = Dart_ListLength(list_h, &n);
+  if (Dart_IsError(len_err)) {
+    Dart_SetReturnValue(args, len_err);
+    return;
+  }
+  std::vector<Dart_Handle> elems(n);
+  for (intptr_t i = 0; i < n; i++) {
+    elems[i] = Dart_ListGetAt(list_h, i);
+    if (Dart_IsError(elems[i])) {
+      Dart_SetReturnValue(args, elems[i]);
+      return;
+    }
+  }
+  const std::string cls_name(cls_c);
+  const std::string selector(sel_c);
+
+  // --- 2) look up + invoke (transition to VM state) -------------------------
+  Thread* thread = Thread::Current();
+  Dart_Handle result_handle = Dart_Null();
+  std::string err;
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    Isolate* isolate = thread->isolate();
+
+    // Find the class in a loaded `st:mst/N` library (newest first). The ST
+    // loader creates one library per stLoad and registers classes into it.
+    const GrowableObjectArray& libs = GrowableObjectArray::Handle(
+        zone, isolate->object_store()->libraries());
+    const String& cname =
+        String::Handle(zone, Symbols::New(thread, cls_name.c_str()));
+    Class& cls = Class::Handle(zone);
+    Library& lib = Library::Handle(zone);
+    String& url = String::Handle(zone);
+    for (intptr_t i = libs.Length() - 1; i >= 0 && cls.IsNull(); i--) {
+      lib ^= libs.At(i);
+      url = lib.url();
+      if (url.IsNull()) continue;
+      if (strncmp(url.ToCString(), "st:mst/", 7) != 0) continue;
+      cls = lib.LookupLocalClass(cname);
+    }
+    if (cls.IsNull()) {
+      err = "stInvokeStatic: no loaded ST class '" + cls_name + "'";
+    } else {
+      // Member-finalize the target class on demand. Registration is lazy
+      // (st_loader.cc), so finalize it here — via ClassFinalizer::FinalizeClass,
+      // NOT EnsureIsFinalized, which routes to Parser::ParseClass and crashes on
+      // an ST class (no TokenStream). Once finalized, lazy compile never
+      // re-parses it. Only the invoked class (+ its super chain) is finalized,
+      // so a method-less base elsewhere in the corpus is never touched.
+      if (!cls.is_finalized()) {
+        ClassFinalizer::FinalizeClass(cls);
+      }
+      const String& sel =
+          String::Handle(zone, Symbols::New(thread, selector.c_str()));
+      const Function& fn =
+          Function::Handle(zone, cls.LookupStaticFunction(sel));
+      if (fn.IsNull()) {
+        err = "stInvokeStatic: class '" + cls_name +
+              "' has no static method '" + selector + "'";
+      } else {
+        const Array& arr = Array::Handle(zone, Array::New(n, Heap::kOld));
+        for (intptr_t i = 0; i < n; i++) {
+          arr.SetAt(i, Object::Handle(zone, Api::UnwrapHandle(elems[i])));
+        }
+        // Triggers lazy compile -> compiler.cc hook -> st::BuildGraph -> run.
+        // An Error result (compile failure / unhandled exception) is returned
+        // as-is so it propagates to Dart.
+        const Object& result =
+            Object::Handle(zone, DartEntry::InvokeFunction(fn, arr));
+        result_handle = Api::NewHandle(thread, result.raw());
+      }
+    }
+  }
+
+  if (!err.empty()) {
+    Dart_SetReturnValue(args, Dart_NewApiError(err.c_str()));
+    return;
+  }
+  Dart_SetReturnValue(args, result_handle);
 }
 
 }  // namespace bin

@@ -492,6 +492,11 @@ void Cocoa_setSplitMinSize(Dart_NativeArguments args);
 // VM object model (ST_PLAN.md Sprint 2). Returns a summary or "ERR: ...".
 void ST_load(Dart_NativeArguments args);
 
+// Smalltalk invocation surface (defined in macdart/st/st_natives.cc) — look up a
+// loaded ST class's class-side (static) method by selector and call it, JIT-
+// compiling its body on first use (ST_PLAN.md Sprint 3). Returns the result.
+void ST_invokeStatic(Dart_NativeArguments args);
+
 // Reverse-callback natives (defined in cocoa_callbacks.mm) — target-action,
 // delegates, and the syntax-highlight span applier.
 void Cocoa_registerCallbackDispatch(Dart_NativeArguments args);
@@ -542,6 +547,7 @@ void Sqlite_query(Dart_NativeArguments args);
   V(Cocoa_setSelectorAction, 3)                                                \
   V(Cocoa_setSplitMinSize, 2)                                                  \
   V(ST_load, 1)                                                                \
+  V(ST_invokeStatic, 3)                                                        \
   V(Cocoa_registerCallbackDispatch, 1)                                         \
   V(Cocoa_makeActionTarget, 1)                                                 \
   V(Cocoa_wireAction, 2)                                                       \

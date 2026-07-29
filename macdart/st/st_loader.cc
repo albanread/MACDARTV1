@@ -240,24 +240,69 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
       MethodNode* m = e.methods[j].node;
       const String& sel =
           String::Handle(zone, Symbols::New(thread, m->selector.c_str()));
+      const bool is_static = e.methods[j].is_static;
       const Function& fn = Function::Handle(
           zone, Function::New(sel, RawFunction::kRegularFunction,
-                              /*is_static=*/e.methods[j].is_static,
+                              /*is_static=*/is_static,
                               /*is_const=*/false, /*is_abstract=*/false,
                               /*is_external=*/false, /*is_native=*/false, k,
                               TokenPosition::kNoSource, Heap::kOld));
       fn.set_result_type(Object::dynamic_type());
+
+      // Parameter shape (Sprint 3): the Sprint-3 IL builder and, crucially,
+      // DartEntry::InvokeFunction both need the arity to match the selector.
+      // An instance method has an implicit receiver `this`; a class-side
+      // (static) method does not. All parameter types are `dynamic` — the ST
+      // bridge dispatches dynamically (ST_PLAN.md §3). Mirrors
+      // KernelReader::SetupFunctionParameters (kernel_reader.cc:764).
+      const intptr_t extra = is_static ? 0 : 1;  // implicit receiver
+      const intptr_t num_params = extra + static_cast<intptr_t>(m->args.size());
+      fn.set_num_fixed_parameters(num_params);
+      fn.SetNumOptionalParameters(0, /*are_positional=*/true);
+      fn.set_parameter_types(
+          Array::Handle(zone, Array::New(num_params, Heap::kOld)));
+      fn.set_parameter_names(
+          Array::Handle(zone, Array::New(num_params, Heap::kOld)));
+      intptr_t p = 0;
+      if (!is_static) {
+        fn.SetParameterTypeAt(p, Object::dynamic_type());
+        fn.SetParameterNameAt(p, Symbols::This());
+        p++;
+      }
+      for (size_t a = 0; a < m->args.size(); a++, p++) {
+        fn.SetParameterTypeAt(p, Object::dynamic_type());
+        fn.SetParameterNameAt(
+            p, String::Handle(zone, Symbols::New(thread, m->args[a].c_str())));
+      }
+
       fn.set_kernel_function(reinterpret_cast<void*>(m));
       funcs.SetAt(j, fn);
     }
     k.SetFunctions(funcs);
+    // A concrete class must carry >=1 function or FinalizeClass asserts
+    // (class_finalizer.cc:2667, "at least a constructor"). A method-less ST
+    // base (e.g. Boolean, whose behaviour lives in True/False) has none — mark
+    // it abstract so it satisfies the invariant when finalized as a superclass.
+    // Correct enough for Sprint 3 (no instantiation); Sprint 5 will instead
+    // synthesize an implicit constructor for instantiable classes.
+    if (funcs.Length() == 0) k.set_is_abstract();
 
     pending.Add(k, Heap::kOld);
   }
 
-  // --- finalize (resolve supers + declaration types; lazy member finalize) --
+  // --- finalize (resolve supers + declaration types; members on demand) -----
+  // from_kernel=false: resolve the super chain and finalize declaration types
+  // for every class, but DEFER member finalization. Eager member finalization
+  // (from_kernel=true) trips a DEBUG assert (class_finalizer.cc:2667) on a
+  // method-less ST base class — a concrete class must have >=1 function — so a
+  // whole-corpus load would crash. Registration therefore stays lazy (all 86
+  // MACVM world/*.mst load clean); the invoke path (st_natives.cc
+  // ST_invokeStatic) member-finalizes just the ONE class it calls, via
+  // ClassFinalizer::FinalizeClass, which bypasses the Dart Parser::ParseClass
+  // that EnsureIsFinalized would otherwise crash on (no TokenStream on an ST
+  // class).
   library.SetLoaded();
-  if (!ClassFinalizer::ProcessPendingClasses()) {
+  if (!ClassFinalizer::ProcessPendingClasses(/*from_kernel=*/false)) {
     const Error& err = Error::Handle(zone, thread->sticky_error());
     *error = std::string("ERR: finalization failed: ") +
              (err.IsNull() ? "unknown" : err.ToErrorCString());

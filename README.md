@@ -178,6 +178,35 @@ typo'd selector, an unknown class, or a call that would overflow the
 bridge's 8-register float-argument limit, before the code ever runs. Design
 in [`COCOA_STATIC_CHECK_PLAN.md`](COCOA_STATIC_CHECK_PLAN.md).
 
+## Apps, and running them standalone
+
+Beyond demos, an *app* is an ordinary image class with a `build(ui)` method that
+lays out a surface of native Cocoa controls — `label`/`field`/`button`,
+`checkbox`/`slider`/`popup`/`secure`/`progress`, a scrolling `list`, `tabs`, a
+`scroll` container larger than the window, and a `canvas` that draws (and reports
+clicks) through the same op vocabulary the demos use — with `row`/`column`/`grid`
+helpers to place them and a handler per widget (`onClick`, `onSlide`, …). Edit
+the class, press **Save to Image**, and the app hot-reloads *and re-runs
+`build()` while keeping its state* — the reason the App pane exists. Example apps
+live in `macdart/cocoa/workspace/apps/` (a calculator, a temperature converter, a
+control gallery); install one from the **Apps** menu and Run it on the App tab.
+See [`APP_PANE_PLAN.md`](APP_PANE_PLAN.md).
+
+An app **or** a game can also run on its own, **no IDE** — same class, same
+image, same hot reload, just a bare window:
+
+```bash
+./start-gui.sh --app Calculator                # one image class, full-window
+./start-gui.sh --game brickout                 # a game/demo in its own window
+./start-gui.sh --game invaders --fullscreen    # a game straight to full screen
+```
+
+(equivalently `dartui … workspace.dart --app <Class>` / `--game <Name>`, or the
+`MACDART_APP` / `MACDART_GAME` env vars). A game's Metal pane fills the window
+exactly as it does on the Demos tab, and `--fullscreen` reuses the pane's own
+fullscreen path. An app class must already be in the image — install it in the
+workspace first; games and demos are read from `macdart/cocoa/workspace/demos/`.
+
 ## Licensing
 
 The Dart VM and core libraries this project ports are **BSD-3-Clause**:

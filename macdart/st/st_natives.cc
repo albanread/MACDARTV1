@@ -71,7 +71,8 @@ static bool EnsurePrelude(Thread* thread, std::string* err) {
 // Shared by ST_load (register only — the workspace image reload must never
 // fire do-its) and ST_run (register + execute top-level statements, the
 // MACVM file semantics).
-static void STLoadCommon(Dart_NativeArguments args, bool run_toplevel) {
+static void STLoadCommon(Dart_NativeArguments args, bool run_toplevel,
+                         bool allow_reopen = true) {
   // --- 1) read the source argument (public API; native execution state) -----
   Dart_Handle src_h = Dart_GetNativeArgument(args, 0);
   const char* src_c = NULL;
@@ -119,7 +120,7 @@ static void STLoadCommon(Dart_NativeArguments args, bool run_toplevel) {
     ok = EnsurePrelude(thread, &load_err);
     if (ok) {
       ok = ::st::Loader::Load(std::move(program), source, &summary, &load_err,
-                              /*url_override=*/0, &has_toplevel);
+                              /*url_override=*/0, &has_toplevel, allow_reopen);
     }
   }
 
@@ -178,6 +179,13 @@ static void STLoadCommon(Dart_NativeArguments args, bool run_toplevel) {
 
 void ST_load(Dart_NativeArguments args) { STLoadCommon(args, false); }
 void ST_run(Dart_NativeArguments args) { STLoadCommon(args, true); }
+// The workspace image reload: a FRESH layer — no cross-load reopen, so a
+// re-Accepted class fully shadows its previous version (clean edit
+// semantics, no stale inline caches on replaced methods). The combined decl
+// text still merges same-name definitions within the one load.
+void ST_loadFresh(Dart_NativeArguments args) {
+  STLoadCommon(args, false, /*allow_reopen=*/false);
+}
 
 // stInvokeStatic(String className, String selector, List args) -> result
 //
@@ -347,7 +355,7 @@ void ST_new(Dart_NativeArguments args) {
 // stSend(receiver, String selector, List args) -> result.  Sprint 5: send an
 // instance method to an ST object (receiver = argument 0). The first call
 // lazily compiles the body via the compiler.cc hook -> st::BuildGraph.
-void ST_send(Dart_NativeArguments args) {
+static void STSendCommon(Dart_NativeArguments args, bool probe) {
   Dart_Handle recv_h = Dart_GetNativeArgument(args, 0);
   Dart_Handle sel_h = Dart_GetNativeArgument(args, 1);
   Dart_Handle list_h = Dart_GetNativeArgument(args, 2);
@@ -374,6 +382,7 @@ void ST_send(Dart_NativeArguments args) {
   Thread* thread = Thread::Current();
   Dart_Handle result_handle = Dart_Null();
   std::string err;
+  bool hit = false;
   {
     TransitionNativeToVM transition(thread);
     HANDLESCOPE(thread);
@@ -393,8 +402,10 @@ void ST_send(Dart_NativeArguments args) {
       c ^= c.SuperClass();
     }
     if (fn.IsNull()) {
-      err = "stSend: " + std::string(cls.ToCString()) + " has no method '" +
-            selector + "'";
+      if (!probe) {
+        err = "stSend: " + std::string(cls.ToCString()) +
+              " has no method '" + selector + "'";
+      }
     } else {
       const Array& arr = Array::Handle(zone, Array::New(n + 1, Heap::kOld));
       arr.SetAt(0, recv);  // receiver = argument 0
@@ -404,14 +415,36 @@ void ST_send(Dart_NativeArguments args) {
       const Object& result =
           Object::Handle(zone, DartEntry::InvokeFunction(fn, arr));
       result_handle = Api::NewHandle(thread, result.raw());
+      hit = true;
     }
   }
   if (!err.empty()) {
     Dart_SetReturnValue(args, Dart_NewApiError(err.c_str()));
     return;
   }
+  if (probe) {
+    if (!hit) {
+      Dart_SetReturnValue(args, Dart_Null());
+      return;
+    }
+    if (Dart_IsError(result_handle)) {
+      Dart_SetReturnValue(args, result_handle);  // an ST signal propagates
+      return;
+    }
+    Dart_Handle box = Dart_NewList(1);
+    Dart_ListSetAt(box, 0, result_handle);
+    Dart_SetReturnValue(args, box);
+    return;
+  }
   Dart_SetReturnValue(args, result_handle);
 }
+
+// stSend: dispatch an instance method by selector — the throwing form.
+void ST_send(Dart_NativeArguments args) { STSendCommon(args, false); }
+// stSendTry: probe form — [result] on a hit, null on a miss, NEVER an
+// ApiError for a missing method (an ApiError is not catchable by Dart
+// try/catch, which crashed the Release GUI inside stPrintOf's fallback).
+void ST_sendTry(Dart_NativeArguments args) { STSendCommon(args, true); }
 
 // stClassSend(type, selector, args) -> result.  Sprint 11: the class-side
 // `self <sel>` dispatch — receiver is a CLASS VALUE (Type), target resolved at
@@ -807,6 +840,71 @@ void ST_gcStats(Dart_NativeArguments args) {
   Dart_ListSetAt(list, 6, Dart_NewInteger(0));             // markedBytesLast
   Dart_ListSetAt(list, 7, Dart_NewInteger(0));             // contextAllocs
   Dart_SetReturnValue(args, list);
+}
+
+// stOutline(src) -> List of [type, name, startLine] triples (or an
+// "ERR: ..." String). Sprint 12: the import slicer — parse-only, no VM
+// registration. Types: 'class' (Super subclass: Name), 'extend'
+// (Name extend / Name class extend), 'extmethod' (Name >> sel), 'vardecl'
+// (top-level | a b |), 'stmt' (a bare do-it statement). The caller slices
+// the source by consecutive startLines (each item's chunk runs to the next
+// item's start), so leading comments travel with the item they precede.
+void ST_outline(Dart_NativeArguments args) {
+  Dart_Handle src_h = Dart_GetNativeArgument(args, 0);
+  const char* src_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(src_h, &src_c)) || src_c == NULL) {
+    Dart_SetReturnValue(args,
+                        Dart_NewStringFromCString("ERR: bad source argument"));
+    return;
+  }
+  std::string source(src_c);
+  ::st::Lexer lexer(source);
+  std::vector<::st::Token> tokens;
+  ::st::LexError lex_err;
+  if (!lexer.Tokenize(&tokens, &lex_err)) {
+    char buf[600];
+    snprintf(buf, sizeof(buf), "ERR: lex %d:%d: %s", lex_err.line,
+             lex_err.col, lex_err.message.c_str());
+    Dart_SetReturnValue(args, Dart_NewStringFromCString(buf));
+    return;
+  }
+  ::st::Parser parser(std::move(tokens));
+  ::st::ParseError perr;
+  std::unique_ptr<::st::ProgramNode> program = parser.ParseProgram(&perr);
+  if (program == nullptr || !perr.ok) {
+    char buf[600];
+    snprintf(buf, sizeof(buf), "ERR: parse %d:%d: %s", perr.line, perr.col,
+             perr.message.c_str());
+    Dart_SetReturnValue(args, Dart_NewStringFromCString(buf));
+    return;
+  }
+  Dart_Handle out = Dart_NewList(
+      static_cast<intptr_t>(program->items.size()));
+  intptr_t idx = 0;
+  for (auto& item : program->items) {
+    ::st::Node* n = item.get();
+    if (n == nullptr) continue;
+    const char* type = "stmt";
+    std::string name;
+    if (auto* cd = dynamic_cast<::st::ClassDefNode*>(n)) {
+      type = "class";
+      name = cd->name;
+    } else if (auto* ex = dynamic_cast<::st::ExtendNode*>(n)) {
+      type = "extend";
+      name = ex->class_name;
+    } else if (auto* em = dynamic_cast<::st::ExtMethodNode*>(n)) {
+      type = "extmethod";
+      name = em->class_name;
+    } else if (dynamic_cast<::st::VarDeclNode*>(n) != nullptr) {
+      type = "vardecl";
+    }
+    Dart_Handle triple = Dart_NewList(3);
+    Dart_ListSetAt(triple, 0, Dart_NewStringFromCString(type));
+    Dart_ListSetAt(triple, 1, Dart_NewStringFromCString(name.c_str()));
+    Dart_ListSetAt(triple, 2, Dart_NewInteger(n->pos.line));
+    Dart_ListSetAt(out, idx++, triple);
+  }
+  Dart_SetReturnValue(args, out);
 }
 
 // stCheck(src) -> ''.  Parse-only validation (Sprint 10: the editor's cheap

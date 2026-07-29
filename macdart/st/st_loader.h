@@ -54,7 +54,8 @@ class Loader {
                    std::string* summary,
                    std::string* error,
                    const char* url_override = 0,
-                   bool* has_toplevel = 0);
+                   bool* has_toplevel = 0,
+                   bool allow_reopen = true);
 };
 
 // Find a loaded ST class by name across EVERY st: library (newest first) —

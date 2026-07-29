@@ -19,6 +19,7 @@
 #include <string.h>
 
 #include <map>
+#include <set>
 #include <vector>
 
 #include "vm/class_finalizer.h"
@@ -280,7 +281,8 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
                   std::string* summary,
                   std::string* error,
                   const char* url_override,
-                  bool* has_toplevel) {
+                  bool* has_toplevel,
+                  bool allow_reopen) {
   using namespace dart;
 
   // Retain the AST for the isolate's lifetime BEFORE stamping any marker into
@@ -407,7 +409,7 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
   std::vector<bool> reopen(entries.size(), false);
   std::vector<const dart::Class*> prior_cls(entries.size(), NULL);
   std::vector<const dart::Class*> prior_shadow(entries.size(), NULL);
-  for (size_t i = 0; i < entries.size(); i++) {
+  for (size_t i = 0; allow_reopen && i < entries.size(); i++) {
     if (!entries[i].ivars.empty()) continue;
     if (entries[i].name == "STMain") continue;  // per-load driver, never merged
     Class& prior = Class::ZoneHandle(
@@ -529,14 +531,26 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
           }
         }
       }
-      // APPEND methods (and classVars) to the prior class + its shadow;
-      // ivars and finalization state stay untouched.
+      // REPLACE-or-append methods (and append classVars) on the prior class
+      // + its shadow; ivars and finalization state stay untouched. A
+      // same-selector redefinition REPLACES the old method — last load wins
+      // (Smalltalk accept semantics; also what the workspace's re-Accept
+      // reload depends on).
+      std::set<std::string> new_inst;
+      std::set<std::string> new_stat;
+      for (size_t j = 0; j < e.methods.size(); j++) {
+        (e.methods[j].is_static ? new_stat : new_inst)
+            .insert(MangleSelector(e.methods[j].node->selector));
+      }
       GrowableObjectArray& grow = GrowableObjectArray::Handle(
           zone, GrowableObjectArray::New(Heap::kOld));
       Array& old_funcs = Array::Handle(zone, k.functions());
       Function& fh2 = Function::Handle(zone);
+      String& fname = String::Handle(zone);
       for (intptr_t j = 0; j < old_funcs.Length(); j++) {
         fh2 ^= old_funcs.At(j);
+        fname = fh2.name();
+        if (new_inst.count(fname.ToCString()) != 0) continue;  // replaced
         grow.Add(fh2, Heap::kOld);
       }
       for (size_t j = 0; j < e.methods.size(); j++) {
@@ -554,6 +568,8 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
         Array& old_sfuncs = Array::Handle(zone, sh.functions());
         for (intptr_t j = 0; j < old_sfuncs.Length(); j++) {
           fh2 ^= old_sfuncs.At(j);
+          fname = fh2.name();
+          if (new_stat.count(fname.ToCString()) != 0) continue;  // replaced
           sgrow.Add(fh2, Heap::kOld);
         }
         for (size_t j = 0; j < e.methods.size(); j++) {

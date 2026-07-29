@@ -56,6 +56,45 @@ using namespace dart;  // NOLINT — this TU is VM-internal, like st_loader.cc.
 
 namespace {
 
+// Universal-helper rewrites (one canonical list — used by BOTH the normal
+// send path and cascades): Dart-receiver fast paths with ST-dispatch
+// fallback inside each helper.
+struct HelperRewrite { const char* sel; const char* helper; size_t argc; };
+static const HelperRewrite kHelperRewrites[] = {
+    {"at:", "stAt1", 1},        {"at:put:", "stAtPut1", 2},
+    {"size", "stSizeOf", 0},    {"isEmpty", "stIsEmptyU", 0},
+    {"not", "stNot", 0},        {"error:", "stError", 1},
+    {"&", "stBoolAnd", 1},      {"|", "stBoolOr", 1},
+    {"add:", "stAddU", 1},      {"do:", "stDo", 1},
+    {"value", "stValue0", 0},   {"value:", "stValue1", 1},
+    {"value:value:", "stValue2", 2},
+    {"value:value:value:", "stValue3", 3},
+    {"value:value:value:value:", "stValue4", 4},
+    {"max:", "stMax", 1},       {"min:", "stMin", 1},
+    {"asSymbol", "stAsSymbol", 0},
+    {"printString", "stPrintOf", 0},
+    {"displayString", "stDisplayOf", 0},
+    {"asString", "stDisplayOf", 0},
+    {"printOn:", "stPrintOn", 1},
+    {"class", "stClassOf", 0},
+    {"/", "stDivide", 1},
+    {"asDouble", "stAsDouble", 0}, {"asFloat", "stAsDouble", 0},
+    {"asInteger", "stTruncated", 0}, {"truncated", "stTruncated", 0},
+    {"rounded", "stRounded", 0},   {"floor", "stFloorU", 0},
+    {"ceiling", "stCeilingU", 0},  {"negated", "stNegated", 0},
+    {"sqrt", "stSqrt", 0},
+};
+static const HelperRewrite* FindHelperRewrite(const std::string& sel,
+                                              size_t argc) {
+  for (size_t i = 0; i < sizeof(kHelperRewrites) / sizeof(kHelperRewrites[0]);
+       i++) {
+    if (sel == kHelperRewrites[i].sel && argc == kHelperRewrites[i].argc) {
+      return &kHelperRewrites[i];
+    }
+  }
+  return NULL;
+}
+
 // Parse an ST integer literal (`42`, `-7`, radix `16rFF`) to int64. Sprint 3
 // small-integer scope; big-int promotion is left to Dart's own tower later.
 int64_t ParseStInt(const std::string& text) {
@@ -1033,38 +1072,9 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
     return instructions;
   }
   {
-    // Universal helpers: 1-based at:/at:put: on Dart Lists, size/isEmpty
-    // across bridged receivers, `not`, `error:` — each falls back to real ST
-    // dispatch inside the helper, so ST-defined at:/size keep working.
-    static const struct { const char* sel; const char* helper; size_t argc; }
-        kHelperRewrites[] = {
-            {"at:", "stAt1", 1},        {"at:put:", "stAtPut1", 2},
-            {"size", "stSizeOf", 0},    {"isEmpty", "stIsEmptyU", 0},
-            {"not", "stNot", 0},        {"error:", "stError", 1},
-            {"&", "stBoolAnd", 1},      {"|", "stBoolOr", 1},
-            {"add:", "stAddU", 1},      {"do:", "stDo", 1},
-            {"value", "stValue0", 0},   {"value:", "stValue1", 1},
-            {"value:value:", "stValue2", 2},
-            {"value:value:value:", "stValue3", 3},
-            {"value:value:value:value:", "stValue4", 4},
-            {"max:", "stMax", 1},       {"min:", "stMin", 1},
-            {"asSymbol", "stAsSymbol", 0},
-            {"printString", "stPrintOf", 0},
-            {"displayString", "stDisplayOf", 0},
-            {"asString", "stDisplayOf", 0},
-            {"printOn:", "stPrintOn", 1},
-            {"class", "stClassOf", 0},
-            {"/", "stDivide", 1},
-            {"asDouble", "stAsDouble", 0}, {"asFloat", "stAsDouble", 0},
-            {"asInteger", "stTruncated", 0}, {"truncated", "stTruncated", 0},
-            {"rounded", "stRounded", 0},   {"floor", "stFloorU", 0},
-            {"ceiling", "stCeilingU", 0},  {"negated", "stNegated", 0},
-            {"sqrt", "stSqrt", 0},
-        };
-    for (size_t i = 0; i < sizeof(kHelperRewrites) / sizeof(kHelperRewrites[0]);
-         i++) {
-      if (node->selector != kHelperRewrites[i].sel) continue;
-      if (node->args.size() != kHelperRewrites[i].argc) continue;
+    const HelperRewrite* hr =
+        FindHelperRewrite(node->selector, node->args.size());
+    if (hr != NULL) {
       Fragment instructions = TranslateExpression(node->receiver.get());
       instructions += PushArgument();
       for (size_t a = 0; a < node->args.size(); a++) {
@@ -1072,8 +1082,7 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
         instructions += PushArgument();
       }
       instructions += StaticCall(
-          Function::ZoneHandle(
-              zone_, LookupCocoaFunction(kHelperRewrites[i].helper)),
+          Function::ZoneHandle(zone_, LookupCocoaFunction(hr->helper)),
           1 + static_cast<intptr_t>(node->args.size()));
       return instructions;
     }
@@ -1906,18 +1915,36 @@ Fragment StGraphBuilder::TranslateCascade(CascadeNode* node) {
       instructions += Drop();
       continue;
     }
+    // `; yourself` — the receiver itself (the idiom that makes a cascade
+    // answer the object being configured).
+    if (m->selector == "yourself" && m->args.empty()) {
+      instructions += LoadLocal(recv);
+      if (k + 1 < node->messages.size()) instructions += Drop();
+      continue;
+    }
     instructions += LoadLocal(recv);
     instructions += PushArgument();
     for (size_t a = 0; a < m->args.size(); a++) {
       instructions += TranslateExpression(m->args[a].get());
       instructions += PushArgument();
     }
-    const String& sel =
-        String::ZoneHandle(zone_, Symbols::New(thread_, m->selector.c_str()));
-    const Token::Kind kind = MethodKind(sel);
     const intptr_t argc = 1 + static_cast<intptr_t>(m->args.size());
-    const intptr_t nchecked = (kind != Token::kILLEGAL) ? argc : 1;
-    instructions += InstanceCall(sel, kind, argc, nchecked);  // pushes result
+    // Same routing as a normal send (Sprint 12): universal helpers first,
+    // else the aliased/mangled selector — a cascaded `add:`/`at:put:` must
+    // behave exactly like its non-cascaded form.
+    const HelperRewrite* hr =
+        FindHelperRewrite(m->selector, m->args.size());
+    if (hr != NULL) {
+      instructions += StaticCall(
+          Function::ZoneHandle(zone_, LookupCocoaFunction(hr->helper)), argc);
+    } else {
+      const std::string dsel = DartSelector(m->selector);
+      const String& sel =
+          String::ZoneHandle(zone_, Symbols::New(thread_, dsel.c_str()));
+      const Token::Kind kind = MethodKind(sel);
+      const intptr_t nchecked = (kind != Token::kILLEGAL) ? argc : 1;
+      instructions += InstanceCall(sel, kind, argc, nchecked);  // pushes result
+    }
     if (k + 1 < node->messages.size()) instructions += Drop();  // keep only last
   }
   return instructions;

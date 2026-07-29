@@ -2194,6 +2194,39 @@ Future<String> handle(String line) async {
     }
     case 'classsrc': return await askDeferrable('classsrc', arg);
     case 'remove': return await askDeferrable('remove', arg);
+    case 'lang': {
+      // Generic language-isolate passthrough for scripted tests:
+      // `lang <cmd> [arg]` → ask(cmd, arg). Read-only browsing verbs mostly
+      // (classes, classmembers, members, categories, ...).
+      var s2 = arg.indexOf(' ');
+      var sub = s2 < 0 ? arg : arg.substring(0, s2);
+      var rest = s2 < 0 ? '' : arg.substring(s2 + 1);
+      var r = await ask(sub, rest);
+      return r == null ? 'nil' : r.toString();
+    }
+    case 'acceptb64': {
+      // Scripted MULTILINE accept: the control line is one line by contract,
+      // so a whole-decl edit travels base64-encoded. Same gate as 'accept'.
+      var text;
+      try { text = UTF8.decode(BASE64.decode(arg.trim())); }
+      catch (e) { return 'ERR: acceptb64: bad payload'; }
+      if (gDbgPaused) return await ask('accept', text);
+      var r = await checkDecls(<dynamic>[text]);
+      if (!r.ok) {
+        return "ERR: refused — " + r.message +
+               (r.line > 0 ? "  (line " + r.line.toString() + ")" : "");
+      }
+      return await askDeferrable('accept', text);
+    }
+    case 'stimport': {
+      // Sprint 12: import MACVM .mst file(s)/directory into the image as
+      // editable ST decls (one merged decl per class + boot chunks). Slow for
+      // a whole world (parses + reloads everything), so it bypasses the doit
+      // watchdog with its own generous quiet timeout.
+      var r = await askQuiet('stimport', arg.trim(),
+          const Duration(seconds: 180));
+      return r == null ? 'ERR: stimport timed out' : r.toString();
+    }
     case 'kill': await respawnLanguage("manual kill"); return "ok";
     case 'quit':
       Cocoa.cls("NSApplication").sharedApplication().terminate(null); return "ok";
@@ -5098,7 +5131,7 @@ Future<CheckResult> compileCheck(String src,
     for (var d in others) {
       if (skip.contains(d[0].toString())) continue;
       var s = d[1].toString();
-      if (_wsStClassRe.hasMatch(s)) continue;  // Smalltalk decl: not Dart context
+      if (_wsIsSt(s)) continue;  // Smalltalk decl: not Dart context
       ctx.write("\n");
       ctx.write(s);
       ctx.write("\n");
@@ -5159,15 +5192,24 @@ String _cleanError(String msg, int offset) {
 /// than a refused Accept.
 /// Compile [decls] against the image without committing anything. The single
 /// gate every route into the image goes through — buttons and scripts alike.
-// A Smalltalk declaration (`Super subclass: Name [`) — the DART compile check
-// must not see it; the language isolate parse-checks it with stCheck instead.
+// A Smalltalk declaration — the DART compile check must not see it; the
+// language isolate parse-checks it with stCheck instead. Covers class defs
+// (`Super subclass: Name [`), Sprint-12 extension chunks (`Foo extend [`,
+// `Foo class >> sel [`), and st-doit boot chunks (`"st-doit name"` header).
 final RegExp _wsStClassRe = new RegExp(
     r'^\s*(?:"(?:[^"]|"")*"\s*)*\w+\s+subclass:\s*\w+\s*\[');
+final RegExp _wsStExtendRe = new RegExp(
+    r'^\s*(?:"(?:[^"]|"")*"\s*)*\w+(?:\s+class)?\s+(?:extend\s*\[|>>)');
+final RegExp _wsStDoitRe = new RegExp(r'^\s*"st-doit\s+[^"]+"');
+bool _wsIsSt(String s) =>
+    _wsStClassRe.hasMatch(s) ||
+    _wsStExtendRe.hasMatch(s) ||
+    _wsStDoitRe.hasMatch(s);
 
 Future<CheckResult> checkDecls(List decls) async {
   var dartDecls = <dynamic>[];
   for (var d in decls) {
-    if (!_wsStClassRe.hasMatch(d.toString())) dartDecls.add(d);
+    if (!_wsIsSt(d.toString())) dartDecls.add(d);
   }
   if (dartDecls.isEmpty) return new CheckResult(true, "", 0);  // all Smalltalk
   var names = <String>[];

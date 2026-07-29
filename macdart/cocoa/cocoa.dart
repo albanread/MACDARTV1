@@ -61,12 +61,23 @@ String wsUiReady() native "Workspace_uiReady";
 /// registered ST methods must not be invoked until the Sprint 3 compiler hook.
 String _stLoadRaw(String src) native "ST_load";
 String _stRunRaw(String src) native "ST_run";
+String _stLoadFreshRaw(String src) native "ST_loadFresh";
 
 String stLoad(String src) { _stEnsureHooks(); return _stLoadRaw(src); }
 
 /// Load AND run: like [stLoad], then execute the file's bare top-level
 /// statements (MACVM do-it semantics — a corpus file's own driver lines).
 String stRun(String src) { _stEnsureHooks(); return _stRunRaw(src); }
+
+/// The workspace image reload: a FRESH layer — same-name classes fully
+/// shadow earlier loads instead of being reopened in place, so a
+/// re-Accepted class's edits always win (and no stale inline caches).
+String stLoadFresh(String src) { _stEnsureHooks(); return _stLoadFreshRaw(src); }
+
+/// Parse-only outline for the import slicer: List of [type, name, startLine]
+/// per top-level item ('class'/'extend'/'extmethod'/'vardecl'/'stmt'), or an
+/// "ERR: ..." String on a parse failure.
+stOutline(String src) native "ST_outline";
 
 /// Probe-mode class-side dispatch: answers [result] on a hit (even a nil
 /// result), or null when the class has no such class-side method — WITHOUT
@@ -80,6 +91,11 @@ _stExtSendTry(recv, String sel, List args) native "ST_extSendTry";
 /// `x class` — the receiver's class VALUE (canonical Type; natives answer
 /// their extension holder's Type when the world image is loaded).
 stClassOf(r) native "ST_classOf";
+
+/// Probe-mode instance dispatch: [result] on a hit, null on a MISS — never an
+/// ApiError (an ApiError is not catchable by Dart try/catch; the print
+/// protocol's printOn: fallback must degrade, not crash the Release GUI).
+_stSendTry(recv, String sel, List args) native "ST_sendTry";
 
 bool _stHooked = false;
 
@@ -376,7 +392,8 @@ stPrintOf(x) {
   }
   if (x is Function) return 'a Block';
   var ws = new STWriteBuffer();
-  try { stSend(x, 'printOn:', [ws]); } catch (_) { return x.toString(); }
+  var r = _stSendTry(x, 'printOn:', [ws]);
+  if (r == null) return x.toString();   // no printOn: — the VM default text
   return ws.contents();
 }
 
@@ -388,7 +405,9 @@ stPrintOn(r, s) {
       r is Map || r is Function) {
     return stSend(s, 'nextPutAll:', [stPrintOf(r)]);
   }
-  return stSend(r, 'printOn:', [s]);
+  var v = _stSendTry(r, 'printOn:', [s]);
+  if (v == null) return stSend(s, 'nextPutAll:', [r.toString()]);
+  return v[0];
 }
 
 stGcFull() native "ST_gcFull";

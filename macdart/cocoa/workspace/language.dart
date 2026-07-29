@@ -37,20 +37,135 @@ int _appGen = 0;                    // stale pushes from a stopped app are dropp
 // combined layer (so they see each other), after every successful Dart reload.
 final RegExp _stClassRe = new RegExp(
     r'^\s*(?:"(?:[^"]|"")*"\s*)*(\w+)\s+subclass:\s*(\w+)\s*\[');
+// Sprint 12: an imported world class may START with a reopen/extension form
+// (`Foo extend [`, `Foo class extend [`, `Foo >> sel [`) when its defining
+// file precedes it only with extensions.
+final RegExp _stExtendRe = new RegExp(
+    r'^\s*(?:"(?:[^"]|"")*"\s*)*(\w+)(?:\s+class)?\s+(?:extend\s*\[|>>)');
+// Sprint 12: an st-doit decl (a world file's init/driver lines) is marked by
+// its first line: an ST comment `"st-doit <name>"` written by the importer.
+final RegExp _stDoitRe = new RegExp(r'^\s*"st-doit\s+([^"]+)"');
+
 bool _isStSource(String s) => _stClassRe.hasMatch(s);
+bool _isStDoit(String s) => _stDoitRe.hasMatch(s);
+// ANY Smalltalk decl (class, extension, or do-it chunk): excluded from the
+// Dart scratch and from the Dart compile-lint.
+bool _isStAny(String s) =>
+    _stClassRe.hasMatch(s) || _stExtendRe.hasMatch(s) || _isStDoit(s);
+
 String _stName(String s) {
   var m = _stClassRe.firstMatch(s);
-  return m == null ? null : m.group(2);
+  if (m != null) return m.group(2);
+  var d = _stDoitRe.firstMatch(s);
+  if (d != null) return d.group(1).trim();
+  var e = _stExtendRe.firstMatch(s);
+  return e == null ? null : e.group(1);
 }
 
+// The ST layer, reloaded: every class/extension decl as ONE combined FRESH
+// load (same-name pieces merge within the load; the fresh layer fully
+// shadows earlier ones, so an edit always wins) — then the st-doit decls
+// (world init lines: `Character initTable`, ...) run in NAME order.
 String _stReloadAll() {
   var st = <String>[];
+  var boots = <String>[];
   _decls.forEach((n, s) {
-    if (_isStSource(s)) st.add(s);
+    if (_isStDoit(s)) boots.add(n);
+    else if (_isStAny(s)) st.add(s);
   });
-  if (st.isEmpty) return '';
-  var r = stLoad(st.join('\n\n'));
-  return r.startsWith('ERR:') ? r : '';
+  if (st.isEmpty && boots.isEmpty) return '';
+  if (st.isNotEmpty) {
+    var r = stLoadFresh(st.join('\n\n'));
+    if (r.startsWith('ERR:')) return r;
+  }
+  boots.sort();
+  for (var n in boots) {
+    var r = stRun(_decls[n]);
+    if (r.startsWith('ERR:')) return 'in ' + n + ': ' + r;
+  }
+  return '';
+}
+
+// --- Sprint 12: import MACVM .mst files into the image as editable decls ----
+// One merged decl PER CLASS (all its definitions/reopens across files,
+// separated by provenance comments), plus one `st-doit` decl per file that
+// had top-level statements (init lines run at reload; name-ordered, so the
+// numbered world stems keep their boot order). The slicing comes from the
+// parse-only stOutline native; chunks start at an item's line and run to the
+// next item's, so leading comments travel with what they describe.
+String _stImport(String path) {
+  var files = <String>[];
+  if (FileSystemEntity.isDirectorySync(path)) {
+    for (var f in new Directory(path).listSync()) {
+      if (f.path.endsWith('.mst')) files.add(f.path);
+    }
+    files.sort();
+  } else if (FileSystemEntity.isFileSync(path)) {
+    files.add(path);
+  } else {
+    return 'ERR: stimport: no such file or directory: ' + path;
+  }
+  var classText = <String, StringBuffer>{};
+  var classNames = <String>[];
+  var doitText = <String, String>{};
+  for (var p in files) {
+    var stem = p.split('/').last.replaceAll('.mst', '');
+    var src = new File(p).readAsStringSync();
+    var items = stOutline(src);
+    if (items is String) return 'ERR: stimport ' + stem + ': ' + items;
+    var trip = <List>[];
+    for (var it in items) {
+      if (it != null) trip.add(it);
+    }
+    if (trip.isEmpty) continue;
+    var lines = src.split('\n');
+    var stmts = new StringBuffer();
+    for (var i = 0; i < trip.length; i++) {
+      var type = trip[i][0];
+      var name = trip[i][1];
+      int a = (i == 0) ? 1 : trip[i][2];
+      int b = (i + 1 < trip.length) ? trip[i + 1][2] - 1 : lines.length;
+      if (a < 1) a = 1;
+      if (b > lines.length) b = lines.length;
+      if (b < a) b = a;
+      var chunk = lines.sublist(a - 1, b).join('\n').trimRight();
+      if (chunk.isEmpty) continue;
+      if (type == 'class' || type == 'extend' || type == 'extmethod') {
+        var buf = classText[name];
+        if (buf == null) {
+          buf = new StringBuffer();
+          classText[name] = buf;
+          classNames.add(name);
+        } else {
+          buf.write('\n\n"— from ' + stem + ' —"\n');
+        }
+        buf.write(chunk);
+      } else {
+        // vardecl / stmt — the file's init & driver lines, kept in order.
+        stmts.writeln(chunk);
+      }
+    }
+    if (stmts.isNotEmpty) {
+      var dn = 'boot:' + stem;
+      doitText[dn] = '"st-doit ' + dn + '"\n' + stmts.toString().trimRight();
+    }
+  }
+  if (classNames.isEmpty && doitText.isEmpty) {
+    return 'ERR: stimport: nothing to import in ' + path;
+  }
+  classText.forEach((name, buf) {
+    _decls[name] = buf.toString();
+  });
+  doitText.forEach((name, text) {
+    _decls[name] = text;
+  });
+  var err = _rebuildAndReload();
+  if (err.isNotEmpty) return err;
+  classText.forEach((name, buf) { _imageUpsert(name, _decls[name]); });
+  doitText.forEach((name, text) { _imageUpsert(name, text); });
+  return 'imported ' + classNames.length.toString() + ' classes, ' +
+      doitText.length.toString() + ' boot chunks from ' +
+      files.length.toString() + ' files';
 }
 
 main(List args, SendPort uiPort) {
@@ -102,6 +217,7 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'appstop') out = _appStop();
       else if (cmd == 'appbuild') out = _appBuild(arg);
       else if (cmd == 'appevent') out = _appEvent(arg);
+      else if (cmd == 'stimport') out = _stImport(arg);
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();
     } catch (e) {
@@ -145,7 +261,7 @@ String _stDoit(String code) {
   if (r.startsWith('ERR:')) return r;
   try {
     var v = stInvokeStatic(cls, 'doIt', <dynamic>[]);
-    return v == null ? 'nil' : v.toString();
+    return v == null ? 'nil' : stPrintOf(v).toString();  // ST printString
   } catch (e) {
     return 'ERR: ' + e.toString();
   }
@@ -252,7 +368,7 @@ String _acceptMany(List decls) {
   // before anything is written or reloaded.
   for (var d in decls) {
     var s = d.toString().trim();
-    if (_isStSource(s)) {
+    if (_isStAny(s)) {
       var c = stCheck(s);
       if (c.isNotEmpty) return c;
     }
@@ -333,7 +449,7 @@ String _rebuildAndReload() {
   // the ST layer reloads separately after a successful Dart reload.
   var dart = <String>[];
   _decls.forEach((n, s) {
-    if (!_isStSource(s)) dart.add(s);
+    if (!_isStAny(s)) dart.add(s);
   });
   var region = dart.join('\n\n');
   var text = new File(_scratch).readAsStringSync();
@@ -360,7 +476,7 @@ List _classNames() {
   var out = <String>[];
   _decls.forEach((name, src) {
     var k = _kindOf(src);
-    if (k == 'class' || k == 'enum') out.add(name);
+    if (k == 'class' || k == 'enum' || k == 'st-class') out.add(name);
   });
   out.sort();
   return out;
@@ -369,6 +485,11 @@ List _classNames() {
 List _memberList(String className) {
   var src = _decls[className];
   if (src == null) return const <String>[];
+  if (_isStAny(src)) {
+    var out = <String>[];
+    for (var m in _stMembers(src)) out.add(m[2]);
+    return out;
+  }
   var out = <String>[];
   for (var m in _splitMembers(src)) {
     var sig = _memberSig(m);
@@ -377,8 +498,47 @@ List _memberList(String className) {
   return out;
 }
 
+// Sprint 12: split a (possibly merged) ST class decl into members —
+// [side 'c'|'i', 'method', signature, source] per method. Line-based: a
+// method starts at a line ENDING in '[' at shallow indentation (world style)
+// and runs to the line before the next such header. Class-side headers carry
+// `class >>`. Ivar lines (`| a b |`) and headers are skipped.
+List<List> _stMembers(String src) {
+  var lines = src.split('\n');
+  var headers = <int>[];
+  for (var i = 0; i < lines.length; i++) {
+    var t = lines[i].trimRight();
+    if (!t.endsWith('[')) continue;
+    var lt = t.trimLeft();
+    var indent = t.length - lt.length;
+    if (indent > 4) continue;                      // nested block, not a method
+    if (lt.startsWith('"')) continue;
+    if (lt.contains('subclass:')) continue;
+    if (new RegExp(r'^\w+(\s+class)?\s+extend\s*\[$').hasMatch(lt)) continue;
+    headers.add(i);
+  }
+  var out = <List>[];
+  for (var h = 0; h < headers.length; h++) {
+    var a = headers[h];
+    var b = (h + 1 < headers.length) ? headers[h + 1] : lines.length;
+    // trim the trailing class-closing ']' line off the last member's chunk
+    var body = lines.sublist(a, b).join('\n');
+    var head = lines[a].trim();
+    var sig = head.substring(0, head.length - 1).trim();
+    sig = sig.replaceAll(new RegExp(r'\^\s*<[^>]*>\s*$'), '');
+    sig = sig.replaceAll(new RegExp(r'<[^>]*>'), '');
+    sig = sig.replaceAll(new RegExp(r'\s+'), ' ').trim();
+    var side = sig.contains('class >>') ? 'c' : 'i';
+    sig = sig.replaceAll(new RegExp(r'^\w+\s+class\s*>>\s*'), '');
+    if (sig.isEmpty) continue;
+    out.add([side, 'method', sig, body]);
+  }
+  return out;
+}
+
 String _kindOf(String s) {
-  if (_isStSource(s)) return 'st-class';  // Smalltalk, before Dart heuristics
+  if (_isStDoit(s)) return 'st-doit';     // Smalltalk boot/do-it chunk
+  if (_isStAny(s)) return 'st-class';     // Smalltalk, before Dart heuristics
   // Past the doc comment first — same trap as _declName. A documented class
   // was classified as a 'variable', which quietly removed it from the Editor's
   // class picker and the Browser's class list: the apps/ examples ship with a
@@ -506,6 +666,7 @@ List _worldClasses(String libUri) {
 List _classMembers2(String className) {
   var src = _decls[className];
   if (src == null) return const <List>[];
+  if (_isStAny(src)) return _stMembers(src);
   var out = <List>[];
   for (var m in _splitMembers(src)) {
     var t = m.trim();

@@ -695,10 +695,50 @@ loudly). Stages A and C are modest; A is independently shippable.
   regression; richards/deltablue standalone still exact; 86/86 corpus loads. VM
   surface: three patch-file hunks (type_patch, internal_patch, object_patch) in
   `patches/macdart-port.patch`, dry-run verified against pristine 1.24.3.
+- **Sprint 12 ✓ — the ST layer is BROWSABLE, EDITABLE, PERSISTENT in the GUI.** The
+  world lives in the image as first-class, editable source. Verified end-to-end
+  against the LIVE GUI over the control plane (isolated HOME image, two full
+  reboots):
+  - **`stimport <path>`** (control-plane verb → `_stImport`): slices MACVM `.mst`
+    files via the parse-only **`ST_outline`** native (per-item [type, name,
+    startLine]; chunks run to the next item's line so leading comments travel with
+    their class) into **one merged decl per class** — all its definitions/reopens
+    across files, provenance-commented (`"— from 19_printing —"`) — plus one
+    **`st-doit`** decl per file with top-level statements (marked `"st-doit name"`,
+    name-ordered so the numbered stems keep boot order). The world imports as
+    **168 class decls + 5 boot chunks** and `library_bench` runs against the
+    imported image identically to the file boot.
+  - **Reload semantics**: `_stReloadAll` loads every class decl as ONE combined
+    **`stLoadFresh`** layer (a new `allow_reopen=false` load mode — same-name
+    pieces merge within the load, and the fresh layer fully shadows earlier ones,
+    so a re-Accept's edits ALWAYS win with no stale inline caches), then runs the
+    st-doit decls in name order (`Character initTable` et al — classVars reset on a
+    fresh layer, so the world re-inits per reload, exactly like a boot).
+    File-based `stRun` boots keep reopen, which now REPLACES same-selector
+    methods (last load wins — correct for 19_printing overlaps too).
+  - **Browser**: ST classes list beside Dart classes; `_stMembers` splits a merged
+    decl into [side, 'method', signature, source] (class-side via `class >>`;
+    type annotations stripped from signatures); `classsrc`→edit→Accept round-trips
+    (the Dart lint skips every ST form: class, extend/`>>` chunks, st-doit).
+  - **Proven live**: import → `(1/3)+(1/6)` answers **`1/2`** (world Fraction via
+    its own printOn: — `st>` replies now print with stPrintOf); GUI reboot → world
+    persists from SQLite alone; `classsrc Integer` + append `stTwice [ ^self * 2 ]`
+    + `acceptb64` → **`21 stTwice` → 42 on a native int**; another reboot → the
+    edit persists. Browser lists Integer/Fraction/OrderedCollection/Planner/
+    WriteStream; Fraction's members split correctly.
+  - **Fixes en route**: `ST_sendTry` probe (an ApiError is NOT catchable by Dart
+    try/catch — stPrintOf's printOn: fallback crashed the Release GUI; probes now
+    degrade to toString), cascades route through the SAME selector machinery as
+    normal sends (shared helper-rewrite table + mangling + `; yourself`), st> doit
+    replies use ST printString. New verbs: `stimport`, `acceptb64` (scripted
+    multiline accepts), `lang <cmd>` passthrough. Python vm-service driver for
+    Tcl-8.5-only hosts.
   **Next:** MACVM display/GUI primitive bridge (the 36_pixmap/43_gamepane tier
   currently loads but cannot draw), `Smalltalk at:put:` system-dictionary protocol,
   Behavior/reflection surface (`name`, `superclass`), performance pass on the NSM
-  dispatch path (direct method injection into _Smi/_Double/_OneByteString).
+  dispatch path (direct method injection into _Smi/_Double/_OneByteString), and
+  extension-decl naming (a user `Integer extend [...]` accept currently replaces
+  the imported Integer decl by name rather than merging into it).
 
   **Resumable exceptions (`resume:`) — deferred by choice, not impossibility.** It does
   NOT need continuations: the classic implementation calls the handler *before*

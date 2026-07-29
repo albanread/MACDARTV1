@@ -525,5 +525,14 @@ loudly). Stages A and C are modest; A is independently shippable.
   mutating an ivar** →3; correct through the *optimizing* compiler; all sprints + Dart +
   the 86-file corpus unaffected. Deferred: capture of a *closure's own* locals by a
   nested closure (needs context chaining — fails soft as unsupported-variable).
-- **Next — Stage C: non-local `^`** (the try/catch home-token desugaring), then the
-  workspace GUI, and the MACVM A/B benchmark.
+- **Sprint 8 (A/B benchmark) ✓ — the payoff measured.** The same `stbench.mst`, byte
+  for byte, three ways (`macdart/st/bench/`, results in its README): **MACDART‑ST beats
+  MACVM 52×–230×** (fib30 5 ms vs 262 ms; a 50M-iteration loop 22 ms vs 5,066 ms; 2M
+  block calls 4 ms vs 331 ms; 2M allocations 5 ms vs 358 ms), and the ST-front-end tax
+  vs native Dart on the same VM is **1.00× on loops** (same IL → same machine code),
+  2.5× on send-heavy fib (ST methods are non-inlinable for now), ~1.7× on allocation.
+  Bonus finding: `value:`→`call` is IC-fast (~2 ns/call) — the VM installs a lazy
+  invoke-field dispatcher on `_Closure` after the first miss — and provably correct for
+  distinct closures through one send site.
+- **Next — Stage C: non-local `^`** (the try/catch home-token desugaring), the
+  workspace GUI, and then breadth (corpus bring-up on the bridge).

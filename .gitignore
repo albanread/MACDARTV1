@@ -18,6 +18,7 @@
 /macdart/build/
 /macdart/build-release/
 /macdart/build-st/
+/macdart/build-st-rel/
 
 # --- Transient test-run logs --------------------------------------------------
 /macdart/test/*.txt

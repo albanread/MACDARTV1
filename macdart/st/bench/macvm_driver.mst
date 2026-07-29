@@ -1,0 +1,30 @@
+"macvm_driver.mst — the MACVM-side driver for stbench.mst (concatenated
+ after it by run.sh). Warms each workload, then reports best-of-5 wall
+ milliseconds per workload via Time millisecondsToRun:. Kept out of
+ stbench.mst so the workload file stays pure and byte-identical for both
+ VMs (MACDART's loader would ignore the doit, but its driver never even
+ reads this file)."
+
+Object subclass: STBenchDriver [
+    STBenchDriver class >> time: label run: aBlock [
+        | best t |
+        best := nil.
+        1 to: 5 do: [:i |
+            t := Time millisecondsToRun: aBlock.
+            (best == nil or: [ t < best ]) ifTrue: [ best := t ] ].
+        Transcript show: label , ' ' , best printString , ' ms'; cr
+    ]
+
+    STBenchDriver class >> run [
+        | b |
+        b := STBench new.
+        "warmup — let the adaptive compiler settle"
+        b fib: 20. b sumTo: 100000. b blocks: 10000. b alloc: 10000.
+        self time: 'fib30      ' run: [ b fib: 30 ].
+        self time: 'sum50m     ' run: [ b sumTo: 50000000 ].
+        self time: 'blocks2m   ' run: [ b blocks: 2000000 ].
+        self time: 'alloc2m    ' run: [ b alloc: 2000000 ]
+    ]
+]
+
+STBenchDriver run.

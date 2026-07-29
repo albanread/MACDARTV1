@@ -386,8 +386,20 @@ st_lexer.cc st_parser.cc st_natives.cc)` then add `dart_st` to each
   Debug-assert failures). Ordinary Dart and the 86-file corpus load are unaffected.
   Finalization is lazy at load + on-demand (`FinalizeClass`) per invoked class, so a
   method-less base class never trips the "class needs ≥1 function" assert.
-- **Next — Sprint 4:** blocks/closures (`ClosureCall`), inlined control flow
-  (`ifTrue:ifFalse:`, `whileTrue:`, `to:do:`), and cascades — all in `dart_st`, no
-  new VM patch. Then instance methods (needs `FinalizeClass` layout + `AllocateObject`),
-  the two desugarings (Sprint 5), interop (Sprint 6), the GUI (Sprint 7), and the
-  MACVM A/B benchmark (Sprint 8).
+- **Sprint 4 ✓** — inlined control flow + cascades, no new VM patch (all in
+  `st_flow_graph_builder.cc`). `ifTrue:`/`ifFalse:`/`ifTrue:ifFalse:`, `and:`/`or:`,
+  `whileTrue:`/`whileFalse:`, and `to:do:` inline their block operands (so `[^x]`
+  inside a conditional is a plain `Return`), and cascades work. Verified:
+  `sumWhile:100`→5050, `sumDo:100`→5050 (a `to:do:` loop), `classify:`→0/1/2,
+  `and:` short-circuits, a cascade `5 +1;+2;+3`→8 — all correct through the
+  *optimizing* compiler (40k calls, no Debug-assert failures); ordinary Dart and the
+  86-file corpus load unaffected. A scope pre-pass hoists inlined-block locals + per-
+  loop/cascade synth temps before `AllocateVariables`; control-flow values materialize
+  through one reusable temp. Deferred: **real first-class closures** (`value:`/
+  `ClosureCall`), `timesRepeat:`, instance-var access, `super`/class-name sends.
+- **Next — Sprint 5:** instance methods + ivar access (`LoadField`/`StoreInstanceField`
+  at `Field::Offset()`), `Foo new` + the metaclass tower (needs `AllocateObject` +
+  `Instance::New` on a member-finalized class), and the closure `^` desugaring
+  (`Throw`/`CatchBlockEntry`). Then interop (Sprint 6), the GUI (Sprint 7), and the
+  MACVM A/B benchmark (Sprint 8). VM-API templates already pinned (kernel_to_il
+  `AllocateObject`/`LoadField`/`StoreInstanceField`).

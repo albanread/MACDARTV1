@@ -25,6 +25,7 @@
 
 #include "st_flow_graph_builder.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 
 #include <map>
@@ -146,7 +147,9 @@ class StGraphBuilder {
         stack_(NULL),
         pending_argument_count_(0),
         graph_entry_(NULL),
-        this_var_(NULL) {}
+        this_var_(NULL),
+        value_temp_(NULL),
+        synth_counter_(0) {}
 
   FlowGraph* Build(MethodNode* method);
 
@@ -188,6 +191,27 @@ class StGraphBuilder {
   TargetEntryInstr* BuildTargetEntry() {
     return new (zone_)
         TargetEntryInstr(AllocateBlockId(), CatchClauseNode::kInvalidTryIndex);
+  }
+  JoinEntryInstr* BuildJoinEntry() {
+    return new (zone_)
+        JoinEntryInstr(AllocateBlockId(), CatchClauseNode::kInvalidTryIndex);
+  }
+  Fragment Goto(JoinEntryInstr* destination) {
+    return Fragment(new (zone_) GotoInstr(destination)).closed();
+  }
+  // Branch on the boolean currently on top of the expression stack, comparing
+  // it === Bool::True() (guide §2.5 / kernel BranchIfTrue).
+  Fragment BranchIfTrue(TargetEntryInstr** then_entry,
+                        TargetEntryInstr** otherwise_entry) {
+    Fragment instructions = Constant(Bool::True());
+    Value* right = Pop();  // the true constant
+    Value* left = Pop();   // the condition value
+    StrictCompareInstr* compare = new (zone_) StrictCompareInstr(
+        TokenPosition::kNoSource, Token::kEQ_STRICT, left, right, false);
+    BranchInstr* branch = new (zone_) BranchInstr(compare);
+    *then_entry = *branch->true_successor_address() = BuildTargetEntry();
+    *otherwise_entry = *branch->false_successor_address() = BuildTargetEntry();
+    return instructions + Fragment(branch).closed();
   }
 
   // --- primitives (guide §2, §5.D) ---
@@ -287,6 +311,18 @@ class StGraphBuilder {
   Fragment TranslateAssign(AssignNode* node);
   Fragment TranslateMessage(MessageNode* node);
 
+  // Sprint 4: inlined control flow + cascades.
+  bool IsInlinableControlFlow(MessageNode* node);
+  Fragment TranslateControlFlow(MessageNode* node, bool value_context);
+  Fragment TranslateCascade(CascadeNode* node);
+  Fragment InlineBlockStmts(BlockNode* block);
+  Fragment InlineBlockValue(BlockNode* block);
+  Fragment ArmValue(BlockNode* block);
+  Fragment StoreToValueTemp();
+  void CollectLocals(Node* node, LocalScope* scope);
+  void AddLocalName(const std::string& name, LocalScope* scope);
+  LocalVariable* AllocSynth(Node* node, const char* prefix, LocalScope* scope);
+
   Token::Kind MethodKind(const String& name);
   Fragment Unsupported(Node* node, const char* what);
 
@@ -301,6 +337,9 @@ class StGraphBuilder {
   GraphEntryInstr* graph_entry_;
   LocalVariable* this_var_;                       // NULL for a static method
   std::map<std::string, LocalVariable*> locals_;  // params + temps by name
+  LocalVariable* value_temp_;                     // reusable control-flow value temp
+  std::map<Node*, LocalVariable*> synth_;         // per-node synth temps (to:do: limit, cascade rcvr)
+  intptr_t synth_counter_;                        // makes synth-temp names unique
 };
 
 void StGraphBuilder::PrepareScope(MethodNode* method) {
@@ -345,6 +384,16 @@ void StGraphBuilder::PrepareScope(MethodNode* method) {
     locals_[method->temps[i]] = v;
   }
 
+  // Sprint 4: every INLINED block contributes its args/temps to the method
+  // frame, and to:do:/cascades need synthetic temps. Hoist them all into the
+  // scope BEFORE AllocateVariables (which assigns frame slots once).
+  for (size_t i = 0; i < method->statements.size(); i++) {
+    CollectLocals(method->statements[i].get(), scope);
+  }
+  // A single reusable temp to materialize control-flow expression values.
+  value_temp_ = MakeLocal(":cfval");
+  scope->AddVariable(value_temp_);
+
   // Assign frame slots (first_parameter_index_, first_stack_local_index_,
   // num_stack_locals_) — must happen before any LoadLocal.
   pf_->AllocateVariables();
@@ -387,7 +436,13 @@ Fragment StGraphBuilder::TranslateExpression(Node* node) {
   if (AssignNode* n = dynamic_cast<AssignNode*>(node)) {
     return TranslateAssign(n);
   }
+  if (CascadeNode* n = dynamic_cast<CascadeNode*>(node)) {
+    return TranslateCascade(n);
+  }
   if (MessageNode* n = dynamic_cast<MessageNode*>(node)) {
+    if (IsInlinableControlFlow(n)) {
+      return TranslateControlFlow(n, /*value_context=*/true);
+    }
     return TranslateMessage(n);
   }
   return Unsupported(node, "expression");
@@ -447,6 +502,340 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
   return instructions;
 }
 
+// ---------------------------------------------------------------------------
+// Sprint 4: inlined control flow + cascades. Blocks passed to the control-flow
+// selectors are INLINED (their statements compiled in place), so `^` inside a
+// conditional is a plain Return and no first-class closure is created. Real
+// closures (value:/ClosureCall) remain a later sprint.
+// ---------------------------------------------------------------------------
+
+static bool IsBlockNode(Node* n) { return dynamic_cast<BlockNode*>(n) != NULL; }
+
+void StGraphBuilder::AddLocalName(const std::string& name, LocalScope* scope) {
+  if (name == "self" || name == "super") return;
+  if (locals_.find(name) != locals_.end()) return;  // dedup: a shadow shares it
+  LocalVariable* v = MakeLocal(name);
+  scope->AddVariable(v);
+  locals_[name] = v;
+}
+
+LocalVariable* StGraphBuilder::AllocSynth(Node* node, const char* prefix,
+                                          LocalScope* scope) {
+  char buf[32];
+  snprintf(buf, sizeof(buf), ":%s%ld", prefix,
+           static_cast<long>(synth_counter_++));
+  LocalVariable* v = MakeLocal(buf);
+  scope->AddVariable(v);
+  synth_[node] = v;
+  return v;
+}
+
+// Pre-pass: hoist every inlined-block local + allocate per-node synth temps so
+// AllocateVariables (which runs once) gives them frame slots.
+void StGraphBuilder::CollectLocals(Node* node, LocalScope* scope) {
+  if (node == NULL) return;
+  if (AssignNode* a = dynamic_cast<AssignNode*>(node)) {
+    CollectLocals(a->value.get(), scope);
+  } else if (ReturnNode* r = dynamic_cast<ReturnNode*>(node)) {
+    CollectLocals(r->value.get(), scope);
+  } else if (MessageNode* m = dynamic_cast<MessageNode*>(node)) {
+    CollectLocals(m->receiver.get(), scope);
+    for (size_t i = 0; i < m->args.size(); i++) {
+      CollectLocals(m->args[i].get(), scope);
+    }
+    if (m->selector == "to:do:" && m->args.size() == 2 &&
+        IsBlockNode(m->args[1].get())) {
+      AllocSynth(m, "lim", scope);
+    }
+  } else if (BlockNode* b = dynamic_cast<BlockNode*>(node)) {
+    for (size_t i = 0; i < b->args.size(); i++) AddLocalName(b->args[i], scope);
+    for (size_t i = 0; i < b->temps.size(); i++) AddLocalName(b->temps[i], scope);
+    for (size_t i = 0; i < b->statements.size(); i++) {
+      CollectLocals(b->statements[i].get(), scope);
+    }
+  } else if (CascadeNode* c = dynamic_cast<CascadeNode*>(node)) {
+    CollectLocals(c->receiver.get(), scope);
+    for (size_t i = 0; i < c->messages.size(); i++) {
+      CollectLocals(c->messages[i].get(), scope);
+    }
+    AllocSynth(c, "casc", scope);
+  } else if (DynArrayNode* d = dynamic_cast<DynArrayNode*>(node)) {
+    for (size_t i = 0; i < d->elements.size(); i++) {
+      CollectLocals(d->elements[i].get(), scope);
+    }
+  }
+}
+
+bool StGraphBuilder::IsInlinableControlFlow(MessageNode* node) {
+  const std::string& s = node->selector;
+  if (s == "ifTrue:" || s == "ifFalse:" || s == "and:" || s == "or:") {
+    return node->args.size() == 1 && IsBlockNode(node->args[0].get());
+  }
+  if (s == "ifTrue:ifFalse:" || s == "ifFalse:ifTrue:") {
+    return node->args.size() == 2 && IsBlockNode(node->args[0].get()) &&
+           IsBlockNode(node->args[1].get());
+  }
+  if (s == "whileTrue:" || s == "whileFalse:") {
+    return IsBlockNode(node->receiver.get()) && node->args.size() == 1 &&
+           IsBlockNode(node->args[0].get());
+  }
+  if (s == "to:do:") {
+    return node->args.size() == 2 && IsBlockNode(node->args[1].get());
+  }
+  return false;
+}
+
+// Inline a block as a statement sequence (its value discarded).
+Fragment StGraphBuilder::InlineBlockStmts(BlockNode* block) {
+  return TranslateStatements(block->statements);
+}
+
+// Inline a block so its LAST statement's value is left on the stack.
+Fragment StGraphBuilder::InlineBlockValue(BlockNode* block) {
+  if (block->statements.empty()) return NullConstant();
+  Fragment instructions;
+  for (size_t i = 0; i < block->statements.size(); i++) {
+    if (instructions.is_closed()) return instructions;  // dead code after ^
+    Node* stmt = block->statements[i].get();
+    const bool last = (i + 1 == block->statements.size());
+    if (last && dynamic_cast<ReturnNode*>(stmt) == NULL) {
+      instructions += TranslateExpression(stmt);  // leave the value
+    } else {
+      instructions += TranslateStatement(stmt);   // effect, or a closing ^
+    }
+  }
+  return instructions;
+}
+
+// Pop the value on top and stash it in value_temp_ (leaving the stack empty).
+Fragment StGraphBuilder::StoreToValueTemp() {
+  Fragment instructions;
+  instructions += StoreLocal(value_temp_);  // pops value, pushes stored value...
+  instructions += Drop();                   // ...which we discard
+  return instructions;
+}
+
+// An if/and/or arm producing a value: the block's value (or nil for a missing
+// arm) materialized into value_temp_. A block that closed with `^` stores
+// nothing (that path returned from the method).
+Fragment StGraphBuilder::ArmValue(BlockNode* block) {
+  Fragment instructions =
+      (block != NULL) ? InlineBlockValue(block) : NullConstant();
+  if (instructions.is_open()) instructions += StoreToValueTemp();
+  return instructions;
+}
+
+Fragment StGraphBuilder::TranslateControlFlow(MessageNode* node,
+                                              bool value_context) {
+  const std::string& s = node->selector;
+
+  // --- if variants ------------------------------------------------------
+  if (s == "ifTrue:" || s == "ifFalse:" || s == "ifTrue:ifFalse:" ||
+      s == "ifFalse:ifTrue:") {
+    BlockNode* then_block = NULL;
+    BlockNode* else_block = NULL;
+    if (s == "ifTrue:") {
+      then_block = dynamic_cast<BlockNode*>(node->args[0].get());
+    } else if (s == "ifFalse:") {
+      else_block = dynamic_cast<BlockNode*>(node->args[0].get());
+    } else if (s == "ifTrue:ifFalse:") {
+      then_block = dynamic_cast<BlockNode*>(node->args[0].get());
+      else_block = dynamic_cast<BlockNode*>(node->args[1].get());
+    } else {  // ifFalse:ifTrue:
+      else_block = dynamic_cast<BlockNode*>(node->args[0].get());
+      then_block = dynamic_cast<BlockNode*>(node->args[1].get());
+    }
+
+    Fragment instructions = TranslateExpression(node->receiver.get());
+    TargetEntryInstr* then_entry;
+    TargetEntryInstr* otherwise_entry;
+    instructions += BranchIfTrue(&then_entry, &otherwise_entry);
+
+    Fragment then_fragment(then_entry);
+    Fragment otherwise_fragment(otherwise_entry);
+    if (value_context) {
+      then_fragment += ArmValue(then_block);
+      otherwise_fragment += ArmValue(else_block);
+    } else {
+      if (then_block != NULL) then_fragment += InlineBlockStmts(then_block);
+      if (else_block != NULL) otherwise_fragment += InlineBlockStmts(else_block);
+    }
+
+    Fragment result;
+    if (then_fragment.is_open() && otherwise_fragment.is_open()) {
+      JoinEntryInstr* join = BuildJoinEntry();
+      then_fragment += Goto(join);
+      otherwise_fragment += Goto(join);
+      result = Fragment(instructions.entry, join);
+    } else if (then_fragment.is_open()) {
+      result = Fragment(instructions.entry, then_fragment.current);
+    } else if (otherwise_fragment.is_open()) {
+      result = Fragment(instructions.entry, otherwise_fragment.current);
+    } else {
+      result = instructions.closed();
+    }
+    if (value_context && result.is_open()) result += LoadLocal(value_temp_);
+    return result;
+  }
+
+  // --- and: / or: (short-circuit; always yields a bool) -----------------
+  if (s == "and:" || s == "or:") {
+    BlockNode* block = dynamic_cast<BlockNode*>(node->args[0].get());
+    Fragment instructions = TranslateExpression(node->receiver.get());
+    TargetEntryInstr* then_entry;
+    TargetEntryInstr* otherwise_entry;
+    instructions += BranchIfTrue(&then_entry, &otherwise_entry);
+
+    Fragment then_fragment(then_entry);
+    Fragment otherwise_fragment(otherwise_entry);
+    if (s == "and:") {
+      then_fragment += ArmValue(block);
+      otherwise_fragment += Constant(Bool::False());
+      otherwise_fragment += StoreToValueTemp();
+    } else {  // or:
+      then_fragment += Constant(Bool::True());
+      then_fragment += StoreToValueTemp();
+      otherwise_fragment += ArmValue(block);
+    }
+
+    Fragment result;
+    if (then_fragment.is_open() && otherwise_fragment.is_open()) {
+      JoinEntryInstr* join = BuildJoinEntry();
+      then_fragment += Goto(join);
+      otherwise_fragment += Goto(join);
+      result = Fragment(instructions.entry, join);
+    } else if (then_fragment.is_open()) {
+      result = Fragment(instructions.entry, then_fragment.current);
+    } else if (otherwise_fragment.is_open()) {
+      result = Fragment(instructions.entry, otherwise_fragment.current);
+    } else {
+      result = instructions.closed();
+    }
+    if (result.is_open()) result += LoadLocal(value_temp_);
+    return result;  // a value; the caller Drops it in statement position
+  }
+
+  // --- whileTrue: / whileFalse: -----------------------------------------
+  if (s == "whileTrue:" || s == "whileFalse:") {
+    BlockNode* cond_block = dynamic_cast<BlockNode*>(node->receiver.get());
+    BlockNode* body_block = dynamic_cast<BlockNode*>(node->args[0].get());
+    Fragment condition = InlineBlockValue(cond_block);  // pushes the bool
+    TargetEntryInstr* body_entry;
+    TargetEntryInstr* loop_exit;
+    if (s == "whileTrue:") {
+      condition += BranchIfTrue(&body_entry, &loop_exit);
+    } else {  // whileFalse: — loop while the condition is false
+      condition += BranchIfTrue(&loop_exit, &body_entry);
+    }
+    Fragment body(body_entry);
+    body += InlineBlockStmts(body_block);
+    Instruction* entry;
+    if (body.is_open()) {
+      JoinEntryInstr* join = BuildJoinEntry();
+      body += Goto(join);
+      Fragment loop(join);
+      loop += CheckStackOverflow();
+      loop += condition;
+      entry = new (zone_) GotoInstr(join);
+    } else {
+      entry = condition.entry;
+    }
+    Fragment result(entry, loop_exit);
+    if (value_context) result += NullConstant();  // a loop's value is nil
+    return result;
+  }
+
+  // --- to:do: (a counting loop) -----------------------------------------
+  if (s == "to:do:") {
+    BlockNode* block = dynamic_cast<BlockNode*>(node->args[1].get());
+    LocalVariable* i =
+        (block->args.size() >= 1) ? LookupLocal(block->args[0]) : NULL;
+    LocalVariable* limit = synth_.count(node) ? synth_[node] : NULL;
+    if (i == NULL || limit == NULL) {
+      return Unsupported(node, "to:do: without a bound loop variable");
+    }
+    const String& le = String::ZoneHandle(zone_, Symbols::New(thread_, "<="));
+    const String& plus = String::ZoneHandle(zone_, Symbols::New(thread_, "+"));
+
+    Fragment instructions;
+    instructions += TranslateExpression(node->receiver.get());  // start
+    instructions += StoreLocal(i);
+    instructions += Drop();
+    instructions += TranslateExpression(node->args[0].get());  // stop
+    instructions += StoreLocal(limit);
+    instructions += Drop();
+
+    Fragment condition;
+    condition += LoadLocal(i);
+    condition += PushArgument();
+    condition += LoadLocal(limit);
+    condition += PushArgument();
+    condition += InstanceCall(le, Token::kLTE, 2, 2);
+    TargetEntryInstr* body_entry;
+    TargetEntryInstr* loop_exit;
+    condition += BranchIfTrue(&body_entry, &loop_exit);
+
+    Fragment body(body_entry);
+    body += InlineBlockStmts(block);
+    body += LoadLocal(i);
+    body += PushArgument();
+    body += IntConstant(1);
+    body += PushArgument();
+    body += InstanceCall(plus, Token::kADD, 2, 2);
+    body += StoreLocal(i);
+    body += Drop();
+
+    Instruction* entry;
+    if (body.is_open()) {
+      JoinEntryInstr* join = BuildJoinEntry();
+      body += Goto(join);
+      Fragment loop(join);
+      loop += CheckStackOverflow();
+      loop += condition;
+      entry = new (zone_) GotoInstr(join);
+    } else {
+      entry = condition.entry;
+    }
+    instructions += Fragment(entry, loop_exit);
+    if (value_context) instructions += NullConstant();
+    return instructions;
+  }
+
+  return Unsupported(node, "control-flow selector");
+}
+
+// recv m1; m2; m3  ->  eval recv once into a temp, send each message to it; the
+// cascade's value is the last message's result.
+Fragment StGraphBuilder::TranslateCascade(CascadeNode* node) {
+  LocalVariable* recv = synth_.count(node) ? synth_[node] : NULL;
+  if (recv == NULL) return Unsupported(node, "cascade (no receiver temp)");
+  Fragment instructions = TranslateExpression(node->receiver.get());
+  instructions += StoreLocal(recv);
+  instructions += Drop();
+  for (size_t k = 0; k < node->messages.size(); k++) {
+    MessageNode* m = dynamic_cast<MessageNode*>(node->messages[k].get());
+    if (m == NULL) {
+      instructions += Unsupported(node->messages[k].get(), "cascade message");
+      instructions += Drop();
+      continue;
+    }
+    instructions += LoadLocal(recv);
+    instructions += PushArgument();
+    for (size_t a = 0; a < m->args.size(); a++) {
+      instructions += TranslateExpression(m->args[a].get());
+      instructions += PushArgument();
+    }
+    const String& sel =
+        String::ZoneHandle(zone_, Symbols::New(thread_, m->selector.c_str()));
+    const Token::Kind kind = MethodKind(sel);
+    const intptr_t argc = 1 + static_cast<intptr_t>(m->args.size());
+    const intptr_t nchecked = (kind != Token::kILLEGAL) ? argc : 1;
+    instructions += InstanceCall(sel, kind, argc, nchecked);  // pushes result
+    if (k + 1 < node->messages.size()) instructions += Drop();  // keep only last
+  }
+  return instructions;
+}
+
 Fragment StGraphBuilder::TranslateStatement(Node* node) {
   if (ReturnNode* r = dynamic_cast<ReturnNode*>(node)) {
     Fragment instructions = (r->value != nullptr)
@@ -454,6 +843,15 @@ Fragment StGraphBuilder::TranslateStatement(Node* node) {
                                 : NullConstant();
     instructions += Return();
     return instructions;
+  }
+  // Control-flow messages in statement position (if/while/to:do:) leave NO value
+  // — translate them directly, no trailing Drop. and:/or: are value operators,
+  // so they fall through to the generic expression+Drop path below.
+  if (MessageNode* m = dynamic_cast<MessageNode*>(node)) {
+    if (IsInlinableControlFlow(m) && m->selector != "and:" &&
+        m->selector != "or:") {
+      return TranslateControlFlow(m, /*value_context=*/false);
+    }
   }
   // An expression statement: evaluate for its effect, discard the value.
   Fragment instructions = TranslateExpression(node);

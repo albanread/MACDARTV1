@@ -300,8 +300,13 @@ Plus a snapshot on each surface for the visual.
   (three tabs: inputs, a list, and a scrolling form).
 - **M4 — liveness polish.** Re-run on Accept and on resize, error banner,
   `canvas` widget over the Pixmap path, Apps menu.
-- **M5 — standalone.** `dartui --app Calc`: the same class from the same image,
-  its own process, no workspace chrome. The reason §2 exists.
+- **M5 — standalone.** ✅ DONE. `dartui … workspace.dart --app <Class>` (or
+  `MACDART_APP=<Class>`, or `./start-gui.sh --app <Class>`) runs one image class
+  full-window, no IDE chrome — same class, same image, same hot reload, in the
+  language isolate as always. `main` reads the arg/env, `buildStandaloneWindow`
+  makes a bare window (app surface + a Quit menu) instead of the IDE, and
+  `appRun` uses the pane's real size and skips the tab switch. `log` is now
+  null-safe (no transcript standalone).
 
 ## 11. Decisions locked, and what is still open
 

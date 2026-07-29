@@ -313,6 +313,50 @@ void clearUndo() {
   if (!um.isNil) um.removeAllActions();
 }
 
+bool gStandalone = false;             // running one image class as a windowed app
+
+/// `dartui --app <Class>` (or `MACDART_APP=<Class>`): the class to run standalone.
+/// Name from a script arg or the env var; null = the normal IDE.
+String _standaloneAppName(List<String> args) {
+  if (args != null) {
+    for (var i = 0; i < args.length; i++) {
+      if (args[i] == '--app' && i + 1 < args.length) return args[i + 1];
+      if (args[i].startsWith('--app=')) return args[i].substring(6);
+    }
+  }
+  var e = Platform.environment['MACDART_APP'];
+  return (e != null && e.trim().isNotEmpty) ? e.trim() : null;
+}
+
+/// A minimal window: the app surface fills the whole content, plus a Quit menu.
+/// The app runs in the language isolate exactly as on the App tab — the same
+/// class, the same image, the same hot reload — just without the IDE chrome.
+void buildStandaloneWindow(String title) {
+  gStandalone = true;
+  Cocoa.cls("NSProcessInfo").processInfo().setProcessName(title);
+  var app = Cocoa.cls("NSApplication").sharedApplication();
+  var mainMenu = Cocoa.cls("NSMenu").alloc().init();
+  var appItem = Cocoa.cls("NSMenuItem").alloc().init();
+  mainMenu.addItem(appItem);
+  var appMenu = Cocoa.cls("NSMenu").alloc().init();
+  appItem.setSubmenu(appMenu);
+  stdItem(appMenu, "Quit " + title, "q", "terminate:");
+  app.setMainMenu(mainMenu);
+
+  gWindow = Cocoa.cls("NSWindow").alloc().initWithContentRect(
+      [0.0, 0.0, 900.0, 600.0], styleMask: 15, backing: 2, defer: false);
+  gWindow.setTitle(title);
+  gWindow.setContentMinSize([320.0, 240.0]);
+  gContent = gWindow.contentView();
+  gAppPane = Cocoa.cls("NSView").alloc().initWithFrame([0.0, 0.0, 900.0, 600.0]);
+  gAppPane.setAutoresizingMask(kWidthSizable + kHeightSizable);
+  gAppPane.setAutoresizesSubviews(false);
+  gContent.addSubview(gAppPane);
+  gWindow.center();
+  gWindow.makeKeyAndOrderFront(null);
+  app.activateIgnoringOtherApps(true);
+}
+
 void buildWindow() {
   gWindow = Cocoa.cls("NSWindow").alloc().initWithContentRect(
       [0.0, 0.0, 900.0, 640.0], styleMask: 15, backing: 2, defer: false);
@@ -492,8 +536,10 @@ void repaint() {
 void log(String line) {
   gLog.add(line);
   if (gLog.length > 200) gLog = gLog.sublist(gLog.length - 200);
-  gTranscript.setString(gLog.join("\n"));
-  gTranscript.scrollToEndOfDocument(null);
+  if (gTranscript != null) {                 // no transcript in a standalone app window
+    gTranscript.setString(gLog.join("\n"));
+    gTranscript.scrollToEndOfDocument(null);
+  }
   repaint();   // async/callback updates run outside AppKit's event flush
 }
 
@@ -4468,9 +4514,11 @@ void appWatchResize() {
 }
 
 Future appRun(String name) async {
-  switchTab(7);
+  if (!gStandalone) switchTab(7);
   appStatus("starting " + name + "…");
-  var r = await ask('apprun', <dynamic>[name, kAppW, appPaneHeight()]);
+  var b = gAppPane.bounds();               // the surface's real size (full window standalone)
+  var w = (b is List && b.length >= 3) ? (b[2] as num).toDouble() : kAppW;
+  var r = await ask('apprun', <dynamic>[name, w, appPaneHeight()]);
   var s = r.toString();
   if (s.startsWith('ERR')) {
     gAppName = null;
@@ -5499,10 +5547,12 @@ ARCHITECTURE
   extension — macdart/tcl/dartui.tcl), and pushed events.
 ''';
 
-main() async {
+main(List<String> args) async {
   gAssets = Platform.script.resolve('assets/').toFilePath();   // icons + texture
   initEvents();     // AppKit callbacks re-enter through this port — see [defer]
-  buildWindow();
+  var standaloneApp = _standaloneAppName(args);
+  if (standaloneApp != null) buildStandaloneWindow(standaloneApp);
+  else buildWindow();
 
   // The language isolate hot-reloads (rewrites) its own root file, so spawn it
   // from a MUTABLE COPY of the tracked language.dart template, never the source.
@@ -5517,8 +5567,10 @@ main() async {
   await spawnLanguage();
   log("language isolate ready — image: " + gDbPath);
   keyWatch();       // record held keys app-wide; games poll it via pull ticks
-  startMetrics();   // ~4 Hz VM counters in the toolbar
-  snapshotLastGood();
+  if (!gStandalone) {
+    startMetrics();   // ~4 Hz VM counters in the toolbar (no toolbar standalone)
+    snapshotLastGood();
+  }
 
   // ONE listener: the vm-service. Control rides it as the ext.dartui.send
   // extension (macdart/tcl/dartui.tcl), introspection is the Observatory
@@ -5529,4 +5581,12 @@ main() async {
   // UI isolate error as fatal, so a workspace that failed to load exits instead
   // of sitting there as a process with no window.
   wsUiReady();
+
+  // Standalone: run the requested class now that the language isolate is ready.
+  if (standaloneApp != null) {
+    await appRun(standaloneApp);
+    if (gAppName == null) {
+      gWindow.setTitle(standaloneApp + " — not found in the image");
+    }
+  }
 }

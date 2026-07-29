@@ -777,8 +777,15 @@ class AppSurface {
   void pane() { _cmd(<dynamic>['container', null, 0]); }
 
   /// A drawing surface. Paint it with draw(id, ops) — the same op vocabulary the
-  /// demos use. `bg` (an [r,g,b] 0..1) is an optional initial fill.
-  void canvas(String id, {List frame, List bg}) {
+  /// demos use. `bg` (an [r,g,b] 0..1) is an optional initial fill. onClick(x,y)
+  /// fires on a click, in top-left canvas coordinates.
+  void canvas(String id, {List frame, List bg, Function onClick}) {
+    if (onClick != null) _on(id, 'click', (s) {
+      var parts = s.toString().split(',');
+      var x = parts.length > 0 ? double.parse(parts[0], (_) => 0.0) : 0.0;
+      var y = parts.length > 1 ? double.parse(parts[1], (_) => 0.0) : 0.0;
+      onClick(x, y);
+    });
     _cmd(<dynamic>['add', 'canvas', id, <String, dynamic>{'frame': frame, 'bg': bg}]);
   }
 

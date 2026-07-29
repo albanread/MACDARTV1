@@ -43,8 +43,12 @@ class Gallery {
     ui.button('go', title: 'Fire', frame: rows[4], enabled: armed,
               onClick: (_) => status(ui, 'fired at level ' + _pct(level) + ' (' + colour + ')'));
     // a canvas the slider fills, in the popup's colour — custom drawing beside
-    // the native controls, on the same surface
-    ui.canvas('cv', frame: [12.0, 198.0, 380.0, 40.0], bg: [0.12, 0.12, 0.14]);
+    // the native controls; click it to drop a marker and report the point
+    ui.canvas('cv', frame: [12.0, 198.0, 380.0, 40.0], bg: [0.12, 0.12, 0.14],
+              onClick: (x, y) {
+                status(ui, 'canvas click at ' + x.round().toString() + ', ' + y.round().toString());
+                ui.draw('cv', [['oval', x - 4.0, y - 4.0, 8.0, 8.0, 1.0, 1.0, 1.0, true]]);
+              });
 
     // --- tab 1: a scrolling list --------------------------------------------
     ui.tab('tabs', 1);

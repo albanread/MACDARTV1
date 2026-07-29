@@ -2011,6 +2011,14 @@ Future<String> handle(String line) async {
       var s = appValueOf(arg.trim());
       return s == null ? "ERR: no widget " + arg.trim() : s;
     }
+    case 'appcanvasclick': {             // "appcanvasclick <id> <x> <y>" — drive a canvas click
+      var parts = arg.trim().split(new RegExp(r'\s+'));
+      if (parts.length < 3) return "ERR: appcanvasclick <id> <x> <y>";
+      if (gAppKinds[parts[0]] != 'canvas') return "ERR: no canvas " + parts[0];
+      appFire(parts[0], 'click', parts[1] + ',' + parts[2]);
+      await appSettle();
+      return "ok";
+    }
     case 'apptab': {                     // "apptab <tabsId> <index>" — show a tab
       var parts = arg.trim().split(new RegExp(r'\s+'));
       if (parts.length < 2) return "ERR: apptab <tabsId> <index>";
@@ -4322,6 +4330,21 @@ void appAdd(String kind, String id, Map p) {
     if (p['bg'] is List && p['bg'].length >= 3) {   // optional initial fill
       renderInto(img, cw, ch, <dynamic>[<dynamic>['clear', p['bg'][0], p['bg'][1], p['bg'][2]]]);
     }
+    // Clicks: a gesture recogniser fires the same proxy action a button does
+    // (Cocoa_wireAction is generic). The point comes back bottom-left in view
+    // coords; flip to top-left canvas coords to match the draw ops.
+    var gr = Cocoa.cls("NSClickGestureRecognizer").alloc().init();
+    v.addGestureRecognizer(gr);
+    var cvView = v, cvH = ch;
+    gTargets.add(onAction(gr, (s) => defer(() {
+      var pt = gr.locationInView(cvView);
+      var x = 0.0, y = 0.0;
+      if (pt is List && pt.length >= 2) {
+        x = (pt[0] as num).toDouble();
+        y = (pt[1] as num).toDouble();
+      }
+      appFire(id, 'click', x.toStringAsFixed(1) + ',' + (cvH - y).toStringAsFixed(1));
+    })));
   } else if (kind == 'scroll') {
     // A viewport whose document view can be LARGER than the frame, so an app
     // taller/wider than the pane scrolls. Widgets route into the document view.

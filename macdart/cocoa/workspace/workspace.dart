@@ -1919,6 +1919,13 @@ Future<String> handle(String line) async {
       await appEdit();
       return gEdClass == null ? "ERR: nothing to edit" : "editing " + gEdClass;
     }
+    case 'appremove': {
+      // Optional arg selects the class; with none, the picker's selection goes.
+      var want = arg.trim();
+      if (want.isNotEmpty && gAppPicker != null) gAppPicker.selectItemWithTitle(want);
+      await appUninstall();
+      return gAppStatusLbl.stringValue().UTF8String();
+    }
     case 'appstatus': return gAppName == null ? "idle" : "running " + gAppName;
     case 'apptree': {
       if (gAppName == null) return "(no app running)";
@@ -3996,8 +4003,10 @@ void buildAppTab(Cocoa ap) {
   // through the Editor tab like any other class, and Save to Image commits it —
   // which hot-reloads and re-runs build(), so the app keeps its state.
   button(ap, "Edit", [386.0, 390.0, 60.0, 26.0], (s) => appEdit());
-  pinTop(<String>["Run", "Stop App", "Edit"]);
-  gAppTitleLbl = label(ap, [452.0, 394.0, 200.0, 16.0]);
+  // The inverse of installing: delete the picked class from the image.
+  button(ap, "Remove", [450.0, 390.0, 76.0, 26.0], (s) => appUninstall());
+  pinTop(<String>["Run", "Stop App", "Edit", "Remove"]);
+  gAppTitleLbl = label(ap, [534.0, 394.0, 200.0, 16.0]);
   gAppTitleLbl.setAutoresizingMask(kMinYMargin);
   gAppStatusLbl = label(ap, [8.0, 366.0, 852.0, 16.0]);
   gAppStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
@@ -4233,6 +4242,32 @@ Future appRun(String name) async {
 /// Open the app's own source in the Editor. The running app if there is one,
 /// otherwise whatever is selected in the picker — so it also works as "show me
 /// what I am about to run".
+/// The inverse of installing an app: delete the picker's class from the image
+/// (the language isolate's 'remove' drops it from the decls AND the SQLite DB,
+/// then hot-reloads — so it is gone live, not just on disk). A running app is
+/// stopped first so the pane is not left showing a class that no longer
+/// exists. Recoverable: shipped examples reinstall from the Apps menu, and an
+/// open Editor buffer can Save to Image to bring a user class back.
+Future appUninstall() async {
+  if (gAppPicker == null || gAppPicker.numberOfItems() == 0) {
+    appStatus("nothing to remove — the image has no app classes");
+    return;
+  }
+  var name = gAppPicker.titleOfSelectedItem().UTF8String();
+  if (name == gAppName) await appStop();
+  var r = (await ask('remove', name)).toString();
+  if (r.startsWith('removed')) {
+    appStatus("removed " + name + " from the image (Apps menu reinstalls the examples)");
+    log("✓ app removed — " + name);
+  } else {
+    appStatus("remove failed — " + r);
+    log("✗ app remove — " + r);
+  }
+  appRefreshList();
+  _reloadClassList();
+  editorRefreshClasses();
+}
+
 Future appEdit() async {
   var name = gAppName;
   if (name == null && gAppPicker != null && gAppPicker.numberOfItems() > 0) {
@@ -5125,6 +5160,10 @@ MENUS
   Apps   install an example from apps/ into the image and run it. In the App
          pane, Edit opens the running app's own source in the Editor; Save to
          Image commits it, and the app rebuilds while keeping its state.
+         Remove is install's inverse: it deletes the picked class from the
+         image (DB + live, via hot reload), stopping it first if running —
+         examples reinstall from this menu, and an open Editor buffer can
+         Save to Image to bring a class back.
   View   the tabs, and Clear Transcript (Cmd-K).
 
 EDITOR

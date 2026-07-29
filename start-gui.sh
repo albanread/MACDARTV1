@@ -12,6 +12,8 @@
 #                                  plane: no Tcl driving, no debugger Attach)
 #   ./start-gui.sh --app <Class>   run ONE class from the image as a standalone
 #                                  windowed app, no IDE (install it first)
+#   ./start-gui.sh --game <Name>   run a game/demo standalone (add --fullscreen
+#                                  to launch a game pane straight to full screen)
 #
 # `dartui` is the GUI host: the `dart` binary plus a thread-0 AppKit host, so the
 # UI isolate runs where AppKit is legal. It takes the workspace script as its
@@ -33,7 +35,7 @@ LOG=/tmp/macdart-gui.log
 LAST_GOOD="$HOME/.macdart/workspace.last-good.dart"
 
 background=0 rebuild=0 fresh=0 restore=0 supervise=0
-observe=1 obsport=8181 appname=""
+observe=1 obsport=8181 appname="" gamename="" wantfull=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -b|--background) background=1 ;;
@@ -45,7 +47,11 @@ while [ $# -gt 0 ]; do
     --observe=*)     obsport="${1#--observe=}" ;;
     --app)           appname="${2:?--app needs a class name}"; shift ;;
     --app=*)         appname="${1#--app=}" ;;
-    -h|--help)       sed -n '3,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --game|--demo)   gamename="${2:?--game needs a name}"; shift ;;
+    --game=*)        gamename="${1#--game=}" ;;
+    --demo=*)        gamename="${1#--demo=}" ;;
+    --fullscreen|--full) wantfull=1 ;;
+    -h|--help)       sed -n '3,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "start-gui.sh: unknown option '$1' (try --help)" >&2; exit 2 ;;
   esac
   shift
@@ -126,7 +132,9 @@ if [ "$observe" = 1 ]; then
 fi
 
 POST=()
-[ -n "$appname" ] && POST=(--app "$appname")
+[ -n "$appname" ] && POST+=(--app "$appname")
+[ -n "$gamename" ] && POST+=(--game "$gamename")
+[ "$wantfull" = 1 ] && POST+=(--fullscreen)
 
 echo "image:   $IMAGE"
 

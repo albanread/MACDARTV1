@@ -382,3 +382,15 @@ headless verification.
   compiled at runtime; a bad shader must fail as a logged error, never an
   abort);
 - ABC tunes in M4 or deferred entirely.
+
+## Standalone game windows (done)
+
+`dartui … workspace.dart --game <Name>` (or `--demo <Name>`, `MACDART_GAME=`,
+`./start-gui.sh --game <Name>`) runs a game/demo in its own bare window, no IDE:
+`buildStandaloneGameWindow` makes a full-window `gDemoView`, and the game pane
+opens over it exactly as on the Demos tab (`gpEnter` uses the view's frame +
+superview), scaled 2× from 424×240. Add `--fullscreen` to open straight into
+the game pane's fullscreen (reuses `gpFullscreen`, the Full button's path; the
+flag is checked once in `gpEnter`). `runDemoAt` skips the tab switch and the
+`renderDemo` redisplay guard widens for standalone (so canvas demos present
+too, not just Metal games). Same standalone plumbing as the app pane's `--app`.

@@ -331,18 +331,23 @@ String _standaloneAppName(List<String> args) {
 /// A minimal window: the app surface fills the whole content, plus a Quit menu.
 /// The app runs in the language isolate exactly as on the App tab — the same
 /// class, the same image, the same hot reload — just without the IDE chrome.
-void buildStandaloneWindow(String title) {
-  gStandalone = true;
+bool gStandaloneFullscreen = false;   // a --game launched with --fullscreen
+
+// The app menu (Quit) both standalone windows share.
+void _standaloneMenu(String title) {
   Cocoa.cls("NSProcessInfo").processInfo().setProcessName(title);
-  var app = Cocoa.cls("NSApplication").sharedApplication();
   var mainMenu = Cocoa.cls("NSMenu").alloc().init();
   var appItem = Cocoa.cls("NSMenuItem").alloc().init();
   mainMenu.addItem(appItem);
   var appMenu = Cocoa.cls("NSMenu").alloc().init();
   appItem.setSubmenu(appMenu);
   stdItem(appMenu, "Quit " + title, "q", "terminate:");
-  app.setMainMenu(mainMenu);
+  Cocoa.cls("NSApplication").sharedApplication().setMainMenu(mainMenu);
+}
 
+void buildStandaloneWindow(String title) {
+  gStandalone = true;
+  _standaloneMenu(title);
   gWindow = Cocoa.cls("NSWindow").alloc().initWithContentRect(
       [0.0, 0.0, 900.0, 600.0], styleMask: 15, backing: 2, defer: false);
   gWindow.setTitle(title);
@@ -354,7 +359,53 @@ void buildStandaloneWindow(String title) {
   gContent.addSubview(gAppPane);
   gWindow.center();
   gWindow.makeKeyAndOrderFront(null);
-  app.activateIgnoringOtherApps(true);
+  Cocoa.cls("NSApplication").sharedApplication().activateIgnoringOtherApps(true);
+}
+
+/// `dartui … --game <Name>` / `--demo <Name>` (or `MACDART_GAME=<Name>`): the
+/// game/demo to run standalone.
+String _standaloneGameName(List<String> args) {
+  if (args != null) {
+    for (var i = 0; i < args.length; i++) {
+      if ((args[i] == '--game' || args[i] == '--demo') && i + 1 < args.length) return args[i + 1];
+      if (args[i].startsWith('--game=')) return args[i].substring(7);
+      if (args[i].startsWith('--demo=')) return args[i].substring(7);
+    }
+  }
+  var e = Platform.environment['MACDART_GAME'];
+  return (e != null && e.trim().isNotEmpty) ? e.trim() : null;
+}
+
+/// [title, path] of the demo/game whose title or filename contains `name`.
+List<String> _resolveDemo(String name) {
+  var want = name.toLowerCase();
+  for (var d in scanDemos()) {
+    if (d[0].toLowerCase().contains(want) ||
+        d[1].split('/').last.toLowerCase().contains(want)) return d;
+  }
+  return null;
+}
+
+/// A bare window hosting the demo/game surface: the game pane opens OVER a
+/// full-window gDemoView exactly as it does on the Demos tab (gpEnter uses
+/// gDemoView's frame + superview), so games and canvas demos both just work.
+void buildStandaloneGameWindow(String title) {
+  gStandalone = true;
+  _standaloneMenu(title);
+  gWindow = Cocoa.cls("NSWindow").alloc().initWithContentRect(
+      [0.0, 0.0, 848.0, 480.0], styleMask: 15, backing: 2, defer: false);  // 2x a 424x240 game
+  gWindow.setTitle(title);
+  gWindow.setContentMinSize([424.0, 240.0]);
+  gContent = gWindow.contentView();
+  gDemoImage = Cocoa.cls("NSImage").alloc().initWithSize([kDemoW, kDemoH]);
+  gDemoView = Cocoa.cls("NSImageView").alloc().initWithFrame([0.0, 0.0, 848.0, 480.0]);
+  gDemoView.setImageScaling(3);        // proportional up/down — pixel-doubles the game
+  gDemoView.setImage(gDemoImage);
+  gDemoView.setAutoresizingMask(kWidthSizable + kHeightSizable);
+  gContent.addSubview(gDemoView);
+  gWindow.center();
+  gWindow.makeKeyAndOrderFront(null);
+  Cocoa.cls("NSApplication").sharedApplication().activateIgnoringOtherApps(true);
 }
 
 void buildWindow() {
@@ -3561,6 +3612,9 @@ void gpEnter(List cmds) {
     var e = gpApply(rest);
     if (e != null) log("⚠ gp: " + e.toString());
   }
+  // A standalone game launched with --fullscreen goes fullscreen as soon as its
+  // pane exists (once, then clear the flag so re-opens stay windowed).
+  if (gStandaloneFullscreen) { gStandaloneFullscreen = false; gpFullscreen(true); }
 }
 
 void gpLeave() {
@@ -3697,7 +3751,7 @@ void renderDemo(List cmds) {
   renderInto(gDemoImage, kDemoW, kDemoH, cmds);
   // Off the Demos tab, keep rendering (the demo is live) but skip the window
   // redisplay — no point repainting pixels nobody can see at 30fps.
-  if (gTab == 6 && gDemoView != null) {
+  if ((gTab == 6 || gStandalone) && gDemoView != null) {
     gDemoView.setImage(gDemoImage);    // never trust the view's cached rep
     gDemoView.setNeedsDisplay(true);
     repaint();
@@ -3746,7 +3800,7 @@ Future runDemoAt(String title, String path) async {
   gDemoPaints = 0;
   gDemoFinished = false;
   gDemoTitle = title;
-  switchTab(6);
+  if (!gStandalone) switchTab(6);
   demoStatus("starting " + title + "…");
   gDemoPort = new ReceivePort();
   gDemoErrPort = new ReceivePort();
@@ -5579,8 +5633,16 @@ main(List<String> args) async {
   gAssets = Platform.script.resolve('assets/').toFilePath();   // icons + texture
   initEvents();     // AppKit callbacks re-enter through this port — see [defer]
   var standaloneApp = _standaloneAppName(args);
-  if (standaloneApp != null) buildStandaloneWindow(standaloneApp);
-  else buildWindow();
+  var standaloneGame = _standaloneGameName(args);
+  if (standaloneApp != null) {
+    buildStandaloneWindow(standaloneApp);
+  } else if (standaloneGame != null) {
+    buildStandaloneGameWindow(standaloneGame);
+    gStandaloneFullscreen = args != null &&
+        (args.contains('--fullscreen') || args.contains('--full'));
+  } else {
+    buildWindow();
+  }
 
   // The language isolate hot-reloads (rewrites) its own root file, so spawn it
   // from a MUTABLE COPY of the tracked language.dart template, never the source.
@@ -5616,5 +5678,9 @@ main(List<String> args) async {
     if (gAppName == null) {
       gWindow.setTitle(standaloneApp + " — not found in the image");
     }
+  } else if (standaloneGame != null) {
+    var d = _resolveDemo(standaloneGame);
+    if (d != null) await runDemoAt(d[0], d[1]);   // opens the game pane on its first frame
+    else gWindow.setTitle(standaloneGame + " — no such game/demo");
   }
 }

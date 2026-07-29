@@ -35,6 +35,7 @@
 #include "st_ast.h"
 
 #include "vm/ast.h"                   // SequenceNode
+#include "vm/class_finalizer.h"       // FinalizeClass (AllocateObject layout)
 #include "vm/flow_graph.h"            // FlowGraph
 #include "vm/intermediate_language.h" // all the *Instr, Value, Definition
 #include "vm/object.h"                // Function, Class, Type, Integer, Bool...
@@ -289,6 +290,43 @@ class StGraphBuilder {
     Push(call);
     return Fragment(call);
   }
+  Fragment StaticCall(const Function& target, intptr_t argument_count) {
+    ArgumentArray arguments = GetArguments(argument_count);
+    StaticCallInstr* call = new (zone_) StaticCallInstr(
+        TokenPosition::kNoSource, target, /*type_args_len=*/0,
+        Array::null_array(), arguments, ic_data_array_);
+    Push(call);
+    return Fragment(call);
+  }
+  Fragment AllocateObject(const Class& cls) {
+    // The class needs an instance layout (member-finalized) before we allocate;
+    // the on-demand finalize mirrors st_natives.cc.
+    if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
+    // The instruction outlives this HANDLESCOPE (it is read at codegen), so the
+    // class must be a zone handle, not a temporary-scoped one.
+    const Class& zcls = Class::ZoneHandle(zone_, cls.raw());
+    ArgumentArray no_args = new (zone_) ZoneGrowableArray<PushArgumentInstr*>();
+    AllocateObjectInstr* alloc = new (zone_)
+        AllocateObjectInstr(TokenPosition::kNoSource, zcls, no_args);
+    Push(alloc);
+    return Fragment(alloc);
+  }
+  // A Dart getter access `x.name` (receiver already pushed as an argument):
+  // the mangled getter name + Token::kGET, so we read the value rather than
+  // call it. Used for ST unary sends that bridge to a dart:core getter.
+  Fragment Getter(const std::string& dart_name) {
+    ArgumentArray arguments = GetArguments(1);  // the receiver
+    const String& gname = String::ZoneHandle(
+        zone_, Field::GetterSymbol(
+                   String::Handle(zone_, Symbols::New(thread_,
+                                                      dart_name.c_str()))));
+    InstanceCallInstr* call = new (zone_) InstanceCallInstr(
+        TokenPosition::kNoSource, gname, Token::kGET, arguments,
+        /*type_args_len=*/0, Array::null_array(), /*num_args_checked=*/1,
+        ic_data_array_);
+    Push(call);
+    return Fragment(call);
+  }
   Fragment CheckStackOverflow() {
     return Fragment(
         new (zone_) CheckStackOverflowInstr(TokenPosition::kNoSource, 0));
@@ -349,6 +387,12 @@ class StGraphBuilder {
   void CollectLocals(Node* node, LocalScope* scope);
   void AddLocalName(const std::string& name, LocalScope* scope);
   LocalVariable* AllocSynth(Node* node, const char* prefix, LocalScope* scope);
+
+  // Sprint 6: class-side sends (Foo new / a class method) + dart:core aliases.
+  RawClass* ResolveClassName(const std::string& name);
+  Fragment TranslateClassSend(const Class& cls, MessageNode* node);
+  std::string DartSelector(const std::string& st_selector);
+  std::string DartGetter(const std::string& st_selector);
 
   Token::Kind MethodKind(const String& name);
   Fragment Unsupported(Node* node, const char* what);
@@ -485,8 +529,14 @@ Fragment StGraphBuilder::TranslateLiteral(LiteralNode* node) {
       return Constant(Bool::True());
     case LiteralNode::Kind::kFalse:
       return Constant(Bool::False());
+    case LiteralNode::Kind::kString:
+      return Constant(String::ZoneHandle(
+          zone_, String::New(node->text.c_str(), Heap::kOld)));
+    case LiteralNode::Kind::kFloat:
+      return Constant(Double::ZoneHandle(
+          zone_, Double::New(strtod(node->text.c_str(), NULL), Heap::kOld)));
     default:
-      return Unsupported(node, "literal (string/float/symbol/char/array)");
+      return Unsupported(node, "literal (symbol/char/array)");
   }
 }
 
@@ -539,14 +589,47 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
   if (node->receiver == nullptr) {
     return Unsupported(node, "cascade message (no receiver)");
   }
+
+  // A send to a class NAME: `Foo new` allocates, `Foo x: .. y: ..` calls a
+  // class-side (static) method. Only for an identifier that is not a local /
+  // self and resolves to a loaded ST class.
+  if (VariableNode* rv = dynamic_cast<VariableNode*>(node->receiver.get())) {
+    if (rv->name != "self" && rv->name != "super" &&
+        LookupLocal(rv->name) == NULL) {
+      const Class& cls = Class::Handle(zone_, ResolveClassName(rv->name));
+      if (!cls.IsNull()) return TranslateClassSend(cls, node);
+    }
+  }
+
+  // `x yourself` -> x (identity): just the receiver's value.
+  if (node->selector == "yourself" && node->args.empty()) {
+    return TranslateExpression(node->receiver.get());
+  }
+
+  // A unary send that bridges to a dart:core GETTER (`x size` -> `x.length`):
+  // getters read a value, so they use the mangled name + Token::kGET, not a
+  // method call (which would try to invoke the value).
+  if (node->args.empty()) {
+    const std::string getter = DartGetter(node->selector);
+    if (!getter.empty()) {
+      Fragment instructions = TranslateExpression(node->receiver.get());
+      instructions += PushArgument();
+      instructions += Getter(getter);
+      return instructions;
+    }
+  }
+
   Fragment instructions = TranslateExpression(node->receiver.get());
   instructions += PushArgument();
   for (size_t i = 0; i < node->args.size(); i++) {
     instructions += TranslateExpression(node->args[i].get());
     instructions += PushArgument();
   }
+  // Translate the ST selector to its dart:core equivalent (printString ->
+  // toString, = -> ==, ...) so a send reaches the bridged core method.
+  const std::string dart_sel = DartSelector(node->selector);
   const String& selector =
-      String::ZoneHandle(zone_, Symbols::New(thread_, node->selector.c_str()));
+      String::ZoneHandle(zone_, Symbols::New(thread_, dart_sel.c_str()));
   const Token::Kind kind = MethodKind(selector);
   const intptr_t argument_count = 1 + static_cast<intptr_t>(node->args.size());
   // Operators type-check every argument (guide §2.4); a plain send checks 1.
@@ -554,6 +637,72 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
       (kind != Token::kILLEGAL) ? argument_count : 1;
   instructions += InstanceCall(selector, kind, argument_count, num_args_checked);
   return instructions;
+}
+
+// A class name resolves to a loaded ST class in the receiver's own library
+// (same stLoad). Capitalized identifiers only.
+RawClass* StGraphBuilder::ResolveClassName(const std::string& name) {
+  if (name.empty() || name[0] < 'A' || name[0] > 'Z') return Class::null();
+  const Class& owner = Class::Handle(zone_, pf_->function().Owner());
+  if (owner.IsNull()) return Class::null();
+  const Library& lib = Library::Handle(zone_, owner.library());
+  if (lib.IsNull()) return Class::null();
+  const String& sym = String::Handle(zone_, Symbols::New(thread_, name.c_str()));
+  return lib.LookupLocalClass(sym);
+}
+
+// `Foo <sel>`: a class-side (static) method wins; otherwise `new`/`basicNew`
+// allocates a fresh instance. (Class-side method names are NOT aliased —
+// aliases are for dart:core sends, not user methods.)
+Fragment StGraphBuilder::TranslateClassSend(const Class& cls,
+                                            MessageNode* node) {
+  // Member-finalize the target class first — LookupStaticFunction would
+  // otherwise route through EnsureIsFinalized -> the Dart parser, which crashes
+  // on a TokenStream-less ST class (same guard as st_natives.cc).
+  if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
+  const String& sel =
+      String::Handle(zone_, Symbols::New(thread_, node->selector.c_str()));
+  // Zone handle: StaticCallInstr keeps the Function past this HANDLESCOPE (and
+  // asserts IsZoneHandle).
+  const Function& fn =
+      Function::ZoneHandle(zone_, cls.LookupStaticFunction(sel));
+  if (!fn.IsNull()) {
+    Fragment instructions;  // static call: push args only (no receiver)
+    for (size_t i = 0; i < node->args.size(); i++) {
+      instructions += TranslateExpression(node->args[i].get());
+      instructions += PushArgument();
+    }
+    instructions += StaticCall(fn, static_cast<intptr_t>(node->args.size()));
+    return instructions;
+  }
+  if ((node->selector == "new" || node->selector == "basicNew") &&
+      node->args.empty()) {
+    return AllocateObject(cls);
+  }
+  return Unsupported(node, "class-side send (no matching class method)");
+}
+
+// ST selector -> dart:core selector, where they differ. Selectors that already
+// match (+, -, <, abs, ...) pass through. The long tail is filled as needed.
+std::string StGraphBuilder::DartSelector(const std::string& s) {
+  if (s == "=") return "==";
+  if (s == "printString" || s == "displayString" || s == "asString") {
+    return "toString";
+  }
+  if (s == "at:") return "[]";
+  if (s == "at:put:") return "[]=";
+  if (s == ",") return "+";
+  return s;
+}
+
+// ST unary selectors that bridge to a dart:core GETTER (not a method). Empty
+// means "not a getter alias" — fall through to a normal send.
+std::string StGraphBuilder::DartGetter(const std::string& s) {
+  if (s == "size") return "length";
+  if (s == "hash") return "hashCode";
+  if (s == "isEmpty") return "isEmpty";
+  if (s == "isNotEmpty" || s == "notEmpty") return "isNotEmpty";
+  return "";
 }
 
 // ---------------------------------------------------------------------------

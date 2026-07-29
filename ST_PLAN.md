@@ -411,6 +411,21 @@ st_lexer.cc st_parser.cc st_natives.cc)` then add `dart_st` to each
   statics/control-flow/Dart/corpus unaffected. **Deferred**: `Foo new` from ST *source*
   (class-name globals + metaclass tower), real first-class closures (`value:`/
   `ClosureCall`), `super` sends, the closure `^` desugaring.
-- **Next — Sprint 6:** interop breadth (the `dart:core`/`dart:cocoa` selector-alias
-  bridge, `super`/class-name sends, `Foo new` from source), then real closures, the
-  workspace GUI (Sprint 7), and the MACVM A/B benchmark (Sprint 8).
+- **Sprint 6 ✓** — interop breadth, no new VM patch. `Foo new`/`basicNew` and
+  class-side factory sends from ST *source* (class-name resolution + `AllocateObject` /
+  `StaticCall`, target on-demand finalized); string + double literals; a `dart:core`
+  selector-alias bridge — methods (`printString`→`toString`, `=`→`==`, `,`→`+`,
+  `at:`/`at:put:`→`[]`/`[]=`) and getters (`size`→`length`, `hash`→`hashCode`, via the
+  mangled name + `Token::kGET`); `yourself`. ST methods are marked **non-inlinable** in
+  the loader — the optimizer's inliner builds callee graphs itself and would misroute an
+  ST callee to the kernel builder; they still optimize top-level. Verified: a
+  self-contained `Point`/`Demo` program allocates and uses its own instances (`run`→7,
+  `viaFactory`→11), `42 printString`→"42", `'ab','cd'`→"abcd", `'hello world' size`→11,
+  `3=3`→true, `3.5+1.5`→5.0; an ST-calls-ST method is correct through the optimizing
+  compiler (sum 1..40000 = 800020000); all earlier sprints + Dart + the 86-file corpus
+  unaffected. (Two handle-lifetime bugs fixed along the way: `AllocateObject`/`StaticCall`
+  need **zone** handles, not temporary-scoped ones.) **Deferred**: the metaclass tower
+  with class variables + class-side `self`, real first-class closures, `super`.
+- **Next — Sprint 7:** real first-class closures (`[:x|…]` as a value / `ClosureCall` +
+  the non-local `^` desugaring), `super` sends, then the workspace GUI, and the MACVM
+  A/B benchmark (Sprint 8).

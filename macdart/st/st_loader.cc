@@ -276,6 +276,13 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
       }
 
       fn.set_kernel_function(reinterpret_cast<void*>(m));
+      // ST methods are NOT inlinable: the optimizer's inliner builds callee
+      // graphs itself (flow_graph_inliner.cc), and would route an ST-marked
+      // callee to the kernel builder — misreading the st::MethodNode. Marking
+      // them non-inlinable makes the inliner skip them at its CanBeInlined
+      // gate; they still optimize top-level. (Threading an InlineExitCollector
+      // through st::BuildGraph to support real ST inlining is a later sprint.)
+      fn.set_is_inlinable(false);
       funcs.SetAt(j, fn);
     }
     k.SetFunctions(funcs);

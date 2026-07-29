@@ -202,6 +202,20 @@ static void Cocoa_send(Dart_NativeArguments args) {
   Dart_StringToCString(Dart_GetNativeArgument(args, 1), &sel_name);
   SEL sel = sel_registerName(sel_name);
 
+  // DIAGNOSTIC GUARD: a nonzero handle far below any mappable address is not
+  // a pointer — a corrupted/reused _handle. objc_msgSend on it is the segv
+  // that has been killing the GUI. Name the selector and refuse the send
+  // (throw a catchable Dart error) instead of taking the process down.
+  if (h != 0 && (uint64_t)h < 0x100000000ULL) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "dart:cocoa: BAD HANDLE 0x%llx for selector '%s' — refusing send",
+             (unsigned long long)h, sel_name ? sel_name : "?");
+    fprintf(stderr, "%s\n", buf);
+    Dart_ThrowException(Dart_NewStringFromCString(buf));
+    return;
+  }
+
   // Resolve the concrete method's type encoding (object_getClass handles both
   // instance and class sends — a class's metaclass holds its class methods).
   Method m = class_getInstanceMethod(object_getClass(target), sel);

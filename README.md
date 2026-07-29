@@ -45,7 +45,12 @@ patched code at runtime).
 For a source-grounded tour of that machine — the in-VM parser, the two-tier
 speculative JIT, its optimization passes, the ARM64 backend, and the
 deoptimization safety net that lets it speculate — see the study in
-[`docs/dart-vm-compiler.md`](docs/dart-vm-compiler.md).
+[`docs/dart-vm-compiler.md`](docs/dart-vm-compiler.md). Two companion notes go
+further: [`docs/dart-vm-frontend-guide.md`](docs/dart-vm-frontend-guide.md) shows
+how to write a *new* front-end that emits the VM's IL, and
+[`docs/dart-vm-hosting-languages.md`](docs/dart-vm-hosting-languages.md) uses the
+VM's per-function front-end selection to host another language (Smalltalk, Lisp,
+…) *alongside* full Dart — keeping all of `dart:core`.
 
 ## What the port actually is
 

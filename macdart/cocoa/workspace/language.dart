@@ -643,13 +643,22 @@ List _categories() {
 
 List _worldLibs() {
   var out = <String>[];
-  currentMirrorSystem().libraries.forEach((uri, lib) { out.add(uri.toString()); });
+  currentMirrorSystem().libraries.forEach((uri, lib) {
+    var u = uri.toString();
+    // Smalltalk libraries are NOT mirror-safe: their classes have no
+    // TokenStream, and ClassMirror.members routes through EnsureIsFinalized
+    // -> the Dart parser, which CRASHES the process. ST classes browse
+    // through the User App path (image decls) instead.
+    if (u.startsWith('st:')) return;
+    out.add(u);
+  });
   out.sort();
   return out;
 }
 
 List _worldClasses(String libUri) {
   var out = <String>[];
+  if (libUri.startsWith('st:')) return out;   // mirror-unsafe (no TokenStream)
   currentMirrorSystem().libraries.forEach((uri, lib) {
     if (uri.toString() == libUri) {
       lib.declarations.forEach((sym, decl) {
@@ -693,6 +702,7 @@ bool _isMethod(String m) {
 
 // World class members via mirrors, same record format (source = signature, r/o).
 List _worldClassMembers(String qualified) {   // "libUri|ClassName"
+  if (qualified.startsWith('st:')) return const <List>[];  // mirror-unsafe
   var parts = qualified.split('|');
   if (parts.length != 2) return const <List>[];
   var out = <List>[];
@@ -724,6 +734,7 @@ List _worldClassMembers(String qualified) {   // "libUri|ClassName"
 // so the Definition pane can show the ENTIRE class at once even though no source
 // exists on disk, the way an IDE shows a stubbed SDK declaration.
 String _worldClassSrc(String qualified) {   // "libUri|ClassName"
+  if (qualified.startsWith('st:')) return '';              // mirror-unsafe
   var parts = qualified.split('|');
   if (parts.length != 2) return '';
   var result = '';

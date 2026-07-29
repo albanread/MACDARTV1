@@ -1,0 +1,34 @@
+"literals.mst — literal, block and expression coverage as top-level do-its."
+
+"Numbers: integer, negative, radix, float, exponent float."
+x := 42.
+y := -7.
+mask := 16rFF.
+pi := 3.14159.
+big := 1.0e3.
+
+"Strings (with an escaped quote) and characters."
+greeting := 'it''s alive'.
+letter := $a.
+
+"Symbols: unary, keyword-run, binary, and quoted."
+sels := #( #foo #at:put: #+ #'x y' ).
+
+"Literal array with mixed elements, bare identifiers-as-symbols, nested array,
+ and the pseudo-values nil/true/false which stay literal inside arrays."
+mixed := #( 1 $a foo 'bar' #sym nil true false (nested 2 3) ).
+
+"Byte array."
+bytes := #[ 1 2 3 255 ].
+
+"Dynamic array with computed elements."
+points := { 1 + 2. self origin. buffer size }.
+
+"Pseudo-variables and message precedence: unary > binary > keyword."
+result := super at: x + 1 put: buffer first negated.
+
+"A block with arguments and temporaries, evaluated via a keyword send."
+sum := coll inject: 0 into: [ :acc :each | | t | t := each * 2. acc + t ].
+
+"Cascade to a stream."
+stream nextPutAll: 'a'; nextPut: $b; nextPutAll: greeting; flush.

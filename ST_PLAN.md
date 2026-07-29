@@ -1,0 +1,380 @@
+# ST_PLAN — MACVM Smalltalk (`.mst`) as a second language in MACDART
+
+Adding **MACVM's `.mst` Smalltalk** to the MACDART VM as a *second, coexisting
+front-end*, selected per function, sharing one object model and all of `dart:core`
++ `dart:cocoa` with Dart, and running at full JIT speed on the same ARM64 backend.
+
+This plan is the concrete follow-through on the three study docs — read them first
+for the *why*; this doc is the *how* and the *when*:
+
+- [`docs/dart-vm-compiler.md`](docs/dart-vm-compiler.md) — the compiler we build on.
+- [`docs/dart-vm-frontend-guide.md`](docs/dart-vm-frontend-guide.md) — how to emit Dart IL (the `Fragment` API, the minimal contract).
+- [`docs/dart-vm-hosting-languages.md`](docs/dart-vm-hosting-languages.md) — the dual-front-end architecture (Part A) and why Smalltalk is Tier‑1 (Part B).
+
+---
+
+## 0. TL;DR and the milestone ladder
+
+The Dart VM already selects a front-end **per `Function`** via the opaque
+`kernel_function_` marker (`raw_object.h:853`); the kernel path that reads it is
+compiled but **dormant** in V1. We reuse that slot for Smalltalk, add a tracked
+`macdart/st/` library (mirroring exactly how `dart:cocoa` is built), and hook one
+branch into `compiler.cc`. Everything downstream — SSA, optimizer, register
+allocator, ARM64 backend, GC, inline caches, deopt, and `dart:core`/`dart:cocoa` —
+is reused **unchanged**.
+
+**The milestone that defines success** (Sprint 3): *a Smalltalk method, e.g.
+`Foo >> double: n [ ^ n + n ]`, JIT-compiled by the MACDART VM and returning the
+right answer when called from Dart.* Everything before it is scaffolding; everything
+after it is breadth.
+
+| Sprint | Milestone | VM risk |
+|---|---|---|
+| **0** | `.mst` reads to an AST (standalone, no VM) | none |
+| **1** | the reader parses the real MACVM corpus | none |
+| **2** | `.mst` classes/methods **register** in the VM class table | first VM link + rebuild |
+| **3** | **a trivial ST method JIT-compiles and runs** ← the headline | `compiler.cc` patch + rebuild |
+| **4** | blocks, closures, control flow, cascades | none new |
+| **5** | the two desugarings (`^` non-local return, metaclass tower) + `doesNotUnderstand:`→`noSuchMethod` | none new |
+| **6** | ST ↔ Dart interop; ST calls `dart:core` and `dart:cocoa` | none new |
+| **7** | workspace GUI: load/run/debug `.mst` | none new |
+| **8** | corpus bring-up + A/B benchmark vs MACVM | none new |
+
+---
+
+## 1. The input: the MACVM `.mst` dialect
+
+MACVM's `world/*.mst` files (≈90 of them, `01_object.mst` … `75_dns.mst`) are
+**GNU-Smalltalk-style bracketed source**, *not* the old bang-chunk fileIn format.
+The constructs, verbatim from the repo:
+
+```smalltalk
+Object subclass: Posix [
+    | fd buffer |                        "instance variables"
+    <classVars: Scratch>                 "class-body pragma"
+
+    openForRead: aPath [                 "instance method (keyword selector)"
+        | f |                            "temporaries"
+        f := self primOpen: aPath flags: 0.
+        ^f
+    ]
+
+    Posix class >> kqueue [              "class-side method"
+        <primitive: FFI function: #kqueue ret: #g args: #()>
+    ]
+
+    readInto: buf count: n [
+        [ n := self primRead: buf count: 4096. n > 0 ] whileTrue: [ self step ].
+        1 to: n do: [ :i | dst at: i put: (buf byteAt: i - 1) ].
+        ^self
+    ]
+]
+
+PosixFile class >> oRdOnly [ ^0 ]        "external top-level method"
+```
+
+Salient features: bracket class bodies (`Super subclass: Name [ … ]`), in-body
+instance methods (`selector [ body ]`) and class methods (`Name class >> selector
+[ body ]`), external `Name >> …` / `Name extend [ … ]`, `< … >` pragmas (notably
+`<primitive: …>` and `<primitive: FFI …>`), blocks `[:x | … ]`, cascades `;`,
+keyword messages, and literals `#sym` `#(…)` `#[…]` `'str'` `$c` `16rFF`.
+
+### 1.1 The pragma question (the real semantic bridge)
+
+The kernel `.mst` files (`01`–`~32`) are dense with `<primitive: N>` and
+`<primitive: FFI …>` — they implement the base classes on MACVM's *own* primitives
+and FFI. **We do not port those.** Instead (see §3) Smalltalk base classes are
+*bridged* to `dart:core`, so `SmallInteger>>+` is Dart `int`'s `+`, not a ported
+primitive. The application-level files (Mandelbrot, benchdash, breakout, the Cocoa
+UI) are the interesting targets and mostly sit on the base protocol we bridge.
+`<primitive: FFI …>` and `<primitive: N>` pragmas are handled per §3.3.
+
+---
+
+## 2. Architecture
+
+### 2.1 The integration pattern = the `dart:cocoa` pattern
+
+MACDART's VM tree (`macdart/runtime/`) is **gitignored and regenerated** by
+`macdart/port/extract.sh` from a stock Dart 1.24.3 checkout, then the port patch is
+applied. So new C++ **cannot** live in `macdart/runtime/`. It follows the exact
+shape `dart:cocoa` already uses (`macdart/CMakeLists.txt:244-259`):
+
+- **Tracked source** in its own dir: `macdart/st/` (like `macdart/cocoa/`).
+- Compiled as a **static lib** `dart_st` (like `dart_cocoa`), linked into
+  `dart_bootstrap`, `gen_snapshot`, `dart`, and `dartui`.
+- It `#include`s VM headers (they are on the include path: `include_directories(${RT}
+  …)`), so it can call `FlowGraph`, `Instruction`, `Class::New`, etc.
+- **VM hook-points** (edits to regenerated files) go in `patches/macdart-port.patch`,
+  exactly like the 10-file cocoa/invocation edits already there.
+
+### 2.2 The per-function marker — reuse the dormant `kernel_function_`
+
+Every `Function` carries `NOT_IN_PRECOMPILED(void* kernel_function_)`
+(`raw_object.h:853`), read by `UseKernelFrontEndFor` (`compiler.cc:116`) and
+`DartCompilationPipeline::BuildFlowGraph` (`compiler.cc:132`) to route a body to the
+kernel IL builder. In V1 there is **no kernel input**, so this slot is always `NULL`
+and the branch is dead. We **repurpose it for Smalltalk** — a `void*` to an
+`st::MethodNode` — with **zero object-layout change** (no new field, so no snapshot
+regeneration). The patch changes `BuildFlowGraph`'s kernel branch to call
+`st::BuildGraph` instead of the (dormant) kernel builder.
+
+> **Decision D1 (locked for the POC, revisit later):** reuse `kernel_function_`
+> rather than add a parallel `st_function_` field. Rationale: adding a `RawFunction`
+> field changes heap layout and forces a `gen_snapshot` rebuild and snapshot-version
+> bump; reuse costs nothing because the kernel path is dead here. If we ever want the
+> kernel front-end back *and* Smalltalk, add the parallel field then (a one-liner in
+> `raw_object.h` + accessors mirroring `object.h:2630-2642`).
+
+### 2.3 The pieces (mapped to the hosting-doc blueprint, Part A §5)
+
+```
+ .mst source
+     │  ┌──────────────────────────────── macdart/st/ (tracked, dart_st lib) ───────────┐
+     ▼  │                                                                                │
+ st::Lexer ─► st::Parser ─► st::AST ─► st::Loader ─────────────► [ VM object model ]     │
+   (Sprint 0/1)             │            creates Library (imports dart:core),            │
+                            │            Class::New (×2: instance + metaclass),          │
+                            │            Function::New per method  ── set_kernel_function(node)
+                            │            Field::New per ivar; RegisterClass;              │
+                            │            ClassFinalizer::ProcessPendingClasses            │
+                            │                                                             │
+                            └─► st::FlowGraphBuilder  ◄── (lazy, on first call, via the   │
+                                (ST AST → Dart IL,        compiler.cc patch hook)         │
+                                 Fragment combinator)                                     │
+     └──────────────────────────────────────────────────────────────────────────────────┘
+                                        │  returns FlowGraph*
+                                        ▼
+        ComputeSSA ─► optimizer ─► register alloc ─► ARM64 codegen ─► deopt   (ALL SHARED, UNCHANGED)
+```
+
+Five contributions, one hook — every item has a working template in the tree:
+
+| # | Piece | File(s) | Template to copy |
+|---|---|---|---|
+| i | Reader (lexer/parser/AST) | `macdart/st/st_{lexer,parser,ast}.*` | — (standalone) |
+| ii | Loader (object-model registration) | `macdart/st/st_loader.cc` | `kernel_reader.cc` (`ReadLibrary`, `Class::New`, `Function::New`, `set_kernel_function`) |
+| iii | IL builder | `macdart/st/st_flow_graph_builder.cc` | `kernel_to_il.cc` (`Fragment`, `BuildGraphOfFunction`, primitives) — see the front-end guide |
+| iv | Pipeline hook | patch to `runtime/vm/compiler.cc` | the existing kernel arm of `BuildFlowGraph`/`ParseFunction` (`compiler.cc:124-151`) |
+| v | Dart-facing driver + natives | `macdart/st/st_natives.cc`, a `dart:st`-style entry | `cocoa_natives.mm` / `workspace_natives.cc` |
+
+---
+
+## 3. Reuse `dart:core` — the base-class bridging strategy
+
+This is the crux of Tier‑1 (cheap) hosting: **do not reimplement the Smalltalk
+number tower / collections**. Map Smalltalk base classes onto Dart's.
+
+### 3.1 Base-class identity
+
+The loader recognizes a fixed set of **bridged** class names and maps sends to the
+corresponding Dart class instead of creating a new one:
+
+| Smalltalk | Dart (`dart:core`) |
+|---|---|
+| `Object` | `Object` |
+| `SmallInteger` / `LargeInteger` / `Integer` | `int` (`Smi`→`Mint`→`Bigint`) |
+| `Float` / `FloatD` | `double` |
+| `Boolean` / `True` / `False` | `bool` |
+| `UndefinedObject` (`nil`) | `Null` |
+| `String` / `Symbol` | `String` |
+| `Array` / `OrderedCollection` | `List` |
+| `BlockClosure` | `Function` (closure) |
+| `Character` | (library `Character` over `int` code units) |
+
+### 3.2 Selector aliasing
+
+Where Smalltalk and Dart spell the same operation differently, the IL builder emits
+the **Dart** selector: `printString`→`toString`, `size`→`length`, `do:`→`forEach`,
+`at:`/`at:put:`→`[]`/`[]=`, `,` (concat) stays `+` for strings, `=`→`==`, `hash`→
+`hashCode`, `isNil`→(`== null`). A small alias table lives in the builder; the long
+tail is filled as the corpus demands. Selectors that already match (`+ - * < >
+ifTrue:ifFalse: whileTrue: value value:`) pass through unchanged.
+
+### 3.3 `<primitive:>` pragmas
+
+- `<primitive: N>` on a *bridged* base method → the method never runs; the send was
+  already routed to Dart (§3.2), so the pragma is ignored.
+- `<primitive: FFI function: #f ret: … args: …>` → map to the MACDART equivalent:
+  POSIX/`libc` FFI becomes a `dart:cocoa`/native call; Cocoa FFI becomes a
+  `dart:cocoa` send. A `st:prim` compatibility shim (a handful of natives in
+  `st_natives.cc`, plus a `.dart`/`.mst` prelude) covers the primitives the target
+  files actually use. **Scoped per target file, not exhaustively.**
+- `<primitive: N>` on an *application* class → treat as `self primitiveFailed` /
+  a `noSuchMethod`-style error until implemented.
+
+### 3.4 The two desugarings (from feasibility Part B)
+
+1. **Non-local return `^expr` from inside a block.** The home method wraps its body:
+   `try { … } catch (_STReturn r) { if (r.home == thisToken) return r.value; rethrow; }`;
+   a `^` inside a block throws `_STReturn(homeToken, value)`. If the home frame is
+   already dead → no catch → "block cannot return" — which is the correct semantics.
+   Uses `ThrowInstr`/`CatchBlockEntry`; cost only on the `^`-in-block slow path.
+2. **Class-side / metaclasses.** Each ST class becomes **two** Dart classes: instance
+   `Foo` and metaclass-instance `Foo_class` with a singleton; `Foo new` is an
+   `InstanceCall` on that singleton, class variables are its fields. Faithful metaclass
+   tower using single dispatch throughout.
+
+---
+
+## 4. Semantic mapping (quick reference)
+
+| Smalltalk | Dart IL / runtime | Sprint |
+|---|---|---|
+| unary/binary/keyword send | `InstanceCallInstr` (verbatim selector or §3.2 alias) | 3 |
+| `self` / args / temps | `LoadLocal` / `StoreLocal` (params + temps via scope prep) | 3 |
+| `^expr` (method) | `Return` | 3 |
+| literals `1 1.5 'x' #s $c` | `Constant` | 3 |
+| resolvable static/`super` send | `StaticCallInstr` | 3 |
+| `[:x | … ]` block | `Closure` + `Context`; `value`/`value:` → `ClosureCallInstr` | 4 |
+| `ifTrue:ifFalse:`, `and:`, `or:` | inlined branch (or send to `bool`) | 4 |
+| `whileTrue:`, `to:do:`, `timesRepeat:` | inlined loop (or send) | 4 |
+| cascade `;` | shared-receiver `InstanceCall` sequence | 4 |
+| `^` from block | `_STReturn` throw/catch (§3.4.1) | 5 |
+| `Foo new`, class vars | metaclass singleton (§3.4.2) | 5 |
+| `doesNotUnderstand:` | dispatch-miss → `noSuchMethod` (`InvokeNoSuchMethod`) | 5 |
+| `#perform:` / `respondsTo:` | reflective `InstanceCall` / dynamic lookup | 6 |
+
+---
+
+## 5. The sprints
+
+Each sprint lists **goal · deliverables · acceptance · risk**. Sprints 0–1 touch no
+VM code and cannot destabilize the working GUI; the VM work is quarantined to 2–3.
+
+### Sprint 0 — the reader (standalone, no VM) · *in progress*
+- **Goal.** Lex + parse the `.mst` dialect (§1) to an AST, standalone C++17.
+- **Deliverables.** `macdart/st/st_{ast.h,lexer.*,parser.*}`, a `st_dump` tool,
+  `build.sh`, `examples/*.mst`, `README.md`.
+- **Acceptance.** `st_dump` parses the §1 constructs and the examples, prints a clean AST.
+- **Risk.** None — nothing links against the VM, nothing in CMake changes.
+
+### Sprint 1 — grammar hardening against the corpus
+- **Goal.** Parse the real MACVM `world/*.mst` (≈90 files), or a defined subset.
+- **Deliverables.** A grammar note; a corpus runner reporting per-file parse pass/fail;
+  fixes for the long tail (radix/scaled numbers, `extend`, dynamic arrays, nested pragmas).
+- **Setup.** Clone the corpus (read-only reference; run yourself):
+  ```bash
+  git clone --depth 1 https://github.com/albanread/MACVM.git /tmp/MACVM
+  for f in /tmp/MACVM/world/*.mst; do macdart/st/st_dump "$f" >/dev/null || echo "FAIL $f"; done
+  ```
+- **Acceptance.** ≥ the core files (`01`–`13`) plus a chosen app file parse clean;
+  coverage reported.
+- **Risk.** None.
+
+### Sprint 2 — the loader: classes/methods register in the VM
+- **Goal.** Turn an ST AST into registered VM entities (bodies still stubbed).
+- **Deliverables.** `macdart/st/st_loader.cc` (mirrors `kernel_reader.cc`):
+  `Library::NewLibraryHelper(url, import_core=true)`; per class `Class::New(lib,…)` +
+  `Library::AddClass` (two classes per ST class, §3.4.2); per method `Function::New`
+  stamped `set_kernel_function(stNode)`; per ivar `Field::New`;
+  `ClassFinalizer::ProcessPendingClasses`. Wire `dart_st` into `CMakeLists.txt` and link it.
+- **Acceptance.** After loading a `.mst`, the classes exist in the class table and a
+  selector lookup (`Class::LookupDynamicFunction`) finds the methods; verified from a
+  tiny Dart harness calling an `st_natives` entry (`stLoad(source)`).
+- **Risk.** First VM link + `dartui` rebuild. Isolated: no method bodies compile yet, so
+  no codegen path is exercised.
+
+### Sprint 3 — the IL builder: **a Smalltalk method runs** ← headline
+- **Goal.** Compile a trivial ST method body to Dart IL and run it.
+- **Deliverables.** `macdart/st/st_flow_graph_builder.cc` — a `Fragment` combinator
+  copy (~40 lines, front-end guide §1) + the minimal primitives (`Constant`,
+  `LoadLocal`/`StoreLocal`, `PushArgument`, `InstanceCall`, `StaticCall`, `Return`) and
+  the scope prep (`LocalVariable`s + `AllocateVariables`). The `compiler.cc` **patch**:
+  route ST-marked functions (`kernel_function() != NULL`) to `st::BuildGraph` in
+  `BuildFlowGraph`, and skip textual parse in `ParseFunction`.
+- **Acceptance.** `Foo >> double: n [ ^ n + n ]` (or `>> answer [ ^40 + 2 ]`)
+  JIT-compiles and returns `84`/`42` when invoked from Dart.
+- **Risk.** The `compiler.cc` patch + rebuild. This is the one genuinely delicate step;
+  the deopt-id-order and stack-balance invariants (front-end guide §4.1, §5) must hold.
+
+### Sprint 4 — blocks, control flow, cascades
+- **Goal.** Closures and the common control messages.
+- **Deliverables.** `[:x | …]` → `Closure`+`Context`; `value`/`value:` → `ClosureCall`;
+  `ifTrue:ifFalse:`/`and:`/`or:` inlined to branches; `whileTrue:`/`to:do:`/
+  `timesRepeat:` inlined to loops; cascades.
+- **Acceptance.** A method using a block, a loop, and a conditional computes correctly
+  (e.g. a factorial or a sum-to-N).
+- **Risk.** None new (all in `dart_st`).
+
+### Sprint 5 — the two desugarings + `doesNotUnderstand:`
+- **Goal.** Non-local return, the metaclass tower, and DNU.
+- **Deliverables.** `^`-in-block → `_STReturn` throw/catch (§3.4.1); `Foo new` + class
+  vars via the metaclass singleton (§3.4.2); unknown selector → `noSuchMethod`.
+- **Acceptance.** Class-side construction, a non-local return from a block, and a
+  `doesNotUnderstand:` handler all work.
+- **Risk.** None new.
+
+### Sprint 6 — interop with `dart:core` and `dart:cocoa`
+- **Goal.** Prove the free interop the architecture promises.
+- **Deliverables.** The §3 bridge (base-class identity + selector aliases + the
+  `<primitive:>` shim) fleshed out for the demo targets; ST → Dart and Dart → ST calls.
+- **Acceptance.** An ST method calls `print`, builds an `NSString`, and pokes the game
+  pane; a Dart do-it calls an ST method and gets the result.
+- **Risk.** None new.
+
+### Sprint 7 — workspace GUI integration
+- **Goal.** Smalltalk in the IDE.
+- **Deliverables.** Load `.mst` into the image (a Smalltalk source column beside the
+  Dart one, or an `.mst` import); a "run ST method" path; confirm the debugger and
+  profiler work on ST frames (they should — the IL carries `TokenPosition`s).
+- **Acceptance.** Load a `.mst`, run a method from the workspace, step it in the debugger.
+- **Risk.** None new (workspace/`language.dart` are runtime scripts, no rebuild).
+
+### Sprint 8 — corpus bring-up + benchmark
+- **Goal.** Run real MACVM code; measure against MACVM.
+- **Deliverables.** Bring up a growing subset of `world/` on the bridge; port a shared
+  benchmark (benchdash/Mandelbrot already exist on both sides); A/B vs MACVM's JIT.
+- **Acceptance.** A nontrivial MACVM program runs on MACDART; a benchmark number lands.
+- **Risk.** None new.
+
+---
+
+## 6. File / build / patch layout
+
+```
+macdart/st/                         # tracked (NOT gitignored, like macdart/cocoa/)
+  st_ast.h  st_lexer.{h,cc}  st_parser.{h,cc}      # reader           (Sprint 0/1)
+  st_dump.cc  build.sh  examples/*.mst  README.md  # standalone tool  (Sprint 0)
+  st_loader.{h,cc}                                 # object-model reg  (Sprint 2)
+  st_flow_graph_builder.{h,cc}  st_fragment.h      # ST AST → IL       (Sprint 3+)
+  st_natives.cc  st.dart                           # Dart-facing driver(Sprint 2/6)
+macdart/CMakeLists.txt              # add_library(dart_st …) + link into the 4 exes
+macdart/patches/macdart-port.patch  # + runtime/vm/compiler.cc hook (Sprint 3)
+ST_PLAN.md                          # this file
+```
+
+CMake change mirrors `dart_cocoa` (`CMakeLists.txt:245-259`, `315/327/356/372`):
+`add_library(dart_st STATIC macdart/st/st_loader.cc st_flow_graph_builder.cc
+st_lexer.cc st_parser.cc st_natives.cc)` then add `dart_st` to each
+`target_link_libraries`. The standalone `st_dump` stays a separate, VM-free target.
+
+---
+
+## 7. Risks & open decisions
+
+- **D1 (locked):** reuse `kernel_function_` as the ST marker — zero layout change (§2.2).
+- **D2:** base classes bridge to `dart:core` rather than being reimplemented (§3) — the
+  whole Tier‑1 bet. Revisit only if a target needs true Smalltalk metaobject semantics
+  the bridge can't express.
+- **R1 (Sprint 3):** the `compiler.cc` patch is the one delicate VM edit. Mitigation: it
+  mirrors the existing kernel arm almost line-for-line; keep it tiny; the deopt-id and
+  stack-balance invariants are asserted by the VM (front-end guide §5), so mistakes
+  crash loudly rather than miscompile silently.
+- **R2:** `<primitive: FFI …>` breadth — MACVM's kernel files are FFI-heavy. Mitigation:
+  we don't port kernel files (§3.3); the shim covers only what the demo targets use.
+- **R3:** number semantics — ST `SmallInteger` overflow promotes exactly like Dart
+  `Smi`→`Mint`→`Bigint`, so arithmetic is a direct match; no masking needed (unlike a
+  fixed-width language).
+- **R4:** rebuild cost — Sprints 2–3 rebuild `dartui`; keep the working release binary
+  aside so the GUI stays usable during bring-up.
+
+---
+
+## 8. Status
+
+- **Sprint 0:** in progress — the standalone `.mst` reader (`macdart/st/`).
+- Everything else: planned as above.
+
+Next after Sprint 0 lands: run it over the MACVM corpus (Sprint 1), then start the
+loader (Sprint 2) — the first step that links against the VM.

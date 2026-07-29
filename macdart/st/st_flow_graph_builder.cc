@@ -154,7 +154,13 @@ class StGraphBuilder {
         this_var_(NULL),
         value_temp_(NULL),
         synth_counter_(0),
-        closure_var_(NULL) {}
+        closure_var_(NULL),
+        in_closure_(false),
+        needs_nlr_(false),
+        try_index_(CatchClauseNode::kInvalidTryIndex),
+        exc_var_(NULL),
+        stk_var_(NULL),
+        saved_ctx_var_(NULL) {}
 
   FlowGraph* Build(MethodNode* method);
   FlowGraph* BuildClosure(BlockNode* block);  // Stage A: a closure body
@@ -195,12 +201,10 @@ class StGraphBuilder {
   // --- block factory + ids (guide §5.C) ---
   intptr_t AllocateBlockId() { return next_block_id_++; }
   TargetEntryInstr* BuildTargetEntry() {
-    return new (zone_)
-        TargetEntryInstr(AllocateBlockId(), CatchClauseNode::kInvalidTryIndex);
+    return new (zone_) TargetEntryInstr(AllocateBlockId(), try_index_);
   }
   JoinEntryInstr* BuildJoinEntry() {
-    return new (zone_)
-        JoinEntryInstr(AllocateBlockId(), CatchClauseNode::kInvalidTryIndex);
+    return new (zone_) JoinEntryInstr(AllocateBlockId(), try_index_);
   }
   Fragment Goto(JoinEntryInstr* destination) {
     return Fragment(new (zone_) GotoInstr(destination)).closed();
@@ -218,6 +222,19 @@ class StGraphBuilder {
     *then_entry = *branch->true_successor_address() = BuildTargetEntry();
     *otherwise_entry = *branch->false_successor_address() = BuildTargetEntry();
     return instructions + Fragment(branch).closed();
+  }
+  // Branch on identity of the top two stack values (Stage C: the NLR home
+  // test — carrier.home === my context).
+  Fragment BranchIfStrictEqual(TargetEntryInstr** then_entry,
+                               TargetEntryInstr** otherwise_entry) {
+    Value* right = Pop();
+    Value* left = Pop();
+    StrictCompareInstr* compare = new (zone_) StrictCompareInstr(
+        TokenPosition::kNoSource, Token::kEQ_STRICT, left, right, false);
+    BranchInstr* branch = new (zone_) BranchInstr(compare);
+    *then_entry = *branch->true_successor_address() = BuildTargetEntry();
+    *otherwise_entry = *branch->false_successor_address() = BuildTargetEntry();
+    return Fragment(branch).closed();
   }
 
   // --- primitives (guide §2, §5.D) ---
@@ -433,6 +450,9 @@ class StGraphBuilder {
   void MarkCapturedInClosures(Node* node);
   void MarkFreeNames(Node* node);
 
+  // Stage C: resolve a dart:cocoa top-level helper (stNlrThrow/Home/Value).
+  RawFunction* LookupCocoaFunction(const char* name);
+
   // Sprint 6: class-side sends (Foo new / a class method) + dart:core aliases.
   RawClass* ResolveClassName(const std::string& name);
   Fragment TranslateClassSend(const Class& cls, MessageNode* node);
@@ -459,6 +479,14 @@ class StGraphBuilder {
   intptr_t synth_counter_;                        // makes synth-temp names unique
   LocalVariable* closure_var_;                    // the :closure param (closure builds)
   std::vector<LocalVariable*> param_vars_;        // params in frame order (capture copy)
+  // Stage C (non-local ^): a `^` under a first-class closure throws an _STNlr
+  // carrier; the home method wraps its body in a catch keyed on its Context.
+  bool in_closure_;                               // building a closure body?
+  bool needs_nlr_;                                // method has a ^-carrying closure
+  intptr_t try_index_;                            // try index for new blocks
+  LocalVariable* exc_var_;                        // :exception (catch-defined)
+  LocalVariable* stk_var_;                        // :stack_trace (catch-defined)
+  LocalVariable* saved_ctx_var_;                  // :saved_try_context_var
 };
 
 void StGraphBuilder::PrepareScope(MethodNode* method) {
@@ -517,6 +545,27 @@ void StGraphBuilder::PrepareScope(MethodNode* method) {
   // pass so it can never be captured.)
   for (size_t i = 0; i < method->statements.size(); i++) {
     MarkCapturedInClosures(method->statements[i].get());
+  }
+  // Stage C: a method containing a ^-carrying closure needs (a) a NON-NULL,
+  // per-activation Context to serve as the NLR home token — the synthetic
+  // captured ":home" guarantees one, and, living in locals_, it exports into
+  // every closure's ContextScope so each closure restores the home context —
+  // and (b) the three try/catch frame variables the catch machinery uses.
+  if (needs_nlr_) {
+    LocalVariable* home = MakeLocal(":home");
+    home->set_is_captured();
+    scope->AddVariable(home);
+    locals_[":home"] = home;
+
+    exc_var_ = MakeLocal(":exception");
+    exc_var_->set_is_forced_stack();
+    scope->AddVariable(exc_var_);
+    stk_var_ = MakeLocal(":stack_trace");
+    stk_var_->set_is_forced_stack();
+    scope->AddVariable(stk_var_);
+    saved_ctx_var_ = MakeLocal(":saved_try_context_var");
+    saved_ctx_var_->set_is_forced_stack();
+    scope->AddVariable(saved_ctx_var_);
   }
   // A single reusable temp to materialize control-flow expression values.
   value_temp_ = MakeLocal(":cfval");
@@ -982,7 +1031,9 @@ void StGraphBuilder::MarkCapturedInClosures(Node* node) {
       }
     }
   } else if (BlockNode* b = dynamic_cast<BlockNode*>(node)) {
-    // A closure: everything referenced beneath it captures.
+    // A closure: everything referenced beneath it captures; a `^` beneath it
+    // (any depth) is a non-local return, so the method needs the NLR catch.
+    if (HasReturn(b)) needs_nlr_ = true;
     for (size_t i = 0; i < b->statements.size(); i++) {
       MarkFreeNames(b->statements[i].get());
     }
@@ -996,6 +1047,21 @@ void StGraphBuilder::MarkCapturedInClosures(Node* node) {
       MarkCapturedInClosures(d->elements[i].get());
     }
   }
+}
+
+// Stage C: resolve a top-level dart:cocoa helper by name (the NLR carrier
+// functions live there — ordinary Dart, so the optimizer may even inline them
+// into the ST caller).
+RawFunction* StGraphBuilder::LookupCocoaFunction(const char* name) {
+  // kOld: this can run on the BACKGROUND compiler thread (an optimized
+  // recompile), which must not allocate in new space.
+  const Library& lib = Library::Handle(
+      zone_, Library::LookupLibrary(
+                 thread_,
+                 String::Handle(zone_, String::New("dart:cocoa", Heap::kOld))));
+  if (lib.IsNull()) return Function::null();
+  return lib.LookupFunctionAllowPrivate(
+      String::Handle(zone_, Symbols::New(thread_, name)));
 }
 
 // Under a closure: mark every referenced name that is a method local (or self)
@@ -1074,6 +1140,11 @@ Fragment StGraphBuilder::InlineBlockValue(BlockNode* block) {
       instructions += TranslateExpression(stmt);  // leave the value
     } else {
       instructions += TranslateStatement(stmt);   // effect, or a closing ^
+      if (last && instructions.is_open()) {
+        // Stage C: a last-position `^` inside a closure THROWS (open, dead
+        // fall-through) rather than closing — supply the dead value.
+        instructions += NullConstant();
+      }
     }
   }
   return instructions;
@@ -1484,6 +1555,7 @@ void StGraphBuilder::PrepareClosureScope(BlockNode* block) {
 }
 
 FlowGraph* StGraphBuilder::BuildClosure(BlockNode* block) {
+  in_closure_ = true;  // `^` in this body = non-local return (Stage C)
   PrepareClosureScope(block);
 
   TargetEntryInstr* normal_entry = BuildTargetEntry();
@@ -1504,17 +1576,8 @@ FlowGraph* StGraphBuilder::BuildClosure(BlockNode* block) {
     body += Drop();
   }
 
-  if (HasReturn(block)) {
-    // `^` inside a first-class closure is a NON-LOCAL return (Stage C); until
-    // then the closure conservatively evaluates to nil, loudly.
-    OS::PrintErr(
-        "st::BuildClosure: non-local ^ in a closure at %d:%d (Stage C) — "
-        "closure yields nil\n",
-        block->pos.line, block->pos.col);
-    body += NullConstant();
-  } else {
-    body += InlineBlockValue(block);  // the last statement's value (or nil)
-  }
+  body += InlineBlockValue(block);  // the last statement's value (or nil);
+                                    // a `^` inside throws the NLR carrier
   if (body.is_open()) body += Return();
 
   normal_entry->LinkTo(body.entry);
@@ -1523,6 +1586,26 @@ FlowGraph* StGraphBuilder::BuildClosure(BlockNode* block) {
 
 Fragment StGraphBuilder::TranslateStatement(Node* node) {
   if (ReturnNode* r = dynamic_cast<ReturnNode*>(node)) {
+    if (in_closure_) {
+      // Stage C: `^` under a first-class closure is a NON-LOCAL return from
+      // the home method — throw the carrier {home: my restored context,
+      // value}. stNlrThrow never returns; its (dead) result is dropped so the
+      // stack stays balanced, and the fragment stays open as dead code.
+      const Function& throw_fn =
+          Function::ZoneHandle(zone_, LookupCocoaFunction("stNlrThrow"));
+      Fragment instructions;
+      instructions += LoadLocal(pf_->current_context_var());  // home token
+      instructions += PushArgument();
+      if (r->value != nullptr) {
+        instructions += TranslateExpression(r->value.get());
+      } else {
+        instructions += NullConstant();
+      }
+      instructions += PushArgument();
+      instructions += StaticCall(throw_fn, 2);
+      instructions += Drop();
+      return instructions;
+    }
     Fragment instructions = (r->value != nullptr)
                                 ? TranslateExpression(r->value.get())
                                 : NullConstant();
@@ -1591,6 +1674,19 @@ FlowGraph* StGraphBuilder::Build(MethodNode* method) {
     }
   }
 
+  // Stage C: enter the NLR try region. The context prologue above stays
+  // OUTSIDE it so :saved_try_context_var (stored here, restored by the catch)
+  // holds the real context. The body's blocks inherit try index 0.
+  if (needs_nlr_) {
+    body += LoadLocal(pf_->current_context_var());
+    body += StoreLocal(saved_ctx_var_);
+    body += Drop();
+    try_index_ = 0;
+    JoinEntryInstr* try_entry = BuildJoinEntry();  // carries try index 0
+    body += Goto(try_entry);
+    body = Fragment(body.entry, try_entry);  // continue appending after it
+  }
+
   body += TranslateStatements(method->statements);
 
   // Guarantee the body is closed on every path (invariant #1): a method with no
@@ -1598,6 +1694,60 @@ FlowGraph* StGraphBuilder::Build(MethodNode* method) {
   if (body.is_open()) {
     body += NullConstant();
     body += Return();
+  }
+
+  // Stage C: the NLR catch handler. Catch-all; if the carrier's home is THIS
+  // activation's context, return its value — otherwise rethrow (an outer ST
+  // frame may be the home; an escaped-home carrier reaches the top as the
+  // classic cannotReturn error).
+  if (needs_nlr_) {
+    try_index_ = CatchClauseNode::kInvalidTryIndex;  // handler is outside
+    const Array& handler_types =
+        Array::ZoneHandle(zone_, Array::New(1, Heap::kOld));
+    handler_types.SetAt(0, Object::dynamic_type());
+    CatchBlockEntryInstr* catch_entry = new (zone_) CatchBlockEntryInstr(
+        TokenPosition::kNoSource, /*is_generated=*/false, AllocateBlockId(),
+        try_index_, graph_entry_, handler_types, /*handler_index=*/0,
+        *exc_var_, *stk_var_, /*needs_stacktrace=*/true,
+        thread_->GetNextDeoptId(), /*should_restore_closure_context=*/false);
+    graph_entry_->AddCatchEntry(catch_entry);
+    Fragment handler(catch_entry);
+    // Restore the context (kernel CatchBlockEntry does the same).
+    handler += LoadLocal(saved_ctx_var_);
+    handler += StoreLocal(pf_->current_context_var());
+    handler += Drop();
+    // stNlrHome(e) === my context ?
+    const Function& home_fn =
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stNlrHome"));
+    const Function& value_fn =
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stNlrValue"));
+    handler += LoadLocal(exc_var_);
+    handler += PushArgument();
+    handler += StaticCall(home_fn, 1);
+    handler += LoadLocal(pf_->current_context_var());
+    TargetEntryInstr* match_entry;
+    TargetEntryInstr* nomatch_entry;
+    handler += BranchIfStrictEqual(&match_entry, &nomatch_entry);
+    // match: return the carrier's value from this method.
+    Fragment match_fragment(match_entry);
+    match_fragment += LoadLocal(exc_var_);
+    match_fragment += PushArgument();
+    match_fragment += StaticCall(value_fn, 1);
+    match_fragment += Return();
+    // no match: rethrow (kernel RethrowException bookkeeping: the two
+    // PushArguments are consumed by the ReThrow at run time; drop them from
+    // the model stack and fix the pending count).
+    Fragment nomatch_fragment(nomatch_entry);
+    nomatch_fragment += LoadLocal(exc_var_);
+    nomatch_fragment += PushArgument();
+    nomatch_fragment += LoadLocal(stk_var_);
+    nomatch_fragment += PushArgument();
+    nomatch_fragment += Drop();
+    nomatch_fragment += Drop();
+    nomatch_fragment +=
+        Fragment(new (zone_) ReThrowInstr(TokenPosition::kNoSource,
+                                          /*catch_try_index=*/0)).closed();
+    pending_argument_count_ -= 2;
   }
 
   normal_entry->LinkTo(body.entry);

@@ -74,6 +74,35 @@ dynamic stNew(String className) native "ST_new";
 /// the first call lazily compiles the method body. Returns the result.
 dynamic stSend(receiver, String selector, List args) native "ST_send";
 
+// --- Smalltalk non-local return (ST_PLAN.md closures Stage C) ---------------
+// A `^expr` inside a FIRST-CLASS closure returns from the closure's HOME
+// method activation. The ST IL builder desugars it to stNlrThrow(home, value)
+// where `home` is the home activation's Context object (unique per
+// activation); the home method's body is wrapped in a catch that returns
+// `value` when the carrier's home is ITS context, and rethrows otherwise. A
+// carrier that reaches the top means the home frame already returned — the
+// classic "block cannot return" error, reported as an unhandled _STNlr.
+class _STNlr {
+  var home;
+  var value;
+  _STNlr(this.home, this.value);
+  String toString() => "Smalltalk non-local return: the block's home method"
+      " has already returned (BlockContext>>cannotReturn)";
+}
+
+stNlrThrow(home, value) {
+  throw new _STNlr(home, value);
+}
+
+stNlrHome(e) {
+  if (e is _STNlr) return e.home;
+  return false; // never identical to a Context: forces a rethrow
+}
+
+stNlrValue(e) {
+  return e.value;
+}
+
 // --- Low-level natives ------------------------------------------------------
 int _nsStringFromCString(String s) native "Cocoa_nsStringFromCString";
 int _nsStringLength(int handle) native "Cocoa_nsStringLength";

@@ -534,5 +534,23 @@ loudly). Stages A and C are modest; A is independently shippable.
   Bonus finding: `value:`→`call` is IC-fast (~2 ns/call) — the VM installs a lazy
   invoke-field dispatcher on `_Closure` after the first miss — and provably correct for
   distinct closures through one send site.
-- **Next — Stage C: non-local `^`** (the try/catch home-token desugaring), the
-  workspace GUI, and then breadth (corpus bring-up on the bridge).
+- **Closures Stage C ✓ — non-local `^`.** A `^` under a first-class closure throws an
+  `_STNlr` carrier (`stNlrThrow(home, value)`, helpers in `cocoa.dart`) whose home token
+  is the method's per-activation **Context** (a synthetic captured `:home` guarantees one
+  exists and exports into every closure's ContextScope, so each closure restores the home
+  context); a `^`-carrying method wraps its body in a real IL try/catch — try index 0 on
+  the body's blocks, `:saved_try_context_var` stored *after* the context prologue,
+  `CatchBlockEntryInstr` + `graph_entry->AddCatchEntry`, catch-all handler that compares
+  `stNlrHome(e) === current_context_var` and either returns `stNlrValue(e)` or
+  `ReThrow`s (kernel `RethrowException` bookkeeping). Verified: `^` unwinds **through**
+  an intermediate ST frame (99), falls through when untaken (1), homes to the correct
+  activation in a nested chain (199), and an **escaped** block's `^` raises the classic
+  `BlockContext>>cannotReturn` error; correct through the optimizing compiler (60k calls
+  — after fixing a background-compiler new-space allocation: `String::New` needs
+  `Heap::kOld` on the compile path). Bonus: an ST closure is callable directly as a Dart
+  closure (`b()`).
+- **The core language is semantically complete.** Methods, objects+ivars, control flow,
+  cascades, `super`, class-side + `Foo new`, capturing closures, and non-local `^` all
+  run — Smalltalk's block-based idioms (`detect:`-style early exit through a passed
+  block) now work. **Next:** the workspace GUI, corpus/base-library breadth on the
+  bridge, nested-closure-own-local capture, the metaclass tower.

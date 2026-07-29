@@ -16,6 +16,7 @@
 #include "st_loader.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #include <map>
 #include <vector>
@@ -114,16 +115,16 @@ void Aggregate(ProgramNode* program, ClassTable* table) {
   }
 }
 
-// Resolve an ST superclass name to a Dart super Type. The minimal Sprint-2
-// bridge roots every class at dart:core's Object EXCEPT when the named
-// superclass is another ST class defined in the same load (a real in-file
-// hierarchy, e.g. `Object subclass: Point` after `nil subclass: Object`). We do
-// NOT bridge to arbitrary dart:core classes here: most (String, int, double,
-// List, …) are sealed and cannot be extended, so `String subclass: Symbol`
-// would fail finalization. The real base-class bridging — where an ST send is
-// routed to a dart:core method — happens later in the IL builder (Sprint 3/6),
-// not by literally subclassing a core type. The returned Type is intentionally
-// UNFINALIZED for the in-file case; ProcessPendingClasses finalizes it.
+// Resolve an ST superclass name to a Dart super Type. The minimal bridge roots
+// every class at dart:core's Object EXCEPT when the named superclass is another
+// ST class — in the SAME load, or (Sprint 9) in ANY earlier st: library, so a
+// user file's `Error subclass: MyErr` finds the prelude's Error. We do NOT
+// bridge to arbitrary dart:core classes here: most (String, int, double, List,
+// …) are sealed and cannot be extended, so `String subclass: Symbol` would
+// fail finalization. The real base-class bridging — where an ST send is routed
+// to a dart:core method — happens in the IL builder, not by literally
+// subclassing a core type. The returned Type is intentionally UNFINALIZED for
+// the in-load case; ProcessPendingClasses finalizes it.
 dart::RawType* ResolveSuper(dart::Thread* thread,
                             const dart::Library& lib,
                             const std::string& name) {
@@ -134,6 +135,9 @@ dart::RawType* ResolveSuper(dart::Thread* thread,
   // LookupLocalClass (not LookupClass) — the latter follows the dart:core import
   // and would resolve `String`/`int`/… to the sealed core class.
   Class& super = Class::Handle(zone, lib.LookupLocalClass(sym));
+  if (super.IsNull()) {
+    super = FindStClassByName(thread, name.c_str());  // an earlier st: library
+  }
   if (super.IsNull() || super.NumTypeParameters() > 0) {
     return Type::ObjectType();
   }
@@ -143,10 +147,33 @@ dart::RawType* ResolveSuper(dart::Thread* thread,
 
 }  // namespace
 
+// The shared cross-load resolver (st_loader.h): newest st: library first.
+dart::RawClass* FindStClassByName(dart::Thread* thread, const char* name) {
+  using namespace dart;
+  Zone* zone = thread->zone();
+  Isolate* isolate = thread->isolate();
+  const GrowableObjectArray& libs = GrowableObjectArray::Handle(
+      zone, isolate->object_store()->libraries());
+  const String& cname = String::Handle(zone, Symbols::New(thread, name));
+  Library& lib = Library::Handle(zone);
+  String& url = String::Handle(zone);
+  Class& cls = Class::Handle(zone);
+  for (intptr_t i = libs.Length() - 1; i >= 0; i--) {
+    lib ^= libs.At(i);
+    url = lib.url();
+    if (url.IsNull()) continue;
+    if (strncmp(url.ToCString(), "st:", 3) != 0) continue;
+    cls = lib.LookupLocalClass(cname);
+    if (!cls.IsNull()) return cls.raw();
+  }
+  return Class::null();
+}
+
 bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
                   const std::string& source,
                   std::string* summary,
-                  std::string* error) {
+                  std::string* error,
+                  const char* url_override) {
   using namespace dart;
 
   // Retain the AST for the isolate's lifetime BEFORE stamping any marker into
@@ -164,7 +191,9 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
 
   // --- the library (imports dart:core so ST classes can later call it) ------
   const String& url = String::Handle(
-      zone, String::NewFormatted("st:mst/%d", g_load_counter++));
+      zone, (url_override != 0)
+                ? String::New(url_override, Heap::kOld)
+                : String::NewFormatted("st:mst/%d", g_load_counter++));
   const String& src = String::Handle(zone, String::New(source.c_str()));
   Library& library = Library::Handle(zone, Library::New(url));
   // Import dart:core so ST classes can later resolve/call it (this replicates

@@ -552,5 +552,26 @@ loudly). Stages A and C are modest; A is independently shippable.
 - **The core language is semantically complete.** Methods, objects+ivars, control flow,
   cascades, `super`, class-side + `Foo new`, capturing closures, and non-local `^` all
   run — Smalltalk's block-based idioms (`detect:`-style early exit through a passed
-  block) now work. **Next:** the workspace GUI, corpus/base-library breadth on the
-  bridge, nested-closure-own-local capture, the metaclass tower.
+  block) now work.
+- **Sprint 9 ✓ — exceptions + `become:` (beyond MACVM).** An auto-loaded **prelude**
+  (`st_prelude.h` → the `st:prelude` library; cross-load class resolution via a shared
+  `FindStClassByName`) defines `Exception`/`Error` and `STSystem`. The **`<stprim: name>`
+  pragma** makes a method body a direct call to a `dart:cocoa` helper (MACVM's own
+  primitive mechanism, reborn). **Exceptions**: `signal`/`signal:` throw an
+  `_STException` carrier; `on:do:`/`ensure:`/`ifCurtailed:` lower to Dart
+  try/catch/finally helpers over closure calls — so `ensure:` runs during non-local `^`
+  unwinding *exactly*; handler matching is class-walk `stIsKindOf` against a **class
+  value** (capitalized names now resolve to Type constants); class-side
+  `Error signal: 'x'` desugars to create-and-signal (ANSI behaviour — a static would
+  collide with the instance member); an ivar reference under a closure now implies
+  capturing `self`. **Become**: `STSystem forward: a to: b` = the VM's
+  `Become::ElementsForwardIdentity` (the reload primitive — every reference to a, heap
+  and stack, becomes b), and `STSystem become: a with: b` = a two-way identity swap via
+  shallow copies — **the feature MACVM had to drop**. Verified (10/10): signal/catch
+  with messageText, no-throw value, subclass match (cross-load `Error subclass: MyErr`),
+  non-match propagation, ensure on normal/throw/NLR paths, becomeForward (both holders
+  see b), become swap; 60k exception/NLR calls correct through the optimizing compiler;
+  all prior sprints + Dart + the 86-file corpus unaffected.
+  **Next:** the workspace GUI, corpus/base-library breadth, nested-closure-own-local
+  capture, the metaclass tower, resumable-exception protocol (`retry`/`resume` — noted
+  as not reasonably implementable without continuations).

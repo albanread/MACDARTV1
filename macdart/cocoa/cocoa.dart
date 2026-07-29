@@ -103,6 +103,70 @@ stNlrValue(e) {
   return e.value;
 }
 
+// --- Smalltalk exceptions (ST_PLAN.md Sprint 9) -----------------------------
+// ST `signal` throws the exception INSTANCE inside an _STException carrier;
+// `[..] on: Cls do: [:e | ..]` lowers to stOnDo(protected, type, handler) —
+// ST closures are directly callable as Dart closures, so the whole protocol
+// is ordinary Dart try/catch/finally. ensure: therefore runs during a
+// non-local return (the _STNlr carrier passes through `finally`) — exact
+// Smalltalk unwind semantics for free. _STNlr always rethrows: a `^` is not
+// a Smalltalk exception and must never be caught by on:do:.
+class _STException {
+  var instance; // the ST exception object (an Exception subclass instance)
+  _STException(this.instance);
+  String toString() {
+    var t = null;
+    try {
+      t = stSend(instance, 'messageText', []);
+    } catch (_) {}
+    return "Smalltalk exception: " + (t == null ? "(no message)" : t.toString());
+  }
+}
+
+stSignal(instance) {
+  throw new _STException(instance);
+}
+
+stOnDo(protected, type, handler) {
+  try {
+    return protected();
+  } catch (e) {
+    if (e is _STNlr) rethrow; // non-local ^ is not an exception
+    if (e is _STException && stIsKindOf(e.instance, type)) {
+      return handler(e.instance);
+    }
+    rethrow;
+  }
+}
+
+stEnsure(protected, cleanup) {
+  try {
+    return protected();
+  } finally {
+    cleanup();
+  }
+}
+
+stIfCurtailed(protected, cleanup) {
+  try {
+    return protected();
+  } catch (e) {
+    cleanup();
+    rethrow;
+  }
+}
+
+/// Is [obj]'s class the [type]'s class or one of its subclasses?
+bool stIsKindOf(obj, type) native "ST_isKindOf";
+
+// --- Smalltalk become (Sprint 9) --------------------------------------------
+/// One-way: every reference to [a] becomes a reference to [b] (the VM's
+/// reload-morphing primitive). Returns [b].
+stBecomeForward(a, b) native "ST_becomeForward";
+
+/// Two-way identity swap via shallow copies (identity hashes are the copies').
+stBecome(a, b) native "ST_become";
+
 // --- Low-level natives ------------------------------------------------------
 int _nsStringFromCString(String s) native "Cocoa_nsStringFromCString";
 int _nsStringLength(int handle) native "Cocoa_nsStringLength";

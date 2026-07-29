@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "st_ast.h"
+#include "st_loader.h"                // FindStClassByName (cross-load resolve)
 
 #include "vm/ast.h"                   // SequenceNode
 #include "vm/class_finalizer.h"       // FinalizeClass (AllocateObject layout)
@@ -665,7 +666,16 @@ Fragment StGraphBuilder::TranslateVariable(VariableNode* node) {
       return instructions;
     }
   }
-  return Unsupported(node, "variable (global / class name)");
+  // Sprint 9: a capitalized name resolving to an ST class is a CLASS VALUE —
+  // its Type object — so classes flow as arguments (`[..] on: Error do: ..`).
+  {
+    const Class& cls = Class::Handle(zone_, ResolveClassName(node->name));
+    if (!cls.IsNull()) {
+      return Constant(
+          Type::ZoneHandle(zone_, Type::NewNonParameterizedType(cls)));
+    }
+  }
+  return Unsupported(node, "variable (global)");
 }
 
 Fragment StGraphBuilder::TranslateAssign(AssignNode* node) {
@@ -722,6 +732,31 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
     return TranslateExpression(node->receiver.get());
   }
 
+  // Sprint 9: the exception protocol lowers to dart:cocoa helpers over
+  // closure calls (ST closures are Dart-callable): `[..] on: Cls do: [:e|..]`
+  // -> stOnDo(protected, type, handler); ensure:/ifCurtailed: likewise. Since
+  // stEnsure is a Dart try/finally, an ensure: block runs during NLR
+  // unwinding — exact Smalltalk semantics.
+  if ((node->selector == "on:do:" && node->args.size() == 2) ||
+      ((node->selector == "ensure:" || node->selector == "ifCurtailed:") &&
+       node->args.size() == 1)) {
+    const char* helper = (node->selector == "on:do:")
+                             ? "stOnDo"
+                             : (node->selector == "ensure:") ? "stEnsure"
+                                                             : "stIfCurtailed";
+    const Function& fn =
+        Function::ZoneHandle(zone_, LookupCocoaFunction(helper));
+    Fragment instructions = TranslateExpression(node->receiver.get());
+    instructions += PushArgument();
+    for (size_t i = 0; i < node->args.size(); i++) {
+      instructions += TranslateExpression(node->args[i].get());
+      instructions += PushArgument();
+    }
+    instructions +=
+        StaticCall(fn, 1 + static_cast<intptr_t>(node->args.size()));
+    return instructions;
+  }
+
   // A unary send that bridges to a dart:core GETTER (`x size` -> `x.length`):
   // getters read a value, so they use the mangled name + Token::kGET, not a
   // method call (which would try to invoke the value).
@@ -755,16 +790,11 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
   return instructions;
 }
 
-// A class name resolves to a loaded ST class in the receiver's own library
-// (same stLoad). Capitalized identifiers only.
+// A class name resolves to a loaded ST class in ANY st: library (the user's
+// loads and the prelude — newest first). Capitalized identifiers only.
 RawClass* StGraphBuilder::ResolveClassName(const std::string& name) {
   if (name.empty() || name[0] < 'A' || name[0] > 'Z') return Class::null();
-  const Class& owner = Class::Handle(zone_, pf_->function().Owner());
-  if (owner.IsNull()) return Class::null();
-  const Library& lib = Library::Handle(zone_, owner.library());
-  if (lib.IsNull()) return Class::null();
-  const String& sym = String::Handle(zone_, Symbols::New(thread_, name.c_str()));
-  return lib.LookupLocalClass(sym);
+  return FindStClassByName(thread_, name.c_str());
 }
 
 // `Foo <sel>`: a class-side (static) method wins; otherwise `new`/`basicNew`
@@ -772,16 +802,23 @@ RawClass* StGraphBuilder::ResolveClassName(const std::string& name) {
 // aliases are for dart:core sends, not user methods.)
 Fragment StGraphBuilder::TranslateClassSend(const Class& cls,
                                             MessageNode* node) {
-  // Member-finalize the target class first — LookupStaticFunction would
-  // otherwise route through EnsureIsFinalized -> the Dart parser, which crashes
-  // on a TokenStream-less ST class (same guard as st_natives.cc).
-  if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
   const String& sel =
       String::Handle(zone_, Symbols::New(thread_, node->selector.c_str()));
-  // Zone handle: StaticCallInstr keeps the Function past this HANDLESCOPE (and
-  // asserts IsZoneHandle).
-  const Function& fn =
-      Function::ZoneHandle(zone_, cls.LookupStaticFunction(sel));
+  // Walk the SUPER chain for the class-side method (Sprint 9: inherited
+  // class-side conveniences work), member-finalizing each visited class — a
+  // bare LookupStaticFunction would route through EnsureIsFinalized -> the
+  // Dart parser, which crashes on a TokenStream-less ST class. Zone handle:
+  // StaticCallInstr keeps the Function past this HANDLESCOPE.
+  Function& fn = Function::ZoneHandle(zone_);
+  {
+    Class& c = Class::Handle(zone_, cls.raw());
+    while (!c.IsNull()) {
+      if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+      fn ^= c.LookupStaticFunction(sel);
+      if (!fn.IsNull()) break;
+      c ^= c.SuperClass();
+    }
+  }
   if (!fn.IsNull()) {
     Fragment instructions;  // static call: push args only (no receiver)
     for (size_t i = 0; i < node->args.size(); i++) {
@@ -794,6 +831,25 @@ Fragment StGraphBuilder::TranslateClassSend(const Class& cls,
   if ((node->selector == "new" || node->selector == "basicNew") &&
       node->args.empty()) {
     return AllocateObject(cls);
+  }
+  // Sprint 9: ANSI `Exception class >> signal[:]` — a class-side signal send
+  // creates and signals: `Error signal: 'x'` == `Error new signal: 'x'`.
+  // (A static method of that name would collide with the instance member
+  // under Dart's rules, so the builder desugars instead — and this way it
+  // works for every user-defined exception subclass automatically.)
+  if ((node->selector == "signal" && node->args.empty()) ||
+      (node->selector == "signal:" && node->args.size() == 1)) {
+    Fragment instructions = AllocateObject(cls);
+    instructions += PushArgument();
+    for (size_t i = 0; i < node->args.size(); i++) {
+      instructions += TranslateExpression(node->args[i].get());
+      instructions += PushArgument();
+    }
+    const String& sel = String::ZoneHandle(
+        zone_, Symbols::New(thread_, node->selector.c_str()));
+    const intptr_t argc = 1 + static_cast<intptr_t>(node->args.size());
+    instructions += InstanceCall(sel, Token::kILLEGAL, argc, 1);
+    return instructions;
   }
   return Unsupported(node, "class-side send (no matching class method)");
 }
@@ -1074,12 +1130,21 @@ void StGraphBuilder::MarkFreeNames(Node* node) {
     } else {
       std::map<std::string, LocalVariable*>::iterator it =
           locals_.find(v->name);
-      if (it != locals_.end()) it->second->set_is_captured();
+      if (it != locals_.end()) {
+        it->second->set_is_captured();
+      } else if (this_var_ != NULL && IvarOffset(v->name) >= 0) {
+        // Referencing an INSTANCE VARIABLE under a closure captures self.
+        this_var_->set_is_captured();
+      }
     }
   } else if (AssignNode* a = dynamic_cast<AssignNode*>(node)) {
     std::map<std::string, LocalVariable*>::iterator it =
         locals_.find(a->name);
-    if (it != locals_.end()) it->second->set_is_captured();
+    if (it != locals_.end()) {
+      it->second->set_is_captured();
+    } else if (this_var_ != NULL && IvarOffset(a->name) >= 0) {
+      this_var_->set_is_captured();  // ivar write under a closure needs self
+    }
     MarkFreeNames(a->value.get());
   } else if (ReturnNode* r = dynamic_cast<ReturnNode*>(node)) {
     MarkFreeNames(r->value.get());
@@ -1644,6 +1709,38 @@ FlowGraph* StGraphBuilder::Build(MethodNode* method) {
   TargetEntryInstr* normal_entry = BuildTargetEntry();
   graph_entry_ =
       new (zone_) GraphEntryInstr(*pf_, normal_entry, osr_id_);
+
+  // Sprint 9: a `<stprim: name>` pragma body IS a call to the named
+  // dart:cocoa helper with (self +) the parameters as arguments — the
+  // prelude's primitive mechanism (signal, becomeForward:, ...), the same
+  // shape MACVM's own kernel uses for its primitives.
+  for (size_t i = 0; i < method->pragmas.size(); i++) {
+    const std::string& text = method->pragmas[i].text;
+    if (text.compare(0, 8, "stprim: ") != 0) continue;
+    std::string prim = text.substr(8);
+    while (!prim.empty() && prim[prim.size() - 1] == ' ') {
+      prim.erase(prim.size() - 1);
+    }
+    const Function& fn =
+        Function::ZoneHandle(zone_, LookupCocoaFunction(prim.c_str()));
+    Fragment prim_body;
+    prim_body += CheckStackOverflow();
+    intptr_t argc = 0;
+    if (this_var_ != NULL) {
+      prim_body += LoadLocal(this_var_);
+      prim_body += PushArgument();
+      argc++;
+    }
+    for (size_t a = 0; a < method->args.size(); a++) {
+      prim_body += LoadLocal(locals_[method->args[a]]);
+      prim_body += PushArgument();
+      argc++;
+    }
+    prim_body += StaticCall(fn, argc);
+    prim_body += Return();
+    normal_entry->LinkTo(prim_body.entry);
+    return new (zone_) FlowGraph(*pf_, graph_entry_, next_block_id_ - 1);
+  }
 
   Fragment body;
   body += CheckStackOverflow();

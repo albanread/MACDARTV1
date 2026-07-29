@@ -21,6 +21,11 @@
 
 #include "st_ast.h"
 
+namespace dart {
+class RawClass;
+class Thread;
+}  // namespace dart
+
 namespace st {
 
 // Registers a parsed ST program into the CURRENT isolate's object model.
@@ -39,11 +44,21 @@ namespace st {
 // failure and writes a short reason into *error (no exception is thrown).
 class Loader {
  public:
+  // url_override names the library (default: a fresh "st:mst/N"); the prelude
+  // loads as "st:prelude".
   static bool Load(std::unique_ptr<ProgramNode> program,
                    const std::string& source,
                    std::string* summary,
-                   std::string* error);
+                   std::string* error,
+                   const char* url_override = 0);
 };
+
+// Find a loaded ST class by name across EVERY st: library (newest first) —
+// the shared resolver for cross-load references: a user file's
+// `Error subclass: MyErr` finds the prelude's Error; the IL builder's
+// class-name sends and class-as-value references use it too. Returns
+// Class::null() if absent. Caller holds a VM transition + HANDLESCOPE.
+dart::RawClass* FindStClassByName(dart::Thread* thread, const char* name);
 
 }  // namespace st
 

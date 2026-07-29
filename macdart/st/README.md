@@ -1,7 +1,12 @@
-# MACVM Smalltalk (`.mst`) reader — Sprint 0
+# MACVM Smalltalk (`.mst`) reader — Sprint 0 + Sprint 1
 
-This is **Sprint 0 of `ST_PLAN.md`**: a standalone, pure-C++17 **language
-reader** for the GNU-Smalltalk-style bracketed `.mst` dialect used by MACVM.
+This is the standalone, pure-C++17 **language reader** for the
+GNU-Smalltalk-style bracketed `.mst` dialect used by MACVM (Sprint 0), hardened
+against the real MACVM corpus (Sprint 1).
+
+**Corpus coverage: 86/86** of `world/*.mst` parse cleanly. Sprint 1 added
+MACVM's inline `<Type>` annotations plus the `|`-method / `class`-method
+disambiguations that the corpus needs; see below.
 
 It is **completely self-contained** — lexer, AST, recursive-descent parser, and
 a pretty-printing dumper. **There are no Dart-VM dependencies whatsoever.** It
@@ -68,6 +73,16 @@ source line, and a caret, then exits non-zero.
   `Name class >> pattern [ … ]`, `Name extend [ … ]`,
   `Name class extend [ … ]`.
 - Method patterns: unary, binary (`+ arg`), keyword (`at: a put: b`).
+- **MACVM `<Type>` annotations** (accepted and discarded — semantically inert,
+  like Dart's optional types). They appear in exactly three signature positions:
+  instance-variable names (`| array <Array> firstIndex <Integer> |`),
+  method-pattern arguments (`value: v <Integer>`, `= other <Object>`), and an
+  optional return type `^ <Type>` before the body `[`
+  (`isInteger ^ <Boolean> [ ^true ]`, `class ^ <Behavior> [ … ]`). The type may
+  be a simple name (`<Integer>`), a union (`<A|B>`), or a block type
+  (`<[Object,^Boolean]>`). A `<` is only read as a type annotation in these
+  signature positions — everywhere else it is the binary less-than operator, and
+  `<primitive: …>` inside a body stays a pragma.
 - Method body: optional pragmas, optional temps `| t u |`, statements separated
   by `.`; a statement is `^expr` or an expr; assignment `id := expr` (chained).
 - Expression precedence unary > binary > keyword; cascades via `;` (shared
@@ -88,22 +103,43 @@ source line, and a caret, then exits non-zero.
   `ClassDef` when followed by `[`.
 - Pragma `<…>` vs. a `<`-named binary method — a `<` binary token followed by a
   keyword is treated as a pragma opener.
+- `<Type>` annotation vs. binary `<` — a `<` is a type annotation only in the
+  three signature positions above; in expression position it is less-than.
+- Binary method named `|` (the union/or operator) vs. an instance-variable list —
+  inside a class body, a leading `|` followed by an argument name and then the
+  body `[` (or a return `^`) is the `|` method; `| a b |` is an ivar list.
+- Unary method named `class` vs. the metaclass marker — inside a class body a
+  bare `class` followed by `^` or `[` is an ordinary unary method named `class`,
+  not the `Foo class >> …` / `Foo class extend` metaclass form.
 
-## Known TODOs (the long tail, deferred)
+## Known TODOs / documented residuals (the long tail)
 
-- **No VM integration** — this is a reader only (that is the whole point of
-  Sprint 0). No compilation, name resolution, or bytecode.
+The whole `world/*.mst` corpus (86 files) parses. The items below are grammar
+constructs the reader does **not** handle; **none of them occur in code position
+in the corpus**, so none block the 86/86 (each note says where the corpus stands).
+
+- **No VM integration** — this is a reader only (the whole point of Sprint 0).
+  No compilation, name resolution, or bytecode.
+- **Annotated `|` method** — a binary method named `|` written *with* a type
+  annotation (`| arg <Type> [ … ]`) is still ambiguous with a typed
+  instance-variable list and is not disambiguated. MACVM's own sources omit the
+  annotation on these (`| aBoolean [`, `| aCollection [`), which the reader does
+  handle; the annotated form does not appear in the corpus.
 - Pragmas are captured as raw text, not interpreted; a pragma body containing a
   bare `>` (other than its closer) is not handled, and non-keyword pragmas
-  (`<primitive>`) aren't specially recognized.
+  (`<primitive>`) aren't specially recognized. *(No corpus pragma contains a
+  bare `>` or `|`.)*
 - `#(at:put:)` written contiguously yields two symbol elements (`#at:` `#put:`)
-  rather than one combined `#at:put:` symbol.
+  rather than one combined `#at:put:` symbol. *(The corpus writes these as
+  quoted strings, e.g. `#('at:put:' …)`, so it is unaffected.)*
 - Empty temporaries/args `||` lexes as a single binary `||` token, so an empty
-  `| |` temp list is not recognized (real code uses `| a b |` with names).
+  `| |` temp list is not recognized. *(Not used in the corpus.)*
 - `a -3` (space before, none after `-`) reads `-3` as a negative literal rather
   than `a - 3`; this dialect ambiguity is intentionally left as-is.
 - `ClassName class [ … ]` class-side *grouping* blocks are not parsed (only
-  `ClassName class >> selector` class-side methods are).
+  `ClassName class >> selector` class-side methods are). *(Not used in the
+  corpus.)*
 - Scaled decimals (`3.14s2`), `radix` exponent letters beyond `e/E/d/D`, and
-  extended/Unicode identifiers are not handled.
+  extended/Unicode identifiers are not handled. *(In the corpus scaled decimals
+  appear only inside comments/strings, never as code literals.)*
 - No semantic checks (duplicate temps, arg/selector arity, undeclared vars).

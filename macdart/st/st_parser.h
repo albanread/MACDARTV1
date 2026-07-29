@@ -59,6 +59,12 @@ class Parser {
 
   // --- method / block internals ---
   void ParseMethodPattern(MethodNode* m);
+  // Consumes an optional MACVM `<Type>` annotation in a signature position
+  // (ivar name, method-pattern argument, or `^ <Type>` return type). These are
+  // semantically inert for the reader, so they are accepted and discarded.
+  // Returns true if one was consumed. MUST only be called in signature
+  // positions — never in expression position, where `<` is binary less-than.
+  bool SkipTypeAnnotationOpt();
   Pragma ParsePragma();
   bool ParseTempsOpt(std::vector<std::string>* out);
   void ParseStatements(std::vector<NodePtr>* out, Tok terminator);

@@ -206,12 +206,28 @@ void Parser::ParseClassBody(
     std::vector<std::unique_ptr<VarDeclNode>>* ivars,
     std::vector<std::unique_ptr<MethodNode>>* methods) {
   while (!Is(Tok::kRBracket) && !Is(Tok::kEof) && !failed()) {
+    // Binary method named `|` (the union / or operator): `| arg [ ... ]` or
+    // `| arg ^ <Type> [ ... ]`. Distinguished from an instance-variable list
+    // (`| a b |`) by an argument name followed immediately by the method body
+    // `[` or a return-type `^` — neither of which can appear in an ivar list.
+    // (An *annotated* `| arg <Type> [ … ]` form stays ambiguous with a typed
+    // ivar list; MACVM's own sources omit the annotation here to avoid it.)
+    if (Is(Tok::kBar) && PeekTok(1).kind == Tok::kIdent &&
+        (PeekTok(2).kind == Tok::kLBracket || PeekTok(2).kind == Tok::kCaret)) {
+      auto m = ParseMethod(/*is_class_side=*/false);
+      if (failed()) return;
+      methods->push_back(std::move(m));
+      continue;
+    }
     // Instance-variable declaration: | a b |
     if (Is(Tok::kBar)) {
       Token bar = Take();
       auto vd = std::make_unique<VarDeclNode>();
       vd->pos = {bar.line, bar.col};
-      while (Is(Tok::kIdent)) vd->names.push_back(Take().text);
+      while (Is(Tok::kIdent)) {
+        vd->names.push_back(Take().text);
+        SkipTypeAnnotationOpt();  // optional `<Type>` after an ivar name
+      }
       Expect(Tok::kBar, "'|' to close instance-variable list");
       ivars->push_back(std::move(vd));
       continue;
@@ -276,6 +292,7 @@ void Parser::ParseMethodPattern(MethodNode* m) {
         return;
       }
       m->args.push_back(Take().text);
+      SkipTypeAnnotationOpt();  // optional `<Type>` after the argument name
     }
     m->selector = sel;
   } else if (Is(Tok::kBinary) || Is(Tok::kBar)) {
@@ -285,11 +302,39 @@ void Parser::ParseMethodPattern(MethodNode* m) {
       return;
     }
     m->args.push_back(Take().text);
+    SkipTypeAnnotationOpt();  // optional `<Type>` after the argument name
   } else if (Is(Tok::kIdent)) {
     m->selector = Take().text;  // unary selector
   } else {
     Fail(Cur(), "expected a method selector pattern");
   }
+
+  // Optional MACVM return-type annotation: `^ <Type>` before the body `[`.
+  if (Is(Tok::kCaret) && PeekTok(1).kind == Tok::kBinary &&
+      PeekTok(1).text == "<") {
+    Take();  // '^'
+    SkipTypeAnnotationOpt();
+  }
+}
+
+// Consumes an optional MACVM `<Type>` annotation. Only valid in signature
+// positions (see header). The type expression is discarded. It may be a simple
+// name (`<Integer>`), a union (`<A|B>`), or a block type (`<[Object,^Boolean]>`)
+// — none of which contain a top-level `>`, so we consume tokens up to the
+// closing `>`. `<` and `>` each lex as a single kBinary token here because they
+// are followed by a non-binary character (identifier or `[`).
+bool Parser::SkipTypeAnnotationOpt() {
+  if (!(Is(Tok::kBinary) && Cur().text == "<")) return false;
+  Take();  // '<'
+  while (!Is(Tok::kEof) && !(Is(Tok::kBinary) && Cur().text == ">")) {
+    Take();
+  }
+  if (Is(Tok::kBinary) && Cur().text == ">") {
+    Take();  // '>'
+  } else {
+    Fail(Cur(), "unterminated type annotation (missing '>')");
+  }
+  return true;
 }
 
 Pragma Parser::ParsePragma() {

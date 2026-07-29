@@ -4336,15 +4336,20 @@ void appAdd(String kind, String id, Map p) {
     var gr = Cocoa.cls("NSClickGestureRecognizer").alloc().init();
     v.addGestureRecognizer(gr);
     var cvView = v, cvH = ch;
-    gTargets.add(onAction(gr, (s) => defer(() {
+    gTargets.add(onAction(gr, (s) {
+      // Read the point NOW — the action fires synchronously with the gesture, so
+      // its location is valid here; a deferred read gets a stale/default point.
+      // Defer only the delivery (the [defer] rule is about re-entering, which
+      // appFire does; a plain locationInView query does not).
       var pt = gr.locationInView(cvView);
       var x = 0.0, y = 0.0;
       if (pt is List && pt.length >= 2) {
         x = (pt[0] as num).toDouble();
         y = (pt[1] as num).toDouble();
       }
-      appFire(id, 'click', x.toStringAsFixed(1) + ',' + (cvH - y).toStringAsFixed(1));
-    })));
+      var fy = cvH - y;
+      defer(() => appFire(id, 'click', x.toStringAsFixed(1) + ',' + fy.toStringAsFixed(1)));
+    }));
   } else if (kind == 'scroll') {
     // A viewport whose document view can be LARGER than the frame, so an app
     // taller/wider than the pane scrolls. Widgets route into the document view.

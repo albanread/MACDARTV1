@@ -275,7 +275,9 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
             p, String::Handle(zone, Symbols::New(thread, m->args[a].c_str())));
       }
 
-      fn.set_kernel_function(reinterpret_cast<void*>(m));
+      // Stored as a Node* (closures store their BlockNode* the same way);
+      // st::BuildGraph recovers a Node* and dispatches on the dynamic type.
+      fn.set_kernel_function(reinterpret_cast<void*>(static_cast<Node*>(m)));
       // ST methods are NOT inlinable: the optimizer's inliner builds callee
       // graphs itself (flow_graph_inliner.cc), and would route an ST-marked
       // callee to the kernel builder — misreading the st::MethodNode. Marking

@@ -38,7 +38,9 @@
 #include "vm/class_finalizer.h"       // FinalizeClass (AllocateObject layout)
 #include "vm/flow_graph.h"            // FlowGraph
 #include "vm/intermediate_language.h" // all the *Instr, Value, Definition
+#include "vm/isolate.h"               // Isolate (closure-function table)
 #include "vm/object.h"                // Function, Class, Type, Integer, Bool...
+#include "vm/object_store.h"          // object_store()->closure_class()
 #include "vm/os.h"                    // OS::PrintErr
 #include "vm/parser.h"                // ParsedFunction
 #include "vm/scopes.h"                // LocalScope, LocalVariable
@@ -153,6 +155,7 @@ class StGraphBuilder {
         synth_counter_(0) {}
 
   FlowGraph* Build(MethodNode* method);
+  FlowGraph* BuildClosure(BlockNode* block);  // Stage A: a closure body
 
  private:
   // --- expression stack (guide §1.3, §5.B) ---
@@ -385,8 +388,15 @@ class StGraphBuilder {
   Fragment ArmValue(BlockNode* block);
   Fragment StoreToValueTemp();
   void CollectLocals(Node* node, LocalScope* scope);
+  void CollectLocalsInBlock(BlockNode* block, LocalScope* scope);
   void AddLocalName(const std::string& name, LocalScope* scope);
   LocalVariable* AllocSynth(Node* node, const char* prefix, LocalScope* scope);
+
+  // Closures Stage A (non-capturing): a BlockNode in value position becomes a
+  // first-class Closure; `value*` sends become InstanceCall("call").
+  Fragment TranslateClosure(BlockNode* block);
+  void PrepareClosureScope(BlockNode* block);
+  static bool HasReturn(Node* node);
 
   // Sprint 6: class-side sends (Foo new / a class method) + dart:core aliases.
   RawClass* ResolveClassName(const std::string& name);
@@ -510,6 +520,9 @@ Fragment StGraphBuilder::TranslateExpression(Node* node) {
   }
   if (CascadeNode* n = dynamic_cast<CascadeNode*>(node)) {
     return TranslateCascade(n);
+  }
+  if (BlockNode* n = dynamic_cast<BlockNode*>(node)) {
+    return TranslateClosure(n);  // a block in value position = a closure
   }
   if (MessageNode* n = dynamic_cast<MessageNode*>(node)) {
     if (IsInlinableControlFlow(n)) {
@@ -720,6 +733,16 @@ Fragment StGraphBuilder::TranslateSuperSend(MessageNode* node) {
 // ST selector -> dart:core selector, where they differ. Selectors that already
 // match (+, -, <, abs, ...) pass through. The long tail is filled as needed.
 std::string StGraphBuilder::DartSelector(const std::string& s) {
+  // Closure invocation: the runtime's IC-miss path invokes a closure receiver
+  // sent `call` (runtime_entry.cc:1575), so the whole value* family lowers to
+  // one selector. KNOWN CONFLICT: an ST class defining its own `value`/`value:`
+  // method is unreachable via these selectors (the send becomes `call`); the
+  // fix — dual-registering such methods under `call` in the loader — is
+  // deferred until corpus code needs it.
+  if (s == "value" || s == "value:" || s == "value:value:" ||
+      s == "value:value:value:" || s == "value:value:value:value:") {
+    return "call";
+  }
   if (s == "=") return "==";
   if (s == "printString" || s == "displayString" || s == "asString") {
     return "toString";
@@ -777,20 +800,39 @@ void StGraphBuilder::CollectLocals(Node* node, LocalScope* scope) {
   } else if (ReturnNode* r = dynamic_cast<ReturnNode*>(node)) {
     CollectLocals(r->value.get(), scope);
   } else if (MessageNode* m = dynamic_cast<MessageNode*>(node)) {
-    CollectLocals(m->receiver.get(), scope);
-    for (size_t i = 0; i < m->args.size(); i++) {
-      CollectLocals(m->args[i].get(), scope);
-    }
-    if (m->selector == "to:do:" && m->args.size() == 2 &&
-        IsBlockNode(m->args[1].get())) {
-      AllocSynth(m, "lim", scope);
+    if (IsInlinableControlFlow(m)) {
+      // Inlined control flow: its block operands compile IN this frame, so
+      // their args/temps hoist here. Non-block operands recurse normally.
+      if (m->receiver != nullptr) {
+        if (BlockNode* rb = dynamic_cast<BlockNode*>(m->receiver.get())) {
+          CollectLocalsInBlock(rb, scope);
+        } else {
+          CollectLocals(m->receiver.get(), scope);
+        }
+      }
+      for (size_t i = 0; i < m->args.size(); i++) {
+        if (BlockNode* ab = dynamic_cast<BlockNode*>(m->args[i].get())) {
+          CollectLocalsInBlock(ab, scope);
+        } else {
+          CollectLocals(m->args[i].get(), scope);
+        }
+      }
+      if (m->selector == "to:do:" && m->args.size() == 2 &&
+          IsBlockNode(m->args[1].get())) {
+        AllocSynth(m, "lim", scope);
+      }
+    } else {
+      CollectLocals(m->receiver.get(), scope);
+      for (size_t i = 0; i < m->args.size(); i++) {
+        CollectLocals(m->args[i].get(), scope);
+      }
     }
   } else if (BlockNode* b = dynamic_cast<BlockNode*>(node)) {
-    for (size_t i = 0; i < b->args.size(); i++) AddLocalName(b->args[i], scope);
-    for (size_t i = 0; i < b->temps.size(); i++) AddLocalName(b->temps[i], scope);
-    for (size_t i = 0; i < b->statements.size(); i++) {
-      CollectLocals(b->statements[i].get(), scope);
-    }
+    // A block in VALUE position (not a control-flow operand) is a first-class
+    // CLOSURE: its args/temps belong to the closure function's own frame, not
+    // this one. All this frame needs is a temp to hold the allocated closure
+    // while its fields are stored (TranslateClosure).
+    if (!synth_.count(b)) AllocSynth(b, "clos", scope);
   } else if (CascadeNode* c = dynamic_cast<CascadeNode*>(node)) {
     CollectLocals(c->receiver.get(), scope);
     for (size_t i = 0; i < c->messages.size(); i++) {
@@ -802,6 +844,58 @@ void StGraphBuilder::CollectLocals(Node* node, LocalScope* scope) {
       CollectLocals(d->elements[i].get(), scope);
     }
   }
+}
+
+// An INLINED block's args/temps hoist into the enclosing frame; recurse into
+// its statements (where nested closures/synths may appear).
+void StGraphBuilder::CollectLocalsInBlock(BlockNode* block, LocalScope* scope) {
+  for (size_t i = 0; i < block->args.size(); i++) {
+    AddLocalName(block->args[i], scope);
+  }
+  for (size_t i = 0; i < block->temps.size(); i++) {
+    AddLocalName(block->temps[i], scope);
+  }
+  for (size_t i = 0; i < block->statements.size(); i++) {
+    CollectLocals(block->statements[i].get(), scope);
+  }
+}
+
+// Does this subtree contain a `^` return? Used to reject non-local `^` inside
+// a first-class closure (Stage C) — over-approximating into nested blocks is
+// deliberate: any `^` under a closure is a non-local return from the home.
+bool StGraphBuilder::HasReturn(Node* node) {
+  if (node == NULL) return false;
+  if (dynamic_cast<ReturnNode*>(node) != NULL) return true;
+  if (AssignNode* a = dynamic_cast<AssignNode*>(node)) {
+    return HasReturn(a->value.get());
+  }
+  if (MessageNode* m = dynamic_cast<MessageNode*>(node)) {
+    if (HasReturn(m->receiver.get())) return true;
+    for (size_t i = 0; i < m->args.size(); i++) {
+      if (HasReturn(m->args[i].get())) return true;
+    }
+    return false;
+  }
+  if (BlockNode* b = dynamic_cast<BlockNode*>(node)) {
+    for (size_t i = 0; i < b->statements.size(); i++) {
+      if (HasReturn(b->statements[i].get())) return true;
+    }
+    return false;
+  }
+  if (CascadeNode* c = dynamic_cast<CascadeNode*>(node)) {
+    if (HasReturn(c->receiver.get())) return true;
+    for (size_t i = 0; i < c->messages.size(); i++) {
+      if (HasReturn(c->messages[i].get())) return true;
+    }
+    return false;
+  }
+  if (DynArrayNode* d = dynamic_cast<DynArrayNode*>(node)) {
+    for (size_t i = 0; i < d->elements.size(); i++) {
+      if (HasReturn(d->elements[i].get())) return true;
+    }
+    return false;
+  }
+  return false;
 }
 
 bool StGraphBuilder::IsInlinableControlFlow(MessageNode* node) {
@@ -1074,6 +1168,146 @@ Fragment StGraphBuilder::TranslateCascade(CascadeNode* node) {
   return instructions;
 }
 
+// ---------------------------------------------------------------------------
+// Closures Stage A (non-capturing). A BlockNode in value position becomes a
+// first-class Closure object; `value*` sends lower to InstanceCall("call"),
+// which the runtime's IC-miss path invokes on a closure receiver
+// (runtime_entry.cc:1575 -> DartEntry::InvokeClosure). References from the
+// closure body to enclosing method locals / self are Unsupported until the
+// Stage-B capture layer; `^` inside a closure is Stage C.
+// ---------------------------------------------------------------------------
+
+// Mirror of kernel_to_il.cc TranslateFunctionNode (:6604): get-or-create the
+// closure Function (dedup'd per (parent, synthetic position)), then allocate a
+// Closure object and store the function + a null context into it.
+Fragment StGraphBuilder::TranslateClosure(BlockNode* block) {
+  LocalVariable* tmp = synth_.count(block) ? synth_[block] : NULL;
+  if (tmp == NULL) return Unsupported(block, "closure (no creation temp)");
+
+  Isolate* isolate = thread_->isolate();
+  // A unique synthetic position per block: NewClosureFunction /
+  // LookupClosureFunction dedup by (parent, position), so kNoSource would
+  // alias every block in a method. Line/col are unique per block start.
+  const TokenPosition pos =
+      TokenPosition(block->pos.line * 1000 + block->pos.col).ToSynthetic();
+  Function& fn = Function::ZoneHandle(
+      zone_, isolate->LookupClosureFunction(pf_->function(), pos));
+  if (fn.IsNull()) {
+    fn = Function::NewClosureFunction(Symbols::AnonymousClosure(),
+                                      pf_->function(), pos);
+    fn.set_result_type(Object::dynamic_type());
+    // The VM closure calling convention: argument 0 is the closure object
+    // itself; the block's own args follow.
+    const intptr_t num_params = 1 + static_cast<intptr_t>(block->args.size());
+    fn.set_num_fixed_parameters(num_params);
+    fn.SetNumOptionalParameters(0, /*are_positional=*/true);
+    fn.set_parameter_types(
+        Array::Handle(zone_, Array::New(num_params, Heap::kOld)));
+    fn.set_parameter_names(
+        Array::Handle(zone_, Array::New(num_params, Heap::kOld)));
+    fn.SetParameterTypeAt(0, Object::dynamic_type());
+    fn.SetParameterNameAt(
+        0, String::Handle(zone_, Symbols::New(thread_, ":closure")));
+    for (size_t a = 0; a < block->args.size(); a++) {
+      fn.SetParameterTypeAt(1 + a, Object::dynamic_type());
+      fn.SetParameterNameAt(
+          1 + a,
+          String::Handle(zone_, Symbols::New(thread_, block->args[a].c_str())));
+    }
+    fn.set_context_scope(Object::empty_context_scope());  // Stage A: no capture
+    // The marker, stored as Node* like the loader's methods; st::BuildGraph
+    // dispatches on the dynamic type.
+    fn.set_kernel_function(reinterpret_cast<void*>(static_cast<Node*>(block)));
+    fn.set_is_inlinable(false);  // same inliner-misroute guard as ST methods
+    isolate->AddClosureFunction(fn);
+  }
+
+  // Allocate the Closure and fill its two fields (function, context).
+  const Class& closure_class =
+      Class::ZoneHandle(zone_, isolate->object_store()->closure_class());
+  ArgumentArray no_args =
+      new (zone_) ZoneGrowableArray<PushArgumentInstr*>(zone_, 0);
+  AllocateObjectInstr* alloc = new (zone_)
+      AllocateObjectInstr(TokenPosition::kNoSource, closure_class, no_args);
+  alloc->set_closure_function(fn);
+  Push(alloc);
+  Fragment instructions(alloc);
+  instructions += StoreLocal(tmp);
+  instructions += Drop();
+  instructions += LoadLocal(tmp);
+  instructions += Constant(fn);
+  instructions += StoreInstanceField(Closure::function_offset());
+  instructions += LoadLocal(tmp);
+  instructions += NullConstant();  // Stage A: nothing captured
+  instructions += StoreInstanceField(Closure::context_offset());
+  instructions += LoadLocal(tmp);  // the closure is the expression's value
+  return instructions;
+}
+
+// Scope prep for a CLOSURE body compile: argument 0 is the closure object,
+// then the block args; block temps are stack locals. No `self` (this_var_
+// stays NULL — self/ivars inside a closure are Stage B).
+void StGraphBuilder::PrepareClosureScope(BlockNode* block) {
+  const Function& function = pf_->function();
+
+  LocalScope* scope = new (zone_) LocalScope(NULL, 0, 0);
+  scope->set_begin_token_pos(function.token_pos());
+  scope->set_end_token_pos(function.end_token_pos());
+
+  LocalVariable* context_var = pf_->current_context_var();
+  context_var->set_is_forced_stack();
+  scope->AddVariable(context_var);
+
+  pf_->SetNodeSequence(new (zone_)
+                           SequenceNode(TokenPosition::kNoSource, scope));
+
+  intptr_t pos = 0;
+  LocalVariable* closure_var = MakeLocal(":closure");
+  scope->InsertParameterAt(pos++, closure_var);
+  for (size_t i = 0; i < block->args.size(); i++) {
+    LocalVariable* v = MakeLocal(block->args[i]);
+    scope->InsertParameterAt(pos++, v);
+    locals_[block->args[i]] = v;
+  }
+  for (size_t i = 0; i < block->temps.size(); i++) {
+    LocalVariable* v = MakeLocal(block->temps[i]);
+    scope->AddVariable(v);
+    locals_[block->temps[i]] = v;
+  }
+  for (size_t i = 0; i < block->statements.size(); i++) {
+    CollectLocals(block->statements[i].get(), scope);
+  }
+  value_temp_ = MakeLocal(":cfval");
+  scope->AddVariable(value_temp_);
+
+  pf_->AllocateVariables();
+}
+
+FlowGraph* StGraphBuilder::BuildClosure(BlockNode* block) {
+  PrepareClosureScope(block);
+
+  TargetEntryInstr* normal_entry = BuildTargetEntry();
+  graph_entry_ = new (zone_) GraphEntryInstr(*pf_, normal_entry, osr_id_);
+
+  Fragment body;
+  body += CheckStackOverflow();
+  if (HasReturn(block)) {
+    // `^` inside a first-class closure is a NON-LOCAL return (Stage C); until
+    // then the closure conservatively evaluates to nil, loudly.
+    OS::PrintErr(
+        "st::BuildClosure: non-local ^ in a closure at %d:%d (Stage C) — "
+        "closure yields nil\n",
+        block->pos.line, block->pos.col);
+    body += NullConstant();
+  } else {
+    body += InlineBlockValue(block);  // the last statement's value (or nil)
+  }
+  if (body.is_open()) body += Return();
+
+  normal_entry->LinkTo(body.entry);
+  return new (zone_) FlowGraph(*pf_, graph_entry_, next_block_id_ - 1);
+}
+
 Fragment StGraphBuilder::TranslateStatement(Node* node) {
   if (ReturnNode* r = dynamic_cast<ReturnNode*>(node)) {
     Fragment instructions = (r->value != nullptr)
@@ -1135,13 +1369,18 @@ FlowGraph* StGraphBuilder::Build(MethodNode* method) {
 FlowGraph* BuildGraph(ParsedFunction* pf,
                       const ZoneGrowableArray<const ICData*>& ic_data_array,
                       intptr_t osr_id) {
-  // Recover the ST method node from the marker the loader stamped
-  // (ST_PLAN.md §2.2): kernel_function() is reused as the st::MethodNode*.
-  MethodNode* method =
-      reinterpret_cast<MethodNode*>(pf->function().kernel_function());
-  ASSERT(method != NULL);
+  // Recover the marker (ST_PLAN.md §2.2). It is stored as a Node*: the loader
+  // stamps methods with a MethodNode*, and TranslateClosure stamps closure
+  // functions with their BlockNode* — dispatch on the dynamic type.
+  Node* node = reinterpret_cast<Node*>(pf->function().kernel_function());
+  ASSERT(node != NULL);
   StGraphBuilder builder(pf, ic_data_array, osr_id);
-  FlowGraph* graph = builder.Build(method);
+  FlowGraph* graph = NULL;
+  if (MethodNode* method = dynamic_cast<MethodNode*>(node)) {
+    graph = builder.Build(method);
+  } else if (BlockNode* block = dynamic_cast<BlockNode*>(node)) {
+    graph = builder.BuildClosure(block);
+  }
   ASSERT(graph != NULL);
   return graph;
 }

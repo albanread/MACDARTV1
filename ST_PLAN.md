@@ -494,9 +494,23 @@ loudly). Stages A and C are modest; A is independently shippable.
   superclass (walking the chain, finalizing each visited class on demand) and emits a
   StaticCall with self as argument 0. Verified across a 3-level hierarchy
   (Puppy→Dog→Animal, `super speak` chaining two levels → 111). No new VM patch.
-- **Next — first-class closures:** the largest remaining language piece. `[:x|…]` as a
-  first-class *value* with variable **capture** (a `Context` for captured vars, a closure
-  `Function` per block with a preserved `ContextScope`, `AllocateObject(closure_class)` +
-  `set_closure_function`, `value:`→`ClosureCall`, and the non-local `^` throw/catch
-  desugaring). Needs the context/scope infrastructure — a focused sprint of its own. Then
-  the workspace GUI and the MACVM A/B benchmark.
+- **Closures Stage A ✓** — non-capturing first-class closures (§9 blueprint). A
+  `BlockNode` in value position creates a real `Closure` (a dedup'd closure `Function`
+  per block via unique synthetic TokenPositions, `empty_context_scope`, the block
+  stamped as its marker; `AllocateObject(closure_class)` + `set_closure_function` +
+  function/context fields), and `value`/`value:`/… lower to `InstanceCall("call")`,
+  which the runtime invokes on a closure receiver. `st::BuildGraph` dispatches
+  method-vs-closure on the marker's dynamic type; `BuildClosure` compiles the block
+  body (arg 0 = the closure itself). The pre-pass hoists only *inlined* blocks —
+  closure blocks are self-contained. Verified: `[:x|x*x] value: 5`→25, `[42] value`→42,
+  `value:value:`→7, a closure **passed across methods** →11, one closure invoked twice
+  →50; correct through the *optimizing* compiler (40k calls); `^`-in-closure fails soft
+  (stderr note + nil, per Stage C); all sprints + Dart + the 86-file corpus unaffected.
+  Known conflict (documented in `DartSelector`): an ST class's own `value` method is
+  shadowed by the `call` alias until dual-registration lands.
+- **Next — Stage B: variable capture** (§9): mark captured method locals before
+  `AllocateVariables`, allocate/chain the `Context` in the method prologue, route
+  captured `LoadLocal`/`StoreLocal` through `LoadContextAt` + `Context::variable_offset`,
+  store the real context into the closure, `PreserveOuterScope`/`RestoreOuterScope` for
+  the closure-side scope. Then Stage C (non-local `^`), the workspace GUI, and the MACVM
+  A/B benchmark.

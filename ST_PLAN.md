@@ -508,9 +508,22 @@ loudly). Stages A and C are modest; A is independently shippable.
   (stderr note + nil, per Stage C); all sprints + Dart + the 86-file corpus unaffected.
   Known conflict (documented in `DartSelector`): an ST class's own `value` method is
   shadowed by the `call` alias until dual-registration lands.
-- **Next — Stage B: variable capture** (§9): mark captured method locals before
-  `AllocateVariables`, allocate/chain the `Context` in the method prologue, route
-  captured `LoadLocal`/`StoreLocal` through `LoadContextAt` + `Context::variable_offset`,
-  store the real context into the closure, `PreserveOuterScope`/`RestoreOuterScope` for
-  the closure-side scope. Then Stage C (non-local `^`), the workspace GUI, and the MACVM
-  A/B benchmark.
+- **Closures Stage B ✓ — variable capture.** A capture-analysis pre-pass marks every
+  method local (and `self`) referenced under a closure block `set_is_captured()` before
+  `AllocateVariables` (which then assigns context slots); the method prologue allocates
+  the heap `Context` into `current_context_var` and copies captured *parameters* in from
+  their raw frame slots (`Symbols::TempParam()` synthetic, kernel `:3277` pattern);
+  captured `LoadLocal`/`StoreLocal` route through the context (single level — the one
+  shared method context, level 0 everywhere, so nested closures re-export for free);
+  closure creation hand-builds the `ContextScope` (name/type/index/level per captured
+  var) and stores the real `current_context_var`; the closure body restores the outer
+  scope via `LocalScope::RestoreOuterScope` (a restored `this` becomes `self`, so
+  closures reach ivars) and its prologue loads the saved context out of the closure.
+  Verified: capture-and-read →15; **mutation through the context** (method observes
+  closure writes) →9; **captured parameter** →42; **a closure escaping its frame**
+  (heap context outlives the method) →8; a counter closure invoked 3× →3; **self-capture
+  mutating an ivar** →3; correct through the *optimizing* compiler; all sprints + Dart +
+  the 86-file corpus unaffected. Deferred: capture of a *closure's own* locals by a
+  nested closure (needs context chaining — fails soft as unsupported-variable).
+- **Next — Stage C: non-local `^`** (the try/catch home-token desugaring), then the
+  workspace GUI, and the MACVM A/B benchmark.

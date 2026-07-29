@@ -27,6 +27,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <map>
 #include <string>
@@ -152,7 +153,8 @@ class StGraphBuilder {
         graph_entry_(NULL),
         this_var_(NULL),
         value_temp_(NULL),
-        synth_counter_(0) {}
+        synth_counter_(0),
+        closure_var_(NULL) {}
 
   FlowGraph* Build(MethodNode* method);
   FlowGraph* BuildClosure(BlockNode* block);  // Stage A: a closure body
@@ -232,17 +234,44 @@ class StGraphBuilder {
     return Constant(Instance::ZoneHandle(zone_, Instance::null()));
   }
   Fragment LoadLocal(LocalVariable* variable) {
+    if (variable->is_captured()) {
+      // Stage B: a captured variable lives in the heap Context, not the frame.
+      // Single-level capture: the context is current_context_var directly
+      // (which is never itself captured, so the recursion terminates).
+      Fragment instructions = LoadLocal(pf_->current_context_var());
+      instructions += LoadField(Context::variable_offset(variable->index()));
+      return instructions;
+    }
     LoadLocalInstr* load =
         new (zone_) LoadLocalInstr(*variable, TokenPosition::kNoSource);
     Push(load);
     return Fragment(load);
   }
   Fragment StoreLocal(LocalVariable* variable) {
+    if (variable->is_captured()) {
+      // stack: [value] -> spill to value_temp_ (never captured), store into
+      // the context, re-push the value (a store is an expression).
+      Fragment instructions;
+      instructions += StoreLocal(value_temp_);
+      instructions += Drop();
+      instructions += LoadLocal(pf_->current_context_var());
+      instructions += LoadLocal(value_temp_);
+      instructions +=
+          StoreInstanceField(Context::variable_offset(variable->index()));
+      instructions += LoadLocal(value_temp_);
+      return instructions;
+    }
     Value* value = Pop();
     StoreLocalInstr* store = new (zone_)
         StoreLocalInstr(*variable, value, TokenPosition::kNoSource);
     Push(store);
     return Fragment(store);
+  }
+  Fragment AllocateContext(intptr_t size) {
+    AllocateContextInstr* allocate =
+        new (zone_) AllocateContextInstr(TokenPosition::kNoSource, size);
+    Push(allocate);
+    return Fragment(allocate);
   }
   Fragment LoadField(intptr_t offset) {
     LoadFieldInstr* load = new (zone_) LoadFieldInstr(
@@ -398,6 +427,12 @@ class StGraphBuilder {
   void PrepareClosureScope(BlockNode* block);
   static bool HasReturn(Node* node);
 
+  // Closures Stage B (capture): method locals referenced under a closure are
+  // marked captured (before AllocateVariables assigns their context slots).
+  // (AllocateContext is defined inline with the other primitives above.)
+  void MarkCapturedInClosures(Node* node);
+  void MarkFreeNames(Node* node);
+
   // Sprint 6: class-side sends (Foo new / a class method) + dart:core aliases.
   RawClass* ResolveClassName(const std::string& name);
   Fragment TranslateClassSend(const Class& cls, MessageNode* node);
@@ -422,6 +457,8 @@ class StGraphBuilder {
   LocalVariable* value_temp_;                     // reusable control-flow value temp
   std::map<Node*, LocalVariable*> synth_;         // per-node synth temps (to:do: limit, cascade rcvr)
   intptr_t synth_counter_;                        // makes synth-temp names unique
+  LocalVariable* closure_var_;                    // the :closure param (closure builds)
+  std::vector<LocalVariable*> param_vars_;        // params in frame order (capture copy)
 };
 
 void StGraphBuilder::PrepareScope(MethodNode* method) {
@@ -452,12 +489,14 @@ void StGraphBuilder::PrepareScope(MethodNode* method) {
                       Symbols::This(), Object::dynamic_type());
     scope->InsertParameterAt(pos++, this_var);
     this_var_ = this_var;
+    param_vars_.push_back(this_var);
   }
   // One parameter LocalVariable per selector argument.
   for (size_t i = 0; i < method->args.size(); i++) {
     LocalVariable* v = MakeLocal(method->args[i]);
     scope->InsertParameterAt(pos++, v);
     locals_[method->args[i]] = v;
+    param_vars_.push_back(v);
   }
   // One local LocalVariable per method temporary.
   for (size_t i = 0; i < method->temps.size(); i++) {
@@ -471,6 +510,13 @@ void StGraphBuilder::PrepareScope(MethodNode* method) {
   // scope BEFORE AllocateVariables (which assigns frame slots once).
   for (size_t i = 0; i < method->statements.size(); i++) {
     CollectLocals(method->statements[i].get(), scope);
+  }
+  // Stage B: mark every method local referenced under a CLOSURE block as
+  // captured — BEFORE AllocateVariables, which then assigns those variables
+  // context slots instead of frame slots. (value_temp_ is created after this
+  // pass so it can never be captured.)
+  for (size_t i = 0; i < method->statements.size(); i++) {
+    MarkCapturedInClosures(method->statements[i].get());
   }
   // A single reusable temp to materialize control-flow expression values.
   value_temp_ = MakeLocal(":cfval");
@@ -898,6 +944,100 @@ bool StGraphBuilder::HasReturn(Node* node) {
   return false;
 }
 
+// Stage B capture analysis: walk the method body; INLINED control-flow blocks
+// are part of this frame (recurse through them), while any other BlockNode is
+// a closure — every name referenced under it captures the matching method
+// local. Over-approximation (shadowed names, nested blocks) is deliberate: a
+// needlessly-captured variable still behaves correctly, just via the context.
+void StGraphBuilder::MarkCapturedInClosures(Node* node) {
+  if (node == NULL) return;
+  if (AssignNode* a = dynamic_cast<AssignNode*>(node)) {
+    MarkCapturedInClosures(a->value.get());
+  } else if (ReturnNode* r = dynamic_cast<ReturnNode*>(node)) {
+    MarkCapturedInClosures(r->value.get());
+  } else if (MessageNode* m = dynamic_cast<MessageNode*>(node)) {
+    if (IsInlinableControlFlow(m)) {
+      if (m->receiver != nullptr) {
+        if (BlockNode* rb = dynamic_cast<BlockNode*>(m->receiver.get())) {
+          for (size_t i = 0; i < rb->statements.size(); i++) {
+            MarkCapturedInClosures(rb->statements[i].get());
+          }
+        } else {
+          MarkCapturedInClosures(m->receiver.get());
+        }
+      }
+      for (size_t i = 0; i < m->args.size(); i++) {
+        if (BlockNode* ab = dynamic_cast<BlockNode*>(m->args[i].get())) {
+          for (size_t j = 0; j < ab->statements.size(); j++) {
+            MarkCapturedInClosures(ab->statements[j].get());
+          }
+        } else {
+          MarkCapturedInClosures(m->args[i].get());
+        }
+      }
+    } else {
+      MarkCapturedInClosures(m->receiver.get());
+      for (size_t i = 0; i < m->args.size(); i++) {
+        MarkCapturedInClosures(m->args[i].get());
+      }
+    }
+  } else if (BlockNode* b = dynamic_cast<BlockNode*>(node)) {
+    // A closure: everything referenced beneath it captures.
+    for (size_t i = 0; i < b->statements.size(); i++) {
+      MarkFreeNames(b->statements[i].get());
+    }
+  } else if (CascadeNode* c = dynamic_cast<CascadeNode*>(node)) {
+    MarkCapturedInClosures(c->receiver.get());
+    for (size_t i = 0; i < c->messages.size(); i++) {
+      MarkCapturedInClosures(c->messages[i].get());
+    }
+  } else if (DynArrayNode* d = dynamic_cast<DynArrayNode*>(node)) {
+    for (size_t i = 0; i < d->elements.size(); i++) {
+      MarkCapturedInClosures(d->elements[i].get());
+    }
+  }
+}
+
+// Under a closure: mark every referenced name that is a method local (or self)
+// as captured. Recurses through everything, including nested blocks.
+void StGraphBuilder::MarkFreeNames(Node* node) {
+  if (node == NULL) return;
+  if (VariableNode* v = dynamic_cast<VariableNode*>(node)) {
+    if (v->name == "self" || v->name == "super") {
+      if (this_var_ != NULL) this_var_->set_is_captured();
+    } else {
+      std::map<std::string, LocalVariable*>::iterator it =
+          locals_.find(v->name);
+      if (it != locals_.end()) it->second->set_is_captured();
+    }
+  } else if (AssignNode* a = dynamic_cast<AssignNode*>(node)) {
+    std::map<std::string, LocalVariable*>::iterator it =
+        locals_.find(a->name);
+    if (it != locals_.end()) it->second->set_is_captured();
+    MarkFreeNames(a->value.get());
+  } else if (ReturnNode* r = dynamic_cast<ReturnNode*>(node)) {
+    MarkFreeNames(r->value.get());
+  } else if (MessageNode* m = dynamic_cast<MessageNode*>(node)) {
+    MarkFreeNames(m->receiver.get());
+    for (size_t i = 0; i < m->args.size(); i++) {
+      MarkFreeNames(m->args[i].get());
+    }
+  } else if (BlockNode* b = dynamic_cast<BlockNode*>(node)) {
+    for (size_t i = 0; i < b->statements.size(); i++) {
+      MarkFreeNames(b->statements[i].get());
+    }
+  } else if (CascadeNode* c = dynamic_cast<CascadeNode*>(node)) {
+    MarkFreeNames(c->receiver.get());
+    for (size_t i = 0; i < c->messages.size(); i++) {
+      MarkFreeNames(c->messages[i].get());
+    }
+  } else if (DynArrayNode* d = dynamic_cast<DynArrayNode*>(node)) {
+    for (size_t i = 0; i < d->elements.size(); i++) {
+      MarkFreeNames(d->elements[i].get());
+    }
+  }
+}
+
 bool StGraphBuilder::IsInlinableControlFlow(MessageNode* node) {
   const std::string& s = node->selector;
   if (s == "ifTrue:" || s == "ifFalse:" || s == "and:" || s == "or:") {
@@ -1214,7 +1354,38 @@ Fragment StGraphBuilder::TranslateClosure(BlockNode* block) {
           1 + a,
           String::Handle(zone_, Symbols::New(thread_, block->args[a].c_str())));
     }
-    fn.set_context_scope(Object::empty_context_scope());  // Stage A: no capture
+    // Stage B: export every captured variable visible here (the method's
+    // captured locals — or, inside a closure body, the restored outer vars,
+    // which re-export to nested closures for free since the context is the
+    // single shared method context at level 0).
+    std::vector<LocalVariable*> captured;
+    if (this_var_ != NULL && this_var_->is_captured()) {
+      captured.push_back(this_var_);
+    }
+    for (std::map<std::string, LocalVariable*>::iterator it = locals_.begin();
+         it != locals_.end(); ++it) {
+      if (it->second->is_captured()) captured.push_back(it->second);
+    }
+    if (captured.empty()) {
+      fn.set_context_scope(Object::empty_context_scope());
+    } else {
+      const ContextScope& context_scope = ContextScope::Handle(
+          zone_, ContextScope::New(static_cast<intptr_t>(captured.size()),
+                                   /*is_implicit=*/false));
+      for (size_t ci = 0; ci < captured.size(); ci++) {
+        LocalVariable* v = captured[ci];
+        const intptr_t idx = static_cast<intptr_t>(ci);
+        context_scope.SetTokenIndexAt(idx, TokenPosition::kNoSource);
+        context_scope.SetDeclarationTokenIndexAt(idx, TokenPosition::kNoSource);
+        context_scope.SetNameAt(idx, v->name());
+        context_scope.SetIsFinalAt(idx, false);
+        context_scope.SetIsConstAt(idx, false);
+        context_scope.SetTypeAt(idx, Object::dynamic_type());
+        context_scope.SetContextIndexAt(idx, v->index());
+        context_scope.SetContextLevelAt(idx, 0);  // single shared context
+      }
+      fn.set_context_scope(context_scope);
+    }
     // The marker, stored as Node* like the loader's methods; st::BuildGraph
     // dispatches on the dynamic type.
     fn.set_kernel_function(reinterpret_cast<void*>(static_cast<Node*>(block)));
@@ -1238,7 +1409,9 @@ Fragment StGraphBuilder::TranslateClosure(BlockNode* block) {
   instructions += Constant(fn);
   instructions += StoreInstanceField(Closure::function_offset());
   instructions += LoadLocal(tmp);
-  instructions += NullConstant();  // Stage A: nothing captured
+  // The current context (null when this frame captured nothing) — the closure
+  // body's prologue restores it into its own current_context_var.
+  instructions += LoadLocal(pf_->current_context_var());
   instructions += StoreInstanceField(Closure::context_offset());
   instructions += LoadLocal(tmp);  // the closure is the expression's value
   return instructions;
@@ -1250,7 +1423,18 @@ Fragment StGraphBuilder::TranslateClosure(BlockNode* block) {
 void StGraphBuilder::PrepareClosureScope(BlockNode* block) {
   const Function& function = pf_->function();
 
-  LocalScope* scope = new (zone_) LocalScope(NULL, 0, 0);
+  // Stage B: if this closure captured outer variables, rebuild them from the
+  // ContextScope the creation site preserved — the VM primitive
+  // LocalScope::RestoreOuterScope (parser.cc:6596) returns an outer scope
+  // whose variables are already marked captured with the right context
+  // levels/indices. The closure's own scope is its child.
+  const ContextScope& context_scope =
+      ContextScope::Handle(zone_, function.context_scope());
+  LocalScope* outer = NULL;
+  if (!context_scope.IsNull() && context_scope.num_variables() > 0) {
+    outer = LocalScope::RestoreOuterScope(context_scope);
+  }
+  LocalScope* scope = new (zone_) LocalScope(outer, 0, 0);
   scope->set_begin_token_pos(function.token_pos());
   scope->set_end_token_pos(function.end_token_pos());
 
@@ -1261,9 +1445,25 @@ void StGraphBuilder::PrepareClosureScope(BlockNode* block) {
   pf_->SetNodeSequence(new (zone_)
                            SequenceNode(TokenPosition::kNoSource, scope));
 
+  // Register the restored captured variables by name (before the block's own
+  // args/temps, so a shadowing block arg correctly wins the map). A restored
+  // `this` becomes self.
+  if (outer != NULL) {
+    for (intptr_t i = 0; i < outer->num_variables(); i++) {
+      LocalVariable* v = outer->VariableAt(i);
+      const char* name = v->name().ToCString();
+      if (strcmp(name, "this") == 0) {
+        this_var_ = v;
+      } else {
+        locals_[std::string(name)] = v;
+      }
+    }
+  }
+
   intptr_t pos = 0;
   LocalVariable* closure_var = MakeLocal(":closure");
   scope->InsertParameterAt(pos++, closure_var);
+  closure_var_ = closure_var;
   for (size_t i = 0; i < block->args.size(); i++) {
     LocalVariable* v = MakeLocal(block->args[i]);
     scope->InsertParameterAt(pos++, v);
@@ -1291,6 +1491,19 @@ FlowGraph* StGraphBuilder::BuildClosure(BlockNode* block) {
 
   Fragment body;
   body += CheckStackOverflow();
+
+  // Stage B prologue: restore the captured context. The closure object is
+  // argument 0; its saved context (stored at creation) becomes this frame's
+  // current_context_var, through which every captured load/store routes.
+  const ContextScope& context_scope =
+      ContextScope::Handle(zone_, pf_->function().context_scope());
+  if (!context_scope.IsNull() && context_scope.num_variables() > 0) {
+    body += LoadLocal(closure_var_);
+    body += LoadField(Closure::context_offset());
+    body += StoreLocal(pf_->current_context_var());
+    body += Drop();
+  }
+
   if (HasReturn(block)) {
     // `^` inside a first-class closure is a NON-LOCAL return (Stage C); until
     // then the closure conservatively evaluates to nil, loudly.
@@ -1351,6 +1564,33 @@ FlowGraph* StGraphBuilder::Build(MethodNode* method) {
 
   Fragment body;
   body += CheckStackOverflow();
+
+  // Stage B: if any locals were captured, allocate the heap Context and chain
+  // it into current_context_var, then copy captured PARAMETERS from their
+  // incoming frame slots into it (mirrors kernel BuildGraphOfFunction:3277 —
+  // the captured variable's LocalVariable now holds a CONTEXT index, so the
+  // raw frame slot needs a synthetic forced-stack variable to read it).
+  const intptr_t context_size =
+      pf_->node_sequence()->scope()->num_context_variables();
+  if (context_size > 0) {
+    body += AllocateContext(context_size);
+    body += StoreLocal(pf_->current_context_var());  // never captured: plain
+    body += Drop();
+    intptr_t frame_index = pf_->first_parameter_index();
+    for (size_t i = 0; i < param_vars_.size(); i++, frame_index--) {
+      LocalVariable* variable = param_vars_[i];
+      if (!variable->is_captured()) continue;
+      LocalVariable* raw_parameter = new (zone_)
+          LocalVariable(TokenPosition::kNoSource, TokenPosition::kNoSource,
+                        Symbols::TempParam(), Object::dynamic_type());
+      raw_parameter->set_index(frame_index);
+      raw_parameter->set_is_captured_parameter(true);
+      body += LoadLocal(pf_->current_context_var());
+      body += LoadLocal(raw_parameter);
+      body += StoreInstanceField(Context::variable_offset(variable->index()));
+    }
+  }
+
   body += TranslateStatements(method->statements);
 
   // Guarantee the body is closed on every path (invariant #1): a method with no

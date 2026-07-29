@@ -66,6 +66,14 @@ String stLoad(String src) native "ST_load";
 dynamic stInvokeStatic(String className, String selector, List args)
     native "ST_invokeStatic";
 
+/// Allocate an instance of a loaded ST class [className] (ST_PLAN.md Sprint 5).
+/// The class is member-finalized on demand; returns the new ST instance.
+dynamic stNew(String className) native "ST_new";
+
+/// Send instance method [selector] with [args] to an ST [receiver] (Sprint 5);
+/// the first call lazily compiles the method body. Returns the result.
+dynamic stSend(receiver, String selector, List args) native "ST_send";
+
 // --- Low-level natives ------------------------------------------------------
 int _nsStringFromCString(String s) native "Cocoa_nsStringFromCString";
 int _nsStringLength(int handle) native "Cocoa_nsStringLength";

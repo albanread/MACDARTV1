@@ -240,6 +240,21 @@ class StGraphBuilder {
     Push(store);
     return Fragment(store);
   }
+  Fragment LoadField(intptr_t offset) {
+    LoadFieldInstr* load = new (zone_) LoadFieldInstr(
+        Pop(), offset, AbstractType::ZoneHandle(zone_),
+        TokenPosition::kNoSource);
+    Push(load);
+    return Fragment(load);
+  }
+  Fragment StoreInstanceField(intptr_t offset) {
+    Value* value = Pop();
+    const StoreBarrierType barrier =
+        value->BindsToConstant() ? kNoStoreBarrier : kEmitStoreBarrier;
+    StoreInstanceFieldInstr* store = new (zone_) StoreInstanceFieldInstr(
+        offset, Pop(), value, barrier, TokenPosition::kNoSource);
+    return Fragment(store);  // a store produces no value (no Push)
+  }
   Fragment PushArgument() {
     PushArgumentInstr* argument = new (zone_) PushArgumentInstr(Pop());
     Push(argument);
@@ -300,6 +315,18 @@ class StGraphBuilder {
     return new (zone_) LocalVariable(TokenPosition::kNoSource,
                                      TokenPosition::kNoSource, sym,
                                      Object::dynamic_type());
+  }
+  // Byte offset of an instance variable of the receiver's class, or -1 if
+  // `name` is not one. The owner class is member-finalized before compile
+  // (st_natives.cc ST_send / ST_new), so Field::Offset() is valid.
+  intptr_t IvarOffset(const std::string& name) {
+    const Class& owner = Class::Handle(zone_, pf_->function().Owner());
+    if (owner.IsNull()) return -1;
+    const String& sym =
+        String::Handle(zone_, Symbols::New(thread_, name.c_str()));
+    const Field& field = Field::Handle(zone_, owner.LookupInstanceField(sym));
+    if (field.IsNull()) return -1;
+    return field.Offset();
   }
 
   // --- translation ---
@@ -470,15 +497,42 @@ Fragment StGraphBuilder::TranslateVariable(VariableNode* node) {
   }
   LocalVariable* local = LookupLocal(node->name);
   if (local != NULL) return LoadLocal(local);
-  return Unsupported(node, "variable (instance var / global)");
+  // An instance variable of the receiver's class: self.<field>.
+  if (this_var_ != NULL) {
+    const intptr_t offset = IvarOffset(node->name);
+    if (offset >= 0) {
+      Fragment instructions = LoadLocal(this_var_);  // push self
+      instructions += LoadField(offset);             // pop self, push the field
+      return instructions;
+    }
+  }
+  return Unsupported(node, "variable (global / class name)");
 }
 
 Fragment StGraphBuilder::TranslateAssign(AssignNode* node) {
   LocalVariable* local = LookupLocal(node->name);
-  if (local == NULL) return Unsupported(node, "assignment to non-local");
-  Fragment instructions = TranslateExpression(node->value.get());
-  instructions += StoreLocal(local);  // pops value, leaves stored value on stack
-  return instructions;
+  if (local != NULL) {
+    Fragment instructions = TranslateExpression(node->value.get());
+    instructions += StoreLocal(local);  // pops value, leaves stored value
+    return instructions;
+  }
+  // An instance variable: self.<field> := value, leaving the value on the stack
+  // (an assignment is an expression). value_temp_ carries the value across the
+  // StoreInstanceField (which pushes nothing).
+  if (this_var_ != NULL) {
+    const intptr_t offset = IvarOffset(node->name);
+    if (offset >= 0) {
+      Fragment instructions = TranslateExpression(node->value.get());  // value
+      instructions += StoreLocal(value_temp_);   // value -> value_temp_
+      instructions += Drop();
+      instructions += LoadLocal(this_var_);      // push self
+      instructions += LoadLocal(value_temp_);    // push value
+      instructions += StoreInstanceField(offset);  // pop value, pop self
+      instructions += LoadLocal(value_temp_);    // the assignment's value
+      return instructions;
+    }
+  }
+  return Unsupported(node, "assignment to non-local");
 }
 
 Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {

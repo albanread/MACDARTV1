@@ -397,9 +397,20 @@ st_lexer.cc st_parser.cc st_natives.cc)` then add `dart_st` to each
   loop/cascade synth temps before `AllocateVariables`; control-flow values materialize
   through one reusable temp. Deferred: **real first-class closures** (`value:`/
   `ClosureCall`), `timesRepeat:`, instance-var access, `super`/class-name sends.
-- **Next — Sprint 5:** instance methods + ivar access (`LoadField`/`StoreInstanceField`
-  at `Field::Offset()`), `Foo new` + the metaclass tower (needs `AllocateObject` +
-  `Instance::New` on a member-finalized class), and the closure `^` desugaring
-  (`Throw`/`CatchBlockEntry`). Then interop (Sprint 6), the GUI (Sprint 7), and the
-  MACVM A/B benchmark (Sprint 8). VM-API templates already pinned (kernel_to_il
-  `AllocateObject`/`LoadField`/`StoreInstanceField`).
+- **Sprint 5 ✓** — instance methods + ivar state, no new VM patch. Instance methods
+  read/write instance variables via `LoadField`/`StoreInstanceField` at
+  `Field::Offset()` on `self` (an assignment carries its value through `value_temp_`);
+  the owner class is member-finalized on demand. Two natives — `stNew(class)`
+  (`Instance::New` on a finalized class) and `stSend(recv, sel, args)`
+  (`LookupDynamicFunction` + `DartEntry::InvokeFunction` with the receiver as arg 0) —
+  allocate objects and send instance messages from Dart. Verified: a `Counter`
+  (init/bump/bumpBy:/count) → 12; a `Point` with x/y, `sum`→7, `manhattanTo:`→10
+  (dispatches `x`/`y` to *another* Point and calls `int.abs` from `dart:core`); two
+  instances keep isolated state; an ivar-mutating loop is correct through the
+  *optimizing* compiler (`add=40000 sumTo=5050`, no assert failures);
+  statics/control-flow/Dart/corpus unaffected. **Deferred**: `Foo new` from ST *source*
+  (class-name globals + metaclass tower), real first-class closures (`value:`/
+  `ClosureCall`), `super` sends, the closure `^` desugaring.
+- **Next — Sprint 6:** interop breadth (the `dart:core`/`dart:cocoa` selector-alias
+  bridge, `super`/class-name sends, `Foo new` from source), then real closures, the
+  workspace GUI (Sprint 7), and the MACVM A/B benchmark (Sprint 8).

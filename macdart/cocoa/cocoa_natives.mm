@@ -496,6 +496,8 @@ void ST_load(Dart_NativeArguments args);
 // loaded ST class's class-side (static) method by selector and call it, JIT-
 // compiling its body on first use (ST_PLAN.md Sprint 3). Returns the result.
 void ST_invokeStatic(Dart_NativeArguments args);
+void ST_new(Dart_NativeArguments args);
+void ST_send(Dart_NativeArguments args);
 
 // Reverse-callback natives (defined in cocoa_callbacks.mm) — target-action,
 // delegates, and the syntax-highlight span applier.
@@ -548,6 +550,8 @@ void Sqlite_query(Dart_NativeArguments args);
   V(Cocoa_setSplitMinSize, 2)                                                  \
   V(ST_load, 1)                                                                \
   V(ST_invokeStatic, 3)                                                        \
+  V(ST_new, 1)                                                                 \
+  V(ST_send, 3)                                                                \
   V(Cocoa_registerCallbackDispatch, 1)                                         \
   V(Cocoa_makeActionTarget, 1)                                                 \
   V(Cocoa_wireAction, 2)                                                       \

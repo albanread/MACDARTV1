@@ -192,5 +192,125 @@ void ST_invokeStatic(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, result_handle);
 }
 
+// Find a loaded ST class by name — newest st:mst/ library first. Returns
+// Class::null() if absent. Caller holds a VM transition + HANDLESCOPE.
+static RawClass* FindStClass(Thread* thread, const std::string& name) {
+  Zone* zone = thread->zone();
+  Isolate* isolate = thread->isolate();
+  const GrowableObjectArray& libs = GrowableObjectArray::Handle(
+      zone, isolate->object_store()->libraries());
+  const String& cname =
+      String::Handle(zone, Symbols::New(thread, name.c_str()));
+  Library& lib = Library::Handle(zone);
+  String& url = String::Handle(zone);
+  Class& cls = Class::Handle(zone);
+  for (intptr_t i = libs.Length() - 1; i >= 0; i--) {
+    lib ^= libs.At(i);
+    url = lib.url();
+    if (url.IsNull()) continue;
+    if (strncmp(url.ToCString(), "st:mst/", 7) != 0) continue;
+    cls = lib.LookupLocalClass(cname);
+    if (!cls.IsNull()) return cls.raw();
+  }
+  return Class::null();
+}
+
+// stNew(String className) -> instance.  Sprint 5: allocate an instance of a
+// loaded ST class (member-finalized on demand so its instance size/layout
+// exist). The returned Dart object is an instance of the ST class.
+void ST_new(Dart_NativeArguments args) {
+  Dart_Handle cls_h = Dart_GetNativeArgument(args, 0);
+  const char* cls_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(cls_h, &cls_c)) || cls_c == NULL) {
+    Dart_SetReturnValue(args, Dart_NewApiError("stNew: bad class argument"));
+    return;
+  }
+  const std::string cls_name(cls_c);
+  Thread* thread = Thread::Current();
+  Dart_Handle result_handle = Dart_Null();
+  std::string err;
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    Class& cls = Class::Handle(zone, FindStClass(thread, cls_name));
+    if (cls.IsNull()) {
+      err = "stNew: no loaded ST class '" + cls_name + "'";
+    } else {
+      if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
+      const Instance& obj =
+          Instance::Handle(zone, Instance::New(cls, Heap::kNew));
+      result_handle = Api::NewHandle(thread, obj.raw());
+    }
+  }
+  if (!err.empty()) {
+    Dart_SetReturnValue(args, Dart_NewApiError(err.c_str()));
+    return;
+  }
+  Dart_SetReturnValue(args, result_handle);
+}
+
+// stSend(receiver, String selector, List args) -> result.  Sprint 5: send an
+// instance method to an ST object (receiver = argument 0). The first call
+// lazily compiles the body via the compiler.cc hook -> st::BuildGraph.
+void ST_send(Dart_NativeArguments args) {
+  Dart_Handle recv_h = Dart_GetNativeArgument(args, 0);
+  Dart_Handle sel_h = Dart_GetNativeArgument(args, 1);
+  Dart_Handle list_h = Dart_GetNativeArgument(args, 2);
+  const char* sel_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(sel_h, &sel_c)) || sel_c == NULL) {
+    Dart_SetReturnValue(args, Dart_NewApiError("stSend: bad selector argument"));
+    return;
+  }
+  intptr_t n = 0;
+  Dart_Handle len_err = Dart_ListLength(list_h, &n);
+  if (Dart_IsError(len_err)) {
+    Dart_SetReturnValue(args, len_err);
+    return;
+  }
+  std::vector<Dart_Handle> elems(n);
+  for (intptr_t i = 0; i < n; i++) {
+    elems[i] = Dart_ListGetAt(list_h, i);
+    if (Dart_IsError(elems[i])) {
+      Dart_SetReturnValue(args, elems[i]);
+      return;
+    }
+  }
+  const std::string selector(sel_c);
+  Thread* thread = Thread::Current();
+  Dart_Handle result_handle = Dart_Null();
+  std::string err;
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Object& recv = Object::Handle(zone, Api::UnwrapHandle(recv_h));
+    const Class& cls = Class::Handle(zone, recv.clazz());
+    if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
+    const String& sel =
+        String::Handle(zone, Symbols::New(thread, selector.c_str()));
+    const Function& fn =
+        Function::Handle(zone, cls.LookupDynamicFunction(sel));
+    if (fn.IsNull()) {
+      err = "stSend: " + std::string(cls.ToCString()) + " has no method '" +
+            selector + "'";
+    } else {
+      const Array& arr = Array::Handle(zone, Array::New(n + 1, Heap::kOld));
+      arr.SetAt(0, recv);  // receiver = argument 0
+      for (intptr_t i = 0; i < n; i++) {
+        arr.SetAt(i + 1, Object::Handle(zone, Api::UnwrapHandle(elems[i])));
+      }
+      const Object& result =
+          Object::Handle(zone, DartEntry::InvokeFunction(fn, arr));
+      result_handle = Api::NewHandle(thread, result.raw());
+    }
+  }
+  if (!err.empty()) {
+    Dart_SetReturnValue(args, Dart_NewApiError(err.c_str()));
+    return;
+  }
+  Dart_SetReturnValue(args, result_handle);
+}
+
 }  // namespace bin
 }  // namespace dart

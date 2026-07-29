@@ -83,7 +83,7 @@ present="$(python3 "$CTL" --port "$PORT" lang classsrc Fraction 2>/dev/null | he
 if [ -n "$present" ] && [ "$REIMPORT" != 1 ]; then
   echo "st: world already in the image"
 else
-  echo "st: importing the world from $WORLD…"
+  echo "st: importing the world from ${WORLD} ..."
   result="$(python3 "$CTL" --port "$PORT" --timeout 300 stimport "$WORLD")"
   case "$result" in
     ERR*|"") echo "start-st-gui.sh: import failed: $result" >&2

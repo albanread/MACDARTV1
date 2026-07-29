@@ -487,6 +487,11 @@ void Workspace_uiReady(Dart_NativeArguments args);
 void Cocoa_setSelectorAction(Dart_NativeArguments args);
 void Cocoa_setSplitMinSize(Dart_NativeArguments args);
 
+// Smalltalk loader native (defined in macdart/st/st_natives.cc) — parses a
+// `.mst` source string and registers its classes/methods/fields into the live
+// VM object model (ST_PLAN.md Sprint 2). Returns a summary or "ERR: ...".
+void ST_load(Dart_NativeArguments args);
+
 // Reverse-callback natives (defined in cocoa_callbacks.mm) — target-action,
 // delegates, and the syntax-highlight span applier.
 void Cocoa_registerCallbackDispatch(Dart_NativeArguments args);
@@ -536,6 +541,7 @@ void Sqlite_query(Dart_NativeArguments args);
   V(Workspace_uiReady, 0)                                                      \
   V(Cocoa_setSelectorAction, 3)                                                \
   V(Cocoa_setSplitMinSize, 2)                                                  \
+  V(ST_load, 1)                                                                \
   V(Cocoa_registerCallbackDispatch, 1)                                         \
   V(Cocoa_makeActionTarget, 1)                                                 \
   V(Cocoa_wireAction, 2)                                                       \

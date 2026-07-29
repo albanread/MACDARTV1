@@ -51,6 +51,14 @@ String wsUiReloadStatus() native "Workspace_uiReloadStatus";
 /// a running process with no window and no control socket.
 String wsUiReady() native "Workspace_uiReady";
 
+/// Load MACVM Smalltalk source [src] (a `.mst` string) into the live VM object
+/// model: its classes/methods/fields are REGISTERED in the class table (method
+/// bodies are not compiled yet — that is ST_PLAN.md Sprint 3). Returns a
+/// human-readable summary of what was registered, or an `"ERR: ..."` string on
+/// a lex/parse/finalize failure (never throws). Verification surface only:
+/// registered ST methods must not be invoked until the Sprint 3 compiler hook.
+String stLoad(String src) native "ST_load";
+
 // --- Low-level natives ------------------------------------------------------
 int _nsStringFromCString(String s) native "Cocoa_nsStringFromCString";
 int _nsStringLength(int handle) native "Cocoa_nsStringLength";

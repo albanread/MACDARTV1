@@ -17,6 +17,7 @@
 # --- Build outputs ------------------------------------------------------------
 /macdart/build/
 /macdart/build-release/
+/macdart/build-st/
 
 # --- Transient test-run logs --------------------------------------------------
 /macdart/test/*.txt

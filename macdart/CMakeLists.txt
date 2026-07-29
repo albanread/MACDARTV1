@@ -249,6 +249,10 @@ add_library(dart_cocoa STATIC
   ${COCOA}/cocoa_abi.cc        # @encode -> ABI-token classifier
   ${COCOA}/workspace_natives.cc # live-workspace eval primitives (Dart_EvaluateExpr)
   ${COCOA}/sqlite_natives.cc   # SQLite image store (libsqlite3)
+  ${MACDART_ROOT}/st/st_lexer.cc   # MACVM Smalltalk (.mst) reader: tokenizer
+  ${MACDART_ROOT}/st/st_parser.cc  # MACVM Smalltalk (.mst) reader: parser
+  ${MACDART_ROOT}/st/st_loader.cc  # ST -> VM object model registration (Sprint 2)
+  ${MACDART_ROOT}/st/st_natives.cc # stLoad native (ST_load) — verification surface
   ${COCOA}/gamepane/gp_synth.cc   # game pane: SFX synth (pure C++)
   ${COCOA}/gamepane/gp_engine.mm  # game pane: layered Metal engine
   ${COCOA}/gamepane/gp_natives.mm # game pane: the Dart boundary

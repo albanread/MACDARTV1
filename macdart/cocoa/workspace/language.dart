@@ -665,7 +665,8 @@ class AppSurface {
     _out.send(<dynamic>['appui', name, gen, b]);
   }
 
-  // -- the widget vocabulary (M1: title, label, field, button) ---------------
+  // -- the widget vocabulary: title, label, field, button, checkbox, slider,
+  //    popup, secure, progress, box ------------------------------------------
 
   /// The surface's title — the window title once popped out.
   void title(String text) { _cmd(<dynamic>['title', text]); }
@@ -697,12 +698,65 @@ class AppSurface {
         <String, dynamic>{'title': title, 'frame': frame, 'enabled': enabled}]);
   }
 
+  // -- more controls: the handler is wrapped so the app gets a TYPED value
+  //    (bool for a checkbox, double for a slider), not the raw wire string. ---
+
+  /// A labelled on/off switch. onToggle receives a bool.
+  void checkbox(String id, {String label: '', List frame, bool value: false,
+                            bool enabled: true, Function onToggle}) {
+    if (onToggle != null) _on(id, 'toggle', (s) => onToggle(s.toString() == 'true'));
+    _cmd(<dynamic>['add', 'checkbox', id, <String, dynamic>{
+        'title': label, 'frame': frame, 'value': value, 'enabled': enabled}]);
+  }
+
+  /// A horizontal slider over [min,max]. onSlide receives a double.
+  void slider(String id, {List frame, double min: 0.0, double max: 1.0,
+                          double value: 0.0, bool enabled: true, Function onSlide}) {
+    if (onSlide != null) _on(id, 'slide', (s) => onSlide(double.parse(s.toString(), (_) => value)));
+    _cmd(<dynamic>['add', 'slider', id, <String, dynamic>{
+        'frame': frame, 'min': min, 'max': max, 'value': value, 'enabled': enabled}]);
+  }
+
+  /// A drop-down of choices. onSelect receives the chosen title (a String).
+  void popup(String id, {List items, List frame, String selected,
+                         bool enabled: true, Function onSelect}) {
+    if (onSelect != null) _on(id, 'select', (s) => onSelect(s == null ? '' : s.toString()));
+    _cmd(<dynamic>['add', 'popup', id, <String, dynamic>{
+        'items': items, 'frame': frame, 'selected': selected, 'enabled': enabled}]);
+  }
+
+  /// A password field — like `field`, but the characters are hidden.
+  void secure(String id, {String text: '', List frame, Function onText, Function onEnter}) {
+    _on(id, 'text', onText);
+    _on(id, 'enter', onEnter);
+    _cmd(<dynamic>['add', 'secure', id,
+        <String, dynamic>{'text': text, 'frame': frame}]);
+  }
+
+  /// A determinate progress bar over [min,max]. Display only; drive it with set.
+  void progress(String id, {List frame, double min: 0.0, double max: 1.0,
+                            double value: 0.0}) {
+    _cmd(<dynamic>['add', 'progress', id, <String, dynamic>{
+        'frame': frame, 'min': min, 'max': max, 'value': value}]);
+  }
+
+  /// A titled group frame — visual grouping behind other widgets.
+  void box(String id, {String title: '', List frame}) {
+    _cmd(<dynamic>['add', 'box', id, <String, dynamic>{'title': title, 'frame': frame}]);
+  }
+
   /// Change a live widget without rebuilding — the fast path a keystroke takes.
-  void set(String id, {String text, String title, bool enabled}) {
+  /// value: slider/progress position; checked: a checkbox; selected/items: a popup.
+  void set(String id, {String text, String title, bool enabled, num value,
+                       bool checked, List items, String selected}) {
     var p = <String, dynamic>{};
     if (text != null) p['text'] = text;
     if (title != null) p['title'] = title;
     if (enabled != null) p['enabled'] = enabled;
+    if (value != null) p['value'] = value;
+    if (checked != null) p['checked'] = checked;
+    if (items != null) p['items'] = items;
+    if (selected != null) p['selected'] = selected;
     _cmd(<dynamic>['set', id, p]);
   }
 

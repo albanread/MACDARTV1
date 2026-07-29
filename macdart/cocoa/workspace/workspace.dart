@@ -4127,6 +4127,49 @@ void appAdd(String kind, String id, Map p) {
         appFire(id, 'text', s.stringValue().UTF8String()))));
     gTargets.add(onAction(v, (s) => defer(() =>
         appFire(id, 'enter', s.stringValue().UTF8String()))));
+  } else if (kind == 'checkbox') {
+    v = Cocoa.cls("NSButton").alloc().initWithFrame(frame);
+    v.setButtonType(3);                          // NSButtonTypeSwitch
+    v.setTitle(p['title'] == null ? '' : p['title'].toString());
+    v.setState(p['value'] == true ? 1 : 0);
+    if (p['enabled'] == false) v.setEnabled(false);
+    gTargets.add(onAction(v, (s) => defer(() =>
+        appFire(id, 'toggle', v.state() == 1 ? 'true' : 'false'))));
+  } else if (kind == 'slider') {
+    v = Cocoa.cls("NSSlider").alloc().initWithFrame(frame);
+    v.setMinValue(_appD(p['min'], 0.0));
+    v.setMaxValue(_appD(p['max'], 1.0));
+    v.setDoubleValue(_appD(p['value'], 0.0));
+    if (p['enabled'] == false) v.setEnabled(false);
+    gTargets.add(onAction(v, (s) => defer(() =>
+        appFire(id, 'slide', v.doubleValue().toString()))));
+  } else if (kind == 'popup') {
+    v = Cocoa.cls("NSPopUpButton").alloc().initWithFrame(frame, pullsDown: false);
+    var items = p['items'];
+    if (items is List) for (var it in items) v.addItemWithTitle(it.toString());
+    if (p['selected'] != null) v.selectItemWithTitle(p['selected'].toString());
+    if (p['enabled'] == false) v.setEnabled(false);
+    gTargets.add(onAction(v, (s) => defer(() =>
+        appFire(id, 'select', v.titleOfSelectedItem().UTF8String()))));
+  } else if (kind == 'secure') {
+    v = Cocoa.cls("NSSecureTextField").alloc().initWithFrame(frame);
+    v.setStringValue(p['text'] == null ? '' : p['text'].toString());
+    gTargets.add(onTextChange(v, (s) => defer(() =>
+        appFire(id, 'text', s.stringValue().UTF8String()))));
+    gTargets.add(onAction(v, (s) => defer(() =>
+        appFire(id, 'enter', s.stringValue().UTF8String()))));
+  } else if (kind == 'progress') {
+    v = Cocoa.cls("NSProgressIndicator").alloc().initWithFrame(frame);
+    v.setStyle(0);                               // NSProgressIndicatorStyleBar
+    v.setIndeterminate(false);
+    v.setMinValue(_appD(p['min'], 0.0));
+    v.setMaxValue(_appD(p['max'], 1.0));
+    v.setDoubleValue(_appD(p['value'], 0.0));
+  } else if (kind == 'box') {
+    v = Cocoa.cls("NSBox").alloc().initWithFrame(frame);
+    var t = p['title'] == null ? '' : p['title'].toString();
+    if (t.isEmpty) v.setTitlePosition(0);        // NSNoTitle
+    else v.setTitle(t);
   } else {                             // 'label', and anything unknown
     kind = 'label';
     v = Cocoa.cls("NSTextField").alloc().initWithFrame(frame);
@@ -4140,12 +4183,26 @@ void appAdd(String kind, String id, Map p) {
   gAppOrder.add(id);
 }
 
+double _appD(var x, double dflt) => (x is num) ? x.toDouble() : dflt;
+
 void appSet(String id, Map p) {
   var v = gAppViews[id];
   if (v == null) return;
+  var kind = gAppKinds[id];
   if (p['text'] != null) v.setStringValue(p['text'].toString());
   if (p['title'] != null) v.setTitle(p['title'].toString());
   if (p['enabled'] != null) v.setEnabled(p['enabled'] == true);
+  if (p['value'] != null && (kind == 'slider' || kind == 'progress')) {
+    v.setDoubleValue((p['value'] as num).toDouble());
+  }
+  if (p['checked'] != null && kind == 'checkbox') v.setState(p['checked'] == true ? 1 : 0);
+  if (kind == 'popup') {
+    if (p['items'] is List) {
+      v.removeAllItems();
+      for (var it in p['items']) v.addItemWithTitle(it.toString());
+    }
+    if (p['selected'] != null) v.selectItemWithTitle(p['selected'].toString());
+  }
 }
 
 void appRemove(String id) {
@@ -4161,6 +4218,10 @@ String appValueOf(String id) {
   if (v == null) return null;
   var kind = gAppKinds[id];
   if (kind == 'button') return v.title().UTF8String();
+  if (kind == 'checkbox') return v.state() == 1 ? 'true' : 'false';
+  if (kind == 'slider' || kind == 'progress') return v.doubleValue().toString();
+  if (kind == 'popup') return v.titleOfSelectedItem().UTF8String();
+  if (kind == 'box') return '';                // a group frame has no value
   return v.stringValue().UTF8String();
 }
 

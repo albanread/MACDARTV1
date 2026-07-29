@@ -282,12 +282,17 @@ Plus a snapshot on each surface for the visual.
   fix (§7). Built immediately after M1 rather than last, because an abstraction
   with only one implementation is an abstraction nobody has tested — and because
   moving a live app between hosts is the feature that proves the whole design.
-- **M3 — vocabulary.** ✅ PARTIAL. `checkbox` (NSButton switch), `slider`
+- **M3 — vocabulary.** ✅ DONE. `checkbox` (NSButton switch), `slider`
   (NSSlider), `popup` (NSPopUpButton), `secure` (NSSecureTextField), `progress`
-  (NSProgressIndicator), `box` (NSBox group) shipped — handlers are wrapped so
-  the app gets a typed value (bool/double), and `set` grew `value`/`checked`/
-  `items`/`selected`. Live reference: `apps/gallery.dart`. Still open: `list`,
-  `tabs`, and `grid`/`row`/`column` layout helpers.
+  (NSProgressIndicator), `box` (NSBox group), `list` (NSTableView), `tabs`
+  (NSTabView), and `scroll` (an NSScrollView container whose content can exceed
+  the pane) all shipped. Interactive handlers are wrapped so the app gets a
+  typed value (bool/double/String); `set` grew `value`/`checked`/`items`/
+  `selected`. Containers route widgets via `tab(id,n)` / `into(id)` / `pane()`,
+  with the coordinate flip taken from the tab's contentRect or the scroll's
+  content height (a not-yet-shown page reads 0). Layout helpers `row`/`column`/
+  `grid` return frame lists (pure Dart). Live reference: `apps/gallery.dart`
+  (three tabs: inputs, a list, and a scrolling form).
 - **M4 — liveness polish.** Re-run on Accept and on resize, error banner,
   `canvas` widget over the Pixmap path, Apps menu.
 - **M5 — standalone.** `dartui --app Calc`: the same class from the same image,

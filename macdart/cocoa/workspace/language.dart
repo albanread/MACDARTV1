@@ -745,6 +745,63 @@ class AppSurface {
     _cmd(<dynamic>['add', 'box', id, <String, dynamic>{'title': title, 'frame': frame}]);
   }
 
+  /// A scrolling single-column list. onSelect receives the chosen row's text;
+  /// update the rows live with set(id, items: [...]).
+  void list(String id, {List items, List frame, Function onSelect}) {
+    if (onSelect != null) _on(id, 'select', (s) => onSelect(s == null ? '' : s.toString()));
+    _cmd(<dynamic>['add', 'list', id, <String, dynamic>{'items': items, 'frame': frame}]);
+  }
+
+  /// A tabbed container. After it, route widgets into a tab with `tab(id, n)`;
+  /// their frames are relative to that tab's page. `pane()` routes back to the
+  /// surface. The native tab view shows/hides pages for you.
+  void tabs(String id, {List items, List frame}) {
+    _cmd(<dynamic>['add', 'tabs', id, <String, dynamic>{'items': items, 'frame': frame}]);
+  }
+
+  /// Route subsequent widgets into tab `index` of the tabs widget `tabsId`.
+  void tab(String tabsId, int index) { _cmd(<dynamic>['container', tabsId, index]); }
+
+  /// A scrolling viewport whose CONTENT can be larger than its frame — so an app
+  /// with more controls than fit the pane scrolls. Route widgets into it with
+  /// into(id); their frames are relative to the width×height content area.
+  void scroll(String id, {List frame, double width: 0.0, double height: 0.0}) {
+    _cmd(<dynamic>['add', 'scroll', id,
+        <String, dynamic>{'frame': frame, 'cw': width, 'ch': height}]);
+  }
+
+  /// Route subsequent widgets into container `id` (a scroll, or a tab's page 0).
+  void into(String id) { _cmd(<dynamic>['container', id, 0]); }
+
+  /// Route subsequent widgets back onto the surface itself.
+  void pane() { _cmd(<dynamic>['container', null, 0]); }
+
+  // -- layout helpers: pure frame math, no widget. Feed the frames to widgets. -
+
+  /// `count` frames stacked DOWN from (x,y), each w×h, `gap` apart.
+  List column(double x, double y, double w, double h, int count, {double gap: 6.0}) {
+    var out = <dynamic>[];
+    for (var i = 0; i < count; i++) out.add(<double>[x, y + i * (h + gap), w, h]);
+    return out;
+  }
+
+  /// `count` frames placed ACROSS from (x,y), each w×h, `gap` apart.
+  List row(double x, double y, double w, double h, int count, {double gap: 6.0}) {
+    var out = <dynamic>[];
+    for (var i = 0; i < count; i++) out.add(<double>[x + i * (w + gap), y, w, h]);
+    return out;
+  }
+
+  /// A cols×rows grid of w×h frames from (x,y), row-major.
+  List grid(double x, double y, double w, double h, int cols, int rows,
+            {double gapX: 6.0, double gapY: 6.0}) {
+    var out = <dynamic>[];
+    for (var r = 0; r < rows; r++)
+      for (var c = 0; c < cols; c++)
+        out.add(<double>[x + c * (w + gapX), y + r * (h + gapY), w, h]);
+    return out;
+  }
+
   /// Change a live widget without rebuilding — the fast path a keystroke takes.
   /// value: slider/progress position; checked: a checkbox; selected/items: a popup.
   void set(String id, {String text, String title, bool enabled, num value,

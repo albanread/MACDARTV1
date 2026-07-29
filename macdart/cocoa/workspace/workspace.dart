@@ -1965,6 +1965,15 @@ Future<String> handle(String line) async {
       var s = appValueOf(arg.trim());
       return s == null ? "ERR: no widget " + arg.trim() : s;
     }
+    case 'apptab': {                     // "apptab <tabsId> <index>" — show a tab
+      var parts = arg.trim().split(new RegExp(r'\s+'));
+      if (parts.length < 2) return "ERR: apptab <tabsId> <index>";
+      var tv = gAppViews[parts[0]];
+      if (tv == null || gAppKinds[parts[0]] != 'tabs') return "ERR: no tabs widget " + parts[0];
+      tv.selectTabViewItemAtIndex(int.parse(parts[1], onError: (_) => 0));
+      repaint();
+      return "ok";
+    }
     case 'demostop': stopDemo("stopped"); return "ok";
     // received vs painted: if painted stalls while received climbs, the pacer
     // is dropping every frame — the screen is NOT showing what the demo sends.
@@ -3984,6 +3993,12 @@ Cocoa gAppPane, gAppPicker, gAppStatusLbl, gAppTitleLbl;
 Map<String, Cocoa> gAppViews = <String, Cocoa>{};
 Map<String, String> gAppKinds = <String, String>{};
 List<String> gAppOrder = <String>[];
+Map<String, List> gAppListItems = <String, List>{};          // rows of each list widget
+Map<String, List<Cocoa>> gAppTabPages = <String, List<Cocoa>>{};  // content view per tab
+Map<String, Cocoa> gAppScrollDoc = <String, Cocoa>{};   // a scroll container's document view
+Map<String, double> gAppScrollH = <String, double>{};   // its content height, for the coord flip
+Cocoa gAppContainer;                  // where adds land now (a tab page/scroll doc), or null = the pane
+double gAppContainerH = 0.0;          // its height for the coord flip (a non-shown tab page reads 0)
 List gAppSpec = <dynamic>[];      // commands since the last clear, for a rebuild
 String gAppName;                  // the running app's class, null when idle
 const double kAppW = 852.0;
@@ -4035,12 +4050,20 @@ double appPaneHeight() {
   return (b[3] as num).toDouble();
 }
 
-/// Top-left [x,y,w,h] in the surface -> an AppKit frame in the container.
-List _appFrame(var f) {
+double _appViewH(Cocoa v) {
+  if (v == null) return 352.0;
+  var b = v.bounds();
+  return (b is List && b.length >= 4) ? (b[3] as num).toDouble() : 352.0;
+}
+
+/// Top-left [x,y,w,h] in a container of height `ch` -> an AppKit (bottom-left)
+/// frame. Widgets on the pane flip by the pane's height; widgets inside a tab
+/// flip by that page's height, so tab-relative coordinates work the same way.
+List _appFrameIn(var f, double ch) {
   if (f is! List || f.length < 4) return [0.0, 0.0, 80.0, 20.0];
   var x = (f[0] as num).toDouble(), y = (f[1] as num).toDouble();
   var w = (f[2] as num).toDouble(), h = (f[3] as num).toDouble();
-  return [x, appPaneHeight() - y - h, w, h];
+  return [x, ch - y - h, w, h];
 }
 
 // NSTextAlignment took the UIKit values years ago: left 0, CENTER 1, RIGHT 2.
@@ -4092,6 +4115,33 @@ void appApply(List cmds, bool retain) {
     } else if (op == 'focus') {
       var v = gAppViews[c[1].toString()];
       if (v != null) gWindow.makeFirstResponder(v);
+    } else if (op == 'container') {
+      // Route subsequent adds into a tab page (or back to the pane on null).
+      if (c.length < 2 || c[1] == null) {
+        gAppContainer = null;
+      } else {
+        var cid = c[1].toString();
+        var pages = gAppTabPages[cid];
+        if (pages != null) {
+          var idx = (c.length > 2 && c[2] is int) ? c[2] : 0;
+          if (idx >= 0 && idx < pages.length) {
+            gAppContainer = pages[idx];
+            // A page not currently shown has 0 bounds; the tab view's
+            // contentRect is the stable page size to flip coordinates by.
+            var tv = gAppViews[cid];
+            var cr = (tv != null) ? tv.contentRect() : null;
+            gAppContainerH = (cr is List && cr.length >= 4)
+                ? (cr[3] as num).toDouble() : _appViewH(gAppContainer);
+          } else {
+            gAppContainer = null;
+          }
+        } else if (gAppScrollDoc[cid] != null) {
+          gAppContainer = gAppScrollDoc[cid];       // route into the scroll's document view
+          gAppContainerH = gAppScrollH[cid];        // flip by the content height, not the viewport
+        } else {
+          gAppContainer = null;
+        }
+      }
     }
   }
   repaint();
@@ -4106,12 +4156,21 @@ void appClearViews() {
   gAppViews.clear();
   gAppKinds.clear();
   gAppOrder = <String>[];
+  gAppListItems.clear();
+  gAppTabPages.clear();
+  gAppScrollDoc.clear();
+  gAppScrollH.clear();
+  gAppContainer = null;
+  gAppContainerH = 0.0;
 }
 
 void appAdd(String kind, String id, Map p) {
   appRemove(id);                       // rebuilding over an id replaces it
-  var frame = _appFrame(p['frame']);
+  var container = gAppContainer != null ? gAppContainer : gAppPane;
+  var frame = _appFrameIn(p['frame'],
+      gAppContainer != null ? gAppContainerH : appPaneHeight());
   var v;
+  var deferAdd = false;                // a list adds its own scroll view via tableIn
   if (kind == 'button') {
     v = Cocoa.cls("NSButton").alloc().initWithFrame(frame);
     v.setTitle(p['title'] == null ? '' : p['title'].toString());
@@ -4170,6 +4229,62 @@ void appAdd(String kind, String id, Map p) {
     var t = p['title'] == null ? '' : p['title'].toString();
     if (t.isEmpty) v.setTitlePosition(0);        // NSNoTitle
     else v.setTitle(t);
+  } else if (kind == 'list') {
+    var items = <dynamic>[];
+    if (p['items'] is List) for (var it in p['items']) items.add(it.toString());
+    gAppListItems[id] = items;
+    v = tableIn(container, frame);               // adds its own scroll view here
+    deferAdd = true;
+    // tableIn makes the scroll fill its parent; an app widget has a FIXED frame
+    // (a resizing tab page would otherwise grow the list past its bounds, and
+    // NSViews don't clip — the rows would spill over everything).
+    var lsc = v.enclosingScrollView();
+    if (lsc != null && !lsc.isNil) lsc.setAutoresizingMask(0);
+    gTargets.add(onTable(v,
+        () => gAppListItems[id] == null ? 0 : gAppListItems[id].length,
+        (r) => (gAppListItems[id] != null && r >= 0 && r < gAppListItems[id].length)
+            ? gAppListItems[id][r].toString() : '',
+        sel((r) {
+          var rows = gAppListItems[id];
+          if (rows != null && r >= 0 && r < rows.length) appFire(id, 'select', rows[r].toString());
+        })));
+  } else if (kind == 'scroll') {
+    // A viewport whose document view can be LARGER than the frame, so an app
+    // taller/wider than the pane scrolls. Widgets route into the document view.
+    var cw = _appD(p['cw'], frame[2]);
+    var ch = _appD(p['ch'], frame[3]);
+    if (cw < frame[2]) cw = frame[2];
+    if (ch < frame[3]) ch = frame[3];
+    v = Cocoa.cls("NSScrollView").alloc().initWithFrame(frame);
+    v.setHasVerticalScroller(ch > frame[3]);
+    v.setHasHorizontalScroller(cw > frame[2]);
+    v.setBorderType(2);                          // NSBezelBorder
+    v.setDrawsBackground(false);
+    var doc = Cocoa.cls("NSView").alloc().initWithFrame([0.0, 0.0, cw, ch]);
+    v.setDocumentView(doc);
+    gAppScrollDoc[id] = doc;
+    gAppScrollH[id] = ch;
+    // NSScrollView shows the document ORIGIN (bottom-left) first; a top-anchored
+    // form should start at its first field, so scroll the clip to the top.
+    var clip = v.contentView();
+    if (clip != null && !clip.isNil) {
+      clip.scrollToPoint([0.0, ch - frame[3]]);
+      v.reflectScrolledClipView(clip);
+    }
+  } else if (kind == 'tabs') {
+    v = Cocoa.cls("NSTabView").alloc().initWithFrame(frame);
+    var pages = <Cocoa>[];
+    if (p['items'] is List) {
+      var idx = 0;
+      for (var it in p['items']) {
+        var item = Cocoa.cls("NSTabViewItem").alloc().initWithIdentifier(id + '/' + idx.toString());
+        item.setLabel(it.toString());
+        v.addTabViewItem(item);
+        pages.add(item.view());                  // each tab's content view
+        idx++;
+      }
+    }
+    gAppTabPages[id] = pages;
   } else {                             // 'label', and anything unknown
     kind = 'label';
     v = Cocoa.cls("NSTextField").alloc().initWithFrame(frame);
@@ -4177,7 +4292,7 @@ void appAdd(String kind, String id, Map p) {
     v.setAlignment(_appAlign(p['align']));
     v.setBezeled(false); v.setEditable(false); v.setDrawsBackground(false);
   }
-  gAppPane.addSubview(v);
+  if (!deferAdd) container.addSubview(v);
   gAppViews[id] = v;
   gAppKinds[id] = kind;
   gAppOrder.add(id);
@@ -4189,6 +4304,17 @@ void appSet(String id, Map p) {
   var v = gAppViews[id];
   if (v == null) return;
   var kind = gAppKinds[id];
+  if (kind == 'list') {                          // a table, not a text widget
+    if (p['items'] is List) {
+      var items = <dynamic>[];
+      for (var it in p['items']) items.add(it.toString());
+      gAppListItems[id] = items;
+      v.reloadData();
+    }
+    if (p['enabled'] != null) v.setEnabled(p['enabled'] == true);
+    return;
+  }
+  if (kind == 'tabs' || kind == 'box' || kind == 'scroll') return;  // containers have no scalar value
   if (p['text'] != null) v.setStringValue(p['text'].toString());
   if (p['title'] != null) v.setTitle(p['title'].toString());
   if (p['enabled'] != null) v.setEnabled(p['enabled'] == true);
@@ -4206,10 +4332,22 @@ void appSet(String id, Map p) {
 }
 
 void appRemove(String id) {
+  var kind = gAppKinds[id];
   var v = gAppViews.remove(id);
-  if (v != null) v.removeFromSuperview();
+  if (v != null) {
+    if (kind == 'list') {                        // remove the enclosing scroll, not the table
+      var sc = v.enclosingScrollView();
+      (sc != null && !sc.isNil ? sc : v).removeFromSuperview();
+    } else {
+      v.removeFromSuperview();
+    }
+  }
   gAppKinds.remove(id);
   gAppOrder.remove(id);
+  gAppListItems.remove(id);
+  gAppTabPages.remove(id);
+  gAppScrollDoc.remove(id);
+  gAppScrollH.remove(id);
 }
 
 /// A widget's current value, as the user would read it.
@@ -4221,7 +4359,13 @@ String appValueOf(String id) {
   if (kind == 'checkbox') return v.state() == 1 ? 'true' : 'false';
   if (kind == 'slider' || kind == 'progress') return v.doubleValue().toString();
   if (kind == 'popup') return v.titleOfSelectedItem().UTF8String();
-  if (kind == 'box') return '';                // a group frame has no value
+  if (kind == 'list') {
+    var r = v.selectedRow();
+    var ri = (r is int) ? r : int.parse(r.toString(), onError: (_) => -1);
+    var items = gAppListItems[id];
+    return (ri >= 0 && items != null && ri < items.length) ? items[ri].toString() : '';
+  }
+  if (kind == 'box' || kind == 'tabs' || kind == 'scroll') return '';   // containers have no value
   return v.stringValue().UTF8String();
 }
 

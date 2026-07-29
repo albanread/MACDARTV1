@@ -1,48 +1,73 @@
 // App: Control gallery
 //
 // One of every widget the App pane knows, wired to react — the live reference
-// for what a Dart app can put on its surface. A slider drives a progress bar
-// and a readout; a checkbox enables/disables the button; a popup and a password
-// field echo into a status line. Everything is one class with a build(ui).
+// for what a Dart app can put on its surface. THREE tabs (laid out with the
+// column helper): Inputs (a slider driving a progress bar + readout, a checkbox
+// enabling the button, a popup and password echoing to a status line), Data (a
+// scrolling list reporting its selection), and Form (a scroll container holding
+// a 12-field form taller than the tab). Everything is one class with a build(ui).
 class Gallery {
   var level = 0.4;
   var armed = true;
   var colour = 'Amber';
-  var secret = '';
+  var picked = '';
 
   build(ui) {
     ui.title('Control gallery');
 
-    ui.box('gInput', title: 'Inputs', frame: [8.0, 96.0, 300.0, 260.0]);
+    // outputs, on the surface itself (above the tabs)
+    ui.label('lL', text: 'Level', frame: [8.0, 8.0, 60.0, 18.0]);
+    ui.progress('bar', frame: [72.0, 8.0, 180.0, 16.0], min: 0.0, max: 1.0, value: level);
+    ui.label('read', text: _pct(level), frame: [258.0, 8.0, 60.0, 18.0]);
+    ui.label('status', text: 'ready', frame: [8.0, 32.0, 420.0, 18.0]);
 
-    ui.label('lS', text: 'Slider', frame: [20.0, 320.0, 70.0, 18.0]);
-    ui.slider('sld', frame: [92.0, 318.0, 180.0, 22.0], min: 0.0, max: 1.0,
-              value: level, onSlide: (v) { level = v; showLevel(ui); });
+    ui.tabs('tabs', items: ['Inputs', 'Data', 'Form'], frame: [8.0, 56.0, 420.0, 288.0]);
 
-    ui.label('lC', text: 'Checkbox', frame: [20.0, 288.0, 70.0, 18.0]);
-    ui.checkbox('cb', label: 'arm the button', frame: [92.0, 286.0, 180.0, 20.0],
-                value: armed, onToggle: (on) { armed = on; ui.set('go', enabled: on);
-                                               status(ui, 'armed: ' + on.toString()); });
-
-    ui.label('lP', text: 'Popup', frame: [20.0, 256.0, 70.0, 18.0]);
+    // --- tab 0: the interactive controls, laid out in a column ---------------
+    ui.tab('tabs', 0);
+    var rows = ui.column(90.0, 16.0, 190.0, 24.0, 5, gap: 12.0);
+    label(ui, 'lS', 'Slider', rows[0]);
+    ui.slider('sld', frame: rows[0], min: 0.0, max: 1.0, value: level,
+              onSlide: (v) { level = v; showLevel(ui); });
+    label(ui, 'lC', 'Checkbox', rows[1]);
+    ui.checkbox('cb', label: 'arm the button', frame: rows[1], value: armed,
+                onToggle: (on) { armed = on; ui.set('go', enabled: on);
+                                 status(ui, 'armed: ' + on.toString()); });
+    label(ui, 'lP', 'Popup', rows[2]);
     ui.popup('pop', items: ['Amber', 'Green', 'Cyan', 'Magenta'], selected: colour,
-             frame: [92.0, 254.0, 140.0, 24.0],
-             onSelect: (c) { colour = c; status(ui, 'colour: ' + c); });
+             frame: rows[2], onSelect: (c) { colour = c; status(ui, 'colour: ' + c); });
+    label(ui, 'lPw', 'Password', rows[3]);
+    ui.secure('pw', frame: rows[3],
+              onText: (s) => status(ui, 'password: ' + s.length.toString() + ' chars'));
+    ui.button('go', title: 'Fire', frame: rows[4], enabled: armed,
+              onClick: (_) => status(ui, 'fired at level ' + _pct(level) + ' (' + colour + ')'));
 
-    ui.label('lPw', text: 'Password', frame: [20.0, 224.0, 70.0, 18.0]);
-    ui.secure('pw', frame: [92.0, 222.0, 180.0, 24.0],
-              onText: (s) { secret = s; status(ui, 'password: ' + s.length.toString() + ' chars'); });
+    // --- tab 1: a scrolling list --------------------------------------------
+    ui.tab('tabs', 1);
+    ui.label('lLi', text: 'Pick a planet:', frame: [12.0, 12.0, 200.0, 18.0]);
+    ui.list('planets',
+            items: ['Mercury', 'Venus', 'Earth', 'Mars', 'Jupiter', 'Saturn', 'Uranus', 'Neptune'],
+            frame: [12.0, 36.0, 200.0, 190.0],
+            onSelect: (name) { picked = name; status(ui, 'picked: ' + name); });
 
-    ui.button('go', title: 'Fire', frame: [92.0, 186.0, 90.0, 28.0], enabled: armed,
-              onClick: (_) { status(ui, 'fired at level ' + _pct(level) + ' (' + colour + ')'); });
+    // --- tab 2: a scroll container holding a form taller than the tab --------
+    ui.tab('tabs', 2);
+    ui.scroll('form', frame: [8.0, 8.0, 400.0, 232.0], width: 380.0, height: 560.0);
+    ui.into('form');
+    var fr = ui.column(96.0, 12.0, 260.0, 24.0, 12, gap: 14.0);
+    var names = ['Name', 'Street', 'City', 'Region', 'Postcode', 'Country',
+                 'Phone', 'Email', 'Company', 'Role', 'Notes', 'Referrer'];
+    for (var i = 0; i < names.length; i++) {
+      ui.label('fl' + i.toString(), text: names[i], frame: [8.0, fr[i][1] + 3.0, 84.0, 18.0]);
+      ui.field('ff' + i.toString(), frame: fr[i]);
+    }
 
-    // outputs
-    ui.label('lL', text: 'Level', frame: [20.0, 60.0, 70.0, 18.0]);
-    ui.progress('bar', frame: [92.0, 60.0, 180.0, 16.0], min: 0.0, max: 1.0, value: level);
-    ui.label('read', text: _pct(level), frame: [278.0, 60.0, 60.0, 18.0]);
-
-    ui.label('status', text: 'ready', frame: [8.0, 20.0, 400.0, 18.0]);
+    ui.pane();                          // done routing into tabs
     showLevel(ui);
+  }
+
+  label(ui, String id, String name, List rowFrame) {
+    ui.label(id, text: name, frame: [12.0, rowFrame[1] + 3.0, 72.0, 18.0]);
   }
 
   showLevel(ui) {

@@ -391,6 +391,7 @@ class StGraphBuilder {
   // Sprint 6: class-side sends (Foo new / a class method) + dart:core aliases.
   RawClass* ResolveClassName(const std::string& name);
   Fragment TranslateClassSend(const Class& cls, MessageNode* node);
+  Fragment TranslateSuperSend(MessageNode* node);
   std::string DartSelector(const std::string& st_selector);
   std::string DartGetter(const std::string& st_selector);
 
@@ -590,6 +591,13 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
     return Unsupported(node, "cascade message (no receiver)");
   }
 
+  // `super sel: ..` — dispatch starts in the superclass, resolved now.
+  if (VariableNode* sv = dynamic_cast<VariableNode*>(node->receiver.get())) {
+    if (sv->name == "super" && this_var_ != NULL) {
+      return TranslateSuperSend(node);
+    }
+  }
+
   // A send to a class NAME: `Foo new` allocates, `Foo x: .. y: ..` calls a
   // class-side (static) method. Only for an identifier that is not a local /
   // self and resolves to a loaded ST class.
@@ -680,6 +688,33 @@ Fragment StGraphBuilder::TranslateClassSend(const Class& cls,
     return AllocateObject(cls);
   }
   return Unsupported(node, "class-side send (no matching class method)");
+}
+
+// `super sel: ..`: resolve the method starting in the OWNER's superclass and
+// emit a StaticCall with self as argument 0 (an instance method's receiver).
+// Walks the super chain (LookupDynamicFunction is per class), finalizing each
+// visited class on demand.
+Fragment StGraphBuilder::TranslateSuperSend(MessageNode* node) {
+  const Class& owner = Class::Handle(zone_, pf_->function().Owner());
+  const String& sel =
+      String::Handle(zone_, Symbols::New(thread_, node->selector.c_str()));
+  Function& fn = Function::ZoneHandle(zone_);
+  Class& c = Class::Handle(zone_, owner.SuperClass());
+  while (!c.IsNull()) {
+    if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+    fn ^= c.LookupDynamicFunction(sel);
+    if (!fn.IsNull()) break;
+    c ^= c.SuperClass();
+  }
+  if (fn.IsNull()) return Unsupported(node, "super send (not found in supers)");
+  Fragment instructions = LoadLocal(this_var_);  // receiver = self
+  instructions += PushArgument();
+  for (size_t i = 0; i < node->args.size(); i++) {
+    instructions += TranslateExpression(node->args[i].get());
+    instructions += PushArgument();
+  }
+  instructions += StaticCall(fn, 1 + static_cast<intptr_t>(node->args.size()));
+  return instructions;
 }
 
 // ST selector -> dart:core selector, where they differ. Selectors that already

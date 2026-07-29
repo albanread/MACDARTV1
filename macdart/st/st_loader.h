@@ -65,6 +65,16 @@ class Loader {
 // Class::null() if absent. Caller holds a VM transition + HANDLESCOPE.
 dart::RawClass* FindStClassByName(dart::Thread* thread, const char* name);
 
+// Sprint 12b: the --with-st boot. Resolve the vendored world directory
+// (explicit path > $MACDART_ST_WORLD > relative to the executable), install
+// the ST dispatch hooks, and stRun every *.mst in name order. Returns NULL on
+// success (msg_buf gets a one-line summary) or an error string. Called from
+// runtime/bin/main.cc after the main isolate's script has loaded.
+const char* BootWorldForMain(const char* explicit_dir,
+                             const char* exe_path,
+                             char* msg_buf,
+                             int msg_cap);
+
 // The canonical VM-internal name of an ST selector: ':' -> '_' ("at:put:" ->
 // "at_put_"). Keeps keyword selectors distinct from unary ones (signal vs
 // signal:) while producing valid Dart method names; every registration and

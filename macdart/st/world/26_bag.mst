@@ -1,0 +1,90 @@
+"26_bag.mst — Bag (W1 'full collections protocol' Layer A). NEW class.
+ Strongtalk's own Bag.dlt is itself just a thin wrapper over a Dictionary
+ of (element -> occurrence count) — 'contents <VarDict[E,Int]>' — so this
+ needs no new hash-table engine at all, unlike Set (which stores bare
+ elements): it reuses MACVM's existing, tested Dictionary directly.
+ Collection subclass: Bag (matching Strongtalk's real hierarchy: Bag sits
+ directly under Collection, a *sibling* of HashedCollection, not a child
+ of it — a Bag isn't itself a hash table, it just holds one).
+
+ remove:/remove:ifAbsent: ARE supported here (unlike Set, which has none,
+ matching Dictionary's own documented v1 'no deletion' scope cut) because
+ a Bag's removal never needs to delete a Dictionary KEY at all — it only
+ ever decrements an occurrence count, floors at 0, and leaves a zero-count
+ entry lying around harmlessly. includes: is therefore `occurrencesOf: >
+ 0`, NOT `contents includesKey:` (which would still answer true for an
+ element decremented all the way to zero) — a real bug considered and
+ avoided before it was ever written, not discovered afterwards.
+
+ size/occurrencesOf:/includes: are all overridden for O(1)/O(distinct
+ elements) efficiency, exactly like Strongtalk's own version, even though
+ the inherited Collection generics (do:-based) would already give the
+ same right answers less efficiently, since do: itself already expands
+ each element `occurrences` times."
+
+"I am an unordered collection that counts duplicates: each distinct
+ element is stored once, together with its number of occurrences. Send
+ add:, add:withOccurrences:, remove:, occurrencesOf:, and includes:. My
+ size is the total of all occurrence counts, and do: presents each element
+ once per occurrence. Two Bags are equal when they hold the same elements
+ with the same counts. Any collection answers a Bag of its elements via
+ asBag, which makes me handy for frequency counting."
+Collection subclass: Bag [
+    "contents deliberately UNANNOTATED: its true type is Strongtalk's
+     VarDict[E,Int] (an element -> occurrence-count map), which v1's
+     type grammar can't express; a plain <Dictionary> would erase the
+     Integer values to Object and falsely contradict occurrencesOf:'s
+     own (correct) ^<Integer> below."
+    | contents |
+
+    Bag class >> new ^ <Bag> [
+        ^self basicNew init
+    ]
+    init ^ <Self> [
+        contents := Dictionary new.
+    ]
+    add: el <Object> ^ <Object> [
+        ^self add: el withOccurrences: 1
+    ]
+    add: el <Object> withOccurrences: oc <Integer> ^ <Object> [
+        contents at: el put: oc + (self occurrencesOf: el).
+        ^el
+    ]
+    occurrencesOf: o <Object> ^ <Integer> [
+        ^contents at: o ifAbsent: [ 0 ]
+    ]
+    includes: el <Object> ^ <Boolean> [
+        ^(self occurrencesOf: el) > 0
+    ]
+    size ^ <Integer> [
+        ^contents inject: 0 into: [:tot :occ | tot + occ ]
+    ]
+    remove: el <Object> ^ <Object> [
+        ^self remove: el ifAbsent: [ self error: 'element not found' ]
+    ]
+    remove: el <Object> ifAbsent: absentBlock <[]> ^ <Object> [
+        | oc |
+        oc := self occurrencesOf: el.
+        oc = 0 ifTrue: [ ^absentBlock value ].
+        contents at: el put: oc - 1.
+        ^el
+    ]
+    do: aBlock <[Object]> [
+        contents keysAndValuesDo: [:el :occ |
+            occ timesRepeat: [ aBlock value: el ] ]
+    ]
+    printOn: s [
+        s nextPutAll: 'Bag ('.
+        self do: [:each | each printOn: s. s nextPut: $  ].
+        s nextPut: $)
+    ]
+]
+
+Object subclass: Collection [
+    asBag ^ <Bag> [
+        | b |
+        b := Bag new.
+        self do: [:each | b add: each ].
+        ^b
+    ]
+]

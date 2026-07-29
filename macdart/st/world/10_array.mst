@@ -1,0 +1,209 @@
+"10_array.mst — Collection/SequenceableCollection/Array (sprint_s06_detail.md
+ #10). Loaded before 09_character.mst (deviates from the doc's listed 09/10
+ order): Character class>>initTable needs Array>>at:put: to already be
+ installed by the time its top-level doIt runs (world.list is the actual
+ load order; filenames keep the doc's numbering for cross-reference)."
+
+"I am the abstract superclass of all collections. A subclass needs only
+ do: (and add: where adding makes sense); from that I derive the shared
+ enumeration protocol: size, isEmpty, includes:, detect:ifNone:,
+ inject:into:, fold:, select:, reject:, collect:, sum, max, min,
+ occurrencesOf:, addAll:, and the conversions asArray,
+ asOrderedCollection, asSortedCollection, asSet and asBag. My default
+ size counts by iterating, so concrete classes override it where they
+ can answer directly."
+
+Object subclass: Collection [
+    do: aBlock <[Object]> [
+        self subclassResponsibility
+    ]
+    isEmpty ^ <Boolean> [
+        ^self size = 0
+    ]
+    notEmpty ^ <Boolean> [
+        ^self isEmpty not
+    ]
+    size ^ <Integer> [
+        | n |
+        n := 0.
+        self do: [:each | n := n + 1 ].
+        ^n
+    ]
+    includes: anObject <Object> ^ <Boolean> [
+        self do: [:each | each = anObject ifTrue: [ ^true ] ].
+        ^false
+    ]
+    detect: aBlock <[Object,^Boolean]> ^ <Object> [
+        ^self detect: aBlock ifNone: [ self error: 'element not found' ]
+    ]
+    detect: aBlock <[Object,^Boolean]> ifNone: exceptionBlock <[]> ^ <Object> [
+        self do: [:each | (aBlock value: each) ifTrue: [ ^each ] ].
+        ^exceptionBlock value
+    ]
+    inject: thisValue <Object> into: aBinaryBlock <[Object,Object,^Object]> ^ <Object> [
+        | result |
+        result := thisValue.
+        self do: [:each | result := aBinaryBlock value: result value: each ].
+        ^result
+    ]
+    do: aBlock <[Object]> separatedBy: sepBlock <[]> [
+        | first |
+        first := true.
+        self do: [:each |
+            first ifTrue: [ first := false ] ifFalse: [ sepBlock value ].
+            aBlock value: each ]
+    ]
+    addAll: aCollection <Collection> ^ <Collection> [
+        aCollection do: [:each | self add: each ].
+        ^aCollection
+    ]
+    asArray ^ <Array> [
+        | r i |
+        r := Array new: self size.
+        i := 1.
+        self do: [:each | r at: i put: each. i := i + 1 ].
+        ^r
+    ]
+]
+
+"I am the abstract superclass of collections whose elements sit in a
+ fixed order at 1-based integer indices: Array, String,
+ OrderedCollection, Interval and friends. I add the positional
+ protocol: at:, first, last, indexOf:, copyFrom:to:, reversed,
+ concatenation with , (comma), doWithIndex:, with:do:, findFirst:,
+ sub-sequence search (indexOfSubCollection: and relatives), and
+ in-place sort / sort:. My = compares class, size and elements
+ pairwise."
+
+Collection subclass: SequenceableCollection [
+    do: aBlock <[Object]> [
+        1 to: self size do: [:i | aBlock value: (self at: i) ]
+    ]
+    doWithIndex: aBlock <[Object,Integer]> [
+        | i |
+        i := 1.
+        self do: [:each | aBlock value: each value: i. i := i + 1 ]
+    ]
+    keysAndValuesDo: aBlock <[Integer,Object]> [
+        | i |
+        i := 1.
+        self do: [:each | aBlock value: i value: each. i := i + 1 ]
+    ]
+    first ^ <Object> [
+        ^self at: 1
+    ]
+    last ^ <Object> [
+        ^self at: self size
+    ]
+    copyFrom: from <Integer> to: to <Integer> ^ <SequenceableCollection> [
+        | r n |
+        n := to - from + 1.
+        r := self class new: n.
+        1 to: n do: [:i | r at: i put: (self at: from + i - 1) ].
+        ^r
+    ]
+    reversed ^ <SequenceableCollection> [
+        | r n |
+        n := self size.
+        r := self class new: n.
+        1 to: n do: [:i | r at: i put: (self at: n - i + 1) ].
+        ^r
+    ]
+    indexOf: anObject <Object> ifAbsent: absentBlock <[]> ^ <Integer> [
+        1 to: self size do: [:i | (self at: i) = anObject ifTrue: [ ^i ] ].
+        ^absentBlock value
+    ]
+    indexOf: anObject <Object> ^ <Integer> [
+        ^self indexOf: anObject ifAbsent: [ 0 ]
+    ]
+    = other <Object> ^ <Boolean> [
+        self class == other class ifFalse: [ ^false ].
+        self size = other size ifFalse: [ ^false ].
+        1 to: self size do: [:i | (self at: i) = (other at: i) ifFalse: [ ^false ] ].
+        ^true
+    ]
+    , other <SequenceableCollection> ^ <SequenceableCollection> [
+        | r n |
+        n := self size + other size.
+        r := self class new: n.
+        1 to: self size do: [:i | r at: i put: (self at: i) ].
+        1 to: other size do: [:i | r at: self size + i put: (other at: i) ].
+        ^r
+    ]
+]
+
+"I am the fixed-size indexable collection of arbitrary objects — the
+ workhorse sequence. Literal arrays look like #(1 2 3); Array new: n
+ answers n slots, all nil; with:, with:with:, ... build small arrays
+ from values. Access is 1-based through at: and at:put:, each a single
+ VM primitive. I cannot grow — use an OrderedCollection when the size
+ is not known in advance."
+
+ArrayedCollection subclass: Array [
+    Array class >> with: a <Object> ^ <Array> [
+        | r |
+        r := self new: 1.
+        r at: 1 put: a.
+        ^r
+    ]
+    Array class >> with: a <Object> with: b <Object> ^ <Array> [
+        | r |
+        r := self new: 2.
+        r at: 1 put: a.
+        r at: 2 put: b.
+        ^r
+    ]
+    Array class >> with: a <Object> with: b <Object> with: c <Object> ^ <Array> [
+        | r |
+        r := self new: 3.
+        r at: 1 put: a.
+        r at: 2 put: b.
+        r at: 3 put: c.
+        ^r
+    ]
+    Array class >> with: a <Object> with: b <Object> with: c <Object> with: d <Object> ^ <Array> [
+        | r |
+        r := self new: 4.
+        r at: 1 put: a.
+        r at: 2 put: b.
+        r at: 3 put: c.
+        r at: 4 put: d.
+        ^r
+    ]
+    Array class >> with: a <Object> with: b <Object> with: c <Object> with: d <Object> with: e <Object> ^ <Array> [
+        | r |
+        r := self new: 5.
+        r at: 1 put: a.
+        r at: 2 put: b.
+        r at: 3 put: c.
+        r at: 4 put: d.
+        r at: 5 put: e.
+        ^r
+    ]
+    at: i <Integer> ^ <Object> [
+        <primitive: 26>
+    ]
+    at: i <Integer> put: v <Object> ^ <Object> [
+        <primitive: 27>
+    ]
+    size ^ <Integer> [
+        <primitive: 28>
+    ]
+    at: i <Integer> ifAbsent: absentBlock <[]> ^ <Object> [
+        (i between: 1 and: self size) ifFalse: [ ^absentBlock value ].
+        ^self at: i
+    ]
+    "Element-by-element (Arrays hold oops, so there's no byte-memcpy
+     primitive); lets WriteStream-on-Array use the same bulk-copy protocol
+     Strings do (18_writestream.mst's grow/nextPutAll:/contents)."
+    replaceFrom: from <Integer> to: to <Integer> with: src <SequenceableCollection> ^ <Self> [
+        from to: to do: [:i | self at: i put: (src at: i - from + 1) ].
+        ^self
+    ]
+    collect: aBlock <[Object,^Object]> ^ <Array> [
+        | r |
+        r := Array new: self size.
+        1 to: self size do: [:i | r at: i put: (aBlock value: (self at: i)) ].
+        ^r
+    ]
+]

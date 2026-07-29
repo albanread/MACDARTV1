@@ -68,32 +68,21 @@ static bool EnsurePrelude(Thread* thread, std::string* err) {
                             "st:prelude");
 }
 
-// Shared by ST_load (register only — the workspace image reload must never
-// fire do-its) and ST_run (register + execute top-level statements, the
-// MACVM file semantics).
-static void STLoadCommon(Dart_NativeArguments args, bool run_toplevel,
-                         bool allow_reopen = true) {
-  // --- 1) read the source argument (public API; native execution state) -----
-  Dart_Handle src_h = Dart_GetNativeArgument(args, 0);
-  const char* src_c = NULL;
-  Dart_Handle err = Dart_StringToCString(src_h, &src_c);
-  if (Dart_IsError(err) || src_c == NULL) {
-    Dart_SetReturnValue(args,
-                        Dart_NewStringFromCString("ERR: bad source argument"));
-    return;
-  }
-  std::string source(src_c);
-
-  // --- 2) lex + parse (pure C++17 reader, no VM state needed) ---------------
+// The load(+run) core shared by the ST_load/ST_run/ST_loadFresh natives and
+// the --with-st world boot (st::BootWorldForMain): lex/parse/register, then
+// optionally invoke the synthesized STMain>>main. Returns the load summary or
+// an "ERR: ..." string. Caller is in NATIVE state (the transitions are here).
+static std::string STRunSourceString(const std::string& source,
+                                     bool run_toplevel,
+                                     bool allow_reopen) {
   ::st::Lexer lexer(source);
   std::vector<::st::Token> tokens;
   ::st::LexError lex_err;
   if (!lexer.Tokenize(&tokens, &lex_err)) {
     char buf[600];
-    snprintf(buf, sizeof(buf), "ERR: lex %d:%d: %s", lex_err.line, lex_err.col,
-             lex_err.message.c_str());
-    Dart_SetReturnValue(args, Dart_NewStringFromCString(buf));
-    return;
+    snprintf(buf, sizeof(buf), "ERR: lex %d:%d: %s", lex_err.line,
+             lex_err.col, lex_err.message.c_str());
+    return std::string(buf);
   }
   ::st::Parser parser(std::move(tokens));
   ::st::ParseError perr;
@@ -102,11 +91,9 @@ static void STLoadCommon(Dart_NativeArguments args, bool run_toplevel,
     char buf[600];
     snprintf(buf, sizeof(buf), "ERR: parse %d:%d: %s", perr.line, perr.col,
              perr.message.c_str());
-    Dart_SetReturnValue(args, Dart_NewStringFromCString(buf));
-    return;
+    return std::string(buf);
   }
 
-  // --- 3) register into the live object model (transition to VM state) ------
   std::string summary;
   std::string load_err;
   bool ok = false;
@@ -115,23 +102,14 @@ static void STLoadCommon(Dart_NativeArguments args, bool run_toplevel,
     Thread* thread = Thread::Current();
     TransitionNativeToVM transition(thread);
     HANDLESCOPE(thread);
-    // Sprint 9: the prelude (Exception/Error/STSystem) loads first, once per
-    // isolate, so user code can subclass and reference it.
     ok = EnsurePrelude(thread, &load_err);
     if (ok) {
       ok = ::st::Loader::Load(std::move(program), source, &summary, &load_err,
                               /*url_override=*/0, &has_toplevel, allow_reopen);
     }
   }
+  if (!ok) return load_err;
 
-  if (!ok) {
-    Dart_SetReturnValue(args, Dart_NewStringFromCString(load_err.c_str()));
-    return;
-  }
-
-  // Sprint 11b: bare top-level statements ran at load in MACVM — invoke the
-  // synthesized STMain>>main now. A signal/compile failure comes back as an
-  // "ERR: toplevel: ..." string (the load itself stays registered).
   if (run_toplevel && has_toplevel) {
     Thread* thread = Thread::Current();
     std::string run_err;
@@ -169,12 +147,27 @@ static void STLoadCommon(Dart_NativeArguments args, bool run_toplevel,
         }
       }
     }
-    if (!run_err.empty()) {
-      Dart_SetReturnValue(args, Dart_NewStringFromCString(run_err.c_str()));
-      return;
-    }
+    if (!run_err.empty()) return run_err;
   }
-  Dart_SetReturnValue(args, Dart_NewStringFromCString(summary.c_str()));
+  return summary;
+}
+
+// Shared by ST_load (register only — the workspace image reload must never
+// fire do-its) and ST_run (register + execute top-level statements, the
+// MACVM file semantics).
+static void STLoadCommon(Dart_NativeArguments args, bool run_toplevel,
+                         bool allow_reopen = true) {
+  Dart_Handle src_h = Dart_GetNativeArgument(args, 0);
+  const char* src_c = NULL;
+  Dart_Handle err = Dart_StringToCString(src_h, &src_c);
+  if (Dart_IsError(err) || src_c == NULL) {
+    Dart_SetReturnValue(args,
+                        Dart_NewStringFromCString("ERR: bad source argument"));
+    return;
+  }
+  const std::string result =
+      STRunSourceString(std::string(src_c), run_toplevel, allow_reopen);
+  Dart_SetReturnValue(args, Dart_NewStringFromCString(result.c_str()));
 }
 
 void ST_load(Dart_NativeArguments args) { STLoadCommon(args, false); }
@@ -1088,3 +1081,118 @@ void ST_become(Dart_NativeArguments args) {
 
 }  // namespace bin
 }  // namespace dart
+
+// --- the --with-st world boot (Sprint 12b) ---------------------------------
+// Called from runtime/bin/main.cc (the one-line hook in the patch) after the
+// main isolate's script has loaded: resolve the vendored world directory,
+// install the ST dispatch hooks, and stRun every *.mst in name order. All the
+// logic lives HERE (tracked); the VM tree carries only the call.
+
+#include <dirent.h>
+#include <sys/stat.h>
+
+#include <algorithm>
+
+namespace st {
+
+static bool DirHasWorld(const std::string& dir) {
+  struct stat st_buf;
+  return stat((dir + "/01_object.mst").c_str(), &st_buf) == 0;
+}
+
+// Resolution order: explicit --with-st=<path> > $MACDART_ST_WORLD > the
+// vendored copy relative to the executable (build dirs live under macdart/,
+// so <exedir>/../st/world is macdart/st/world; <exedir>/st/world covers an
+// installed layout).
+static std::string ResolveWorldDir(const char* explicit_dir,
+                                   const char* exe_path) {
+  if (explicit_dir != NULL && explicit_dir[0] != '\0') {
+    return std::string(explicit_dir);
+  }
+  const char* env = getenv("MACDART_ST_WORLD");
+  if (env != NULL && env[0] != '\0') return std::string(env);
+  std::string exe(exe_path == NULL ? "" : exe_path);
+  const size_t slash = exe.rfind('/');
+  const std::string bindir = (slash == std::string::npos)
+                                 ? std::string(".")
+                                 : exe.substr(0, slash);
+  const char* rels[] = {"/../st/world", "/st/world", "/../../macdart/st/world"};
+  for (size_t i = 0; i < sizeof(rels) / sizeof(rels[0]); i++) {
+    const std::string cand = bindir + rels[i];
+    if (DirHasWorld(cand)) return cand;
+  }
+  return std::string();
+}
+
+const char* BootWorldForMain(const char* explicit_dir,
+                             const char* exe_path,
+                             char* msg_buf,
+                             int msg_cap) {
+  static std::string s_error;  // stable storage for the returned message
+  const std::string dir = ResolveWorldDir(explicit_dir, exe_path);
+  if (dir.empty() || !DirHasWorld(dir)) {
+    s_error = "cannot find the Smalltalk world (looked relative to the "
+              "executable; set --with-st=<dir> or $MACDART_ST_WORLD)";
+    if (!dir.empty()) s_error = "no world at " + dir;
+    return s_error.c_str();
+  }
+
+  // The dispatch hooks (class values / core-class extensions) install from
+  // dart:cocoa — the Dart-side wrappers normally do this on first use, but
+  // the boot path enters through C++.
+  {
+    Dart_Handle cocoa =
+        Dart_LookupLibrary(Dart_NewStringFromCString("dart:cocoa"));
+    if (!Dart_IsError(cocoa)) {
+      Dart_Handle r = Dart_Invoke(
+          cocoa, Dart_NewStringFromCString("stEnsureHooks"), 0, NULL);
+      if (Dart_IsError(r)) {
+        s_error = std::string("hook install failed: ") + Dart_GetError(r);
+        return s_error.c_str();
+      }
+    }
+  }
+
+  std::vector<std::string> files;
+  DIR* d = opendir(dir.c_str());
+  if (d == NULL) {
+    s_error = "cannot open " + dir;
+    return s_error.c_str();
+  }
+  struct dirent* ent;
+  while ((ent = readdir(d)) != NULL) {
+    const std::string name(ent->d_name);
+    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".mst") == 0) {
+      files.push_back(name);
+    }
+  }
+  closedir(d);
+  std::sort(files.begin(), files.end());
+
+  int loaded = 0;
+  for (size_t i = 0; i < files.size(); i++) {
+    const std::string path = dir + "/" + files[i];
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f == NULL) {
+      s_error = "cannot read " + path;
+      return s_error.c_str();
+    }
+    std::string src;
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) src.append(buf, n);
+    fclose(f);
+    const std::string r = dart::bin::STRunSourceString(
+        src, /*run_toplevel=*/true, /*allow_reopen=*/true);
+    if (r.compare(0, 4, "ERR:") == 0) {
+      s_error = files[i] + ": " + r;
+      return s_error.c_str();
+    }
+    loaded++;
+  }
+  snprintf(msg_buf, msg_cap, "st: world loaded (%d files) from %s", loaded,
+           dir.c_str());
+  return NULL;
+}
+
+}  // namespace st

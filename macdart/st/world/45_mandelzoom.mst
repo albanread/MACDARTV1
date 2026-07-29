@@ -1,0 +1,103 @@
+"45_mandelzoom.mst — a demo that renders a zooming Mandelbrot set LIVE in the
+ native Metal game pane (docs/gamepane_design.md). Launch it from the Demos menu
+ (or a Workspace) with:  MandelZoom launch
+
+ The escape-time arithmetic is the same JIT-compiled Double math the Canvas
+ Mandelbrot uses — this demo reuses `Mandelbrot>>escapeAtRe:im:`
+ (world/35_mandelbrot.mst) unchanged, the 'fast floats' the tour is about
+ (world/08_double.mst). Each tick it computes a WHOLE 320x240 frame into a
+ reused ByteArray of palette indices, then hands the buffer to the pane in one
+ `blit:` command (primitive 215 → GameCommand::Blit → IndexedPane::blit, a single
+ memcpy into the GPU-uploaded buffer). That is the bulk path for CPU-generated
+ frames: one command per frame instead of one `point:y:color:` per pixel (a full
+ frame would be 76,800 commands), so the whole image updates coherently and the
+ view can dive one notch per frame toward the seahorse valley.
+
+ Palette (game-pane colours are 0..255; index 0 is transparent, user entries
+ start at 16): entry 16 is the near-black interior; entries 17..255 are a
+ colourful band cycled by escape count. In a headless VM every game primitive
+ silently fails, so loading this class outside the GUI is harmless."
+"I render a continuously zooming Mandelbrot set live in the native game
+ pane, diving toward the seahorse valley one notch per frame and resetting
+ once the dive bottoms out, so I loop forever. Launch me from the Demos
+ menu, or a Workspace: MandelZoom launch. Each frame I compute a whole
+ 320x240 view of palette indices — reusing Mandelbrot escapeAtRe:im: for
+ the Double escape-time math — into a reused buffer, then hand it to the
+ pane in a single blit:, the bulk path for CPU-generated frames. Harmless
+ to load in a headless VM (every game primitive silently fails there)."
+Object subclass: MandelZoom [
+    | pane mb maxIter buf centerR centerI scale zoomStep |
+
+    MandelZoom class >> launch [
+        "Open the game pane and start the zooming render."
+        ^self new start
+    ]
+
+    start [
+        pane := GamePane new.
+        maxIter := 150.
+        mb := Mandelbrot new maxIter: maxIter.
+        self buildPalette.
+        buf := ByteArray new: 320 * 240.   "reused frame buffer of palette indices"
+        "A classic zoom target on the boundary (the 'seahorse valley'); Double
+         precision stays clean until we are ~1e-13 wide, far past our reset."
+        centerR := 0.0 - 0.743643887037151.
+        centerI := 0.131825904205330.
+        scale := 3.5.          "width of the view in complex units"
+        zoomStep := 0.9.       "multiply the view width by this each frame"
+        pane onStep: [ self step ]; run.
+        ^self
+    ]
+
+    buildPalette [
+        "Interior = a deep near-black blue (entry 16); 17..255 = a cyclic
+         colour band, the same decimal-channel bands the Canvas Mandelbrot uses
+         (world/35_mandelbrot.mst), baked into the palette once."
+        | k r g b |
+        pane paletteAt: 16 r: 8 g: 8 b: 24.
+        k := 0.
+        [ k < 239 ] whileTrue: [
+            r := (k * 8) \\ 256.
+            g := (k * 5) \\ 256.
+            b := 64 + ((k * 11) \\ 192).
+            pane paletteAt: 17 + k r: r g: g b: b.
+            k := k + 1 ].
+        ^self
+    ]
+
+    step [
+        "One frame: compute the whole 320x240 view into `buf` (a palette index
+         per pixel, row-major from the top-left), blit it in one command, then
+         zoom in a notch (resetting to the whole set once we have dived a long
+         way, so it loops forever)."
+        | stepc rmin imin ci cr i n idx |
+        stepc := scale / 320.0.
+        rmin := centerR - (scale / 2.0).
+        imin := centerI - ((240.0 * stepc) / 2.0).
+        i := 1.                            "ByteArray is 1-indexed"
+        0 to: 239 do: [ :py |
+            ci := imin + (py asDouble * stepc).
+            cr := rmin.
+            0 to: 319 do: [ :px |
+                n := mb escapeAtRe: cr im: ci.
+                idx := n >= maxIter
+                    ifTrue: [ 16 ]
+                    ifFalse: [ 17 + (n \\ 239) ].
+                buf at: i put: idx.
+                i := i + 1.
+                cr := cr + stepc ] ].
+        pane blit: buf.
+        pane present.        "show the frame — every frame in the loop presents"
+        scale := scale * zoomStep.
+        scale < 0.00005 ifTrue: [ self diveBottomed ].
+        ^self
+    ]
+
+    diveBottomed [
+        "Reached the depth limit of one zoom dive. MandelZoom loops forever, so
+         reset to the whole set and dive again. A subclass (MandelVM) overrides
+         this to END instead."
+        scale := 3.5.
+        ^self
+    ]
+]

@@ -1,0 +1,133 @@
+"16_dictionary.mst — HashedCollection/Dictionary (sprint_s06_detail.md #16).
+ NEW classes. Two parallel Arrays (keys/vals), power-of-two capacity, nil
+ key slot = empty, linear probing, no deletion/tombstones in v1. scanFor:
+ is the pinned probe loop (verbatim shape)."
+
+"I am the abstract parent of the hash-based collections: Dictionary and
+ Set, and their identity variants. I define no behavior myself — I
+ exist to group the family in the hierarchy; each subclass owns its own
+ table layout and probing."
+
+Collection subclass: HashedCollection [
+]
+
+"I map keys to values by hashing: an open-addressed table that doubles
+ once half full. Store with at:put:, fetch with at: (an error when the
+ key is absent), at:ifAbsent:, at:ifAbsentPut: or at:ifPresent:.
+ Iterate with keysAndValuesDo:, keysDo:, or do: (values only), or ask
+ for keys / values snapshots. Keys are compared with = and must answer
+ a consistent hash; nil is not a valid key. I have no removeKey: — the
+ idiom throughout this system is to store nil at the key as a
+ tombstone instead."
+
+HashedCollection subclass: Dictionary [
+    | tally <Integer> keys <Array> vals <Array> |
+
+    Dictionary class >> new ^ <Dictionary> [
+        ^self basicNew init
+    ]
+    init ^ <Self> [
+        tally := 0.
+        keys := Array new: 8.
+        vals := Array new: 8.
+    ]
+    size ^ <Integer> [
+        ^tally
+    ]
+    isEmpty ^ <Boolean> [
+        ^tally = 0
+    ]
+    scanFor: key <Object> ^ <Integer> [
+        | cap i probe |
+        cap := keys size.
+        i := (key hash bitAnd: cap - 1) + 1.
+        [ true ] whileTrue: [
+            probe := keys at: i.
+            (probe isNil or: [ probe = key ]) ifTrue: [ ^i ].
+            i := i = cap ifTrue: [ 1 ] ifFalse: [ i + 1 ] ]
+    ]
+    privateAt: i <Integer> put: k <Object> value: v <Object> [
+        keys at: i put: k.
+        vals at: i put: v.
+    ]
+    at: key <Object> put: value <Object> ^ <Object> [
+        | i |
+        key isNil ifTrue: [ ^self error: 'nil is not a valid key' ].
+        i := self scanFor: key.
+        (keys at: i) isNil
+            ifTrue: [
+                self privateAt: i put: key value: value.
+                tally := tally + 1.
+                self checkGrow ]
+            ifFalse: [ vals at: i put: value ].
+        ^value
+    ]
+    at: key <Object> ifAbsent: absentBlock <[]> ^ <Object> [
+        | i |
+        i := self scanFor: key.
+        (keys at: i) isNil ifTrue: [ ^absentBlock value ].
+        ^vals at: i
+    ]
+    at: key <Object> ^ <Object> [
+        ^self at: key ifAbsent: [ self error: 'key not found' ]
+    ]
+    at: key <Object> ifAbsentPut: aBlock <[]> ^ <Object> [
+        | i |
+        i := self scanFor: key.
+        (keys at: i) isNil ifTrue: [
+            | v |
+            v := aBlock value.
+            self privateAt: i put: key value: v.
+            tally := tally + 1.
+            self checkGrow.
+            ^v ].
+        ^vals at: i
+    ]
+    includesKey: key <Object> ^ <Boolean> [
+        ^(keys at: (self scanFor: key)) notNil
+    ]
+    keysAndValuesDo: aBlock <[Object,Object]> [
+        1 to: keys size do: [:i |
+            (keys at: i) notNil ifTrue: [ aBlock value: (keys at: i) value: (vals at: i) ] ]
+    ]
+    do: aBlock <[Object]> [
+        self keysAndValuesDo: [:k :v | aBlock value: v ]
+    ]
+    keysDo: aBlock <[Object]> [
+        self keysAndValuesDo: [:k :v | aBlock value: k ]
+    ]
+    keys ^ <OrderedCollection> [
+        | r |
+        r := OrderedCollection new.
+        self keysDo: [:k | r add: k ].
+        ^r
+    ]
+    values ^ <OrderedCollection> [
+        | r |
+        r := OrderedCollection new.
+        self do: [:v | r add: v ].
+        ^r
+    ]
+    associationsDo: aBlock <[Association]> [
+        self keysAndValuesDo: [:k :v | aBlock value: (Association key: k value: v) ]
+    ]
+    checkGrow [
+        tally * 2 > keys size ifTrue: [ self grow ]
+    ]
+    "Re-probes every surviving entry into fresh, doubled-capacity arrays
+     (bucket indices depend on capacity, so a straight copy would break
+     scanFor: on the new table)."
+    grow [
+        | oldKeys oldVals newCap |
+        oldKeys := keys.
+        oldVals := vals.
+        newCap := keys size * 2.
+        keys := Array new: newCap.
+        vals := Array new: newCap.
+        1 to: oldKeys size do: [:i |
+            (oldKeys at: i) notNil ifTrue: [
+                | j |
+                j := self scanFor: (oldKeys at: i).
+                self privateAt: j put: (oldKeys at: i) value: (oldVals at: i) ] ]
+    ]
+]

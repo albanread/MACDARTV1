@@ -1,0 +1,234 @@
+"43_gamepane.mst — GamePane: drive the native Metal game pane from Smalltalk
+ (docs/gamepane_design.md). Its methods speak numbered game primitives (the
+ id-200+ block in src/runtime/primitives.rs) that emit GameCommands over the
+ VM->GUI game channel; the GUI applies each to the native CAMetalLayer pane
+ (gui/src/game_pane.rs). Drawing methods mutate the pane's buffer only.
+ **Inside the frame loop (onStep:), end every frame with `present`** — that is
+ the one moment the GUI shows the frame, and drawing without it flickers or
+ freezes (the GUI deliberately does NOT auto-present mid-loop, so a half-drawn
+ frame is never shown). For a one-shot draw OUTSIDE the loop (a Workspace doit),
+ `present` is optional — the response drain shows anything dirty.
+
+ Colour arguments are 0..255; palette index 0 is transparent, and user palette
+ entries start at 16. In a headless VM (no game sink) every primitive silently
+ fails and returns self, so this class is harmless to load outside the GUI."
+
+"--- Sprite: a handle to a placed sprite instance (docs/gamepane_design.md).
+ Defined before GamePane so GamePane>>defineSprite: can reference it. ---"
+"I am a handle to one sprite instance placed on a GamePane. Obtain me from
+ GamePane>>defineSprite: (which defines the pixel art and places me). Set
+ my palette entries with colorAt:r:g:b: (index 0..15, channels 0..255) and
+ move me with moveTo:y:; changes show on the next presented frame."
+Object subclass: Sprite [
+    | pane id |
+    Sprite class >> pane: aPane id: anId [
+        ^self new setPane: aPane id: anId
+    ]
+    setPane: aPane id: anId [ pane := aPane. id := anId. ^self ]
+    moveTo: x y: y [
+        "Move this sprite to (x, y)."
+        pane primMoveSprite: id x: x y: y.
+        ^self
+    ]
+    colorAt: index r: r g: g b: b [
+        "Set this sprite's palette entry `index` (0..15) to an RGB colour."
+        pane primSpriteColor: id index: index r: r g: g b: b.
+        ^self
+    ]
+]
+
+"I drive the native game pane from Smalltalk: a low-resolution palette
+ display with drawing primitives, sprites, sound, keyboard input and a
+ frame loop. Draw with cls:, point:y:color:, line:y:to:y:color:,
+ fill:y:width:height:color:, disc:y:radius:color:, or blit: a whole frame
+ of palette indices in one command; set colours with paletteAt:r:g:b:
+ (user entries 16..255, channels 0..255; index 0 is transparent). Define
+ sprites with defineSprite: (answers a Sprite handle). Register a
+ per-frame block with onStep: — and end every frame with `present`, the
+ one moment the GUI shows it — plus optional cleanup with onReset:; then
+ `run` starts the GUI-owned frame timer and `stop` ends it. Inside the
+ step block, poll held keys with keyHeld: and my class-side key constants
+ (keyLeft, keyRight, keyUp, keyDown, keyA, keyB). In a headless VM every
+ game primitive silently fails, so I am harmless to load outside the GUI.
+ Breakout and MandelZoom are complete worked examples."
+Object subclass: GamePane [
+    <classVars: StepBlock Keys NextId ResetBlock>
+
+    clearR: r g: g b: b [
+        "Clear the pane to an opaque RGB colour (each 0..255) and present it."
+        <primitive: 200>
+        ^self
+    ]
+    paletteAt: index r: r g: g b: b [
+        "Set palette entry `index` (16..255) to an opaque RGB colour."
+        <primitive: 201>
+        ^self
+    ]
+    cls: index [
+        "Clear the pane to palette `index` (0..255)."
+        <primitive: 202>
+        ^self
+    ]
+    point: x y: y color: c [
+        "Plot a pixel at (x, y) in palette colour `c`."
+        <primitive: 203>
+        ^self
+    ]
+    line: x0 y: y0 to: x1 y: y1 color: c [
+        "Draw a line from (x0, y0) to (x1, y1) in palette colour `c`."
+        <primitive: 204>
+        ^self
+    ]
+    fill: x y: y width: w height: h color: c [
+        "Fill a w x h rectangle at (x, y) in palette colour `c`."
+        <primitive: 205>
+        ^self
+    ]
+    disc: cx y: cy radius: r color: c [
+        "Fill a disc of radius `r` centred at (cx, cy) in palette colour `c`."
+        <primitive: 206>
+        ^self
+    ]
+    present [
+        "Show the frame drawn so far."
+        <primitive: 207>
+        ^self
+    ]
+    blit: aByteArray [
+        "Overwrite the whole pane from a ByteArray of width*height palette
+         indices (row-major, 0 at top-left) in ONE command — the bulk path for a
+         CPU-generated frame, far cheaper than a point:y:color: per pixel.
+         Follow it with `present` to show the frame (required inside the loop)."
+        <primitive: 215>
+        ^self
+    ]
+
+    "--- the frame loop (docs/gamepane_design.md M4) ---"
+
+    onStep: aBlock [
+        "Register the per-frame block. It is held in a class variable, so it is
+         GC-rooted for the whole game (and so is everything it closes over)."
+        StepBlock := aBlock.
+        ^self
+    ]
+    onReset: aBlock [
+        "Register a one-shot cleanup block, run by `reset` (below) the moment
+         this session ends — however it ends: Escape, the close button, a
+         re-launch while this demo is still running, or an orphaned pane
+         force-closed by a primary-VM restart. For a demo with per-session
+         native/worker state beyond StepBlock (ParallelMandel's spawned
+         workers), THIS is the clean-teardown hook — without it, that state
+         has no reset path at all and just accumulates across runs."
+        ResetBlock := aBlock.
+        ^self
+    ]
+    run [
+        "Start the frame loop: the GUI's main-thread timer begins pulling one
+         frame per tick. Returns immediately — the loop is owned by the timer,
+         not by a blocking Smalltalk loop."
+        <primitive: 208>
+        ^self
+    ]
+    stop [
+        "Stop the frame loop."
+        <primitive: 209>
+        ^self
+    ]
+    keyHeld: keyCode [
+        "Is game key `keyCode` (see GamePane class>>keyLeft etc.) held this
+         frame? Only meaningful inside the step block."
+        ^GamePane keyHeld: keyCode
+    ]
+
+    "--- sprites (docs/gamepane_design.md) ---"
+
+    defineSprite: hexRows [
+        "Define a sprite from '/'-separated hex-row art (4 bits/pixel, so up to
+         16 colours per sprite; e.g. 'f0f/0f0/f0f' is 3x3) and place it; answer
+         a Sprite handle. Set its colours with colorAt:r:g:b: and move it with
+         moveTo:y:."
+        | id |
+        id := GamePane nextId.
+        self primDefineSprite: id rows: hexRows.
+        ^Sprite pane: self id: id
+    ]
+    primDefineSprite: id rows: hexRows [ <primitive: 210> ^self ]
+    primSpriteColor: id index: index r: r g: g b: b [ <primitive: 211> ^self ]
+    primMoveSprite: id x: x y: y [ <primitive: 212> ^self ]
+
+    GamePane class >> stepWithKeys: mask [
+        "Run one frame: record the held-key bitmask, then run the step block.
+         Called by the GUI's frame timer via a GameStep request, once per tick
+         on an idle worker (never nested)."
+        Keys := mask.
+        StepBlock isNil ifFalse: [ StepBlock value ].
+        ^self
+    ]
+    GamePane class >> keyHeld: keyCode [
+        "Bit `keyCode` of the current held-key mask."
+        Keys isNil ifTrue: [ ^false ].
+        ^(Keys bitAnd: (1 bitShift: keyCode)) ~= 0
+    ]
+    GamePane class >> reset [
+        "Run and clear whatever cleanup a demo registered via `onReset:` FIRST
+         (while its StepBlock closure is still intact to poke at), then the
+         frame-loop state itself. MACVM has no exception system (fail fast is
+         the house rule) — a broken teardown block surfaces normally, exactly
+         like any other guest error."
+        ResetBlock ifNotNil: [ ResetBlock value. ResetBlock := nil ].
+        StepBlock := nil.
+        Keys := 0.
+    ]
+    GamePane class >> nextId [
+        "A fresh monotonic sprite id. The GUI registry maps it to MacGamePane's
+         own def/instance ids (docs/gamepane_design.md)."
+        NextId isNil ifTrue: [ NextId := 0 ].
+        NextId := NextId + 1.
+        ^NextId
+    ]
+
+    "Game-key bit positions (the GUI packs these from the held-key table)."
+    GamePane class >> keyLeft  [ ^0 ]
+    GamePane class >> keyRight [ ^1 ]
+    GamePane class >> keyUp    [ ^2 ]
+    GamePane class >> keyDown  [ ^3 ]
+    GamePane class >> keyA     [ ^4 ]
+    GamePane class >> keyB     [ ^5 ]
+]
+
+"--- Sound: a named SFX preset played on the one shared engine
+ (docs/gamepane_design.md). `Sound coin play`. ---"
+"I am a named sound-effect preset played on the shared game audio engine:
+ `Sound coin play`. My class-side constructors name the presets — coin,
+ jump, zap, shoot, explode, powerup, hurt, click, bang, blip. In a
+ headless VM `play` is silently a no-op."
+Object subclass: Sound [
+    | preset |
+    Sound class >> preset: n [ ^self new setPreset: n ]
+    Sound class >> coin    [ ^self preset: 0 ]
+    Sound class >> jump    [ ^self preset: 1 ]
+    Sound class >> zap     [ ^self preset: 2 ]
+    Sound class >> shoot   [ ^self preset: 3 ]
+    Sound class >> explode [ ^self preset: 4 ]
+    Sound class >> powerup [ ^self preset: 5 ]
+    Sound class >> hurt    [ ^self preset: 6 ]
+    Sound class >> click   [ ^self preset: 7 ]
+    Sound class >> bang    [ ^self preset: 8 ]
+    Sound class >> blip    [ ^self preset: 9 ]
+    setPreset: n [ preset := n. ^self ]
+    play [ "Play this sound." self primPlay: preset. ^self ]
+    primPlay: n [ <primitive: 213> ^self ]
+]
+
+"--- Tune: an ABC-notation chiptune, played once in the background
+ (docs/gamepane_design.md). `(Tune fromAbc: 'C C G G A A G2') playOnce`. ---"
+"I am a chiptune written in ABC notation, played in the background by the
+ game audio engine: (Tune fromAbc: 'C C G G A A G2') playOnce. In a
+ headless VM `playOnce` is silently a no-op."
+Object subclass: Tune [
+    | abc |
+    Tune class >> fromAbc: aString [ ^self new setAbc: aString ]
+    setAbc: aString [ abc := aString. ^self ]
+    playOnce [ "Play this tune once in the background." self primPlayTune: abc. ^self ]
+    primPlayTune: s [ <primitive: 214> ^self ]
+]

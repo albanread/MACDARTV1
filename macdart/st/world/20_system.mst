@@ -1,0 +1,46 @@
+"20_system.mst — System (sprint_s06_detail.md #20). SystemDictionary reopen:
+ startUp is a no-op hook (Character's table etc. are already initialized by
+ their own files' doIts, well before this loads); quit:/gcScavenge/gcFull/
+ gcStats install onto Smalltalk itself so scripts can say `Smalltalk gcFull`.
+ gcStats (S8) answers an Array of 8 smis, SPEC-pinned order: scavengeCount,
+ fullGcCount, edenUsed, oldUsed, oldCommitted, bytesPromoted,
+ markedBytesLast, contextAllocs — the soak harness and S14's Context-
+ elision gate both index into it by position."
+
+"I am the class of Smalltalk, the single object that represents the
+ running system. Send me gcScavenge or gcFull to force a garbage
+ collection, gcStats for an Array of collector counters, millisecondClock
+ for milliseconds elapsed since the VM started (monotonic, not wall-clock
+ time), and quit or quit: to leave the system with an exit code. These are
+ all backed by VM primitives; startUp is a boot hook that currently does
+ nothing."
+Object subclass: SystemDictionary [
+    startUp ^ <Self> [
+        ^self
+    ]
+    quit: code <Integer> [
+        <primitive: 96>
+    ]
+    quit [
+        ^self quit: 0
+    ]
+    gcScavenge [
+        <primitive: 93>
+    ]
+    gcFull [
+        <primitive: 94>
+    ]
+    gcStats ^ <Array> [
+        <primitive: 97>
+    ]
+    millisecondClock ^ <Integer> [
+        <primitive: 92>
+    ]
+    microsecondClock ^ <Integer> [
+        "Monotonic elapsed-since-VM-start clock in microseconds (same source
+         as millisecondClock, without its .as_millis truncation) — the
+         Cog-comparison harness needs microsecond resolution on the sub-ms
+         benches (docs/cog_bench.md, src/runtime/primitives.rs prim 252)."
+        <primitive: 252>
+    ]
+]

@@ -1,0 +1,425 @@
+"68_cocoaeditor.mst — CocoaEditor: the native class text editor view (the web
+ GUI's `texteditor`, as a Cocoa tab). Loaded ONLY via world/cocoaui.list, after
+ 66_cocoabrowser.mst (it reuses the browser's `hostService` handle + reply
+ reader for image access).
+
+ ARCHITECTURE (deliberately simple — the DATABASE is the source of truth):
+ pick a class, edit its whole-class `.mst` text NATIVELY in the NSTextView, then
+ Save does exactly the two things saving a class means, the SAME way the browser
+ accept already does them:
+   (a) update the PRIMARY VM   — `Worker uiDoit: text` recompiles the class live
+       (methods are mutable; a shape change is deferred to next boot — no become)
+   (b) update the DATABASE     — `hostService acceptEditorClass: text` writes the
+       diff (only changed methods re-version) + exports the world `.mst`
+ No cross-VM buffer relay: the text is a few KB and the DB round-trips it. Load
+ reads `image_store::class_source` (host); Save writes it back. The shared
+ EditorSession/Rope model (world/60) stays available for other uses; this view
+ does not drive it."
+
+"I am the Editor tab: pick any class from the image (type-ahead combobox),
+ Load its whole-class source into a native text view, edit, and Save —
+ which both recompiles the class live on the primary VM and writes the
+ diffed source back to the image and world files (methods change at once;
+ an instance-shape change takes effect on the next launch). My action bar
+ and the File/Source menus also work on plain source files: New, Open,
+ Save, Save As, File In (a fresh world, then your file — exactly like
+ running it from the command line), Add to World (graduate the file into
+ the standard boot), plus Format and Analyze — a real-parser syntax check
+ that marks and scrolls to the offending line. I run in the UI worker VM
+ and reach the image through the host service."
+Object subclass: CocoaEditor [
+    <classVars: Container Picker Buffer BufferScroll ActionDelegates BufferDelegate LastProbe
+                CurrentPath BarBox BarButtons>
+
+    CocoaEditor class >> stripHeight [ ^36.0 ]
+    CocoaEditor class >> barHeight [ ^30.0 ]
+
+    CocoaEditor class >> register [
+        CocoaUI registerViewNamed: #editor title: 'Editor' icon: 'blankSheet'
+                container: [ self containerView ]
+                onShow: [ self refreshClassNames.
+                          CocoaUI window onMain makeFirstResponder: Picker ]
+    ]
+    CocoaEditor class >> containerView [
+        Container isNil ifTrue: [ self buildView ].
+        ^Container
+    ]
+
+    "── build ──"
+    CocoaEditor class >> buildView [
+        | host frame w h barY bx |
+        host := CocoaUI contentHost.
+        frame := host onMain frame.
+        w := frame at: 3. h := frame at: 4.
+        ActionDelegates := OrderedCollection new.
+        Container := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Container onMain setAutoresizesSubviews: true.
+
+        "── the picker strip: an NSComboBox over every class + Load + Save ──"
+        Picker := ((Cocoa classNamed: 'NSComboBox') onMain alloc) onMain
+            initWithFrame: (Array with: 6.0 with: h - 30.0 with: w - 232.0 with: 24.0).
+        Picker onMain setCompletes: true.
+        Picker onMain setNumberOfVisibleItems: 16.
+        Picker onMain setPlaceholderString: 'class name, e.g. Mandelbrot'.
+        Picker onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        self wireAction: Picker to: [ self loadPicked ].
+        Container onMain addSubview: Picker.
+
+        self stripButton: 'Load'
+            frame: (Array with: w - 220.0 with: h - 31.0 with: 104.0 with: 26.0)
+            action: [ self loadPicked ].
+        self stripButton: 'Save'
+            frame: (Array with: w - 112.0 with: h - 31.0 with: 104.0 with: 26.0)
+            action: [ self save ].
+
+        "── the ACTION BAR: a grained strip (the transcript bar's own look)
+           hosting the file workflow as one-click buttons — the File/Source
+           menus' equivalents. The grain box is added FIRST so the buttons
+           render on top of it; everything pins to the top (MinYMargin)."
+        barY := h - self stripHeight - self barHeight.
+        BarBox := CocoaUI addTexturedBoxFrame: (Array with: 0.0 with: barY with: w with: self barHeight)
+                          resize: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin
+                          in: Container.
+        BarButtons := OrderedCollection new.
+        bx := 4.0.
+        self barButton: 'New' frame: (Array with: bx with: barY + 3.0 with: 56.0 with: 24.0)
+             action: [ self fileNew ]. bx := bx + 60.
+        self barButton: 'Open…' frame: (Array with: bx with: barY + 3.0 with: 64.0 with: 24.0)
+             action: [ self fileOpen ]. bx := bx + 68.
+        self barButton: 'Save' frame: (Array with: bx with: barY + 3.0 with: 56.0 with: 24.0)
+             action: [ self fileSave ]. bx := bx + 60.
+        self barButton: 'File In' frame: (Array with: bx with: barY + 3.0 with: 64.0 with: 24.0)
+             action: [ self fileIn ]. bx := bx + 68.
+        self barButton: 'Add to World' frame: (Array with: bx with: barY + 3.0 with: 104.0 with: 24.0)
+             action: [ self addToWorld ]. bx := bx + 108.
+        self barButton: 'Format' frame: (Array with: bx with: barY + 3.0 with: 64.0 with: 24.0)
+             action: [ self formatBuffer ]. bx := bx + 68.
+        self barButton: 'Analyze' frame: (Array with: bx with: barY + 3.0 with: 68.0 with: 24.0)
+             action: [ self analyzeBuffer ].
+
+        "── the buffer: a NATIVE, editable NSTextView, scroll-wrapped (a bare one
+           draws past its frame and bleeds through the next tab — the CG7 mess).
+           Substitutions off so typed source isn't mangled (the Workspace's
+           discipline). The plain text delegate recolours on every change. ──"
+        BufferScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight - self barHeight).
+        BufferScroll onMain setHasVerticalScroller: true.
+        BufferScroll onMain setHasHorizontalScroller: true.
+        BufferScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Buffer := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight - self barHeight).
+        Buffer onMain setEditable: true.
+        Buffer onMain setAutomaticQuoteSubstitutionEnabled: false.
+        Buffer onMain setAutomaticDashSubstitutionEnabled: false.
+        Buffer onMain setAutomaticTextReplacementEnabled: false.
+        Buffer onMain setFont: (CocoaUI fixedFontOfSize: 12.0).
+        Buffer onMain setVerticallyResizable: true.
+        Buffer onMain setHorizontallyResizable: false.
+        Buffer onMain setString: self placeholder.
+        (Buffer onMain textContainer) ifNotNil: [ :tc | tc onMain setWidthTracksTextView: true. tc release ].
+        BufferDelegate := MacvmDelegate textDelegateOn: self.
+        Buffer onMain setDelegate: BufferDelegate.
+        BufferScroll onMain setDocumentView: Buffer.
+        Container onMain addSubview: BufferScroll.
+
+        self refreshClassNames.
+    ]
+
+    CocoaEditor class >> placeholder [
+        ^'"Pick a class above (type-ahead or the dropdown), then Load — or press
+Enter in the field. Edit the source here and Save: the change compiles into the
+running VM AND is written to the image + world (methods live immediately; a
+shape change takes effect on the next launch)."'
+    ]
+
+    CocoaEditor class >> stripButton: title frame: rect action: aBlock [
+        | btn holder delegate |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: CocoaUI maskMinXMargin + CocoaUI maskMinYMargin.
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+        Container onMain addSubview: btn.
+        ^btn
+    ]
+    CocoaEditor class >> barButton: title frame: rect action: aBlock [
+        "An action-bar button: left-anchored, pinned to the TOP (MinYMargin
+         only — stripButton's MinX pin is for the right-aligned strip pair)."
+        | btn holder delegate |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: CocoaUI maskMinYMargin.
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+        Container onMain addSubview: btn.
+        BarButtons add: btn.
+        ^btn
+    ]
+    CocoaEditor class >> wireAction: aControl to: aBlock [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+    ]
+
+    "── the picker options: every class in the image (host-served) ──"
+    CocoaEditor class >> refreshClassNames [
+        | reply names |
+        Picker isNil ifTrue: [ ^self ].
+        reply := CocoaBrowser readReply: (CocoaBrowser hostService onMain classNames).
+        names := self splitLines: reply.
+        Picker onMain removeAllItems.
+        names do: [ :n | n isEmpty ifFalse: [ Picker onMain addItemWithObjectValue: n ] ].
+    ]
+    CocoaEditor class >> splitLines: aString [
+        | lines line lf |
+        lines := OrderedCollection new. line := ''. lf := Character value: 10.
+        aString do: [ :ch |
+            ch = lf ifTrue: [ line isEmpty ifFalse: [ lines add: line ]. line := '' ]
+                    ifFalse: [ line := line , (String with: ch) ] ].
+        line isEmpty ifFalse: [ lines add: line ].
+        ^lines
+    ]
+
+    "── load: read the class's whole-class source from the image (host) ──"
+    CocoaEditor class >> loadPicked [
+        | name src |
+        Picker isNil ifTrue: [ ^self ].
+        name := Picker sendString: 'stringValue'.
+        (name isNil or: [ name isEmpty ]) ifTrue: [ ^self ].
+        src := CocoaBrowser hostClassSource: name.
+        (src isNil or: [ src isEmpty ])
+            ifTrue: [ Buffer onMain setString: '"No class named ', name, ' in the image."' ]
+            ifFalse: [ Buffer onMain setString: src. self recolorize ].
+    ]
+
+    "── save: (a) recompile the class into the PRIMARY VM (live), (b) write the
+       image + world — the same two steps, same mechanisms, the browser accept
+       uses. `uiDoit:` runs the whole-class definition as one top item on the
+       primary (methods recompile live; a shape change is deferred to boot). ──"
+    CocoaEditor class >> save [
+        | text |
+        Buffer isNil ifTrue: [ ^self ].
+        text := self bufferText.
+        (text isNil or: [ text isEmpty ]) ifTrue: [ ^self ].
+        "(a) update the primary VM — compile it live."
+        Worker uiDoit: text onReply: [ :r | CocoaEditor notePrimary: r ].
+        "(b) update the database + world (host, diffed)."
+        CocoaUI appendTranscript: 'editor: '
+            , (CocoaBrowser readReply: (CocoaBrowser hostService onMain acceptEditorClass: text)).
+    ]
+    CocoaEditor class >> notePrimary: r [
+        CocoaUI appendTranscript: 'editor: primary VM <- ' , r.
+    ]
+
+    "── the File menu: work on a USER FILE of classes (open/edit/save/file-in).
+       Disk I/O is CocoaFile (world/49a — UTF-8 slurp/spit, direct bridge send,
+       fine on the UI worker). Open…/Save As… go through the HOST's panel
+       flags (a modal panel must never spin inside this menu callback —
+       panels.rs runs it top-level and calls back openedPath:/savePathChosen:).
+       File In parks the path with the host; the supervisor's primary pump runs
+       the file TOP-LEVEL on the primary (VmHandle::run_file — every item,
+       exactly `macvm run <file>`), and the outcome lands on the Transcript. ──"
+    CocoaEditor class >> currentPath [ ^CurrentPath ]
+    CocoaEditor class >> fileNew [
+        "A fresh, unsaved buffer seeded with a working class template — edit,
+         then File > Save (choose a path) / File In (compiles into the primary)."
+        CurrentPath := nil.
+        self setBufferText: '"New class file. Rename MyClass, add methods, then:
+ File > Save As...  writes this file to disk;
+ File > File In     compiles it into the running VM;
+ Source > Analyze   syntax-checks;  Source > Format  re-indents."
+
+"I am the placeholder class in the editor file template, seeded by File
+ New as a minimal working example. Rename me and replace my methods."
+Object subclass: MyClass [
+    | instanceVar |
+
+    greeting [
+        ^''hello from MyClass''
+    ]
+]'.
+        CocoaUI appendTranscript: 'editor: new file (unsaved)'.
+    ]
+    CocoaEditor class >> fileOpen [ CocoaBrowser hostService onMain requestOpenPanel ]
+    CocoaEditor class >> openedPath: aPath [
+        | text |
+        text := CocoaFile slurp: aPath.
+        text isNil ifTrue: [ ^CocoaUI appendTranscript: 'editor: cannot read ', aPath ].
+        CurrentPath := aPath.
+        self setBufferText: text.
+        CocoaUI appendTranscript: 'editor: opened ', aPath.
+    ]
+    CocoaEditor class >> fileSave [
+        CurrentPath isNil ifTrue: [ ^self fileSaveAs ].
+        (CocoaFile spit: CurrentPath contents: self bufferText)
+            ifTrue: [ CocoaUI appendTranscript: 'editor: saved ', CurrentPath ]
+            ifFalse: [ CocoaUI appendTranscript: 'editor: SAVE FAILED — ', CurrentPath ].
+    ]
+    CocoaEditor class >> fileSaveAs [ CocoaBrowser hostService onMain requestSavePanel ]
+    CocoaEditor class >> savePathChosen: aPath [
+        CurrentPath := aPath.
+        self fileSave.
+    ]
+    CocoaEditor class >> fileInScratchPath [ ^'/tmp/macvm-editor-filein.mst' ]
+    CocoaEditor class >> fileIn [
+        "THE CONTRACT: a fresh world, then your file. The primary RESTARTS from
+         its clean boot state and the file loads on top — `macvm run <file>`
+         inside the GUI. No persistence between file-ins: the same file loads
+         N times without shape errors, and every run starts identical. Write
+         the buffer to its file (or a scratch path when unsaved) first."
+        | path text |
+        text := self bufferText.
+        (text isNil or: [ text isEmpty ]) ifTrue: [ ^self ].
+        path := CurrentPath isNil ifTrue: [ self fileInScratchPath ] ifFalse: [ CurrentPath ].
+        (CocoaFile spit: path contents: text)
+            ifFalse: [ ^CocoaUI appendTranscript: 'editor: cannot write ', path ].
+        CocoaBrowser hostService onMain fileInPath: path.
+        CocoaUI appendTranscript: 'editor: file-in — fresh world, then ', path.
+    ]
+
+    CocoaEditor class >> addToWorld [
+        "Graduate the buffer's file INTO THE WORLD: world/user_<name>.mst +
+         world.list + image import, then a fresh primary that CONTAINS these
+         classes — every future fresh world (File In's included, and reseeds)
+         keeps them. Re-adding the same file updates it. Syntax-gated by the
+         host; a broken file is refused with line/col, nothing written."
+        | path text reply |
+        text := self bufferText.
+        (text isNil or: [ text isEmpty ]) ifTrue: [ ^self ].
+        path := CurrentPath isNil ifTrue: [ self fileInScratchPath ] ifFalse: [ CurrentPath ].
+        (CocoaFile spit: path contents: text)
+            ifFalse: [ ^CocoaUI appendTranscript: 'editor: cannot write ', path ].
+        reply := CocoaBrowser readReply: (CocoaBrowser hostService onMain addToWorldPath: path).
+        CocoaUI appendTranscript: 'editor: ' , ((CocoaBrowser isOk: reply)
+            ifTrue: [ CocoaBrowser payloadOf: reply ]
+            ifFalse: [ 'add-to-world FAILED — ' , (CocoaBrowser errorOf: reply) ]).
+    ]
+
+    "── the Source menu: Format (host re-indenter, comment/string-preserving)
+       and Analyze (the REAL compiler parser; an error marks + scrolls to the
+       offending line). ──"
+    CocoaEditor class >> formatBuffer [
+        | reply |
+        Buffer isNil ifTrue: [ ^self ].
+        reply := CocoaBrowser readReply: (CocoaBrowser hostService onMain formatSource: self bufferText).
+        reply isEmpty ifFalse: [ self setBufferText: reply ].
+        CocoaUI appendTranscript: 'editor: formatted'.
+    ]
+    CocoaEditor class >> analyzeBuffer [
+        | reply parts line |
+        Buffer isNil ifTrue: [ ^self ].
+        reply := CocoaBrowser readReply: (CocoaBrowser hostService onMain analyzeSource: self bufferText).
+        (CocoaBrowser isOk: reply) ifTrue: [
+            self markLine: '0'.
+            ^CocoaUI appendTranscript: 'editor: syntax OK' ].
+        "ERR <line> <col> <message>"
+        parts := CocoaBrowser tokensOf: reply.
+        line := parts size >= 2 ifTrue: [ parts at: 2 ] ifFalse: [ '0' ].
+        self markLine: line.
+        self scrollToLine: line.
+        CocoaUI appendTranscript: 'editor: syntax error @ line/col ', (CocoaBrowser errorOf: reply).
+    ]
+    CocoaEditor class >> markLine: aLineString [
+        "Host-side error mark: clears any previous mark, then (line >= 1)
+         backgrounds that line translucent red. '0' = clear only."
+        | ts |
+        Buffer isNil ifTrue: [ ^self ].
+        ts := Buffer onMain textStorage.
+        ts isNil ifTrue: [ ^self ].
+        CocoaBrowser hostService onMain markErrorStorage: ts line: aLineString.
+        ts release.
+    ]
+    CocoaEditor class >> scrollToLine: aLineString [
+        "Put the caret at the start of 1-based line N and scroll it visible.
+         (Char offsets; UTF-16 drift on heavy non-ASCII source is tolerable —
+         the red mark itself is host-computed and exact.)"
+        | n text pos cur lf i |
+        n := 0.
+        aLineString do: [ :ch | (ch value between: 48 and: 57) ifTrue: [ n := n * 10 + (ch value - 48) ] ].
+        n < 1 ifTrue: [ ^self ].
+        text := self bufferText.
+        pos := 0. cur := 1. lf := Character value: 10. i := 1.
+        [ i <= text size and: [ cur < n ] ] whileTrue: [
+            (text at: i) = lf ifTrue: [ cur := cur + 1. pos := i ].
+            i := i + 1 ].
+        Buffer onMain setSelectedRange: (Array with: pos with: 0).
+        Buffer onMain scrollRangeToVisible: (Array with: pos with: 0).
+    ]
+
+    "── recolour (host-side; fires on load and on every native edit) ──"
+    CocoaEditor class >> textDidChange: aNote [ self recolorize ]
+    CocoaEditor class >> recolorize [
+        | ts |
+        Buffer isNil ifTrue: [ ^self ].
+        ts := Buffer onMain textStorage.
+        ts isNil ifTrue: [ ^self ].
+        CocoaBrowser hostService onMain colorizeStorage: ts.
+        ts release.
+    ]
+    CocoaEditor class >> applyCodeFont [
+        "Re-apply the current code font to the edit buffer — CocoaUI's A-/A+
+         buttons broadcast here (nil-safe; the buffer builds lazily and its
+         build site reads `CocoaUI fixedFontOfSize:`)."
+        Buffer isNil ifFalse: [ Buffer onMain setFont: (CocoaUI fixedFontOfSize: 12.0) ]
+    ]
+
+    "── scripting/automation (rusttcl `gui doit`) so I can drive + snapshot ──"
+    CocoaEditor class >> typeClass: aString [
+        Picker isNil ifFalse: [ Picker onMain setStringValue: aString ]
+    ]
+    CocoaEditor class >> load [ ^self loadPicked ]
+    CocoaEditor class >> bufferText [
+        Buffer isNil ifTrue: [ ^'' ].
+        ^Buffer sendString: 'string'
+    ]
+    CocoaEditor class >> setBufferText: aString [
+        "Replace the whole buffer (a scripted edit), then recolour."
+        Buffer isNil ifFalse: [ Buffer onMain setString: aString. self recolorize ]
+    ]
+    CocoaEditor class >> appendMethod: aString [
+        "Scripting: insert a method just before the buffer's final ] (a real edit)."
+        | t idx |
+        Buffer isNil ifTrue: [ ^self ].
+        t := self bufferText.
+        idx := t size.
+        [ idx > 0 and: [ (t at: idx) ~= $] ] ] whileTrue: [ idx := idx - 1 ].
+        idx = 0 ifTrue: [ ^self ].
+        self setBufferText: (t copyFrom: 1 to: idx - 1) , aString , (t copyFrom: idx to: t size).
+    ]
+
+    "Scripting: evaluate an expression on the PRIMARY VM (to confirm a Save's
+     live recompile landed) and stash the result."
+    CocoaEditor class >> probePrimary: expr [
+        Worker uiDoit: expr onReply: [ :r | LastProbe := r ].
+    ]
+    CocoaEditor class >> lastProbe [ ^LastProbe isNil ifTrue: [ '(none)' ] ifFalse: [ LastProbe ] ]
+
+    CocoaEditor class >> environmentRestarted [ self refreshClassNames. ]
+
+    CocoaEditor class >> teardown [
+        ActionDelegates isNil ifFalse: [
+            ActionDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
+        BufferDelegate isNil ifFalse: [ BufferDelegate isValid ifTrue: [ BufferDelegate release ] ].
+        BarButtons isNil ifFalse: [ BarButtons do: [ :b | CocoaBrowser releaseView: b ] ].
+        CocoaBrowser releaseView: BarBox.
+        CocoaBrowser releaseView: Buffer.
+        CocoaBrowser releaseView: BufferScroll.
+        CocoaBrowser releaseView: Picker.
+        CocoaBrowser releaseView: Container.
+        ActionDelegates := nil. BufferDelegate := nil. Buffer := nil. BufferScroll := nil.
+        Picker := nil. Container := nil. BarBox := nil. BarButtons := nil.
+    ]
+]

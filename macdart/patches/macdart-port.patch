@@ -210,59 +210,6 @@
    if (Dart_IsError(result)) {
      const char* err_msg = Dart_GetError(library);
 
---- a/runtime/bin/main.cc
-+++ b/runtime/bin/main.cc
-@@ -1283,6 +1283,11 @@
- }
- 
- 
-+// Defined in macdart/cocoa/cocoa_host.mm — only linked into the `dartui`
-+// executable (DART_UI_HOST). Services the UI isolate on OS thread 0 via
-+// [NSApp run] + a Dart_HandleMessages() pump.
-+extern "C" int macdart_run_ui_host(void);
-+
- bool RunMainIsolate(const char* script_name, CommandLineOptions* dart_options) {
-   // Call CreateIsolateAndSetup which creates an isolate and loads up
-   // the specified application script.
-@@ -1450,8 +1455,22 @@
-                            kNumIsolateArgs, isolate_args);
-       CHECK_RESULT(result);
- 
-+#if defined(DART_UI_HOST)
-+      // GUI host build (`dartui`): main() was just queued as the startup
-+      // message. Instead of Dart_RunLoop() (which services the isolate on a pool
-+      // thread, where AppKit rejects NSWindow/NSView work), run [NSApp run] on
-+      // THIS thread — OS thread 0 — with a CFRunLoopSource that calls
-+      // Dart_HandleMessages(). So main() and all UI-isolate Dart (incl. the
-+      // control socket and AppKit callbacks) run where AppKit is legal.
-+      // See macdart/cocoa/cocoa_host.mm and WORKSPACE_PLAN.md.
-+      int ui_rc = macdart_run_ui_host();
-+      result = (ui_rc == 0) ? Dart_Null()
-+                            : Dart_NewApiError("dartui host exited non-zero");
-+      CHECK_RESULT(result);
-+#else
-       // Keep handling messages until the last active receive port is closed.
-       result = Dart_RunLoop();
-+#endif  // DART_UI_HOST
-       // Generate an app snapshot after execution if specified.
-       if (gen_snapshot_kind == kAppJIT) {
-         if (!Dart_IsCompilationError(result)) {
-@@ -1611,6 +1630,15 @@
-   bool print_flags_seen = false;
-   bool verbose_debug_seen = false;
- 
-+#if defined(DART_UI_HOST)
-+  // The workspace toolbar reports JIT counters (functions compiled/optimized and
-+  // generated code bytes). INC_STAT in vm/compiler_stats.h is compiled behind
-+  // FLAG_compiler_stats, so without this they would read a flat 0. Costs an
-+  // atomic increment and a timer scope per compilation. See
-+  // Dart_WorkspaceVmStats and macdart/cocoa/workspace/workspace.dart.
-+  vm_options.AddArgument("--compiler_stats");
-+#endif
-+
-   // Perform platform specific initialization.
-   if (!Platform::Initialize()) {
-     Log::PrintErr("Initialization failed\n");
 --- a/runtime/vm/dart_api_impl.cc
 +++ b/runtime/vm/dart_api_impl.cc
 @@ -6277,6 +6277,72 @@
@@ -474,3 +421,131 @@
      return _noSuchMethod(
          invocation.isMethod,
          internal.Symbol.getName(invocation.memberName),
+--- a/runtime/bin/main.cc	2026-07-25 09:31:56.877152483 +0100
++++ b/runtime/bin/main.cc	2026-07-29 23:39:47.717743868 +0100
+@@ -36,6 +36,16 @@
+ 
+ #include "vm/kernel.h"
+ 
++// MACDART ST front-end (--with-st): boot the vendored Smalltalk world into
++// the main isolate before main() runs. The logic lives in macdart/st
++// (st::BootWorldForMain); only this hook is in the VM tree.
++namespace st {
++const char* BootWorldForMain(const char* explicit_dir,
++                             const char* exe_path,
++                             char* msg_buf,
++                             int msg_cap);
++}
++
+ namespace dart {
+ namespace bin {
+ 
+@@ -110,6 +120,9 @@
+ // URIs and the loading of libraries, parts and scripts.
+ static bool trace_loading = false;
+ 
++static bool with_st = false;
++static const char* with_st_path = NULL;
++
+ 
+ static char* app_script_uri = NULL;
+ static const uint8_t* app_isolate_snapshot_data = NULL;
+@@ -555,6 +568,19 @@
+ }
+ 
+ 
++static bool ProcessWithStOption(const char* option_value,
++                                CommandLineOptions* vm_options) {
++  ASSERT(option_value != NULL);
++  with_st = true;
++  if (*option_value == '=') {
++    with_st_path = option_value + 1;
++  } else if (*option_value != '\0') {
++    return false;
++  }
++  return true;
++}
++
++
+ static struct {
+   const char* option_name;
+   bool (*process)(const char* option, CommandLineOptions* vm_options);
+@@ -590,6 +616,7 @@
+     {"--short_socket_write", ProcessShortSocketWriteOption},
+     {"--root-certs-file=", ProcessRootCertsFileOption},
+     {"--root-certs-cache=", ProcessRootCertsCacheOption},
++    {"--with-st", ProcessWithStOption},
+     {NULL, NULL}};
+ 
+ 
+@@ -1283,6 +1310,11 @@
+ }
+ 
+ 
++// Defined in macdart/cocoa/cocoa_host.mm — only linked into the `dartui`
++// executable (DART_UI_HOST). Services the UI isolate on OS thread 0 via
++// [NSApp run] + a Dart_HandleMessages() pump.
++extern "C" int macdart_run_ui_host(void);
++
+ bool RunMainIsolate(const char* script_name, CommandLineOptions* dart_options) {
+   // Call CreateIsolateAndSetup which creates an isolate and loads up
+   // the specified application script.
+@@ -1428,6 +1460,19 @@
+ 
+       if (gen_snapshot_kind == kAppJIT) Dart_SortClasses();
+ 
++      // MACDART --with-st: load the vendored Smalltalk world before main().
++      if (with_st) {
++        char st_msg[512];
++        st_msg[0] = '\0';
++        const char* st_err = ::st::BootWorldForMain(
++            with_st_path, Platform::GetExecutableName(), st_msg,
++            sizeof(st_msg));
++        if (st_err != NULL) {
++          ErrorExit(kErrorExitCode, "--with-st: %s\n", st_err);
++        }
++        Log::PrintErr("%s\n", st_msg);
++      }
++
+       // The helper function _getMainClosure creates a closure for the main
+       // entry point which is either explicitly or implictly exported from the
+       // root library.
+@@ -1450,8 +1495,22 @@
+                            kNumIsolateArgs, isolate_args);
+       CHECK_RESULT(result);
+ 
++#if defined(DART_UI_HOST)
++      // GUI host build (`dartui`): main() was just queued as the startup
++      // message. Instead of Dart_RunLoop() (which services the isolate on a pool
++      // thread, where AppKit rejects NSWindow/NSView work), run [NSApp run] on
++      // THIS thread — OS thread 0 — with a CFRunLoopSource that calls
++      // Dart_HandleMessages(). So main() and all UI-isolate Dart (incl. the
++      // control socket and AppKit callbacks) run where AppKit is legal.
++      // See macdart/cocoa/cocoa_host.mm and WORKSPACE_PLAN.md.
++      int ui_rc = macdart_run_ui_host();
++      result = (ui_rc == 0) ? Dart_Null()
++                            : Dart_NewApiError("dartui host exited non-zero");
++      CHECK_RESULT(result);
++#else
+       // Keep handling messages until the last active receive port is closed.
+       result = Dart_RunLoop();
++#endif  // DART_UI_HOST
+       // Generate an app snapshot after execution if specified.
+       if (gen_snapshot_kind == kAppJIT) {
+         if (!Dart_IsCompilationError(result)) {
+@@ -1611,6 +1670,15 @@
+   bool print_flags_seen = false;
+   bool verbose_debug_seen = false;
+ 
++#if defined(DART_UI_HOST)
++  // The workspace toolbar reports JIT counters (functions compiled/optimized and
++  // generated code bytes). INC_STAT in vm/compiler_stats.h is compiled behind
++  // FLAG_compiler_stats, so without this they would read a flat 0. Costs an
++  // atomic increment and a timer scope per compilation. See
++  // Dart_WorkspaceVmStats and macdart/cocoa/workspace/workspace.dart.
++  vm_options.AddArgument("--compiler_stats");
++#endif
++
+   // Perform platform specific initialization.
+   if (!Platform::Initialize()) {
+     Log::PrintErr("Initialization failed\n");

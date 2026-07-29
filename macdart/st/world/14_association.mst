@@ -1,0 +1,41 @@
+"14_association.mst — Association (sprint_s06_detail.md #14). key/value are
+ genesis-declared named instvars (01/02 order) — plain instvar syntax reads
+ and writes them directly, no instVarAt: needed."
+
+"I am a key-value pair. Build me with key -> value (any object
+ understands ->) or with Association key:value:. I answer key and
+ value, and both have setters. My = and hash consider the key only —
+ two associations with equal keys are equal regardless of value.
+ Dictionary hands me out from associations and associationsDo:."
+
+Object subclass: Association [
+    Association class >> key: k <Object> value: v <Object> ^ <Association> [
+        | a |
+        a := self basicNew.
+        a setKey: k value: v.
+        ^a
+    ]
+    setKey: k <Object> value: v <Object> [
+        key := k.
+        value := v.
+    ]
+    key ^ <Object> [
+        ^key
+    ]
+    value ^ <Object> [
+        ^value
+    ]
+    key: k <Object> [
+        key := k
+    ]
+    value: v <Object> [
+        value := v
+    ]
+    = other <Object> ^ <Boolean> [
+        (other isKindOf: Association) ifFalse: [ ^false ].
+        ^key = other key
+    ]
+    hash ^ <Integer> [
+        ^key hash
+    ]
+]

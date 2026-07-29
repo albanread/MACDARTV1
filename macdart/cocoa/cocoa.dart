@@ -97,6 +97,10 @@ stClassOf(r) native "ST_classOf";
 /// protocol's printOn: fallback must degrade, not crash the Release GUI).
 _stSendTry(recv, String sel, List args) native "ST_sendTry";
 
+/// Public alias for the --with-st boot path (C++ enters via Dart_Invoke,
+/// which cannot reach the private installer).
+void stEnsureHooks() { _stEnsureHooks(); }
+
 bool _stHooked = false;
 
 /// Installed once, before the first ST load: lets _Type.noSuchMethod route a

@@ -1670,6 +1670,8 @@ Future spawnLanguage() async {
       return;
     }
     if (msg is List && msg.length > 3 && msg[0] == 'appui') onAppPush(msg);
+    // Smalltalk `Transcript show: ...; cr` lines from the language isolate.
+    if (msg is List && msg.length == 2 && msg[0] == 'tr') log(msg[1].toString());
   });
   var errPort = new ReceivePort();
   var exitPort = new ReceivePort();
@@ -1738,6 +1740,13 @@ Future<String> handle(String line) async {
   var arg = sp < 0 ? "" : line.substring(sp + 1);
   switch (cmd) {
     case 'ping': return "pong";
+    case 'trtail': {
+      // The Transcript's last N characters (default 400) — lets a headless
+      // test verify what reached the pane (e.g. Smalltalk Transcript lines).
+      var n = int.parse(arg.trim(), onError: (_) => 400);
+      var s = gTranscript == null ? "" : gTranscript.string().UTF8String();
+      return s.length <= n ? s : s.substring(s.length - n);
+    }
     case 'prof': {
       // "prof [ms] [id|name|index]" — sample the target isolate's CPU profile
       // and return the hottest functions by SELF time. Read-only: the VM's
@@ -5088,8 +5097,10 @@ Future<CheckResult> compileCheck(String src,
     var skip = replacing != null ? replacing : <String>[];
     for (var d in others) {
       if (skip.contains(d[0].toString())) continue;
+      var s = d[1].toString();
+      if (_wsStClassRe.hasMatch(s)) continue;  // Smalltalk decl: not Dart context
       ctx.write("\n");
-      ctx.write(d[1].toString());
+      ctx.write(s);
       ctx.write("\n");
     }
     ctx.write("\n");
@@ -5148,13 +5159,23 @@ String _cleanError(String msg, int offset) {
 /// than a refused Accept.
 /// Compile [decls] against the image without committing anything. The single
 /// gate every route into the image goes through — buttons and scripts alike.
+// A Smalltalk declaration (`Super subclass: Name [`) — the DART compile check
+// must not see it; the language isolate parse-checks it with stCheck instead.
+final RegExp _wsStClassRe = new RegExp(
+    r'^\s*(?:"(?:[^"]|"")*"\s*)*\w+\s+subclass:\s*\w+\s*\[');
+
 Future<CheckResult> checkDecls(List decls) async {
-  var names = <String>[];
+  var dartDecls = <dynamic>[];
   for (var d in decls) {
+    if (!_wsStClassRe.hasMatch(d.toString())) dartDecls.add(d);
+  }
+  if (dartDecls.isEmpty) return new CheckResult(true, "", 0);  // all Smalltalk
+  var names = <String>[];
+  for (var d in dartDecls) {
     var n = _classNameOf(d.toString());
     if (n != null) names.add(n);
   }
-  return await compileCheck(decls.join("\n\n"), replacing: names);
+  return await compileCheck(dartDecls.join("\n\n"), replacing: names);
 }
 
 // --- Accept-time Cocoa lint (COCOA_STATIC_CHECK_PLAN.md §2) ------------------

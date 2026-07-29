@@ -350,6 +350,41 @@ void ST_send(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, result_handle);
 }
 
+// stCheck(src) -> ''.  Parse-only validation (Sprint 10: the editor's cheap
+// pre-Accept check): lex+parse, no VM state touched. Returns '' when the
+// source parses, else "ERR: line:col: message".
+void ST_check(Dart_NativeArguments args) {
+  Dart_Handle src_h = Dart_GetNativeArgument(args, 0);
+  const char* src_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(src_h, &src_c)) || src_c == NULL) {
+    Dart_SetReturnValue(args,
+                        Dart_NewStringFromCString("ERR: bad source argument"));
+    return;
+  }
+  std::string source(src_c);
+  ::st::Lexer lexer(source);
+  std::vector<::st::Token> tokens;
+  ::st::LexError lex_err;
+  if (!lexer.Tokenize(&tokens, &lex_err)) {
+    char buf[600];
+    snprintf(buf, sizeof(buf), "ERR: %d:%d: %s", lex_err.line, lex_err.col,
+             lex_err.message.c_str());
+    Dart_SetReturnValue(args, Dart_NewStringFromCString(buf));
+    return;
+  }
+  ::st::Parser parser(std::move(tokens));
+  ::st::ParseError perr;
+  std::unique_ptr<::st::ProgramNode> program = parser.ParseProgram(&perr);
+  if (program == nullptr || !perr.ok) {
+    char buf[600];
+    snprintf(buf, sizeof(buf), "ERR: %d:%d: %s", perr.line, perr.col,
+             perr.message.c_str());
+    Dart_SetReturnValue(args, Dart_NewStringFromCString(buf));
+    return;
+  }
+  Dart_SetReturnValue(args, Dart_NewStringFromCString(""));
+}
+
 // stIsKindOf(obj, type) -> bool.  Is obj's class the Type's class or one of
 // its subclasses? (Sprint 9: the on:do: handler match.)
 void ST_isKindOf(Dart_NativeArguments args) {

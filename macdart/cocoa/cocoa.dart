@@ -159,6 +159,35 @@ stIfCurtailed(protected, cleanup) {
 /// Is [obj]'s class the [type]'s class or one of its subclasses?
 bool stIsKindOf(obj, type) native "ST_isKindOf";
 
+/// Parse-check `.mst` source WITHOUT loading it: returns '' when it parses,
+/// else "ERR: line:col: message" — the editor's cheap pre-Accept validation.
+String stCheck(String src) native "ST_check";
+
+// --- the Smalltalk Transcript (ST_PLAN.md Sprint 10) ------------------------
+// The prelude's `Transcript show:`/`cr` land here (via <stprim:>). show:
+// buffers; cr emits one whole line — to [stTranscriptSink] when a host (the
+// workspace's language isolate) installed one, else to stdout. Each isolate
+// has its own copy of these globals, so demo/game isolates print to stdout
+// while the workspace's language isolate feeds the GUI Transcript.
+var stTranscriptSink; // void Function(String line), or null
+String _stTrBuf = '';
+
+stTrShow(s) {
+  _stTrBuf = _stTrBuf + (s == null ? 'nil' : s.toString());
+  return null;
+}
+
+stTrCr() {
+  var line = _stTrBuf;
+  _stTrBuf = '';
+  if (stTranscriptSink != null) {
+    stTranscriptSink(line);
+  } else {
+    print(line);
+  }
+  return null;
+}
+
 // --- Smalltalk become (Sprint 9) --------------------------------------------
 /// One-way: every reference to [a] becomes a reference to [b] (the VM's
 /// reload-morphing primitive). Returns [b].

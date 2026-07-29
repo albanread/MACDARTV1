@@ -499,6 +499,7 @@ void ST_invokeStatic(Dart_NativeArguments args);
 void ST_new(Dart_NativeArguments args);
 void ST_send(Dart_NativeArguments args);
 void ST_isKindOf(Dart_NativeArguments args);
+void ST_check(Dart_NativeArguments args);
 void ST_becomeForward(Dart_NativeArguments args);
 void ST_become(Dart_NativeArguments args);
 
@@ -556,6 +557,7 @@ void Sqlite_query(Dart_NativeArguments args);
   V(ST_new, 1)                                                                 \
   V(ST_send, 3)                                                                \
   V(ST_isKindOf, 2)                                                            \
+  V(ST_check, 1)                                                               \
   V(ST_becomeForward, 2)                                                       \
   V(ST_become, 2)                                                              \
   V(Cocoa_registerCallbackDispatch, 1)                                         \

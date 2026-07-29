@@ -1415,6 +1415,29 @@ Fragment StGraphBuilder::TranslateControlFlow(MessageNode* node,
 // recv m1; m2; m3  ->  eval recv once into a temp, send each message to it; the
 // cascade's value is the last message's result.
 Fragment StGraphBuilder::TranslateCascade(CascadeNode* node) {
+  // Sprint 10: a cascade whose receiver is a CLASS NAME sends class-side
+  // messages (`Transcript show: 'x'; cr`) — each message goes through the
+  // class-send path (static lookup / new / signal desugars).
+  if (VariableNode* rv = dynamic_cast<VariableNode*>(node->receiver.get())) {
+    if (rv->name != "self" && rv->name != "super" &&
+        LookupLocal(rv->name) == NULL) {
+      const Class& cls = Class::Handle(zone_, ResolveClassName(rv->name));
+      if (!cls.IsNull()) {
+        Fragment instructions;
+        for (size_t k = 0; k < node->messages.size(); k++) {
+          MessageNode* m = dynamic_cast<MessageNode*>(node->messages[k].get());
+          if (m == NULL) {
+            instructions +=
+                Unsupported(node->messages[k].get(), "cascade message");
+          } else {
+            instructions += TranslateClassSend(cls, m);
+          }
+          if (k + 1 < node->messages.size()) instructions += Drop();
+        }
+        return instructions;  // value = the last message's result
+      }
+    }
+  }
   LocalVariable* recv = synth_.count(node) ? synth_[node] : NULL;
   if (recv == NULL) return Unsupported(node, "cascade (no receiver temp)");
   Fragment instructions = TranslateExpression(node->receiver.get());

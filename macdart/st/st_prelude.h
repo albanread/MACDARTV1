@@ -36,6 +36,16 @@ Object subclass: STSystem [
     STSystem class >> forward: a to: b [ <stprim: stBecomeForward> ]
     STSystem class >> become: a with: b [ <stprim: stBecome> ]
 ]
+
+"── The Transcript ───────────────────────────────────────────────────
+ Class-side (a cascade to a class name sends class-side messages —
+ `Transcript show: 'x'; cr`). show: buffers; cr emits the line — into
+ the workspace's Transcript pane when hosted there, else stdout."
+Object subclass: Transcript [
+    Transcript class >> show: s [ <stprim: stTrShow> ]
+    Transcript class >> cr [ <stprim: stTrCr> ]
+    Transcript class >> showCr: s [ Transcript show: s. Transcript cr ]
+]
 )PRELUDE";
 
 }  // namespace st

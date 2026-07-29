@@ -30,8 +30,35 @@ AppSurface _surface;                // where its widgets currently live
 String _appClass;                   // the class it was built from
 int _appGen = 0;                    // stale pushes from a stopped app are dropped
 
+// --- bilingual: Smalltalk declarations in the same image (ST_PLAN Sprint 10).
+// An image decl is Smalltalk when it LOOKS like one — `Super subclass: Name [`
+// (optionally after "..." comments) — so Accept needs no language toggle. ST
+// decls are excluded from the Dart scratch and loaded through stLoad as ONE
+// combined layer (so they see each other), after every successful Dart reload.
+final RegExp _stClassRe = new RegExp(
+    r'^\s*(?:"(?:[^"]|"")*"\s*)*(\w+)\s+subclass:\s*(\w+)\s*\[');
+bool _isStSource(String s) => _stClassRe.hasMatch(s);
+String _stName(String s) {
+  var m = _stClassRe.firstMatch(s);
+  return m == null ? null : m.group(2);
+}
+
+String _stReloadAll() {
+  var st = <String>[];
+  _decls.forEach((n, s) {
+    if (_isStSource(s)) st.add(s);
+  });
+  if (st.isEmpty) return '';
+  var r = stLoad(st.join('\n\n'));
+  return r.startsWith('ERR:') ? r : '';
+}
+
 main(List args, SendPort uiPort) {
   _ui = uiPort;
+  // Smalltalk `Transcript show:`/`cr` lines land in the GUI Transcript.
+  stTranscriptSink = (line) {
+    _ui.send(<dynamic>['tr', line.toString()]);
+  };
   _scratch = args[0];
   if (args.length > 1 && args[1] != null && (args[1] as String).length > 0) {
     _db = new Db.open(args[1]);
@@ -99,7 +126,34 @@ final RegExp _wsVarDecl =
 // `=` but not `==` (an equality test is not an assignment).
 final RegExp _wsAssign = new RegExp(r'^\s*(\w+)\s*=(?!=)\s*([\s\S]+?);?\s*$');
 
+// A Smalltalk do-it: `st> expr` wraps the code as a class-side doIt method,
+// loads it (a fresh tiny library each time; newest-first lookup finds it), and
+// invokes it. A bare expression is wrapped `^ ( expr )`; code with statements
+// (`.`) or an explicit `^` runs verbatim as the method body (write `^` for the
+// value, Smalltalk style).
+int _stDoitN = 0;
+String _stDoit(String code) {
+  var n = ++_stDoitN;
+  var cls = 'STDoIt' + n.toString();
+  var body;
+  if (code.contains('^')) body = code;
+  else if (code.startsWith('|') || code.contains('.')) body = code;
+  else body = '^ ( ' + code + ' )';
+  var src = 'Object subclass: ' + cls + ' [ ' + cls +
+      ' class >> doIt [ ' + body + ' ] ]';
+  var r = stLoad(src);
+  if (r.startsWith('ERR:')) return r;
+  try {
+    var v = stInvokeStatic(cls, 'doIt', <dynamic>[]);
+    return v == null ? 'nil' : v.toString();
+  } catch (e) {
+    return 'ERR: ' + e.toString();
+  }
+}
+
 String _doit(String code) {
+  var t = code.trimLeft();
+  if (t.startsWith('st>')) return _stDoit(t.substring(3).trim());
   var m = _wsVarDecl.firstMatch(code);
   if (m != null) {
     var err = _declareWsVar(m.group(1));
@@ -194,6 +248,15 @@ String _accept(String decl) => _acceptMany(<String>[decl]);
 // GUI Accept: the editor's top-level declarations, redefining by name; UPSERT
 // each into the image, then reload ONCE (live instances of a changed class morph).
 String _acceptMany(List decls) {
+  // ST decls: cheap parse-check FIRST, so a syntax error reports its line/col
+  // before anything is written or reloaded.
+  for (var d in decls) {
+    var s = d.toString().trim();
+    if (_isStSource(s)) {
+      var c = stCheck(s);
+      if (c.isNotEmpty) return c;
+    }
+  }
   var names = <String>[];
   var prev = <String, String>{};        // name -> what was there (null = new)
   for (var d in decls) {
@@ -266,13 +329,21 @@ String _remove(String name) {
 
 // Regenerate the USER region of the scratch file from _decls and hot-reload.
 String _rebuildAndReload() {
-  var region = _decls.values.join('\n\n');
+  // Only DART decls go into the scratch (an .mst class is not Dart source);
+  // the ST layer reloads separately after a successful Dart reload.
+  var dart = <String>[];
+  _decls.forEach((n, s) {
+    if (!_isStSource(s)) dart.add(s);
+  });
+  var region = dart.join('\n\n');
   var text = new File(_scratch).readAsStringSync();
   var s = text.indexOf(_begin) + _begin.length;
   var e = text.indexOf(_end);
   new File(_scratch).writeAsStringSync(
       text.substring(0, s) + '\n' + region + '\n' + text.substring(e));
-  return wsReload();
+  var err = wsReload();
+  if (err.isNotEmpty) return err;
+  return _stReloadAll();
 }
 
 // Every declaration as [name, source]. The UI compiles a proposed edit against
@@ -307,6 +378,7 @@ List _memberList(String className) {
 }
 
 String _kindOf(String s) {
+  if (_isStSource(s)) return 'st-class';  // Smalltalk, before Dart heuristics
   // Past the doc comment first — same trap as _declName. A documented class
   // was classified as a 'variable', which quietly removed it from the Editor's
   // class picker and the Browser's class list: the apps/ examples ship with a
@@ -347,6 +419,8 @@ String _afterLeadingComments(String s) {
 }
 
 String _declName(String d) {
+  var st = _stName(d);                    // Smalltalk: `Super subclass: NAME [`
+  if (st != null) return st;
   d = _afterLeadingComments(d).trim();
   var m = new RegExp(r'^(?:abstract\s+)?(?:class|enum|typedef)\s+(\w+)').firstMatch(d);
   if (m != null) return m.group(1);

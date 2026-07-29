@@ -572,8 +572,29 @@ loudly). Stages A and C are modest; A is independently shippable.
   non-match propagation, ensure on normal/throw/NLR paths, becomeForward (both holders
   see b), become swap; 60k exception/NLR calls correct through the optimizing compiler;
   all prior sprints + Dart + the 86-file corpus unaffected.
-  **Next:** the workspace GUI, corpus/base-library breadth, nested-closure-own-local
-  capture, the metaclass tower.
+- **Sprint 10 ✓ — bilingual workspace (the GUI speaks both languages).** An image decl
+  is Smalltalk when it *looks* like one (`Super subclass: Name [`, after optional `"…"`
+  comments) — so **Accept needs no language toggle**: ST classes store in the same
+  SQLite `decls` table (kind `st-class`), are excluded from the Dart scratch, and load
+  via `stLoad` as ONE combined layer after every successful Dart reload (so they see
+  each other, and **survive restarts** via the boot path). ST accepts parse-check first
+  (the `stCheck` native — line:col errors before anything is written); the workspace's
+  Dart compile-lint skips ST decls both for the accepted source and for the image
+  context it builds around a check. **`st>` do-its** in the workspace pane wrap the code
+  as a class-side `doIt` and invoke it. **`Transcript show: …; cr` lands in the real GUI
+  Transcript** (the prelude's `Transcript` class → buffered `stTr*` helpers →
+  `stTranscriptSink`, wired by the language isolate to a `['tr', line]` push; a cascade
+  to a CLASS receiver now sends class-side messages). A `trtail` verb reads the
+  Transcript back for headless tests. Verified against the LIVE GUI over the control
+  plane on a fresh isolated image: ST Accept → `accepted Point2`; `st>` do-it → 7; the
+  Transcript line visible in the pane; a Dart do-it driving ST objects → 30; ST
+  exceptions in the GUI → 'gui-boom'; a **full dartui reboot on the same image brings
+  Point2 back** → 42; Dart accepts still clean alongside (`Adder` → 42); and one mixed
+  expression using both languages → 42. All CLI regressions + the 86-file corpus green.
+  (Daily use: rebuild the GUI once — `./start-gui.sh --rebuild` — so `build-release`
+  gains the ST engine.)
+  **Next:** corpus/base-library breadth, nested-closure-own-local capture, the
+  metaclass tower.
 
   **Resumable exceptions (`resume:`) — deferred by choice, not impossibility.** It does
   NOT need continuations: the classic implementation calls the handler *before*

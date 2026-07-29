@@ -189,29 +189,46 @@ void ST_invokeStatic(Dart_NativeArguments args) {
       if (strncmp(url.ToCString(), "st:mst/", 7) != 0) continue;
       cls = lib.LookupLocalClass(cname);
     }
-    if (cls.IsNull()) {
+    // Sprint 11, metaclass split: class-side methods live on the `Foo class`
+    // shadow (cross-load resolve — covers the prelude too). Prefer it; fall
+    // back to the flat class for pre-metaclass layouts.
+    Class& meta = Class::Handle(
+        zone, ::st::FindStClassByName(thread, (cls_name + " class").c_str()));
+    if (cls.IsNull() && meta.IsNull()) {
+      cls ^= ::st::FindStClassByName(thread, cls_name.c_str());
+    }
+    if (cls.IsNull() && meta.IsNull()) {
       err = "stInvokeStatic: no loaded ST class '" + cls_name + "'";
     } else {
-      // Member-finalize the target class on demand. Registration is lazy
-      // (st_loader.cc), so finalize it here — via ClassFinalizer::FinalizeClass,
-      // NOT EnsureIsFinalized, which routes to Parser::ParseClass and crashes on
-      // an ST class (no TokenStream). Once finalized, lazy compile never
-      // re-parses it. Only the invoked class (+ its super chain) is finalized,
-      // so a method-less base elsewhere in the corpus is never touched.
-      if (!cls.is_finalized()) {
-        ClassFinalizer::FinalizeClass(cls);
-      }
+      // Member-finalize on demand while WALKING THE SUPER CHAIN for the
+      // method (inherited class-side methods dispatch) — via
+      // ClassFinalizer::FinalizeClass, NOT EnsureIsFinalized, which routes to
+      // Parser::ParseClass and crashes on an ST class (no TokenStream). Once
+      // finalized, lazy compile never re-parses it. Only visited classes are
+      // finalized, so a method-less base elsewhere is never touched.
       const String& sel =
-          String::Handle(zone, Symbols::New(thread, selector.c_str()));
-      const Function& fn =
-          Function::Handle(zone, cls.LookupStaticFunction(sel));
+          String::Handle(zone, Symbols::New(thread, ::st::MangleSelector(selector).c_str()));
+      Function& fn = Function::Handle(zone);
+      Class& c = Class::Handle(zone, meta.IsNull() ? cls.raw() : meta.raw());
+      while (!c.IsNull()) {
+        if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+        fn ^= c.LookupStaticFunction(sel);
+        if (!fn.IsNull()) break;
+        c ^= c.SuperClass();
+      }
       if (fn.IsNull()) {
         err = "stInvokeStatic: class '" + cls_name +
               "' has no static method '" + selector + "'";
       } else {
-        const Array& arr = Array::Handle(zone, Array::New(n, Heap::kOld));
+        // Implicit arg 0 = the receiving class as a Type value (Sprint 11 —
+        // class-side `self`). `cls` is the instance class found by name.
+        if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
+        const Type& type = Type::Handle(
+            zone, Type::NewNonParameterizedType(cls));
+        const Array& arr = Array::Handle(zone, Array::New(n + 1, Heap::kOld));
+        arr.SetAt(0, type);
         for (intptr_t i = 0; i < n; i++) {
-          arr.SetAt(i, Object::Handle(zone, Api::UnwrapHandle(elems[i])));
+          arr.SetAt(i + 1, Object::Handle(zone, Api::UnwrapHandle(elems[i])));
         }
         // Triggers lazy compile -> compiler.cc hook -> st::BuildGraph -> run.
         // An Error result (compile failure / unhandled exception) is returned
@@ -230,27 +247,12 @@ void ST_invokeStatic(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, result_handle);
 }
 
-// Find a loaded ST class by name — newest st:mst/ library first. Returns
-// Class::null() if absent. Caller holds a VM transition + HANDLESCOPE.
+// Find a loaded ST class by name — delegates to the shared cross-load
+// resolver (st_loader.cc): every st: library, newest first, INCLUDING the
+// prelude (stNew('Error') from the stError helper must see st:prelude).
+// Returns Class::null() if absent. Caller holds a VM transition + HANDLESCOPE.
 static RawClass* FindStClass(Thread* thread, const std::string& name) {
-  Zone* zone = thread->zone();
-  Isolate* isolate = thread->isolate();
-  const GrowableObjectArray& libs = GrowableObjectArray::Handle(
-      zone, isolate->object_store()->libraries());
-  const String& cname =
-      String::Handle(zone, Symbols::New(thread, name.c_str()));
-  Library& lib = Library::Handle(zone);
-  String& url = String::Handle(zone);
-  Class& cls = Class::Handle(zone);
-  for (intptr_t i = libs.Length() - 1; i >= 0; i--) {
-    lib ^= libs.At(i);
-    url = lib.url();
-    if (url.IsNull()) continue;
-    if (strncmp(url.ToCString(), "st:mst/", 7) != 0) continue;
-    cls = lib.LookupLocalClass(cname);
-    if (!cls.IsNull()) return cls.raw();
-  }
-  return Class::null();
+  return ::st::FindStClassByName(thread, name.c_str());
 }
 
 // stNew(String className) -> instance.  Sprint 5: allocate an instance of a
@@ -324,11 +326,18 @@ void ST_send(Dart_NativeArguments args) {
     Zone* zone = thread->zone();
     const Object& recv = Object::Handle(zone, Api::UnwrapHandle(recv_h));
     const Class& cls = Class::Handle(zone, recv.clazz());
-    if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
     const String& sel =
-        String::Handle(zone, Symbols::New(thread, selector.c_str()));
-    const Function& fn =
-        Function::Handle(zone, cls.LookupDynamicFunction(sel));
+        String::Handle(zone, Symbols::New(thread, ::st::MangleSelector(selector).c_str()));
+    // Walk the super chain (inherited methods dispatch — Error inherits
+    // messageText: from Exception), finalizing each visited class on demand.
+    Function& fn = Function::Handle(zone);
+    Class& c = Class::Handle(zone, cls.raw());
+    while (!c.IsNull()) {
+      if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+      fn ^= c.LookupDynamicFunction(sel);
+      if (!fn.IsNull()) break;
+      c ^= c.SuperClass();
+    }
     if (fn.IsNull()) {
       err = "stSend: " + std::string(cls.ToCString()) + " has no method '" +
             selector + "'";
@@ -341,6 +350,119 @@ void ST_send(Dart_NativeArguments args) {
       const Object& result =
           Object::Handle(zone, DartEntry::InvokeFunction(fn, arr));
       result_handle = Api::NewHandle(thread, result.raw());
+    }
+  }
+  if (!err.empty()) {
+    Dart_SetReturnValue(args, Dart_NewApiError(err.c_str()));
+    return;
+  }
+  Dart_SetReturnValue(args, result_handle);
+}
+
+// stClassSend(type, selector, args) -> result.  Sprint 11: the class-side
+// `self <sel>` dispatch — receiver is a CLASS VALUE (Type), target resolved at
+// runtime by walking its metaclass-shadow chain, so an inherited class-side
+// constructor sees self = the class the message was sent to. Falls back to
+// allocation for new/basicNew and create-and-signal for signal/signal:
+// (mirroring TranslateClassSend's compile-time fallbacks).
+void ST_classSend(Dart_NativeArguments args) {
+  Dart_Handle type_h = Dart_GetNativeArgument(args, 0);
+  Dart_Handle sel_h = Dart_GetNativeArgument(args, 1);
+  Dart_Handle list_h = Dart_GetNativeArgument(args, 2);
+  const char* sel_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(sel_h, &sel_c)) || sel_c == NULL) {
+    Dart_SetReturnValue(args,
+                        Dart_NewApiError("stClassSend: bad selector argument"));
+    return;
+  }
+  intptr_t n = 0;
+  Dart_Handle len_err = Dart_ListLength(list_h, &n);
+  if (Dart_IsError(len_err)) {
+    Dart_SetReturnValue(args, len_err);
+    return;
+  }
+  std::vector<Dart_Handle> elems(n);
+  for (intptr_t i = 0; i < n; i++) {
+    elems[i] = Dart_ListGetAt(list_h, i);
+    if (Dart_IsError(elems[i])) {
+      Dart_SetReturnValue(args, elems[i]);
+      return;
+    }
+  }
+  const std::string selector(sel_c);
+  Thread* thread = Thread::Current();
+  Dart_Handle result_handle = Dart_Null();
+  std::string err;
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Object& type_obj = Object::Handle(zone, Api::UnwrapHandle(type_h));
+    if (!type_obj.IsType()) {
+      err = "stClassSend: receiver is not a class value";
+    } else {
+      const Type& type = Type::Cast(type_obj);
+      const Class& cls = Class::Handle(zone, type.type_class());
+      const String& cname = String::Handle(zone, cls.Name());
+      const std::string cls_name(cname.ToCString());
+      const String& sel =
+          String::Handle(zone, Symbols::New(thread, ::st::MangleSelector(selector).c_str()));
+      // The metaclass-shadow chain holds class-side methods.
+      Function& fn = Function::Handle(zone);
+      Class& c = Class::Handle(
+          zone,
+          ::st::FindStClassByName(thread, (cls_name + " class").c_str()));
+      while (!c.IsNull()) {
+        if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+        fn ^= c.LookupStaticFunction(sel);
+        if (!fn.IsNull()) break;
+        c ^= c.SuperClass();
+      }
+      if (!fn.IsNull()) {
+        const Array& arr =
+            Array::Handle(zone, Array::New(n + 1, Heap::kOld));
+        arr.SetAt(0, type);  // thisCls propagates unchanged
+        for (intptr_t i = 0; i < n; i++) {
+          arr.SetAt(i + 1, Object::Handle(zone, Api::UnwrapHandle(elems[i])));
+        }
+        const Object& result =
+            Object::Handle(zone, DartEntry::InvokeFunction(fn, arr));
+        result_handle = Api::NewHandle(thread, result.raw());
+      } else if ((selector == "new" || selector == "basicNew") && n == 0) {
+        if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
+        const Instance& inst = Instance::Handle(zone, Instance::New(cls));
+        result_handle = Api::NewHandle(thread, inst.raw());
+      } else if ((selector == "signal" && n == 0) ||
+                 (selector == "signal:" && n == 1)) {
+        if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
+        const Instance& inst = Instance::Handle(zone, Instance::New(cls));
+        // Instance-side signal/signal: up the chain (prelude Exception).
+        Function& sfn = Function::Handle(zone);
+        Class& sc = Class::Handle(zone, cls.raw());
+        while (!sc.IsNull()) {
+          if (!sc.is_finalized()) ClassFinalizer::FinalizeClass(sc);
+          sfn ^= sc.LookupDynamicFunction(sel);
+          if (!sfn.IsNull()) break;
+          sc ^= sc.SuperClass();
+        }
+        if (sfn.IsNull()) {
+          err = "stClassSend: '" + cls_name + "' cannot signal";
+        } else {
+          const Array& arr =
+              Array::Handle(zone, Array::New(n + 1, Heap::kOld));
+          arr.SetAt(0, inst);
+          for (intptr_t i = 0; i < n; i++) {
+            arr.SetAt(i + 1,
+                      Object::Handle(zone, Api::UnwrapHandle(elems[i])));
+          }
+          const Object& result =
+              Object::Handle(zone, DartEntry::InvokeFunction(sfn, arr));
+          result_handle = Api::NewHandle(thread, result.raw());
+        }
+      } else {
+        err = "stClassSend: class '" + cls_name +
+              "' has no class-side method '" + selector + "'";
+      }
     }
   }
   if (!err.empty()) {

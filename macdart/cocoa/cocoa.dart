@@ -159,6 +159,84 @@ stIfCurtailed(protected, cleanup) {
 /// Is [obj]'s class the [type]'s class or one of its subclasses?
 bool stIsKindOf(obj, type) native "ST_isKindOf";
 
+// --- corpus-breadth helpers (ST_PLAN Sprint 11) -----------------------------
+/// Class-side `self <sel>`: dispatch on the RECEIVING class (a Type value)
+/// at runtime — walks the metaclass shadow chain; falls back to allocation
+/// for new/basicNew and to create-and-signal for signal/signal:.
+_stClassSend(type, String sel, List args) native "ST_classSend";
+stClassSend0(t, sel) => _stClassSend(t, sel, []);
+stClassSend1(t, sel, a) => _stClassSend(t, sel, [a]);
+stClassSend2(t, sel, a, b) => _stClassSend(t, sel, [a, b]);
+stClassSend3(t, sel, a, b, c) => _stClassSend(t, sel, [a, b, c]);
+stClassSend4(t, sel, a, b, c, d) => _stClassSend(t, sel, [a, b, c, d]);
+stClassSend5(t, sel, a, b, c, d, e) => _stClassSend(t, sel, [a, b, c, d, e]);
+
+// Universal ST-protocol shims: bridged Dart receivers (List/Map/String) get
+// direct semantics — including Smalltalk's 1-BASED indexing — and any other
+// receiver falls back to real ST dispatch via stSend, so an ST class defining
+// its own at:/size keeps working through the same selectors.
+stNot(b) => b == true ? false : true;
+
+/// ST `&`/`|`: Boolean non-short-circuit and/or (Dart 1.24 bool has no
+/// operator&). Ints keep bitwise semantics; anything else -> ST dispatch.
+stBoolAnd(a, b) {
+  if (a is bool && b is bool) return a && b;
+  if (a is int && b is int) return a & b;
+  return stSend(a, '&', [b]);
+}
+
+stBoolOr(a, b) {
+  if (a is bool && b is bool) return a || b;
+  if (a is int && b is int) return a | b;
+  return stSend(a, '|', [b]);
+}
+
+stAt1(c, k) {
+  if (c is List) return c[k - 1]; // Smalltalk indexes from 1
+  if (c is Map) return c[k];
+  return stSend(c, 'at:', [k]);
+}
+
+stAtPut1(c, k, v) {
+  if (c is List) { c[k - 1] = v; return v; }
+  if (c is Map) { c[k] = v; return v; }
+  return stSend(c, 'at:put:', [k, v]);
+}
+
+stSizeOf(c) {
+  if (c is List || c is Map || c is String) return c.length;
+  return stSend(c, 'size', []);
+}
+
+stAddU(c, x) {
+  if (c is List) { c.add(x); return x; }   // ST add: answers the argument
+  return stSend(c, 'add:', [x]);
+}
+
+stDo(c, f) {
+  if (c is List) { for (var e in c) f(e); return c; }
+  if (c is Map) { for (var v in c.values) f(v); return c; }
+  return stSend(c, 'do:', [f]);
+}
+
+stIsEmptyU(c) {
+  if (c is List || c is Map || c is String) return c.isEmpty;
+  return stSend(c, 'isEmpty', []);
+}
+
+/// `self error: 'msg'` — construct and signal a prelude Error.
+stError(recv, msg) {
+  var e = stNew('Error');
+  stSend(e, 'messageText:', [msg]);
+  return stSignal(e);
+}
+
+// List plumbing for the prelude's OrderedCollection/Array (via <stprim:>).
+stNewList() => new List();
+stNewListSized(n) => new List(n);
+stListRemoveFirst(l) => l.removeAt(0);
+stListInsertFirst(l, x) { l.insert(0, x); return x; }
+
 /// Parse-check `.mst` source WITHOUT loading it: returns '' when it parses,
 /// else "ERR: line:col: message" — the editor's cheap pre-Accept validation.
 String stCheck(String src) native "ST_check";

@@ -35,6 +35,37 @@ Exception subclass: Error [ ]
 Object subclass: STSystem [
     STSystem class >> forward: a to: b [ <stprim: stBecomeForward> ]
     STSystem class >> become: a with: b [ <stprim: stBecome> ]
+    STSystem class >> newList [ <stprim: stNewList> ]
+    STSystem class >> sizeOf: c [ <stprim: stSizeOf> ]
+    STSystem class >> removeFirst: l [ <stprim: stListRemoveFirst> ]
+    STSystem class >> insertFirst: l value: x [ <stprim: stListInsertFirst> ]
+]
+
+"── The collection bridge (Sprint 11: corpus breadth) ────────────────
+ An Array IS a Dart fixed-length List (1-based at:/at:put: through the
+ universal helpers); an OrderedCollection wraps a growable Dart List.
+ Enough protocol for the app-tier corpus; grown as files demand."
+Object subclass: Array [
+    Array class >> new: n [ <stprim: stNewListSized> ]
+]
+
+Object subclass: OrderedCollection [
+    | l |
+    OrderedCollection class >> new [ | c | c := self basicNew. c initOC. ^c ]
+    initOC [ l := STSystem newList ]
+    add: x [ l add: x. ^x ]
+    addLast: x [ ^ self add: x ]
+    addFirst: x [ ^ STSystem insertFirst: l value: x ]
+    removeFirst [ ^ STSystem removeFirst: l ]
+    do: b [ l do: b ]
+    size [ ^ STSystem sizeOf: l ]
+    isEmpty [ ^ (STSystem sizeOf: l) = 0 ]
+    notEmpty [ ^ ((STSystem sizeOf: l) = 0) not ]
+    at: i [ ^ l at: i ]
+    at: i put: v [ ^ l at: i put: v ]
+    first [ ^ l at: 1 ]
+    last [ ^ l at: (STSystem sizeOf: l) ]
+    asOrderedCollection [ ^self ]
 ]
 
 "── The Transcript ───────────────────────────────────────────────────

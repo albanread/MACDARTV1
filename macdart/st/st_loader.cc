@@ -145,7 +145,64 @@ dart::RawType* ResolveSuper(dart::Thread* thread,
                    TokenPosition::kNoSource);
 }
 
+// Create one ST method's Function on `owner` (Sprint 3 shape: dynamic params,
+// the AST-node marker, non-inlinable). Statics carry no implicit receiver.
+dart::RawFunction* MakeStFunction(dart::Thread* thread,
+                                  const dart::Class& owner,
+                                  MethodNode* m,
+                                  bool is_static) {
+  using namespace dart;
+  Zone* zone = thread->zone();
+  // Registered under the canonical mangled name (':' -> '_'): valid as a Dart
+  // method name and keeps `signal` vs `signal:` distinct on one class.
+  const String& sel = String::Handle(
+      zone, Symbols::New(thread, MangleSelector(m->selector).c_str()));
+  const Function& fn = Function::Handle(
+      zone, Function::New(sel, RawFunction::kRegularFunction, is_static,
+                          /*is_const=*/false, /*is_abstract=*/false,
+                          /*is_external=*/false, /*is_native=*/false, owner,
+                          TokenPosition::kNoSource, Heap::kOld));
+  fn.set_result_type(Object::dynamic_type());
+  // Every ST method has an implicit parameter 0: instance methods take the
+  // receiver (`this`); class-side methods take the RECEIVING CLASS (Sprint 11
+  // — Smalltalk class-side `self` is the class the message was sent to, not
+  // the defining class, so `IdleTask link:..` inheriting TaskControlBlock's
+  // constructor allocates an IdleTask).
+  const intptr_t num_params = 1 + static_cast<intptr_t>(m->args.size());
+  fn.set_num_fixed_parameters(num_params);
+  fn.SetNumOptionalParameters(0, /*are_positional=*/true);
+  fn.set_parameter_types(
+      Array::Handle(zone, Array::New(num_params, Heap::kOld)));
+  fn.set_parameter_names(
+      Array::Handle(zone, Array::New(num_params, Heap::kOld)));
+  intptr_t p = 0;
+  {
+    fn.SetParameterTypeAt(p, Object::dynamic_type());
+    fn.SetParameterNameAt(p, is_static ? String::Handle(
+                                             zone, Symbols::New(thread, "self"))
+                                       : String::Handle(zone,
+                                                        Symbols::This().raw()));
+    p++;
+  }
+  for (size_t a = 0; a < m->args.size(); a++, p++) {
+    fn.SetParameterTypeAt(p, Object::dynamic_type());
+    fn.SetParameterNameAt(
+        p, String::Handle(zone, Symbols::New(thread, m->args[a].c_str())));
+  }
+  fn.set_kernel_function(reinterpret_cast<void*>(static_cast<Node*>(m)));
+  fn.set_is_inlinable(false);
+  return fn.raw();
+}
+
 }  // namespace
+
+std::string MangleSelector(const std::string& selector) {
+  std::string out = selector;
+  for (size_t i = 0; i < out.size(); i++) {
+    if (out[i] == ':') out[i] = '_';
+  }
+  return out;
+}
 
 // The shared cross-load resolver (st_loader.h): newest st: library first.
 dart::RawClass* FindStClassByName(dart::Thread* thread, const char* name) {
@@ -225,7 +282,14 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
       zone, isolate->object_store()->pending_classes());
 
   // --- sub-pass A: create every Class (so supers resolve by name later) -----
+  // Sprint 11, the METACLASS skeleton: each ST class Foo also gets a shadow
+  // `Foo class` holding its CLASS-SIDE methods — real Smalltalk puts them on
+  // the metaclass, and flattening both sides into one Dart class collides
+  // when a selector exists on both (TaskState running, in the corpus). The
+  // shadow's super chain mirrors the instance chain, so inherited class-side
+  // methods dispatch correctly.
   std::vector<const Class*> klasses(entries.size());
+  std::vector<const Class*> shadows(entries.size());
   for (size_t i = 0; i < entries.size(); i++) {
     const String& cname =
         String::Handle(zone, Symbols::New(thread, entries[i].name.c_str()));
@@ -233,6 +297,12 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
         zone, Class::New(library, cname, script, TokenPosition::kNoSource));
     library.AddClass(k);
     klasses[i] = &k;
+    const String& sname = String::Handle(
+        zone, Symbols::New(thread, (entries[i].name + " class").c_str()));
+    Class& s = Class::ZoneHandle(
+        zone, Class::New(library, sname, script, TokenPosition::kNoSource));
+    library.AddClass(s);
+    shadows[i] = &s;
   }
 
   // --- sub-pass B: super types, fields, functions (with markers) ------------
@@ -260,72 +330,57 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
     }
     k.SetFields(fields);
 
-    // Methods -> Functions. The body is NOT compiled; each Function is stamped
-    // with its st::MethodNode via the dormant kernel_function marker. Nothing
-    // must call these until the Sprint-3 compiler.cc hook exists.
-    const Array& funcs = Array::Handle(zone, Array::New(e.methods.size(),
-                                                        Heap::kOld));
+    // Methods -> Functions (MakeStFunction: dynamic params, AST-node marker,
+    // non-inlinable). INSTANCE methods live on Foo; CLASS-SIDE methods live on
+    // the metaclass shadow `Foo class` — so a selector can exist on both sides
+    // without colliding (the Smalltalk metalevel split).
+    std::vector<MethodNode*> inst;
+    std::vector<MethodNode*> stat;
     for (size_t j = 0; j < e.methods.size(); j++) {
-      MethodNode* m = e.methods[j].node;
-      const String& sel =
-          String::Handle(zone, Symbols::New(thread, m->selector.c_str()));
-      const bool is_static = e.methods[j].is_static;
-      const Function& fn = Function::Handle(
-          zone, Function::New(sel, RawFunction::kRegularFunction,
-                              /*is_static=*/is_static,
-                              /*is_const=*/false, /*is_abstract=*/false,
-                              /*is_external=*/false, /*is_native=*/false, k,
-                              TokenPosition::kNoSource, Heap::kOld));
-      fn.set_result_type(Object::dynamic_type());
-
-      // Parameter shape (Sprint 3): the Sprint-3 IL builder and, crucially,
-      // DartEntry::InvokeFunction both need the arity to match the selector.
-      // An instance method has an implicit receiver `this`; a class-side
-      // (static) method does not. All parameter types are `dynamic` — the ST
-      // bridge dispatches dynamically (ST_PLAN.md §3). Mirrors
-      // KernelReader::SetupFunctionParameters (kernel_reader.cc:764).
-      const intptr_t extra = is_static ? 0 : 1;  // implicit receiver
-      const intptr_t num_params = extra + static_cast<intptr_t>(m->args.size());
-      fn.set_num_fixed_parameters(num_params);
-      fn.SetNumOptionalParameters(0, /*are_positional=*/true);
-      fn.set_parameter_types(
-          Array::Handle(zone, Array::New(num_params, Heap::kOld)));
-      fn.set_parameter_names(
-          Array::Handle(zone, Array::New(num_params, Heap::kOld)));
-      intptr_t p = 0;
-      if (!is_static) {
-        fn.SetParameterTypeAt(p, Object::dynamic_type());
-        fn.SetParameterNameAt(p, Symbols::This());
-        p++;
-      }
-      for (size_t a = 0; a < m->args.size(); a++, p++) {
-        fn.SetParameterTypeAt(p, Object::dynamic_type());
-        fn.SetParameterNameAt(
-            p, String::Handle(zone, Symbols::New(thread, m->args[a].c_str())));
-      }
-
-      // Stored as a Node* (closures store their BlockNode* the same way);
-      // st::BuildGraph recovers a Node* and dispatches on the dynamic type.
-      fn.set_kernel_function(reinterpret_cast<void*>(static_cast<Node*>(m)));
-      // ST methods are NOT inlinable: the optimizer's inliner builds callee
-      // graphs itself (flow_graph_inliner.cc), and would route an ST-marked
-      // callee to the kernel builder — misreading the st::MethodNode. Marking
-      // them non-inlinable makes the inliner skip them at its CanBeInlined
-      // gate; they still optimize top-level. (Threading an InlineExitCollector
-      // through st::BuildGraph to support real ST inlining is a later sprint.)
-      fn.set_is_inlinable(false);
-      funcs.SetAt(j, fn);
+      (e.methods[j].is_static ? stat : inst).push_back(e.methods[j].node);
+    }
+    const Array& funcs =
+        Array::Handle(zone, Array::New(inst.size(), Heap::kOld));
+    Function& fh = Function::Handle(zone);
+    for (size_t j = 0; j < inst.size(); j++) {
+      fh = MakeStFunction(thread, k, inst[j], /*is_static=*/false);
+      funcs.SetAt(j, fh);
     }
     k.SetFunctions(funcs);
+
+    const Class& shadow = *shadows[i];
+    const String& super_shadow_name = String::Handle(
+        zone, Symbols::New(thread, (e.has_super ? e.super + " class"
+                                                : std::string()).c_str()));
+    Class& super_shadow = Class::Handle(
+        zone, e.has_super ? library.LookupLocalClass(super_shadow_name)
+                          : Class::null());
+    if (super_shadow.IsNull() && e.has_super) {
+      super_shadow =
+          FindStClassByName(thread, (e.super + " class").c_str());
+    }
+    shadow.set_super_type(Type::Handle(
+        zone, (!super_shadow.IsNull() && super_shadow.NumTypeParameters() == 0)
+                  ? Type::New(super_shadow, Object::null_type_arguments(),
+                              TokenPosition::kNoSource)
+                  : Type::ObjectType()));
+    const Array& sfuncs =
+        Array::Handle(zone, Array::New(stat.size(), Heap::kOld));
+    for (size_t j = 0; j < stat.size(); j++) {
+      fh = MakeStFunction(thread, shadow, stat[j], /*is_static=*/true);
+      sfuncs.SetAt(j, fh);
+    }
+    shadow.SetFunctions(sfuncs);
+    shadow.SetFields(Object::empty_array());
+
     // A concrete class must carry >=1 function or FinalizeClass asserts
-    // (class_finalizer.cc:2667, "at least a constructor"). A method-less ST
-    // base (e.g. Boolean, whose behaviour lives in True/False) has none — mark
-    // it abstract so it satisfies the invariant when finalized as a superclass.
-    // Correct enough for Sprint 3 (no instantiation); Sprint 5 will instead
-    // synthesize an implicit constructor for instantiable classes.
+    // (class_finalizer.cc:2667, "at least a constructor"). Method-less classes
+    // (and shadows, which are never instantiated) are marked abstract.
     if (funcs.Length() == 0) k.set_is_abstract();
+    shadow.set_is_abstract();
 
     pending.Add(k, Heap::kOld);
+    pending.Add(shadow, Heap::kOld);
   }
 
   // --- finalize (resolve supers + declaration types; members on demand) -----

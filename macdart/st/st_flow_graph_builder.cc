@@ -404,17 +404,22 @@ class StGraphBuilder {
                                      TokenPosition::kNoSource, sym,
                                      Object::dynamic_type());
   }
-  // Byte offset of an instance variable of the receiver's class, or -1 if
-  // `name` is not one. The owner class is member-finalized before compile
+  // Byte offset of an instance variable of the receiver's class — INCLUDING
+  // inherited ivars (Sprint 11: walk the super chain; finalization has laid
+  // fields out hierarchy-wide, so each Field's Offset() is absolute). -1 if
+  // `name` is not an ivar. The owner class is member-finalized before compile
   // (st_natives.cc ST_send / ST_new), so Field::Offset() is valid.
   intptr_t IvarOffset(const std::string& name) {
-    const Class& owner = Class::Handle(zone_, pf_->function().Owner());
-    if (owner.IsNull()) return -1;
     const String& sym =
         String::Handle(zone_, Symbols::New(thread_, name.c_str()));
-    const Field& field = Field::Handle(zone_, owner.LookupInstanceField(sym));
-    if (field.IsNull()) return -1;
-    return field.Offset();
+    Field& field = Field::Handle(zone_);
+    Class& c = Class::Handle(zone_, pf_->function().Owner());
+    while (!c.IsNull()) {
+      field = c.LookupInstanceField(sym);
+      if (!field.IsNull()) return field.Offset();
+      c = c.SuperClass();
+    }
+    return -1;
   }
 
   // --- translation ---
@@ -458,6 +463,7 @@ class StGraphBuilder {
   RawClass* ResolveClassName(const std::string& name);
   Fragment TranslateClassSend(const Class& cls, MessageNode* node);
   Fragment TranslateSuperSend(MessageNode* node);
+  void MetaSplit(const Class& cls, Class& inst, Class& shadow);
   std::string DartSelector(const std::string& st_selector);
   std::string DartGetter(const std::string& st_selector);
 
@@ -477,6 +483,7 @@ class StGraphBuilder {
   std::map<std::string, LocalVariable*> locals_;  // params + temps by name
   LocalVariable* value_temp_;                     // reusable control-flow value temp
   std::map<Node*, LocalVariable*> synth_;         // per-node synth temps (to:do: limit, cascade rcvr)
+  std::map<Node*, LocalVariable*> synth2_;        // second per-node temp (timesRepeat: counter)
   intptr_t synth_counter_;                        // makes synth-temp names unique
   LocalVariable* closure_var_;                    // the :closure param (closure builds)
   std::vector<LocalVariable*> param_vars_;        // params in frame order (capture copy)
@@ -510,8 +517,10 @@ void StGraphBuilder::PrepareScope(MethodNode* method) {
                            SequenceNode(TokenPosition::kNoSource, scope));
 
   intptr_t pos = 0;
-  // Receiver `self`/`this` for an instance method; a class-side (static) method
-  // has none (Sprint 3 acceptance uses only static methods).
+  // Implicit parameter 0: the receiver for an instance method; the RECEIVING
+  // CLASS for a class-side method (Sprint 11 — bound as an ordinary local
+  // named `self`, so it is loadable, capturable, and dispatchable like any
+  // other; this_var_ stays NULL to mark the class side).
   if (!function.is_static()) {
     LocalVariable* this_var = new (zone_)
         LocalVariable(TokenPosition::kNoSource, TokenPosition::kNoSource,
@@ -519,6 +528,11 @@ void StGraphBuilder::PrepareScope(MethodNode* method) {
     scope->InsertParameterAt(pos++, this_var);
     this_var_ = this_var;
     param_vars_.push_back(this_var);
+  } else {
+    LocalVariable* cls_var = MakeLocal("self");
+    scope->InsertParameterAt(pos++, cls_var);
+    locals_["self"] = cls_var;
+    param_vars_.push_back(cls_var);
   }
   // One parameter LocalVariable per selector argument.
   for (size_t i = 0; i < method->args.size(); i++) {
@@ -653,7 +667,11 @@ Fragment StGraphBuilder::TranslateLiteral(LiteralNode* node) {
 Fragment StGraphBuilder::TranslateVariable(VariableNode* node) {
   if (node->name == "self" || node->name == "super") {
     if (this_var_ != NULL) return LoadLocal(this_var_);
-    return Unsupported(node, "self/super in a static method");
+    // Class-side (Sprint 11): `self` is the implicit thisCls parameter — an
+    // ordinary local (capturable). Fall through to standard local resolution.
+    if (node->name != "self" || locals_.count("self") == 0) {
+      return Unsupported(node, "self/super here");
+    }
   }
   LocalVariable* local = LookupLocal(node->name);
   if (local != NULL) return LoadLocal(local);
@@ -757,9 +775,110 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
     return instructions;
   }
 
-  // A unary send that bridges to a dart:core GETTER (`x size` -> `x.length`):
-  // getters read a value, so they use the mangled name + Token::kGET, not a
-  // method call (which would try to invoke the value).
+  // Sprint 11 (corpus breadth): identity, logic, and universal-helper
+  // rewrites. `==`/`~~` are Smalltalk IDENTITY — a StrictCompare, not a send.
+  if ((node->selector == "==" || node->selector == "~~") &&
+      node->args.size() == 1) {
+    Fragment instructions = TranslateExpression(node->receiver.get());
+    instructions += TranslateExpression(node->args[0].get());
+    Value* right = Pop();
+    Value* left = Pop();
+    StrictCompareInstr* compare = new (zone_) StrictCompareInstr(
+        TokenPosition::kNoSource,
+        (node->selector == "==") ? Token::kEQ_STRICT : Token::kNE_STRICT,
+        left, right, false);
+    Push(compare);
+    instructions += Fragment(compare);
+    return instructions;
+  }
+  if (node->args.empty() &&
+      (node->selector == "isNil" || node->selector == "notNil")) {
+    Fragment instructions = TranslateExpression(node->receiver.get());
+    instructions += NullConstant();
+    Value* right = Pop();
+    Value* left = Pop();
+    StrictCompareInstr* compare = new (zone_) StrictCompareInstr(
+        TokenPosition::kNoSource,
+        (node->selector == "isNil") ? Token::kEQ_STRICT : Token::kNE_STRICT,
+        left, right, false);
+    Push(compare);
+    instructions += Fragment(compare);
+    return instructions;
+  }
+  if (node->selector == "~=" && node->args.size() == 1) {
+    // a ~= b  ==  (a = b) not
+    Fragment instructions = TranslateExpression(node->receiver.get());
+    instructions += PushArgument();
+    instructions += TranslateExpression(node->args[0].get());
+    instructions += PushArgument();
+    const String& eq = String::ZoneHandle(zone_, Symbols::New(thread_, "=="));
+    instructions += InstanceCall(eq, Token::kEQ, 2, 2);
+    instructions += PushArgument();
+    instructions += StaticCall(
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stNot")), 1);
+    return instructions;
+  }
+  {
+    // Universal helpers: 1-based at:/at:put: on Dart Lists, size/isEmpty
+    // across bridged receivers, `not`, `error:` — each falls back to real ST
+    // dispatch inside the helper, so ST-defined at:/size keep working.
+    static const struct { const char* sel; const char* helper; size_t argc; }
+        kHelperRewrites[] = {
+            {"at:", "stAt1", 1},        {"at:put:", "stAtPut1", 2},
+            {"size", "stSizeOf", 0},    {"isEmpty", "stIsEmptyU", 0},
+            {"not", "stNot", 0},        {"error:", "stError", 1},
+            {"&", "stBoolAnd", 1},      {"|", "stBoolOr", 1},
+            {"add:", "stAddU", 1},      {"do:", "stDo", 1},
+        };
+    for (size_t i = 0; i < sizeof(kHelperRewrites) / sizeof(kHelperRewrites[0]);
+         i++) {
+      if (node->selector != kHelperRewrites[i].sel) continue;
+      if (node->args.size() != kHelperRewrites[i].argc) continue;
+      Fragment instructions = TranslateExpression(node->receiver.get());
+      instructions += PushArgument();
+      for (size_t a = 0; a < node->args.size(); a++) {
+        instructions += TranslateExpression(node->args[a].get());
+        instructions += PushArgument();
+      }
+      instructions += StaticCall(
+          Function::ZoneHandle(
+              zone_, LookupCocoaFunction(kHelperRewrites[i].helper)),
+          1 + static_cast<intptr_t>(node->args.size()));
+      return instructions;
+    }
+  }
+
+  // Class-side `self <sel>` (Sprint 11): dispatch on the RECEIVING class held
+  // in the implicit thisCls parameter — a runtime class-send (stClassSendN),
+  // because the target depends on which class the original message named
+  // (`IdleTask link:..` running TaskControlBlock's inherited constructor must
+  // see self = IdleTask). Covers class-side closures too (this_var_ is NULL
+  // there as well; `self` is the captured thisCls).
+  if (VariableNode* sv = dynamic_cast<VariableNode*>(node->receiver.get())) {
+    if (sv->name == "self" && this_var_ == NULL && locals_.count("self") &&
+        node->args.size() <= 5) {
+      char helper[16];
+      snprintf(helper, sizeof(helper), "stClassSend%d",
+               static_cast<int>(node->args.size()));
+      Fragment instructions = TranslateExpression(node->receiver.get());
+      instructions += PushArgument();
+      instructions += Constant(String::ZoneHandle(
+          zone_, Symbols::New(thread_, node->selector.c_str())));
+      instructions += PushArgument();
+      for (size_t i = 0; i < node->args.size(); i++) {
+        instructions += TranslateExpression(node->args[i].get());
+        instructions += PushArgument();
+      }
+      instructions += StaticCall(
+          Function::ZoneHandle(zone_, LookupCocoaFunction(helper)),
+          2 + static_cast<intptr_t>(node->args.size()));
+      return instructions;
+    }
+  }
+
+  // A unary send that bridges to a dart:core GETTER (`x hash` ->
+  // `x.hashCode`): getters read a value, so they use the mangled name +
+  // Token::kGET, not a method call (which would try to invoke the value).
   if (node->args.empty()) {
     const std::string getter = DartGetter(node->selector);
     if (!getter.empty()) {
@@ -797,21 +916,48 @@ RawClass* StGraphBuilder::ResolveClassName(const std::string& name) {
   return FindStClassByName(thread_, name.c_str());
 }
 
+// Sprint 11: from either metalevel, find both sides — the instance class and
+// its `Foo class` metaclass shadow. Either out-param may stay null (non-ST or
+// pre-metaclass classes); callers fall back to the class they were handed.
+void StGraphBuilder::MetaSplit(const Class& cls, Class& inst, Class& shadow) {
+  const String& nm = String::Handle(zone_, cls.Name());
+  const std::string n(nm.ToCString());
+  static const char kSuffix[] = " class";
+  const size_t klen = sizeof(kSuffix) - 1;
+  if (n.size() > klen && n.compare(n.size() - klen, klen, kSuffix) == 0) {
+    shadow = cls.raw();
+    inst = FindStClassByName(thread_, n.substr(0, n.size() - klen).c_str());
+  } else {
+    inst = cls.raw();
+    shadow = FindStClassByName(thread_, (n + kSuffix).c_str());
+  }
+}
+
 // `Foo <sel>`: a class-side (static) method wins; otherwise `new`/`basicNew`
 // allocates a fresh instance. (Class-side method names are NOT aliased —
 // aliases are for dart:core sends, not user methods.)
 Fragment StGraphBuilder::TranslateClassSend(const Class& cls,
                                             MessageNode* node) {
-  const String& sel =
-      String::Handle(zone_, Symbols::New(thread_, node->selector.c_str()));
-  // Walk the SUPER chain for the class-side method (Sprint 9: inherited
-  // class-side conveniences work), member-finalizing each visited class — a
-  // bare LookupStaticFunction would route through EnsureIsFinalized -> the
-  // Dart parser, which crashes on a TokenStream-less ST class. Zone handle:
-  // StaticCallInstr keeps the Function past this HANDLESCOPE.
+  const String& sel = String::Handle(
+      zone_,
+      Symbols::New(thread_, ::st::MangleSelector(node->selector).c_str()));
+  // The metaclass split (Sprint 11): class-side methods live on the `Foo
+  // class` shadow, whose super chain mirrors the instance chain (inherited
+  // class-side conveniences work); instances allocate from Foo itself. We may
+  // be handed either side — a source send hands us Foo, class-side `self`
+  // hands us the shadow that owns the running static method.
+  Class& inst_cls = Class::Handle(zone_);
+  Class& shadow = Class::Handle(zone_);
+  MetaSplit(cls, inst_cls, shadow);
+  if (inst_cls.IsNull()) inst_cls = cls.raw();
+
+  // Walk the metaclass chain for the method, member-finalizing each visited
+  // class — a bare LookupStaticFunction would route through EnsureIsFinalized
+  // -> the Dart parser, which crashes on a TokenStream-less ST class. Zone
+  // handle: StaticCallInstr keeps the Function past this HANDLESCOPE.
   Function& fn = Function::ZoneHandle(zone_);
   {
-    Class& c = Class::Handle(zone_, cls.raw());
+    Class& c = Class::Handle(zone_, shadow.IsNull() ? cls.raw() : shadow.raw());
     while (!c.IsNull()) {
       if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
       fn ^= c.LookupStaticFunction(sel);
@@ -820,33 +966,39 @@ Fragment StGraphBuilder::TranslateClassSend(const Class& cls,
     }
   }
   if (!fn.IsNull()) {
-    Fragment instructions;  // static call: push args only (no receiver)
+    // Implicit arg 0 = the RECEIVING class (class-side `self` dispatches on
+    // it — an inherited constructor must allocate the subclass it was sent
+    // to, not its defining class).
+    Fragment instructions = Constant(
+        Type::ZoneHandle(zone_, Type::NewNonParameterizedType(inst_cls)));
+    instructions += PushArgument();
     for (size_t i = 0; i < node->args.size(); i++) {
       instructions += TranslateExpression(node->args[i].get());
       instructions += PushArgument();
     }
-    instructions += StaticCall(fn, static_cast<intptr_t>(node->args.size()));
+    instructions +=
+        StaticCall(fn, 1 + static_cast<intptr_t>(node->args.size()));
     return instructions;
   }
   if ((node->selector == "new" || node->selector == "basicNew") &&
       node->args.empty()) {
-    return AllocateObject(cls);
+    return AllocateObject(inst_cls);
   }
   // Sprint 9: ANSI `Exception class >> signal[:]` — a class-side signal send
   // creates and signals: `Error signal: 'x'` == `Error new signal: 'x'`.
-  // (A static method of that name would collide with the instance member
-  // under Dart's rules, so the builder desugars instead — and this way it
-  // works for every user-defined exception subclass automatically.)
+  // (Kept even with the metaclass tower: it works for every user-defined
+  // exception subclass without each writing a class-side method.)
   if ((node->selector == "signal" && node->args.empty()) ||
       (node->selector == "signal:" && node->args.size() == 1)) {
-    Fragment instructions = AllocateObject(cls);
+    Fragment instructions = AllocateObject(inst_cls);
     instructions += PushArgument();
     for (size_t i = 0; i < node->args.size(); i++) {
       instructions += TranslateExpression(node->args[i].get());
       instructions += PushArgument();
     }
     const String& sel = String::ZoneHandle(
-        zone_, Symbols::New(thread_, node->selector.c_str()));
+        zone_,
+        Symbols::New(thread_, ::st::MangleSelector(node->selector).c_str()));
     const intptr_t argc = 1 + static_cast<intptr_t>(node->args.size());
     instructions += InstanceCall(sel, Token::kILLEGAL, argc, 1);
     return instructions;
@@ -860,8 +1012,9 @@ Fragment StGraphBuilder::TranslateClassSend(const Class& cls,
 // visited class on demand.
 Fragment StGraphBuilder::TranslateSuperSend(MessageNode* node) {
   const Class& owner = Class::Handle(zone_, pf_->function().Owner());
-  const String& sel =
-      String::Handle(zone_, Symbols::New(thread_, node->selector.c_str()));
+  const String& sel = String::Handle(
+      zone_,
+      Symbols::New(thread_, ::st::MangleSelector(node->selector).c_str()));
   Function& fn = Function::ZoneHandle(zone_);
   Class& c = Class::Handle(zone_, owner.SuperClass());
   while (!c.IsNull()) {
@@ -898,19 +1051,23 @@ std::string StGraphBuilder::DartSelector(const std::string& s) {
   if (s == "printString" || s == "displayString" || s == "asString") {
     return "toString";
   }
-  if (s == "at:") return "[]";
-  if (s == "at:put:") return "[]=";
   if (s == ",") return "+";
+  if (s == "bitAnd:") return "&";   // Dart int operator methods
+  if (s == "bitOr:") return "|";
+  if (s == "bitXor:") return "^";
+  if (s == "//") return "~/";       // floored vs truncating: same for positives
+  if (s == "\\\\") return "%";
+  // Any remaining keyword selector targets an ST-defined method: use the
+  // canonical mangled name the loader registered (':' -> '_').
+  if (s.find(':') != std::string::npos) return ::st::MangleSelector(s);
   return s;
 }
 
 // ST unary selectors that bridge to a dart:core GETTER (not a method). Empty
-// means "not a getter alias" — fall through to a normal send.
+// means "not a getter alias" — fall through to a normal send. (size/isEmpty
+// moved to the UNIVERSAL helpers above so ST-defined receivers keep working.)
 std::string StGraphBuilder::DartGetter(const std::string& s) {
-  if (s == "size") return "length";
   if (s == "hash") return "hashCode";
-  if (s == "isEmpty") return "isEmpty";
-  if (s == "isNotEmpty" || s == "notEmpty") return "isNotEmpty";
   return "";
 }
 
@@ -971,6 +1128,15 @@ void StGraphBuilder::CollectLocals(Node* node, LocalScope* scope) {
       if (m->selector == "to:do:" && m->args.size() == 2 &&
           IsBlockNode(m->args[1].get())) {
         AllocSynth(m, "lim", scope);
+      }
+      if (m->selector == "timesRepeat:" && m->args.size() == 1 &&
+          IsBlockNode(m->args[0].get())) {
+        AllocSynth(m, "lim", scope);            // the count      -> synth_
+        char buf[32];
+        snprintf(buf, sizeof(buf), ":i%ld", static_cast<long>(synth_counter_++));
+        LocalVariable* i = MakeLocal(buf);      // the counter    -> synth2_
+        scope->AddVariable(i);
+        synth2_[m] = i;
       }
     } else {
       CollectLocals(m->receiver.get(), scope);
@@ -1185,6 +1351,9 @@ bool StGraphBuilder::IsInlinableControlFlow(MessageNode* node) {
   if (s == "to:do:") {
     return node->args.size() == 2 && IsBlockNode(node->args[1].get());
   }
+  if (s == "timesRepeat:") {
+    return node->args.size() == 1 && IsBlockNode(node->args[0].get());
+  }
   return false;
 }
 
@@ -1371,6 +1540,61 @@ Fragment StGraphBuilder::TranslateControlFlow(MessageNode* node,
     instructions += Drop();
     instructions += TranslateExpression(node->args[0].get());  // stop
     instructions += StoreLocal(limit);
+    instructions += Drop();
+
+    Fragment condition;
+    condition += LoadLocal(i);
+    condition += PushArgument();
+    condition += LoadLocal(limit);
+    condition += PushArgument();
+    condition += InstanceCall(le, Token::kLTE, 2, 2);
+    TargetEntryInstr* body_entry;
+    TargetEntryInstr* loop_exit;
+    condition += BranchIfTrue(&body_entry, &loop_exit);
+
+    Fragment body(body_entry);
+    body += InlineBlockStmts(block);
+    body += LoadLocal(i);
+    body += PushArgument();
+    body += IntConstant(1);
+    body += PushArgument();
+    body += InstanceCall(plus, Token::kADD, 2, 2);
+    body += StoreLocal(i);
+    body += Drop();
+
+    Instruction* entry;
+    if (body.is_open()) {
+      JoinEntryInstr* join = BuildJoinEntry();
+      body += Goto(join);
+      Fragment loop(join);
+      loop += CheckStackOverflow();
+      loop += condition;
+      entry = new (zone_) GotoInstr(join);
+    } else {
+      entry = condition.entry;
+    }
+    instructions += Fragment(entry, loop_exit);
+    if (value_context) instructions += NullConstant();
+    return instructions;
+  }
+
+  // --- timesRepeat: (a counting loop, no loop variable exposed) ----------
+  if (s == "timesRepeat:") {
+    BlockNode* block = dynamic_cast<BlockNode*>(node->args[0].get());
+    LocalVariable* limit = synth_.count(node) ? synth_[node] : NULL;
+    LocalVariable* i = synth2_.count(node) ? synth2_[node] : NULL;
+    if (limit == NULL || i == NULL) {
+      return Unsupported(node, "timesRepeat: without temps");
+    }
+    const String& le = String::ZoneHandle(zone_, Symbols::New(thread_, "<="));
+    const String& plus = String::ZoneHandle(zone_, Symbols::New(thread_, "+"));
+
+    Fragment instructions;
+    instructions += TranslateExpression(node->receiver.get());  // the count
+    instructions += StoreLocal(limit);
+    instructions += Drop();
+    instructions += IntConstant(1);
+    instructions += StoreLocal(i);
     instructions += Drop();
 
     Fragment condition;

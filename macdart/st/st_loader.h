@@ -60,6 +60,12 @@ class Loader {
 // Class::null() if absent. Caller holds a VM transition + HANDLESCOPE.
 dart::RawClass* FindStClassByName(dart::Thread* thread, const char* name);
 
+// The canonical VM-internal name of an ST selector: ':' -> '_' ("at:put:" ->
+// "at_put_"). Keeps keyword selectors distinct from unary ones (signal vs
+// signal:) while producing valid Dart method names; every registration and
+// every lookup site (builder + natives) must agree on this one mangle.
+std::string MangleSelector(const std::string& selector);
+
 }  // namespace st
 
 #endif  // MACDART_ST_ST_LOADER_H_

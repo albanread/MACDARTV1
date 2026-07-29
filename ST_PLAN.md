@@ -426,6 +426,13 @@ st_lexer.cc st_parser.cc st_natives.cc)` then add `dart_st` to each
   unaffected. (Two handle-lifetime bugs fixed along the way: `AllocateObject`/`StaticCall`
   need **zone** handles, not temporary-scoped ones.) **Deferred**: the metaclass tower
   with class variables + class-side `self`, real first-class closures, `super`.
-- **Next — Sprint 7:** real first-class closures (`[:x|…]` as a value / `ClosureCall` +
-  the non-local `^` desugaring), `super` sends, then the workspace GUI, and the MACVM
-  A/B benchmark (Sprint 8).
+- **Sprint 7 — `super` ✓** — `super sel: ..` resolves the method starting in the owner's
+  superclass (walking the chain, finalizing each visited class on demand) and emits a
+  StaticCall with self as argument 0. Verified across a 3-level hierarchy
+  (Puppy→Dog→Animal, `super speak` chaining two levels → 111). No new VM patch.
+- **Next — first-class closures:** the largest remaining language piece. `[:x|…]` as a
+  first-class *value* with variable **capture** (a `Context` for captured vars, a closure
+  `Function` per block with a preserved `ContextScope`, `AllocateObject(closure_class)` +
+  `set_closure_function`, `value:`→`ClosureCall`, and the non-local `^` throw/catch
+  desugaring). Needs the context/scope infrastructure — a focused sprint of its own. Then
+  the workspace GUI and the MACVM A/B benchmark.

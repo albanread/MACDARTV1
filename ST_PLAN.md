@@ -733,6 +733,17 @@ loudly). Stages A and C are modest; A is independently shippable.
     replies use ST printString. New verbs: `stimport`, `acceptb64` (scripted
     multiline accepts), `lang <cmd>` passthrough. Python vm-service driver for
     Tcl-8.5-only hosts.
+- **Sprint 12b ✓ — the world is VENDORED; `dart --with-st` boots it.** The 86
+  world files (+ bench/) are tracked at `macdart/st/world/`;
+  `dart --with-st[=<dir>] prog.dart` loads them into the main isolate before
+  main() runs (`st: world loaded (86 files) from …` on stderr). Resolution:
+  explicit path > `$MACDART_ST_WORLD` > the vendored copy relative to the
+  executable. The boot installs the ST hooks via a public `stEnsureHooks` alias
+  (the C++ path can't reach the private installer) and shares one load core
+  (`STRunSourceString`) with the natives; the VM tree carries only the option
+  entry + a guarded call in `runtime/bin/main.cc` (patch hunk regenerated; all
+  18 hunks dry-run clean against pristine 1.24.3).
+
   **Next:** MACVM display/GUI primitive bridge (the 36_pixmap/43_gamepane tier
   currently loads but cannot draw), `Smalltalk at:put:` system-dictionary protocol,
   Behavior/reflection surface (`name`, `superclass`), performance pass on the NSM

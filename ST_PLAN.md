@@ -371,6 +371,70 @@ st_lexer.cc st_parser.cc st_natives.cc)` then add `dart_st` to each
 
 ---
 
+## 9. Closures — implementation blueprint (the next build)
+
+Full first-class closures with capture are the largest remaining piece. The blueprint
+below was **stress-tested against the VM source**; two risks collapsed into verified
+simpler paths, and two hidden requirements surfaced. Land it in three stages, each
+verifiable alone. Everything is in `st_flow_graph_builder.cc` (+ the loader pre-pass);
+**no new VM patch**.
+
+**Two verified simplifications:**
+- **`value:` needs NO `ClosureCallInstr`.** The IC-miss path special-cases selector
+  `call` on a closure receiver → `DartEntry::InvokeClosure`
+  (`runtime_entry.cc:1575-1580`). So `value`/`value:`/`value:value:` lower to a plain
+  `InstanceCall("call", …)` — correct for any receiver (a non-closure DNUs, which is
+  right), no static receiver knowledge, reuses the existing send machinery. A direct
+  `ClosureCallInstr` is a later optimization, not a requirement.
+- **Closure-side capture scope is a VM primitive.** When the closure body compiles, its
+  scope is built as a child of `LocalScope::RestoreOuterScope(function.context_scope())`
+  (`parser.cc:6596`) — the captured variables come back with correct context
+  levels/indices for free; no hand-reconstruction.
+
+**Two hidden requirements (missed by a first draft):**
+- **A closure function's argument 0 is the closure object itself**, and its prologue
+  must load the saved context: `closure_param → LoadField(Closure::context_offset()) →
+  StoreLocal(current_context_var)` (kernel does this for `IsClosureFunction()`).
+  `num_fixed_parameters` = 1 (closure) + block args.
+- **Unique synthetic TokenPositions per block.** `NewClosureFunction` /
+  `LookupClosureFunction` dedup by (parent, token-pos); all our positions are
+  `kNoSource` and would collide. Synthesize from the parser's `SrcPos` (line/col),
+  `TokenPosition(...).ToSynthetic()`. Also: store the marker as `static_cast<Node*>`
+  consistently (loader stores `MethodNode*`, closures store `BlockNode*`) and
+  `dynamic_cast` on recovery to dispatch method-vs-closure builds.
+
+**Stage A — non-capturing closures** (`[:x | x * x] value: 5` → 25):
+`BlockNode` in value position → `TranslateClosure`: mirror `kernel_to_il.cc:6604` —
+`Function::NewClosureFunction(name, pf_->function(), synthPos)`; empty
+`ContextScope::New(0,false)`; `set_kernel_function(static_cast<Node*>(block))`;
+dynamic params; finalize `SignatureType`; `isolate()->AddClosureFunction`. Emit
+`AllocateObject(closure_class)` + `set_closure_function`, store the Function into
+`Closure::function_offset()` and null into `Closure::context_offset()` (via a synth
+temp). `st::BuildGraph` dispatches on the recovered node type; `BuildClosureGraph`
+takes params = closure + block args and compiles the block body (last-expression
+value). Sends `value*` become `InstanceCall("call")`. The loader pre-pass must stop
+hoisting closure-block locals (only *inlined* control-flow blocks hoist).
+
+**Stage B — variable capture** (`| n | n := 10. ^ [:x | n + x] value: 5` → 15):
+mark method locals referenced inside closure blocks `set_is_captured()` *before*
+`AllocateVariables`; method prologue allocates the context (`AllocateContext(n)` +
+chain to `current_context_var`, copying captured params in — kernel
+`BuildGraphOfFunction:3277-3311`); `LoadLocal`/`StoreLocal` route captured vars via
+`LoadContextAt(level)` + `Context::variable_offset(index)` (kernel `:2646/:2857`);
+closure creation stores the real `current_context_var` into `context_offset` and sets
+`context_scope = blockScope->PreserveOuterScope(context_depth_)` — which requires the
+block's `LocalScope` to be a real child of the method scope (restructure `PrepareScope`
+away from the flat hoist for closure blocks). Closure-body compile uses
+`RestoreOuterScope` (above). Single-level capture first; nested block-in-block later.
+
+**Stage C — non-local `^` from a real closure**: the try/catch home-token desugaring
+(`ThrowInstr`/`CatchBlockEntry` + try-index machinery). Until then, `^` inside a
+*closure* block is `Unsupported` — note that `^` inside *inlined* control-flow blocks
+(the overwhelmingly common case in the corpus) already works as a plain `Return`.
+
+Risk concentrates in Stage B's context indices/levels (Debug asserts catch mismatches
+loudly). Stages A and C are modest; A is independently shippable.
+
 ## 8. Status
 
 - **Sprint 0 ✓** — the standalone `.mst` reader (`macdart/st/`), builds clean.

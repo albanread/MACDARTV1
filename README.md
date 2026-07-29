@@ -42,6 +42,11 @@ a native arm64 JIT on Apple Silicon, which it was never built to do (the 2017
 arm64 backend existed only for iOS, where Dart ran ahead-of-time and never
 patched code at runtime).
 
+For a source-grounded tour of that machine — the in-VM parser, the two-tier
+speculative JIT, its optimization passes, the ARM64 backend, and the
+deoptimization safety net that lets it speculate — see the study in
+[`docs/dart-vm-compiler.md`](docs/dart-vm-compiler.md).
+
 ## What the port actually is
 
 Upstream Dart 1.24.3 already contained a complete, Apple-ABI-aware arm64 backend.

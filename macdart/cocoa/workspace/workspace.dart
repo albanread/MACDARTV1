@@ -780,11 +780,15 @@ void openBrowser() {
 void selectCategory(int row) {
   if (row < 0 || row >= gBrCats.length) return;
   gBrSelCat = gBrCats[row].toString();
-  gBrUserApp = (gBrSelCat == 'User App');
+  // 'Smalltalk' browses the same editable image decls as 'User App', filtered
+  // to the ST layer — both use the decl path (classmembers/classsrc/Accept).
+  var isSt = (gBrSelCat == 'Smalltalk');
+  gBrUserApp = (gBrSelCat == 'User App') || isSt;
   gBrSelClass = null;
   gClassMembers = <dynamic>[]; gVarRecs = <dynamic>[]; gMethodRecs = <dynamic>[];
   gBrowserSrc.setString("");
-  ask(gBrUserApp ? 'classes' : 'worldclasses', gBrUserApp ? '' : gBrSelCat).then((r) {
+  ask(gBrUserApp ? 'classes' : 'worldclasses',
+      gBrUserApp ? (isSt ? 'st' : '') : gBrSelCat).then((r) {
     gBrClasses = _dl(r);
     gClassTable.reloadData(); gVarTable.reloadData(); gMethodTable.reloadData();
     repaint();

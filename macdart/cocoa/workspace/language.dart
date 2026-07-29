@@ -198,7 +198,7 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'acceptLive') out = _acceptLive(arg);
       else if (cmd == 'reset') out = _reset(arg);
       else if (cmd == 'remove') out = _remove(arg);
-      else if (cmd == 'classes') out = _classNames();
+      else if (cmd == 'classes') out = _classNames(arg.toString());
       else if (cmd == 'members') out = _memberList(arg);
       else if (cmd == 'classsrc') out = _decls.containsKey(arg) ? _decls[arg] : '';
       else if (cmd == 'classmembers') out = _classMembers2(arg);
@@ -472,11 +472,16 @@ List _allDecls() {
 }
 
 // --- browser data (user app) ------------------------------------------------
-List _classNames() {
+List _classNames([String filter = '']) {
   var out = <String>[];
   _decls.forEach((name, src) {
     var k = _kindOf(src);
-    if (k == 'class' || k == 'enum' || k == 'st-class') out.add(name);
+    var isDart = (k == 'class' || k == 'enum');
+    var isSt = (k == 'st-class');
+    if (filter == 'dart' && !isDart) return;
+    if (filter == 'st' && !isSt) return;
+    if (filter == '' && !(isDart || isSt)) return;
+    out.add(name);
   });
   out.sort();
   return out;
@@ -636,7 +641,9 @@ String _memberSig(String m) {
 // --- the world (read-only, via dart:mirrors) --------------------------------
 // Browser categories: the editable user app, then the world's libraries.
 List _categories() {
-  var out = <String>['User App'];
+  // 'User App' = every image decl (bilingual); 'Smalltalk' = the ST layer
+  // alone — the world + user ST classes, without the Dart ones.
+  var out = <String>['User App', 'Smalltalk'];
   out.addAll(_worldLibs());
   return out;
 }

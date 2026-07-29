@@ -776,6 +776,21 @@ class AppSurface {
   /// Route subsequent widgets back onto the surface itself.
   void pane() { _cmd(<dynamic>['container', null, 0]); }
 
+  /// A drawing surface. Paint it with draw(id, ops) — the same op vocabulary the
+  /// demos use. `bg` (an [r,g,b] 0..1) is an optional initial fill.
+  void canvas(String id, {List frame, List bg}) {
+    _cmd(<dynamic>['add', 'canvas', id, <String, dynamic>{'frame': frame, 'bg': bg}]);
+  }
+
+  /// Replay a draw list onto a canvas. Ops (coords in top-left points):
+  ///   ['clear', r,g,b]                        wipe to a colour (0..1)
+  ///   ['rect'|'oval', x,y,w,h, r,g,b, fill?]  fill? true = filled, else stroked
+  ///   ['line', x1,y1,x2,y2, r,g,b, width?]
+  ///   ['text', x,y, string, size, r,g,b]
+  ///   ['blit', x,y, w,h, base64Bmp]           a demos/pixmap.dart Pixmap
+  /// Draw lists ACCUMULATE; begin with a 'clear' to wipe.
+  void draw(String id, List ops) { _cmd(<dynamic>['draw', id, ops]); }
+
   // -- layout helpers: pure frame math, no widget. Feed the frames to widgets. -
 
   /// `count` frames stacked DOWN from (x,y), each w×h, `gap` apart.

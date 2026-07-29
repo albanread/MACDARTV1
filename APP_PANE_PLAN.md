@@ -172,7 +172,12 @@ hatch is a later decision, not a v1 feature.
 | `canvas` | NSImage + `Pixmap` blit | the Demos tab |
 
 `canvas` is worth calling out: it reuses the demo draw protocol wholesale, so an
-app gets a drawing area and the two features share one renderer.
+app gets a drawing area and the two features share one renderer. ✅ SHIPPED —
+`renderDemo` was generalised to `renderInto(image, w, h, cmds)`; the Demos tab
+and every app `canvas` now share it. App API: `canvas(id, frame:, bg:)` +
+`draw(id, ops)` (clear/rect/oval/line/text/blit, coords top-left). Draw lists
+accumulate; begin with a `clear`. The gallery's Inputs tab has a live example
+(a bar the slider fills, in the popup's colour).
 
 **Needs a probe before shipping** (§ the probe law): `checkbox`/`radio`
 (`setButtonType:`), visible `tabs` (`setTabViewType(0)` — the workspace uses

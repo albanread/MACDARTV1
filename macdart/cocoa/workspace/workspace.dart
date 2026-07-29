@@ -3574,18 +3574,21 @@ Cocoa _demoColor(r, g, b) => Cocoa.cls("NSColor")
 /// touches AppKit, and it runs on thread 0 by construction. Wrapped in an
 /// autorelease pool: at 30fps the colours and paths would otherwise pile up
 /// until the next drain.
-void renderDemo(List cmds) {
-  if (gDemoImage == null) return;
+/// Replay a draw list into ANY image — the Demos canvas or an app `canvas`
+/// widget. `_w`/`_h` are the image size, for the top-left -> AppKit y-flip.
+/// The op vocabulary (clear/rect/oval/line/text/blit) is shared by both.
+void renderInto(Cocoa _img, double _w, double _h, List cmds) {
+  if (_img == null) return;
   autoreleasePool(() {
-    gDemoImage.lockFocus();
+    _img.lockFocus();
     for (var c in cmds) {
       if (c is! List || c.isEmpty) continue;
       var op = c[0];
       if (op == 'clear') {
         _demoColor(c[1], c[2], c[3]).setFill();
-        Cocoa.cls("NSBezierPath").fillRect([0.0, 0.0, kDemoW, kDemoH]);
+        Cocoa.cls("NSBezierPath").fillRect([0.0, 0.0, _w, _h]);
       } else if (op == 'rect' || op == 'oval') {
-        var rect = [_d(c[1]), kDemoH - _d(c[2]) - _d(c[4]), _d(c[3]), _d(c[4])];
+        var rect = [_d(c[1]), _h - _d(c[2]) - _d(c[4]), _d(c[3]), _d(c[4])];
         var col = _demoColor(c[5], c[6], c[7]);
         var fill = c.length > 8 && c[8] == true;
         if (op == 'rect') {
@@ -3600,8 +3603,8 @@ void renderDemo(List cmds) {
         _demoColor(c[5], c[6], c[7]).setStroke();
         Cocoa.cls("NSBezierPath").setDefaultLineWidth(c.length > 8 ? _d(c[8]) : 1.0);
         Cocoa.cls("NSBezierPath").strokeLineFromPoint(
-            [_d(c[1]), kDemoH - _d(c[2])],
-            toPoint: [_d(c[3]), kDemoH - _d(c[4])]);
+            [_d(c[1]), _h - _d(c[2])],
+            toPoint: [_d(c[3]), _h - _d(c[4])]);
       } else if (op == 'text') {
         var sz = _d(c[4]);
         var attrs = Cocoa.cls("NSMutableDictionary").dictionary();
@@ -3609,7 +3612,7 @@ void renderDemo(List cmds) {
         if (!f.isNil) attrs.setObject(f, forKey: "NSFont");
         attrs.setObject(_demoColor(c[5], c[6], c[7]), forKey: "NSColor");
         Cocoa.cls("NSString").stringWithString(c[3].toString())
-            .drawAtPoint([_d(c[1]), kDemoH - _d(c[2]) - sz * 1.25],
+            .drawAtPoint([_d(c[1]), _h - _d(c[2]) - sz * 1.25],
                 withAttributes: attrs);
       } else if (op == 'blit') {
         // ['blit', x, y, dw, dh, base64-bmp] — a demos/pixmap.dart Pixmap.
@@ -3627,11 +3630,17 @@ void renderDemo(List cmds) {
         // stack, which the bridge's marshaler does not do: fraction arrived as
         // garbage and the image composited invisibly. One rect fits in
         // registers; whole image, source-over, fraction 1 is what we want.
-        img.drawInRect([_d(c[1]), kDemoH - _d(c[2]) - dh, dw, dh]);
+        img.drawInRect([_d(c[1]), _h - _d(c[2]) - dh, dw, dh]);
       }
     }
-    gDemoImage.unlockFocus();
+    _img.unlockFocus();
   });
+}
+
+/// The Demos-tab canvas: render into gDemoImage, then show it on the Demos tab.
+void renderDemo(List cmds) {
+  if (gDemoImage == null) return;
+  renderInto(gDemoImage, kDemoW, kDemoH, cmds);
   // Off the Demos tab, keep rendering (the demo is live) but skip the window
   // redisplay — no point repainting pixels nobody can see at 30fps.
   if (gTab == 6 && gDemoView != null) {
@@ -3997,6 +4006,8 @@ Map<String, List> gAppListItems = <String, List>{};          // rows of each lis
 Map<String, List<Cocoa>> gAppTabPages = <String, List<Cocoa>>{};  // content view per tab
 Map<String, Cocoa> gAppScrollDoc = <String, Cocoa>{};   // a scroll container's document view
 Map<String, double> gAppScrollH = <String, double>{};   // its content height, for the coord flip
+Map<String, Cocoa> gAppCanvasImg = <String, Cocoa>{};   // a canvas widget's backing NSImage
+Map<String, List> gAppCanvasWH = <String, List>{};      // its [w,h], for renderInto's y-flip
 Cocoa gAppContainer;                  // where adds land now (a tab page/scroll doc), or null = the pane
 double gAppContainerH = 0.0;          // its height for the coord flip (a non-shown tab page reads 0)
 List gAppSpec = <dynamic>[];      // commands since the last clear, for a rebuild
@@ -4109,6 +4120,7 @@ void appApply(List cmds, bool retain) {
     if (retain) gAppSpec.add(c);
     if (op == 'add') appAdd(c[1].toString(), c[2].toString(), c[3]);
     else if (op == 'set') appSet(c[1].toString(), c[2]);
+    else if (op == 'draw') appDraw(c[1].toString(), c[2]);
     else if (op == 'remove') appRemove(c[1].toString());
     else if (op == 'title') {
       if (gAppTitleLbl != null) gAppTitleLbl.setStringValue(c[1].toString());
@@ -4160,6 +4172,8 @@ void appClearViews() {
   gAppTabPages.clear();
   gAppScrollDoc.clear();
   gAppScrollH.clear();
+  gAppCanvasImg.clear();
+  gAppCanvasWH.clear();
   gAppContainer = null;
   gAppContainerH = 0.0;
 }
@@ -4248,6 +4262,20 @@ void appAdd(String kind, String id, Map p) {
           var rows = gAppListItems[id];
           if (rows != null && r >= 0 && r < rows.length) appFire(id, 'select', rows[r].toString());
         })));
+  } else if (kind == 'canvas') {
+    // A drawing surface: an NSImageView backed by its own NSImage. ui.draw(id,
+    // ops) replays the SAME clear/rect/oval/line/text/blit vocabulary the demos
+    // use (renderInto) into that image — charts, diagrams, custom widgets.
+    var cw = frame[2], ch = frame[3];
+    var img = Cocoa.cls("NSImage").alloc().initWithSize([cw, ch]);
+    v = Cocoa.cls("NSImageView").alloc().initWithFrame(frame);
+    v.setImageScaling(3);                        // ProportionallyUpOrDown
+    v.setImage(img);
+    gAppCanvasImg[id] = img;
+    gAppCanvasWH[id] = <dynamic>[cw, ch];
+    if (p['bg'] is List && p['bg'].length >= 3) {   // optional initial fill
+      renderInto(img, cw, ch, <dynamic>[<dynamic>['clear', p['bg'][0], p['bg'][1], p['bg'][2]]]);
+    }
   } else if (kind == 'scroll') {
     // A viewport whose document view can be LARGER than the frame, so an app
     // taller/wider than the pane scrolls. Widgets route into the document view.
@@ -4300,6 +4328,19 @@ void appAdd(String kind, String id, Map p) {
 
 double _appD(var x, double dflt) => (x is num) ? x.toDouble() : dflt;
 
+/// Replay a draw list onto a canvas widget's backing image, then refresh it.
+/// Draw lists ACCUMULATE (there is no implicit clear) — start with a 'clear'
+/// op to wipe, exactly as the demos do.
+void appDraw(String id, List cmds) {
+  var img = gAppCanvasImg[id];
+  if (img == null) return;
+  var wh = gAppCanvasWH[id];
+  renderInto(img, _appD(wh[0], 100.0), _appD(wh[1], 100.0), cmds);
+  var view = gAppViews[id];
+  if (view != null) { view.setImage(img); view.setNeedsDisplay(true); }
+  repaint();
+}
+
 void appSet(String id, Map p) {
   var v = gAppViews[id];
   if (v == null) return;
@@ -4348,6 +4389,8 @@ void appRemove(String id) {
   gAppTabPages.remove(id);
   gAppScrollDoc.remove(id);
   gAppScrollH.remove(id);
+  gAppCanvasImg.remove(id);
+  gAppCanvasWH.remove(id);
 }
 
 /// A widget's current value, as the user would read it.
@@ -4365,7 +4408,7 @@ String appValueOf(String id) {
     var items = gAppListItems[id];
     return (ri >= 0 && items != null && ri < items.length) ? items[ri].toString() : '';
   }
-  if (kind == 'box' || kind == 'tabs' || kind == 'scroll') return '';   // containers have no value
+  if (kind == 'box' || kind == 'tabs' || kind == 'scroll' || kind == 'canvas') return '';
   return v.stringValue().UTF8String();
 }
 

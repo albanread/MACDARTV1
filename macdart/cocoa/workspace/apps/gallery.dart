@@ -2,8 +2,9 @@
 //
 // One of every widget the App pane knows, wired to react — the live reference
 // for what a Dart app can put on its surface. THREE tabs (laid out with the
-// column helper): Inputs (a slider driving a progress bar + readout, a checkbox
-// enabling the button, a popup and password echoing to a status line), Data (a
+// column helper): Inputs (a slider driving a progress bar, a readout, and a
+// custom-drawn canvas bar in the popup's colour; a checkbox enabling the
+// button; a popup and password echoing to a status line), Data (a
 // scrolling list reporting its selection), and Form (a scroll container holding
 // a 12-field form taller than the tab). Everything is one class with a build(ui).
 class Gallery {
@@ -35,12 +36,15 @@ class Gallery {
                                  status(ui, 'armed: ' + on.toString()); });
     label(ui, 'lP', 'Popup', rows[2]);
     ui.popup('pop', items: ['Amber', 'Green', 'Cyan', 'Magenta'], selected: colour,
-             frame: rows[2], onSelect: (c) { colour = c; status(ui, 'colour: ' + c); });
+             frame: rows[2], onSelect: (c) { colour = c; status(ui, 'colour: ' + c); drawCanvas(ui); });
     label(ui, 'lPw', 'Password', rows[3]);
     ui.secure('pw', frame: rows[3],
               onText: (s) => status(ui, 'password: ' + s.length.toString() + ' chars'));
     ui.button('go', title: 'Fire', frame: rows[4], enabled: armed,
               onClick: (_) => status(ui, 'fired at level ' + _pct(level) + ' (' + colour + ')'));
+    // a canvas the slider fills, in the popup's colour — custom drawing beside
+    // the native controls, on the same surface
+    ui.canvas('cv', frame: [12.0, 198.0, 380.0, 40.0], bg: [0.12, 0.12, 0.14]);
 
     // --- tab 1: a scrolling list --------------------------------------------
     ui.tab('tabs', 1);
@@ -73,6 +77,25 @@ class Gallery {
   showLevel(ui) {
     ui.set('bar', value: level);
     ui.set('read', text: _pct(level));
+    drawCanvas(ui);
+  }
+
+  // Custom drawing: wipe, draw a filled bar proportional to level in the
+  // popup's colour, and label it — the same op vocabulary the demos use.
+  drawCanvas(ui) {
+    var rgb = _rgb(colour);
+    ui.draw('cv', [
+      ['clear', 0.12, 0.12, 0.14],
+      ['rect', 6.0, 6.0, (368.0 * level), 28.0, rgb[0], rgb[1], rgb[2], true],
+      ['text', 12.0, 9.0, _pct(level) + '  ' + colour, 15.0, 1.0, 1.0, 1.0],
+    ]);
+  }
+
+  _rgb(String name) {
+    if (name == 'Green') return [0.31, 0.78, 0.47];
+    if (name == 'Cyan') return [0.30, 0.78, 0.86];
+    if (name == 'Magenta') return [0.86, 0.35, 0.70];
+    return [0.94, 0.62, 0.24];               // Amber
   }
 
   status(ui, String s) { ui.set('status', text: s); }

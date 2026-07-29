@@ -18,12 +18,12 @@
 # refused: the vm-service IS the channel the import travels over.
 #
 # Talk to it afterwards:
-#   python3 macdart/tools/stgui_ctl.py doit "st> (1/3) + (1/6)"     -> 1/2
+#   python3 macdart/tcl/stgui_ctl.py doit "st> (1/3) + (1/6)"     -> 1/2
 # or type  st> 3 + 4  straight into the workspace pane.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CTL="$ROOT/macdart/tools/stgui_ctl.py"
+CTL="$ROOT/macdart/tcl/stgui_ctl.py"
 WORLD="$ROOT/macdart/st/world"
 PORT=8181
 REIMPORT=0
@@ -56,7 +56,7 @@ fi
 if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "start-st-gui.sh: something is already listening on 127.0.0.1:$PORT" >&2
   echo "  the workspace is probably already running (quit it, or just talk" >&2
-  echo "  to it: python3 macdart/tools/stgui_ctl.py ping)" >&2
+  echo "  to it: python3 macdart/tcl/stgui_ctl.py ping)" >&2
   exit 1
 fi
 
@@ -95,4 +95,4 @@ fi
 
 echo "ready — try it:"
 echo "  in the workspace pane:  st> (1/3) + (1/6)"
-echo "  from a shell:           python3 macdart/tools/stgui_ctl.py doit \"st> 3 + 4\""
+echo "  from a shell:           python3 macdart/tcl/stgui_ctl.py doit \"st> 3 + 4\""

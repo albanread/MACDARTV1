@@ -573,5 +573,17 @@ loudly). Stages A and C are modest; A is independently shippable.
   see b), become swap; 60k exception/NLR calls correct through the optimizing compiler;
   all prior sprints + Dart + the 86-file corpus unaffected.
   **Next:** the workspace GUI, corpus/base-library breadth, nested-closure-own-local
-  capture, the metaclass tower, resumable-exception protocol (`retry`/`resume` — noted
-  as not reasonably implementable without continuations).
+  capture, the metaclass tower.
+
+  **Resumable exceptions (`resume:`) — deferred by choice, not impossibility.** It does
+  NOT need continuations: the classic implementation calls the handler *before*
+  unwinding (the handler runs on top of the signaling frame; `resume: v` is just the
+  handler returning `v` into the still-live `signal`; termination unwinds afterwards via
+  an NLR-style carrier, so `ensure:` stays exact through Dart `finally`). The cost is a
+  per-isolate **handler registry**: every `on:do:` pushes/pops an entry and every signal
+  walks it — taxing the common path that today rides Dart's zero-overhead-entry
+  try/catch. Not worth it: `resume:` serves the `Warning`/`Notification` branch (ANSI
+  `Error` is non-resumable *by design*), and the corpus measures **zero** demand (107
+  `error:` sites, 1 `on:do:`, 0 `resume:` across all 86 MACVM files). Revisit only if
+  this VM is ever asked to host a fuller ANSI/Pharo-style Smalltalk (Notifications,
+  progress signals, a debugger Proceed button) — the registry design above is the path.

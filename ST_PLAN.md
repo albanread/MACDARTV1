@@ -819,10 +819,22 @@ loudly). Stages A and C are modest; A is independently shippable.
     Strings), String lf / Character lf/tab/cr/space bridged, sourceString
     reads on MAIN, appendTranscript: → workspace Transcript, liveReopen/
     uiDoit short-circuit to success (one VM: the accept IS live).
-  - Later slices: the remaining CocoaUI views (66 V1 browser, 68 editor,
-    69 outliner, 71 help — same recipe), the CocoaUI shell itself as an
-    alternative frontend, pixmap/gamepane mapping onto the dartui game
-    pane.
+  - **Sprint 15a ✓ — UNIFICATION: the Browser tab IS the ST browser.** The
+    doctrine (user's): ONE IDE — dartui is the host; the ST tier adds faces,
+    never rival windows. The workspace's Browser tab embeds CocoaBrowser2
+    cross-isolate (language isolate builds the view, UI isolate parents the
+    raw handle via Cocoa.adoptHandle; auto-embed at boot with retry;
+    re-embed after a language respawn). It EDITS BOTH LANGUAGES — Dart
+    classes get signature-matched member saves and whole-decl accepts
+    through the same checked path (proven: a Dart class created + edited
+    through the ST browser's verbs, live probe answering the edit) — which
+    is the criterion that let it replace the Dart browser. Redirect map:
+    Transcript → workspace pane; browser → Browser tab; do-its → st>
+    prefix; the CocoaUI shell stays retired.
+  - **Next (15b)**: the pixmap/gamepane tier (35/36/37/43) → the DEMOS
+    pane (ST framebuffers blitting into dartui's canvas, not their own
+    windows). Then: 68 editor / 69 outliner as tab faces if wanted; NSM
+    perf; reflection surface.
 
   **Also next:** `Smalltalk at:put:` system-dictionary protocol, Behavior/
   reflection surface (`name`, `superclass`), performance pass on the NSM dispatch

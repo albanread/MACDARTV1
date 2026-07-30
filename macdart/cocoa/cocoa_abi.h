@@ -26,6 +26,8 @@ namespace macdart_cocoa {
 // (0x100 | k) and small-int-struct as (0x200 | n).
 enum {
   TOK_G = 'g', TOK_F = 'f', TOK_V = 'v', TOK_B = 'b', TOK_S = 's', TOK_Q = '?',
+  TOK_SEL = ':',     // SEL — a GPR; a Dart String argument marshals through
+                     // sel_registerName (setAction: 'macvmAction:' just works)
   TOK_CSTR = '*',    // char* — a GPR like 'g', but a Dart String marshals as a
                      // C string (not an NSString), and a char* return -> String.
   TOK_OBJ = '@',     // id / Class — a GPR like 'g' for args, but an OBJECT return

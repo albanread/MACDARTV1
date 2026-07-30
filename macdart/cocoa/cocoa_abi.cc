@@ -15,7 +15,7 @@ struct TI {
   int align = 1;
   int hfa_w = 0;   // homogeneous float member width in bits (32/64), 0 = not HFA
   int hfa_n = 0;   // homogeneous float member count, 0 = not HFA
-  enum { SCALAR, FLOAT, PTR, CSTR, OBJ, AGG, VOID, BITFIELD, UNKNOWN } kind = UNKNOWN;
+  enum { SCALAR, FLOAT, PTR, CSTR, OBJ, SEL, AGG, VOID, BITFIELD, UNKNOWN } kind = UNKNOWN;
 };
 
 int RoundUp(int x, int a) { return a <= 1 ? x : ((x + a - 1) / a) * a; }
@@ -132,6 +132,7 @@ TI ParseType(const char*& p) {
   }
   if (c == '#') { p++; TI t; t.kind = TI::OBJ; t.size = 8; t.align = 8; return t; }  // Class
   if (c == '*') { p++; TI t; t.kind = TI::CSTR; t.size = 8; t.align = 8; return t; }
+  if (c == ':') { p++; TI t; t.kind = TI::SEL; t.size = 8; t.align = 8; return t; }
   if (c == 'v') { p++; TI t; t.kind = TI::VOID; t.size = 0; t.align = 1; return t; }
   if (c == '\0') { TI t; t.kind = TI::UNKNOWN; return t; }
   int sz; bool isf, isp;
@@ -154,6 +155,7 @@ int TokenOf(const TI& t, bool is_ret) {
     case TI::PTR:    return TOK_G;
     case TI::CSTR:   return TOK_CSTR;
     case TI::OBJ:    return TOK_OBJ;
+    case TI::SEL:    return is_ret ? TOK_G : TOK_SEL;
     case TI::BITFIELD: return TOK_G;
     case TI::VOID:   return is_ret ? TOK_V : TOK_Q;
     case TI::UNKNOWN: return is_ret && t.size == 0 ? TOK_Q : TOK_Q;

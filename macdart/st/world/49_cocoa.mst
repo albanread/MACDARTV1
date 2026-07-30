@@ -67,6 +67,7 @@ Object subclass: STCocoa [
     STCocoa class >> utf8: x [ <stprim: stObjcUTF8> ]
     STCocoa class >> poolPush [ <stprim: stObjcPoolPush> ]
     STCocoa class >> poolPop: p [ <stprim: stObjcPoolPop> ]
+    STCocoa class >> actionTargetTicket: t [ <stprim: stObjcActionTarget> ]
 ]
 
 "I am a Smalltalk handle on one Objective-C object, minted only by the

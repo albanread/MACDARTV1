@@ -174,6 +174,22 @@ main(List args, SendPort uiPort) {
   stTranscriptSink = (line) {
     _ui.send(<dynamic>['tr', line.toString()]);
   };
+  // Sprint 13b: the ACTION HOST — AppKit-side trampolines post
+  // [ticket, selector] here (Dart_PostCObject, any thread, fails closed on a
+  // dead port); the world's MacvmDelegate registry dispatches to the ST
+  // receiver. Handler errors land in the Transcript, never unwind the loop.
+  var stActions = new ReceivePort();
+  stActions.listen((msg) {
+    try {
+      if (msg is List && msg.length == 2) {
+        stActionDispatch(msg[0], msg[1].toString());
+      }
+    } catch (e) {
+      _ui.send(<dynamic>['tr', 'action handler error: ' + e.toString()]);
+    }
+  });
+  stActionPort = stActions.sendPort;
+
   _scratch = args[0];
   if (args.length > 1 && args[1] != null && (args[1] as String).length > 0) {
     _db = new Db.open(args[1]);

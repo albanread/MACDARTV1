@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "include/dart_api.h"
+#include "include/dart_native_api.h"
 #include "cocoa_natives.h"
 #include "cocoa_abi.h"
 
@@ -29,6 +30,48 @@ enum { SH_VOID = 0, SH_GPR, SH_FPR, SH_F32, SH_HFA2, SH_HFA4, SH_INTPAIR };
 // ObjC autorelease pool primitives (libobjc).
 extern "C" void* objc_autoreleasePoolPush(void);
 extern "C" void objc_autoreleasePoolPop(void*);
+
+// --- Sprint 13b: the action trampoline (callbacks INTO Smalltalk) ----------
+// An STActionTarget holds a raw Dart port + an integer ticket and NOTHING
+// else (the MACVM C4 contract: no guest object is ever stored ObjC-side).
+// AppKit fires it on the MAIN thread; the IMP posts [ticket, selector] to the
+// language isolate via Dart_PostCObject (thread-safe, non-blocking) and
+// returns — the ST handler runs asynchronously in its own isolate and does
+// its UI work through onMain sends. The three IMPs are the selector family
+// MACVM's world wires (macvmAction:/macvmDoIt:/macvmPrintIt:).
+@interface STActionTarget : NSObject {
+ @public
+  Dart_Port port_;
+  int64_t ticket_;
+}
+@end
+
+static void STPostAction(Dart_Port port, int64_t ticket, const char* sel) {
+  if (port == ILLEGAL_PORT) return;
+  Dart_CObject t, s, msg;
+  t.type = Dart_CObject_kInt64;
+  t.value.as_int64 = ticket;
+  s.type = Dart_CObject_kString;
+  s.value.as_string = const_cast<char*>(sel);
+  Dart_CObject* elems[2] = {&t, &s};
+  msg.type = Dart_CObject_kArray;
+  msg.value.as_array.length = 2;
+  msg.value.as_array.values = elems;
+  Dart_PostCObject(port, &msg);  // a dead port is a no-op — fails closed
+}
+
+@implementation STActionTarget
+- (void)macvmAction:(id)sender {
+  STPostAction(port_, ticket_, "macvmAction:");
+}
+- (void)macvmDoIt:(id)sender {
+  STPostAction(port_, ticket_, "macvmDoIt:");
+}
+- (void)macvmPrintIt:(id)sender {
+  STPostAction(port_, ticket_, "macvmPrintIt:");
+}
+@end
+
 
 namespace dart {
 namespace bin {
@@ -77,6 +120,19 @@ static double DoubleFromDart(Dart_Handle h) {
   if (Dart_IsDouble(h)) { double d = 0; Dart_DoubleValue(h, &d); return d; }
   if (Dart_IsInteger(h)) { int64_t v = 0; Dart_IntegerToInt64(h, &v); return (double)v; }
   return 0.0;
+}
+
+// Cocoa_makeActionTarget(SendPort, int ticket) -> a wrapped, owned target.
+static Dart_Handle WrapObject(id obj, const char* sel, bool pre_owned);
+static void Cocoa_makeActionTarget(Dart_NativeArguments args) {
+  Dart_Port port = ILLEGAL_PORT;
+  Dart_SendPortGetId(Dart_GetNativeArgument(args, 0), &port);
+  int64_t ticket = IntArg(args, 1);
+  STActionTarget* t = [[STActionTarget alloc] init];
+  t->port_ = port;
+  t->ticket_ = ticket;
+  // "new" family: the alloc ref IS the wrapper's owned ref (no extra retain).
+  Dart_SetReturnValue(args, WrapObject(t, "newActionTarget", false));
 }
 
 // --- object wrapping: retain-on-wrap + release-on-GC finalizer -------------
@@ -261,6 +317,13 @@ static void CocoaSendCommon(Dart_NativeArguments args, bool on_main) {
     using namespace macdart_cocoa;
     if (tok == TOK_F) {
       if (fi < 8) fpr[fi++] = DoubleFromDart(el);
+    } else if (tok == TOK_SEL) {         // SEL: a Dart String names the selector
+      if (Dart_IsString(el)) {
+        const char* c = NULL; Dart_StringToCString(el, &c);
+        if (gi < 6) gpr[gi++] = (uint64_t)sel_registerName(c ? c : "");
+      } else if (gi < 6) {
+        gpr[gi++] = GprFromDart(el);     // already a SEL-as-int
+      }
     } else if (tok == TOK_CSTR) {        // char*: Dart String -> raw C string
       if (Dart_IsString(el)) {
         const char* c = NULL; Dart_StringToCString(el, &c);
@@ -643,6 +706,7 @@ static void Cocoa_sendMain(Dart_NativeArguments args) {
   V(Cocoa_nsStringUtf8, 1)                                                     \
   V(Cocoa_send, 3)                                                             \
   V(Cocoa_sendMain, 3)                                                         \
+  V(Cocoa_makeActionTarget, 2)                                                 \
   V(Cocoa_getClass, 1)                                                         \
   V(Cocoa_classExists, 1)                                                      \
   V(Cocoa_selectorInfo, 2)                                                     \

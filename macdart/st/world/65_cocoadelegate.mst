@@ -62,9 +62,17 @@ Object subclass: MacvmDelegate [
      on the main thread (CG4 Workspace ⌘D/⌘P) — the receiver implements those."
     MacvmDelegate class >> actionTargetOn: aReceiver [ ^self on: aReceiver role: #action ]
 
+    "MACDART binding: the #action role mints an STActionTarget — an ObjC
+     object holding ONLY (port, ticket), whose macvmAction:/macvmDoIt:/
+     macvmPrintIt: IMPs post [ticket, selector] to the language isolate
+     ASYNCHRONOUSLY (fire-and-forget; the handler's UI work goes back
+     through onMain). The synchronous data-source roles (#table/#outline/
+     #window/#text — a callback that must RETURN a value to AppKit) are not
+     yet bound; they need the sync reverse hop (design §4 Layer C6)."
     MacvmDelegate class >> primNewDelegate: aRole ticket: ticket [
-        <primitive: 249>
-        ^self error: 'delegate creation failed (unknown role, or ObjC registration failed)'
+        aRole = #action ifTrue: [
+            ^ObjcRef onHandle: (STCocoa actionTargetTicket: ticket) ].
+        ^self error: 'delegate role not yet bound on MACDART: ' , aRole printString
     ]
 
     "Called BY the Rust IMP (a top-level VM entry) to run a delegate callback

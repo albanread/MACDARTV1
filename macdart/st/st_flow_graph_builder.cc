@@ -83,6 +83,8 @@ static const HelperRewrite kHelperRewrites[] = {
     {"rounded", "stRounded", 0},   {"floor", "stFloorU", 0},
     {"ceiling", "stCeilingU", 0},  {"negated", "stNegated", 0},
     {"sqrt", "stSqrt", 0},
+    {"perform:", "stPerform1", 1},
+    {"perform:withArguments:", "stPerform2", 2},
 };
 static const HelperRewrite* FindHelperRewrite(const std::string& sel,
                                               size_t argc) {

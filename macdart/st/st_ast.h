@@ -22,6 +22,7 @@ namespace st {
 struct SrcPos {
   int line = 0;
   int col = 0;
+  int offset = 0;    // absolute byte offset into the source (debug info)
 };
 
 // ---------------------------------------------------------------------------
@@ -128,6 +129,7 @@ struct MethodNode : Node {
   std::vector<Pragma> pragmas;
   std::vector<std::string> temps;
   std::vector<NodePtr> statements;
+  int end_offset = 0;          // byte offset just past the closing ']' (debug)
 };
 
 // Instance-variable declaration block: `| a b |` inside a class body.

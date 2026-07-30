@@ -287,6 +287,7 @@ bool Lexer::Tokenize(std::vector<Token>* tokens, LexError* err) {
 
     int c = Peek();
     int line = line_, col = col_;
+    int off = static_cast<int>(idx_);   // token start offset (debug info)
 
     // Numbers. A leading '-' is a negative number literal only when a digit
     // follows; otherwise '-' is a binary selector. This is the classic
@@ -295,6 +296,7 @@ bool Lexer::Tokenize(std::vector<Token>* tokens, LexError* err) {
       bool nerr = false;
       Token t = MakeNumber(&nerr, err);
       if (nerr) return false;
+      t.offset = off;
       tokens->push_back(t);
       continue;
     }
@@ -303,6 +305,7 @@ bool Lexer::Tokenize(std::vector<Token>* tokens, LexError* err) {
       bool serr = false;
       Token t = MakeString(&serr, err);
       if (serr) return false;
+      t.offset = off;
       tokens->push_back(t);
       continue;
     }
@@ -311,17 +314,22 @@ bool Lexer::Tokenize(std::vector<Token>* tokens, LexError* err) {
       bool yerr = false;
       Token t = MakeSymbol(&yerr, err);
       if (yerr) return false;
+      t.offset = off;
       tokens->push_back(t);
       continue;
     }
 
     if (c == '$') {
-      tokens->push_back(MakeCharOrDollar());
+      Token t = MakeCharOrDollar();
+      t.offset = off;
+      tokens->push_back(t);
       continue;
     }
 
     if (IsIdentStart(c)) {
-      tokens->push_back(MakeIdentOrKeyword());
+      Token t = MakeIdentOrKeyword();
+      t.offset = off;
+      tokens->push_back(t);
       continue;
     }
 
@@ -331,6 +339,7 @@ bool Lexer::Tokenize(std::vector<Token>* tokens, LexError* err) {
       Token t;
       t.line = line;
       t.col = col;
+      t.offset = off;
       if (Peek() == '=') {
         Advance();
         t.kind = Tok::kAssign;
@@ -351,6 +360,7 @@ bool Lexer::Tokenize(std::vector<Token>* tokens, LexError* err) {
       t.text = txt;
       t.line = line;
       t.col = col;
+      t.offset = off;
       tokens->push_back(t);
     };
 
@@ -374,7 +384,7 @@ bool Lexer::Tokenize(std::vector<Token>* tokens, LexError* err) {
     // terminator vs. the binary operator).
     if (c == '|') {
       if (IsBinaryChar(Peek(1))) {
-        tokens->push_back(MakeBinary());
+        Token t = MakeBinary(); t.offset = off; tokens->push_back(t);
       } else {
         push1(Tok::kBar, "|");
       }
@@ -382,7 +392,7 @@ bool Lexer::Tokenize(std::vector<Token>* tokens, LexError* err) {
     }
 
     if (IsBinaryChar(c)) {
-      tokens->push_back(MakeBinary());
+      Token t = MakeBinary(); t.offset = off; tokens->push_back(t);
       continue;
     }
 

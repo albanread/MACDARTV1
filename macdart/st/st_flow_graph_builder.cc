@@ -414,7 +414,7 @@ class StGraphBuilder {
     ArgumentArray arguments = GetArguments(argument_count);
     const intptr_t kTypeArgsLen = 0;
     InstanceCallInstr* call = new (zone_)
-        InstanceCallInstr(TokenPosition::kNoSource, name, kind, arguments,
+        InstanceCallInstr(cur_pos_, name, kind, arguments,
                           kTypeArgsLen, Array::null_array(), num_args_checked,
                           ic_data_array_);
     Push(call);
@@ -423,7 +423,7 @@ class StGraphBuilder {
   Fragment StaticCall(const Function& target, intptr_t argument_count) {
     ArgumentArray arguments = GetArguments(argument_count);
     StaticCallInstr* call = new (zone_) StaticCallInstr(
-        TokenPosition::kNoSource, target, /*type_args_len=*/0,
+        cur_pos_, target, /*type_args_len=*/0,
         Array::null_array(), arguments, ic_data_array_);
     Push(call);
     return Fragment(call);
@@ -459,13 +459,13 @@ class StGraphBuilder {
   }
   Fragment CheckStackOverflow() {
     return Fragment(
-        new (zone_) CheckStackOverflowInstr(TokenPosition::kNoSource, 0));
+        new (zone_) CheckStackOverflowInstr(cur_pos_, 0));
   }
   Fragment Return() {
     Value* value = Pop();
     ASSERT(stack_ == NULL);
     ReturnInstr* return_instr =
-        new (zone_) ReturnInstr(TokenPosition::kNoSource, value);
+        new (zone_) ReturnInstr(cur_pos_, value);
     // Inlining: register every return with the exit collector so the inliner
     // can rewrite it into a goto to the continuation (identical to
     // kernel_to_il.cc's Return). NULL when compiling normally.
@@ -616,6 +616,7 @@ class StGraphBuilder {
   const ZoneGrowableArray<const ICData*>& ic_data_array_;
   intptr_t osr_id_;
   InlineExitCollector* exit_collector_;  // non-NULL when inlining this callee
+  TokenPosition cur_pos_ = TokenPosition::kNoSource;  // current stmt's source pos
   intptr_t next_block_id_;
   Value* stack_;
   intptr_t pending_argument_count_;
@@ -2304,6 +2305,12 @@ FlowGraph* StGraphBuilder::BuildClosure(BlockNode* block) {
 }
 
 Fragment StGraphBuilder::TranslateStatement(Node* node) {
+  // Sprint 16: this statement's source offset becomes the token position of the
+  // instructions it emits (calls, checks, returns) — the debugger's breakpoint
+  // map. A `0` offset (synthesized node) leaves the prior position in place.
+  if (node != nullptr && node->pos.offset > 0) {
+    cur_pos_ = TokenPosition(node->pos.offset);
+  }
   if (ReturnNode* r = dynamic_cast<ReturnNode*>(node)) {
     if (in_closure_) {
       // Stage C: `^` under a first-class closure is a NON-LOCAL return from
@@ -2409,6 +2416,10 @@ FlowGraph* StGraphBuilder::Build(MethodNode* method) {
     return new (zone_) FlowGraph(*pf_, graph_entry_, next_block_id_ - 1);
   }
 
+  // Sprint 16: the entry stack-check carries the method's opening position, so
+  // a breakpoint on the method's signature line (or "pause on entry") lands
+  // before the first statement runs.
+  if (method->pos.offset > 0) cur_pos_ = TokenPosition(method->pos.offset);
   Fragment body;
   body += CheckStackOverflow();
 

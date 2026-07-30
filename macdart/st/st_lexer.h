@@ -41,6 +41,7 @@ struct Token {
   std::string text;  // canonical text/value (see per-kind notes above)
   int line = 0;
   int col = 0;
+  int offset = 0;    // absolute byte offset of the token start (debug info)
 };
 
 // A lexer error carries a location and a message; the parser turns this into

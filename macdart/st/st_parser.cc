@@ -8,6 +8,9 @@ namespace st {
 
 namespace {
 
+// SrcPos from a token, carrying its absolute byte offset (Sprint 16 debug).
+static inline SrcPos PosOf(const Token& t) { return {t.line, t.col, t.offset}; }
+
 // Renders a token back to an approximate source form, used only for
 // reconstructing raw pragma text (Sprint 0 does not interpret pragmas).
 std::string TokenToSource(const Token& t) {
@@ -82,7 +85,7 @@ void Parser::Fail(const Token& at, const std::string& msg) {
 
 std::unique_ptr<ProgramNode> Parser::ParseProgram(ParseError* err) {
   auto prog = std::make_unique<ProgramNode>();
-  prog->pos = {Cur().line, Cur().col};
+  prog->pos = PosOf(Cur());
   while (!Is(Tok::kEof) && !failed()) {
     NodePtr item = ParseTopLevelItem();
     if (failed()) break;
@@ -104,7 +107,7 @@ NodePtr Parser::ParseTopLevelItem() {
   // statements (the loader folds them into STMain>>main's temps).
   if (Is(Tok::kBar)) {
     auto d = std::make_unique<VarDeclNode>();
-    d->pos = {Cur().line, Cur().col};
+    d->pos = PosOf(Cur());
     ParseTempsOpt(&d->names);
     return d;
   }
@@ -118,7 +121,7 @@ NodePtr Parser::ParseTopLevelItem() {
       auto m = ParseMethod(/*is_class_side=*/false);
       if (failed()) return nullptr;
       auto e = std::make_unique<ExtMethodNode>();
-      e->pos = {cls.line, cls.col};
+      e->pos = PosOf(cls);
       e->class_name = cls.text;
       e->method = std::move(m);
       return e;
@@ -133,7 +136,7 @@ NodePtr Parser::ParseTopLevelItem() {
         auto m = ParseMethod(/*is_class_side=*/true);
         if (failed()) return nullptr;
         auto e = std::make_unique<ExtMethodNode>();
-        e->pos = {cls.line, cls.col};
+        e->pos = PosOf(cls);
         e->class_name = cls.text;
         e->method = std::move(m);
         return e;
@@ -143,7 +146,7 @@ NodePtr Parser::ParseTopLevelItem() {
         Take();              // class
         Take();              // extend
         auto e = std::make_unique<ExtendNode>();
-        e->pos = {cls.line, cls.col};
+        e->pos = PosOf(cls);
         e->class_name = cls.text;
         e->is_class_side = true;
         Expect(Tok::kLBracket, "'[' to open extend body");
@@ -157,7 +160,7 @@ NodePtr Parser::ParseTopLevelItem() {
       Token cls = Take();  // class name
       Take();              // extend
       auto e = std::make_unique<ExtendNode>();
-      e->pos = {cls.line, cls.col};
+      e->pos = PosOf(cls);
       e->class_name = cls.text;
       e->is_class_side = false;
       Expect(Tok::kLBracket, "'[' to open extend body");
@@ -201,7 +204,7 @@ NodePtr Parser::ParseTopLevelItem() {
 std::unique_ptr<ClassDefNode> Parser::ParseClassDef(
     const std::string& super_name, const Token& start) {
   auto cd = std::make_unique<ClassDefNode>();
-  cd->pos = {start.line, start.col};
+  cd->pos = PosOf(start);
   cd->superclass = super_name;
   Expect(Tok::kLBracket, "'[' to open class body");
   ParseClassBody(&cd->pragmas, &cd->ivars, &cd->methods);
@@ -231,7 +234,7 @@ void Parser::ParseClassBody(
     if (Is(Tok::kBar)) {
       Token bar = Take();
       auto vd = std::make_unique<VarDeclNode>();
-      vd->pos = {bar.line, bar.col};
+      vd->pos = PosOf(bar);
       while (Is(Tok::kIdent)) {
         vd->names.push_back(Take().text);
         SkipTypeAnnotationOpt();  // optional `<Type>` after an ivar name
@@ -267,7 +270,7 @@ void Parser::ParseClassBody(
 
 std::unique_ptr<MethodNode> Parser::ParseMethod(bool is_class_side) {
   auto m = std::make_unique<MethodNode>();
-  m->pos = {Cur().line, Cur().col};
+  m->pos = PosOf(Cur());
   m->is_class_side = is_class_side;
   ParseMethodPattern(m.get());
   if (failed()) return m;
@@ -286,6 +289,7 @@ std::unique_ptr<MethodNode> Parser::ParseMethod(bool is_class_side) {
     break;
   }
   ParseStatements(&m->statements, Tok::kRBracket);
+  m->end_offset = Cur().offset + 1;  // the ']' (Cur before Expect consumes it)
   Expect(Tok::kRBracket, "']' to close method body");
   return m;
 }
@@ -348,7 +352,7 @@ bool Parser::SkipTypeAnnotationOpt() {
 Pragma Parser::ParsePragma() {
   Pragma p;
   Token open = Take();  // '<'
-  p.pos = {open.line, open.col};
+  p.pos = PosOf(open);
   std::string text;
   bool first = true;
   while (!Is(Tok::kEof) && !Is(Tok::kRBracket)) {
@@ -394,7 +398,7 @@ NodePtr Parser::ParseStatement() {
   if (Is(Tok::kCaret)) {
     Token caret = Take();
     auto r = std::make_unique<ReturnNode>();
-    r->pos = {caret.line, caret.col};
+    r->pos = PosOf(caret);
     r->value = ParseExpression();
     return r;
   }
@@ -407,7 +411,7 @@ NodePtr Parser::ParseExpression() {
     Token name = Take();
     Take();  // :=
     auto a = std::make_unique<AssignNode>();
-    a->pos = {name.line, name.col};
+    a->pos = PosOf(name);
     a->name = name.text;
     a->value = ParseExpression();
     return a;
@@ -440,7 +444,7 @@ NodePtr Parser::ParseCascadeOrKeyword() {
 
   while (Accept(Tok::kSemi) && !failed()) {
     auto cm = std::make_unique<MessageNode>();
-    cm->pos = {Cur().line, Cur().col};
+    cm->pos = PosOf(Cur());
     if (Is(Tok::kKeyword)) {
       cm->kind = MessageNode::Kind::kKeyword;
       std::string sel;
@@ -528,7 +532,7 @@ NodePtr Parser::ParsePrimary() {
       Token t = Take();
       if (IsPseudoLiteral(t.text)) {
         auto lit = std::make_unique<LiteralNode>();
-        lit->pos = {t.line, t.col};
+        lit->pos = PosOf(t);
         lit->kind = t.text == "nil"    ? LiteralNode::Kind::kNil
                     : t.text == "true" ? LiteralNode::Kind::kTrue
                                        : LiteralNode::Kind::kFalse;
@@ -536,7 +540,7 @@ NodePtr Parser::ParsePrimary() {
         return lit;
       }
       auto v = std::make_unique<VariableNode>();
-      v->pos = {t.line, t.col};
+      v->pos = PosOf(t);
       v->name = t.text;  // includes self / super / thisContext
       return v;
     }
@@ -559,7 +563,7 @@ NodePtr Parser::ParsePrimary() {
 NodePtr Parser::ParseBlock() {
   Token open = Take();  // '['
   auto b = std::make_unique<BlockNode>();
-  b->pos = {open.line, open.col};
+  b->pos = PosOf(open);
   // Block arguments: (:name)*
   bool had_args = false;
   while (Is(Tok::kColon)) {
@@ -583,7 +587,7 @@ NodePtr Parser::ParseBlock() {
 NodePtr Parser::ParseDynArray() {
   Token open = Take();  // '{'
   auto arr = std::make_unique<DynArrayNode>();
-  arr->pos = {open.line, open.col};
+  arr->pos = PosOf(open);
   while (!Is(Tok::kRBrace) && !Is(Tok::kEof) && !failed()) {
     arr->elements.push_back(ParseExpression());
     if (!Accept(Tok::kDot)) break;
@@ -604,7 +608,7 @@ NodePtr Parser::ParseLiteral() {
     case Tok::kInt: {
       Take();
       auto lit = std::make_unique<LiteralNode>();
-      lit->pos = {t.line, t.col};
+      lit->pos = PosOf(t);
       lit->kind = LiteralNode::Kind::kInt;
       lit->text = t.text;
       return lit;
@@ -612,7 +616,7 @@ NodePtr Parser::ParseLiteral() {
     case Tok::kFloat: {
       Take();
       auto lit = std::make_unique<LiteralNode>();
-      lit->pos = {t.line, t.col};
+      lit->pos = PosOf(t);
       lit->kind = LiteralNode::Kind::kFloat;
       lit->text = t.text;
       return lit;
@@ -620,7 +624,7 @@ NodePtr Parser::ParseLiteral() {
     case Tok::kString: {
       Take();
       auto lit = std::make_unique<LiteralNode>();
-      lit->pos = {t.line, t.col};
+      lit->pos = PosOf(t);
       lit->kind = LiteralNode::Kind::kString;
       lit->text = t.text;
       return lit;
@@ -628,7 +632,7 @@ NodePtr Parser::ParseLiteral() {
     case Tok::kSymbol: {
       Take();
       auto lit = std::make_unique<LiteralNode>();
-      lit->pos = {t.line, t.col};
+      lit->pos = PosOf(t);
       lit->kind = LiteralNode::Kind::kSymbol;
       lit->text = t.text;
       return lit;
@@ -636,7 +640,7 @@ NodePtr Parser::ParseLiteral() {
     case Tok::kChar: {
       Take();
       auto lit = std::make_unique<LiteralNode>();
-      lit->pos = {t.line, t.col};
+      lit->pos = PosOf(t);
       lit->kind = LiteralNode::Kind::kChar;
       lit->text = t.text;
       return lit;
@@ -654,7 +658,7 @@ NodePtr Parser::ParseLiteral() {
 NodePtr Parser::ParseLiteralArray() {
   Token open = Take();  // '#('
   auto arr = std::make_unique<LiteralNode>();
-  arr->pos = {open.line, open.col};
+  arr->pos = PosOf(open);
   arr->kind = LiteralNode::Kind::kArray;
   while (!Is(Tok::kRParen) && !Is(Tok::kEof) && !failed()) {
     arr->elements.push_back(ParseNestedArrayElement());
@@ -677,7 +681,7 @@ NodePtr Parser::ParseNestedArrayElement() {
       // the corresponding literal objects.
       Take();
       auto lit = std::make_unique<LiteralNode>();
-      lit->pos = {t.line, t.col};
+      lit->pos = PosOf(t);
       if (t.text == "nil") {
         lit->kind = LiteralNode::Kind::kNil;
       } else if (t.text == "true") {
@@ -695,7 +699,7 @@ NodePtr Parser::ParseNestedArrayElement() {
     case Tok::kBar: {
       Take();
       auto lit = std::make_unique<LiteralNode>();
-      lit->pos = {t.line, t.col};
+      lit->pos = PosOf(t);
       lit->kind = LiteralNode::Kind::kSymbol;
       lit->text = t.text;
       return lit;
@@ -704,7 +708,7 @@ NodePtr Parser::ParseNestedArrayElement() {
       // Nested array uses bare parens inside a literal array.
       Take();  // '('
       auto arr = std::make_unique<LiteralNode>();
-      arr->pos = {t.line, t.col};
+      arr->pos = PosOf(t);
       arr->kind = LiteralNode::Kind::kArray;
       while (!Is(Tok::kRParen) && !Is(Tok::kEof) && !failed()) {
         arr->elements.push_back(ParseNestedArrayElement());
@@ -725,7 +729,7 @@ NodePtr Parser::ParseNestedArrayElement() {
 NodePtr Parser::ParseByteArray() {
   Token open = Take();  // '#['
   auto arr = std::make_unique<LiteralNode>();
-  arr->pos = {open.line, open.col};
+  arr->pos = PosOf(open);
   arr->kind = LiteralNode::Kind::kByteArray;
   while (!Is(Tok::kRBracket) && !Is(Tok::kEof) && !failed()) {
     if (!Is(Tok::kInt)) {
@@ -734,7 +738,7 @@ NodePtr Parser::ParseByteArray() {
     }
     Token b = Take();
     auto lit = std::make_unique<LiteralNode>();
-    lit->pos = {b.line, b.col};
+    lit->pos = PosOf(b);
     lit->kind = LiteralNode::Kind::kInt;
     lit->text = b.text;
     arr->elements.push_back(std::move(lit));

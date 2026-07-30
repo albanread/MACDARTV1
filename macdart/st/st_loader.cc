@@ -369,11 +369,21 @@ dart::RawFunction* MakeStFunction(dart::Thread* thread,
   // method name and keeps `signal` vs `signal:` distinct on one class.
   const String& sel = String::Handle(
       zone, Symbols::New(thread, MangleSelector(m->selector).c_str()));
+  // Sprint 16: the method's source span [start, end] — the debugger maps a
+  // breakpoint line to a Function whose token range contains that line's byte
+  // offsets. `pos.offset`/`end_offset` are 0 for synthesized methods (STMain),
+  // which correctly keep kNoSource and stay undebuggable.
+  const TokenPosition start_pos = m->pos.offset > 0
+                                      ? TokenPosition(m->pos.offset)
+                                      : TokenPosition::kNoSource;
   const Function& fn = Function::Handle(
       zone, Function::New(sel, RawFunction::kRegularFunction, is_static,
                           /*is_const=*/false, /*is_abstract=*/false,
                           /*is_external=*/false, /*is_native=*/false, owner,
-                          TokenPosition::kNoSource, Heap::kOld));
+                          start_pos, Heap::kOld));
+  if (m->end_offset > 0) {
+    fn.set_end_token_pos(TokenPosition(m->end_offset));
+  }
   fn.set_result_type(Object::dynamic_type());
   // Every ST method has an implicit parameter 0: instance methods take the
   // receiver (`this`); class-side methods take the RECEIVING CLASS (Sprint 11
@@ -609,8 +619,25 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
 
   // One Script backs every class/function in this load (a non-null script keeps
   // Function::IsOptimizable from mistaking these for test functions).
+  // Sprint 16: a KERNEL-tag script + a line_starts table (byte offset of each
+  // line's start) gives source-level debugging its map — TokenRangeAtLine and
+  // GetTokenLine resolve .mst lines from the byte offsets our IL now stamps,
+  // with no TokenStream. (The kind is on the SCRIPT; function optimization,
+  // keyed on the Function, is unchanged.)
   const Script& script = Script::Handle(
-      zone, Script::New(url, src, RawScript::kScriptTag));
+      zone, Script::New(url, src, RawScript::kKernelTag));
+  {
+    const GrowableObjectArray& starts =
+        GrowableObjectArray::Handle(zone, GrowableObjectArray::New());
+    starts.Add(Smi::Handle(zone, Smi::New(0)));  // line 1 starts at offset 0
+    for (intptr_t i = 0; i < static_cast<intptr_t>(source.size()); i++) {
+      if (source[i] == '\n') {
+        starts.Add(Smi::Handle(zone, Smi::New(i + 1)));
+      }
+    }
+    script.set_line_starts(Array::Handle(zone, Array::MakeArray(starts)));
+    script.SetLocationOffset(0, 0);
+  }
 
   // Toplevel class holder (kernel_reader always makes one; library consumers
   // assume library.toplevel_class() is non-null).

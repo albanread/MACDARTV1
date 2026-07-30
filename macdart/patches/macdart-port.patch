@@ -515,55 +515,6 @@
    // Perform platform specific initialization.
    if (!Platform::Initialize()) {
      Log::PrintErr("Initialization failed\n");
---- a/runtime/vm/compiler.cc	2026-07-25 09:31:56.962975982 +0100
-+++ b/runtime/vm/compiler.cc	2026-07-30 13:13:59.625742054 +0100
-@@ -45,6 +45,21 @@
- #include "vm/timeline.h"
- #include "vm/timer.h"
- 
-+// MACDART: the Smalltalk (.mst) IL builder (macdart/st/st_flow_graph_builder.cc,
-+// tracked outside the gitignored runtime tree). ST-marked functions route here
-+// instead of the dormant kernel builder — see BuildFlowGraph below and
-+// ST_PLAN.md Sprint 3. Declared at file scope; compiler.cc is `namespace dart`.
-+namespace st {
-+::dart::FlowGraph* BuildGraph(
-+    ::dart::ParsedFunction*,
-+    const ::dart::ZoneGrowableArray<const ::dart::ICData*>&,
-+    intptr_t);
-+// Scope-only prep for the ST var-descriptor path (ComputeLocalVarDescriptors):
-+// route an ST method here instead of the kernel ScopeBuilder, which segvs on
-+// the ST marker (the profiler/GC/debugger walking an unoptimized ST frame).
-+void PrepareScopes(::dart::ParsedFunction*);
-+}  // namespace st
-+
- namespace dart {
- 
- DEFINE_FLAG(bool,
-@@ -135,6 +150,13 @@
-     const ZoneGrowableArray<const ICData*>& ic_data_array,
-     intptr_t osr_id) {
-   if (UseKernelFrontEndFor(parsed_function)) {
-+    // MACDART: an ST-marked function carries a non-NULL kernel_function_ slot
-+    // (reused as the Smalltalk marker, ST_PLAN.md §2.2). The noSuchMethod /
-+    // invokeField dispatcher kinds also reach here but with a NULL marker and
-+    // stay on the kernel builder below.
-+    if (parsed_function->function().kernel_function() != NULL) {
-+      return st::BuildGraph(parsed_function, ic_data_array, osr_id);
-+    }
-     kernel::TreeNode* node = static_cast<kernel::TreeNode*>(
-         parsed_function->function().kernel_function());
-     kernel::FlowGraphBuilder builder(node, parsed_function, ic_data_array, NULL,
-@@ -1593,7 +1615,9 @@
-       Parser::ParseFunction(parsed_function);
-       parsed_function->AllocateVariables();
-     } else {
--      parsed_function->EnsureKernelScopes();
-+      // MACDART: the marker is an st::Node (V1 has no real kernel), so the
-+      // kernel ScopeBuilder would segv on it. Route to the ST scope builder.
-+      ::st::PrepareScopes(parsed_function);
-     }
-     const LocalVarDescriptors& var_descs = LocalVarDescriptors::Handle(
-         parsed_function->node_sequence()->scope()->GetVarDescriptors(function));
 --- a/runtime/vm/flow_graph_inliner.cc	2026-07-25 09:31:56.971461723 +0100
 +++ b/runtime/vm/flow_graph_inliner.cc	2026-07-30 17:17:34.854423019 +0100
 @@ -23,6 +23,17 @@
@@ -625,23 +576,126 @@
        }
  
 --- a/runtime/vm/object.cc	2026-07-25 09:31:56.984713441 +0100
-+++ b/runtime/vm/object.cc	2026-07-30 19:25:14.201143622 +0100
-@@ -9525,6 +9525,18 @@
-   ASSERT(first_token_index != NULL && last_token_index != NULL);
++++ b/runtime/vm/object.cc	2026-07-30 20:18:15.928847000 +0100
+@@ -9526,6 +9526,11 @@
    ASSERT(line_number > 0);
  
-+  // MACDART: an ST script (st:mst/N) has NO TokenStream — the walk below
-+  // segv'd the whole GUI when the debugger resolved a breakpoint line
-+  // (AddBreakpoint -> BreakpointLocationAtLineCol -> here). Answer "no
-+  // tokens on this line" instead; the service replies with a clean
-+  // kCannotAddBreakpoint error. (Source-level ST breakpoints are the
-+  // ST-debugging sprint: real token positions + a line-starts table.)
+   if (kind() == RawScript::kKernelTag) {
++    // MACDART: ST scripts (st:mst/N) are kernel-tagged with a line_starts
++    // table (Sprint 16) — TokenPositions are byte offsets, and this branch
++    // maps a line to its offset range with no TokenStream. This MUST run
++    // before the TokenStream guard below (which is what makes source-level
++    // ST breakpoints resolve).
+     const Array& line_starts_array = Array::Handle(line_starts());
+     if (line_starts_array.IsNull()) {
+       // Scripts in the AOT snapshot do not have a line starts array.
+@@ -9533,7 +9538,12 @@
+       *last_token_index = TokenPosition::kNoSource;
+       return;
+     }
+-    ASSERT(line_starts_array.Length() >= line_number);
++    if (line_starts_array.Length() < line_number) {
++      // A line past the end of the source (an over-eager IDE request).
++      *first_token_index = TokenPosition::kNoSource;
++      *last_token_index = TokenPosition::kNoSource;
++      return;
++    }
+     Smi& value = Smi::Handle();
+     value ^= line_starts_array.At(line_number - 1);
+     *first_token_index = TokenPosition(value.Value());
+@@ -9547,6 +9557,15 @@
+     return;
+   }
+ 
++  // MACDART: a non-kernel script with no TokenStream (should not happen for ST
++  // now that they are kernel-tagged, but keep the guard — the TokenStream walk
++  // below dereferences null and segv'd the GUI before).
 +  if (tokens() == TokenStream::null()) {
 +    *first_token_index = TokenPosition::kNoSource;
 +    *last_token_index = TokenPosition::kNoSource;
 +    return;
 +  }
 +
-   if (kind() == RawScript::kKernelTag) {
-     const Array& line_starts_array = Array::Handle(line_starts());
-     if (line_starts_array.IsNull()) {
+   Zone* zone = Thread::Current()->zone();
+   *first_token_index = TokenPosition::kNoSource;
+   *last_token_index = TokenPosition::kNoSource;
+--- a/runtime/vm/compiler.cc	2026-07-25 09:31:56.962975982 +0100
++++ b/runtime/vm/compiler.cc	2026-07-30 20:20:51.599885000 +0100
+@@ -45,6 +45,21 @@
+ #include "vm/timeline.h"
+ #include "vm/timer.h"
+ 
++// MACDART: the Smalltalk (.mst) IL builder (macdart/st/st_flow_graph_builder.cc,
++// tracked outside the gitignored runtime tree). ST-marked functions route here
++// instead of the dormant kernel builder — see BuildFlowGraph below and
++// ST_PLAN.md Sprint 3. Declared at file scope; compiler.cc is `namespace dart`.
++namespace st {
++::dart::FlowGraph* BuildGraph(
++    ::dart::ParsedFunction*,
++    const ::dart::ZoneGrowableArray<const ::dart::ICData*>&,
++    intptr_t);
++// Scope-only prep for the ST var-descriptor path (ComputeLocalVarDescriptors):
++// route an ST method here instead of the kernel ScopeBuilder, which segvs on
++// the ST marker (the profiler/GC/debugger walking an unoptimized ST frame).
++void PrepareScopes(::dart::ParsedFunction*);
++}  // namespace st
++
+ namespace dart {
+ 
+ DEFINE_FLAG(bool,
+@@ -135,6 +150,13 @@
+     const ZoneGrowableArray<const ICData*>& ic_data_array,
+     intptr_t osr_id) {
+   if (UseKernelFrontEndFor(parsed_function)) {
++    // MACDART: an ST-marked function carries a non-NULL kernel_function_ slot
++    // (reused as the Smalltalk marker, ST_PLAN.md §2.2). The noSuchMethod /
++    // invokeField dispatcher kinds also reach here but with a NULL marker and
++    // stay on the kernel builder below.
++    if (parsed_function->function().kernel_function() != NULL) {
++      return st::BuildGraph(parsed_function, ic_data_array, osr_id);
++    }
+     kernel::TreeNode* node = static_cast<kernel::TreeNode*>(
+         parsed_function->function().kernel_function());
+     kernel::FlowGraphBuilder builder(node, parsed_function, ic_data_array, NULL,
+@@ -369,6 +391,30 @@
+   if (cls.is_marked_for_parsing()) {
+     return Error::null();
+   }
++  // MACDART: an ST class (st:mst / st:prelude library) has NO Dart source —
++  // routing it to the Parser segv's (no TokenStream). This path is reached by
++  // the DEBUGGER's FindBestFit -> EnsureIsFinalized when resolving a
++  // breakpoint. Finalize it directly via the loader's ClassFinalizer path,
++  // exactly like a typedef class does below.
++  {
++    const Library& lib = Library::Handle(cls.library());
++    if (!lib.IsNull()) {
++      const String& url = String::Handle(lib.url());
++      if (url.StartsWith(String::Handle(String::New("st:")))) {
++        LongJumpScope jump;
++        if (setjmp(*jump.Set()) == 0) {
++          ClassFinalizer::FinalizeClass(cls);
++          return Error::null();
++        } else {
++          Thread* thread = Thread::Current();
++          Error& error = Error::Handle(thread->zone());
++          error = thread->sticky_error();
++          thread->clear_sticky_error();
++          return error.raw();
++        }
++      }
++    }
++  }
+   // If the class is a typedef class there is no need to try and
+   // compile it. Just finalize it directly.
+   if (cls.IsTypedefClass()) {
+@@ -1593,7 +1639,9 @@
+       Parser::ParseFunction(parsed_function);
+       parsed_function->AllocateVariables();
+     } else {
+-      parsed_function->EnsureKernelScopes();
++      // MACDART: the marker is an st::Node (V1 has no real kernel), so the
++      // kernel ScopeBuilder would segv on it. Route to the ST scope builder.
++      ::st::PrepareScopes(parsed_function);
+     }
+     const LocalVarDescriptors& var_descs = LocalVarDescriptors::Handle(
+         parsed_function->node_sequence()->scope()->GetVarDescriptors(function));

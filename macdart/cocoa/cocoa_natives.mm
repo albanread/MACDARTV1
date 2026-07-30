@@ -193,7 +193,7 @@ static double DoubleFromDart(Dart_Handle h) {
 
 // Cocoa_makeActionTarget(SendPort, int ticket) -> a wrapped, owned target.
 static Dart_Handle WrapObject(id obj, const char* sel, bool pre_owned);
-static void Cocoa_makeActionTarget(Dart_NativeArguments args) {
+static void ST_makeActionTarget(Dart_NativeArguments args) {
   Dart_Port port = ILLEGAL_PORT;
   Dart_SendPortGetId(Dart_GetNativeArgument(args, 0), &port);
   int64_t ticket = IntArg(args, 1);
@@ -205,7 +205,7 @@ static void Cocoa_makeActionTarget(Dart_NativeArguments args) {
 }
 
 // Cocoa_makeTableSource(SendPort, int ticket) -> a wrapped, owned source.
-static void Cocoa_makeTableSource(Dart_NativeArguments args) {
+static void ST_makeTableSource(Dart_NativeArguments args) {
   Dart_Port port = ILLEGAL_PORT;
   Dart_SendPortGetId(Dart_GetNativeArgument(args, 0), &port);
   int64_t ticket = IntArg(args, 1);
@@ -787,8 +787,8 @@ static void Cocoa_sendMain(Dart_NativeArguments args) {
   V(Cocoa_nsStringUtf8, 1)                                                     \
   V(Cocoa_send, 3)                                                             \
   V(Cocoa_sendMain, 3)                                                         \
-  V(Cocoa_makeActionTarget, 2)                                                 \
-  V(Cocoa_makeTableSource, 2)                                                  \
+  V(ST_makeActionTarget, 2)                                                    \
+  V(ST_makeTableSource, 2)                                                     \
   V(Cocoa_getClass, 1)                                                         \
   V(Cocoa_classExists, 1)                                                      \
   V(Cocoa_selectorInfo, 2)                                                     \

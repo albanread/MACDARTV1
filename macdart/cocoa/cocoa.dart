@@ -632,8 +632,8 @@ stObjcIsRef(x) => x is Cocoa;
 /// the workspace language isolate installs its port (it owns dart:isolate);
 /// posts arrive there as [ticket, selector] and dispatch through the world's
 /// own MacvmDelegate registry (ticket -> receiver, pure Smalltalk).
-_stMakeActionTarget(port, int ticket) native "Cocoa_makeActionTarget";
-_stMakeTableSource(port, int ticket) native "Cocoa_makeTableSource";
+_stMakeActionTarget(port, int ticket) native "ST_makeActionTarget";
+_stMakeTableSource(port, int ticket) native "ST_makeTableSource";
 var stActionPort;
 stObjcActionTarget(int ticket) {
   if (stActionPort == null) {

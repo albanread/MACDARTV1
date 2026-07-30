@@ -565,7 +565,7 @@
      const LocalVarDescriptors& var_descs = LocalVarDescriptors::Handle(
          parsed_function->node_sequence()->scope()->GetVarDescriptors(function));
 --- a/runtime/vm/flow_graph_inliner.cc	2026-07-25 09:31:56.971461723 +0100
-+++ b/runtime/vm/flow_graph_inliner.cc	2026-07-30 16:39:29.459730520 +0100
++++ b/runtime/vm/flow_graph_inliner.cc	2026-07-30 17:17:34.854423019 +0100
 @@ -23,6 +23,17 @@
  #include "vm/object_store.h"
  #include "vm/timer.h"
@@ -613,3 +613,14 @@
              CSTAT_TIMER_SCOPE(thread(), graphinliner_build_timer);
              callee_graph = builder.BuildGraph();
            }
+@@ -1260,7 +1279,9 @@
+       }
+ 
+       if (target.IsNull()) {
+-        TRACE_INLINING(THR_Print("     Bailout: non-closure operator\n"));
++        TRACE_INLINING(THR_Print(
++            "     Bailout: non-closure operator (arg0 def=%s)\n",
++            call->ArgumentAt(0)->OriginalDefinition()->DebugName()));
+         continue;
+       }
+ 

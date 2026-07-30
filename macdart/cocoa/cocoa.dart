@@ -262,11 +262,11 @@ stNot(b) => b == true ? false : true;
 /// value-family sends: a real closure invokes directly (the optimizer inlines
 /// these helpers, restoring per-site monomorphic ICs); anything else — e.g. a
 /// DeltaBlue Variable with its own `value` method — goes to ST dispatch.
-stValue0(r) { if (r is Function) return r(); return stSend(r, 'value', []); }
-stValue1(r, a) { if (r is Function) return r(a); return stSend(r, 'value:', [a]); }
-stValue2(r, a, b) { if (r is Function) return r(a, b); return stSend(r, 'value:value:', [a, b]); }
-stValue3(r, a, b, c) { if (r is Function) return r(a, b, c); return stSend(r, 'value:value:value:', [a, b, c]); }
-stValue4(r, a, b, c, d) { if (r is Function) return r(a, b, c, d); return stSend(r, 'value:value:value:value:', [a, b, c, d]); }
+stValue0(r) { if (r is Function) return r(); return r.value(); }
+stValue1(r, a) { if (r is Function) return r(a); return r.value_(a); }
+stValue2(r, a, b) { if (r is Function) return r(a, b); return r.value_value_(a, b); }
+stValue3(r, a, b, c) { if (r is Function) return r(a, b, c); return r.value_value_value_(a, b, c); }
+stValue4(r, a, b, c, d) { if (r is Function) return r(a, b, c, d); return r.value_value_value_value_(a, b, c, d); }
 
 /// ST `&`/`|`: Boolean non-short-circuit and/or (Dart 1.24 bool has no
 /// operator&). Ints keep bitwise semantics; anything else -> ST dispatch.
@@ -286,29 +286,29 @@ stAt1(c, k) {
   if (c is List) return c[k - 1]; // Smalltalk indexes from 1
   if (c is Map) return c[k];
   if (c is String) return c[k - 1]; // a Character = a 1-char string
-  return stSend(c, 'at:', [k]);
+  return c.at_(k);
 }
 
 stAtPut1(c, k, v) {
   if (c is List) { c[k - 1] = v; return v; }
   if (c is Map) { c[k] = v; return v; }
-  return stSend(c, 'at:put:', [k, v]);
+  return c.at_put_(k, v);
 }
 
 stSizeOf(c) {
   if (c is List || c is Map || c is String) return c.length;
-  return stSend(c, 'size', []);
+  return c.size();
 }
 
 stAddU(c, x) {
   if (c is List) { c.add(x); return x; }   // ST add: answers the argument
-  return stSend(c, 'add:', [x]);
+  return c.add_(x);
 }
 
 stDo(c, f) {
   if (c is List) { for (var e in c) f(e); return c; }
   if (c is Map) { for (var v in c.values) f(v); return c; }
-  return stSend(c, 'do:', [f]);
+  return c.do_(f);
 }
 
 stIsEmptyU(c) {

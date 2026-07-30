@@ -2126,7 +2126,9 @@ Fragment StGraphBuilder::TranslateClosure(BlockNode* block) {
     // The marker, stored as Node* like the loader's methods; st::BuildGraph
     // dispatches on the dynamic type.
     fn.set_kernel_function(reinterpret_cast<void*>(static_cast<Node*>(block)));
-    fn.set_is_inlinable(false);  // same inliner-misroute guard as ST methods
+    // (Closures are inlinable — the inliner routes the marker to
+    // st::BuildGraph now. InlineClosureCalls resolves the target from the
+    // creation's AllocateObjectInstr::closure_function and splices the body.)
     isolate->AddClosureFunction(fn);
   }
 
@@ -2222,14 +2224,14 @@ void StGraphBuilder::PrepareClosureScope(BlockNode* block) {
 
 FlowGraph* StGraphBuilder::BuildClosure(BlockNode* block) {
   in_closure_ = true;  // `^` in this body = non-local return (Stage C)
-  // v1: closures are not inlined (their capture/context restore prologue is
-  // not wired for the inliner's parameter substitution). Methods inline; a
-  // closure stays a real `call`. Bail cleanly if the inliner tries.
-  if (exit_collector_ != NULL) {
-    pf_->function().set_is_inlinable(false);
-    pf_->Bailout("st::BuildGraph", "ST closure not inlinable in v1");
-    UNREACHABLE();
-  }
+  // CLOSURES INLINE (the deltablue gap): the graph is ordinary IL — the
+  // prologue's LoadField(closure.context) forwards to the caller's
+  // AllocateObject stores once inlined, and SSA renames the locals. The chain
+  // that gets here: a stValueN helper inlines into the ST caller, its `r(a)`
+  // is a ClosureCallInstr, and InlineClosureCalls resolves the target from
+  // AllocateObjectInstr::closure_function. A `^` inside the closure is a
+  // stNlrThrow StaticCall — plain IL, unchanged semantics inlined (it still
+  // unwinds to the home method's catch, which never inlines).
   PrepareClosureScope(block);
 
   TargetEntryInstr* normal_entry = BuildTargetEntry();

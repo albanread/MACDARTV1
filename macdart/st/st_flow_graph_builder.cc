@@ -1157,8 +1157,21 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
             StaticCall(fn, 1 + static_cast<intptr_t>(node->args.size()));
         return instructions;
       }
-      // Unresolved (new/basicNew/signal desugars, or a class-side closure
-      // whose owner isn't the shadow): the runtime class-send handles it.
+      // Unresolved `self new`/`self basicNew` (no user class-side override):
+      // a DIRECT allocation from the runtime thisCls via the lightweight
+      // stBasicNew native — skips the general class-send's string-keyed
+      // library scan + shadow walk (the 200k-alloc hot path). Full thisCls
+      // correctness: an inherited factory allocates the receiving subclass.
+      if ((node->selector == "new" || node->selector == "basicNew") &&
+          node->args.empty()) {
+        Fragment instructions = LoadLocal(locals_["self"]);  // thisCls
+        instructions += PushArgument();
+        instructions += StaticCall(
+            Function::ZoneHandle(zone_, LookupCocoaFunction("stBasicNew")), 1);
+        return instructions;
+      }
+      // Other unresolved (signal desugars, class-side closures whose owner
+      // isn't the shadow): the general runtime class-send handles it.
       char helper[16];
       snprintf(helper, sizeof(helper), "stClassSend%d",
                static_cast<int>(node->args.size()));

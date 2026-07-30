@@ -660,6 +660,31 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
   Dart_SetReturnValue(args, result_handle);
 }
 
+// stBasicNew(type) -> a fresh instance of the type's class. The FAST class-
+// side `self new`/`self basicNew` path: it allocates straight from the runtime
+// thisCls (full correctness — an inherited factory allocates the receiving
+// subclass), skipping the general class-send's string-keyed library scan
+// (FindStClassByName) + shadow-chain walk that dominated a 200k-alloc loop.
+void ST_basicNewFromType(Dart_NativeArguments args) {
+  Dart_Handle type_h = Dart_GetNativeArgument(args, 0);
+  Thread* thread = Thread::Current();
+  Dart_Handle result = Dart_Null();
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Object& t = Object::Handle(zone, Api::UnwrapHandle(type_h));
+    if (t.IsType()) {
+      const Class& cls = Class::Handle(zone, Type::Cast(t).type_class());
+      if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
+      const Instance& inst =
+          Instance::Handle(zone, Instance::New(cls, Heap::kNew));
+      result = Api::NewHandle(thread, inst.raw());
+    }
+  }
+  Dart_SetReturnValue(args, result);
+}
+
 void ST_classSend(Dart_NativeArguments args) { STClassSendCommon(args, false); }
 void ST_classSendTry(Dart_NativeArguments args) {
   STClassSendCommon(args, true);

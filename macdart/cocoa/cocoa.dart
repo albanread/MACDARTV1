@@ -245,6 +245,7 @@ bool stIsKindOf(obj, type) native "ST_isKindOf";
 /// at runtime — walks the metaclass shadow chain; falls back to allocation
 /// for new/basicNew and to create-and-signal for signal/signal:.
 _stClassSend(type, String sel, List args) native "ST_classSend";
+stBasicNew(type) native "ST_basicNewFromType";
 stClassSend0(t, sel) => _stClassSend(t, sel, []);
 stClassSend1(t, sel, a) => _stClassSend(t, sel, [a]);
 stClassSend2(t, sel, a, b) => _stClassSend(t, sel, [a, b]);

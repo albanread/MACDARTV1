@@ -462,8 +462,13 @@ void buildChrome() {
   anchorScroll(gEditor, kWidthSizable + kHeightSizable);
   gTargets.add(onTextChange(gEditor, (s) => highlight()));
 
-  // Browser tab: a Smalltalk-style class browser (World / User App).
-  buildBrowserTab(addTab(gTabView, "browser", 868.0, 420.0));
+  // Browser tab (Sprint 15): MACVM's OWN CocoaBrowser2, embedded — it
+  // browses BOTH languages from the image (and edits them), so it replaces
+  // the Dart browser here. The view is BUILT by the language isolate (where
+  // the ST engine and the image live) and PARENTED by this one: the raw
+  // view handle crosses as an int. buildBrowserTab stays in the file,
+  // dormant, should anyone want the old face back.
+  buildStBrowserTab(addTab(gTabView, "browser", 868.0, 420.0));
 
   // Docs tab: the workspace guide, and searchable Dart V1 help beside it.
   buildDocsTab(addTab(gTabView, "docs", 868.0, 420.0));
@@ -657,6 +662,52 @@ void paneButtons(Cocoa pane, double w, String leftTitle, double lw, CocoaAction 
   l.setToolTip(leftTip);
   r.setToolTip(rightTip);
   _paneBtnFont(l); _paneBtnFont(r);
+}
+
+Cocoa gStBrowserHost;      // the tab view the ST browser embeds into
+Cocoa gStBrowserView;      // the embedded container (language-isolate built)
+
+void buildStBrowserTab(Cocoa host) {
+  gStBrowserHost = host;
+  stBrowserEmbed();
+}
+
+/// Ask the language isolate to build the ST browser for the tab's frame and
+/// parent the returned view. Retries while the language isolate boots; also
+/// called on languageRestarted (the old view's action ports die with its
+/// isolate, so the browser is rebuilt fresh).
+void stBrowserEmbed() {
+  if (gStBrowserHost == null) return;
+  var host = gStBrowserHost;
+  () async {
+    for (var attempt = 0; attempt < 30; attempt++) {
+      var f = host.frame();
+      var wpx = (f is List && f.length == 4) ? f[2] : 868.0;
+      var hpx = (f is List && f.length == 4) ? f[3] : 420.0;
+      var r = await askQuiet(
+          'stbrowser', wpx.toString() + ' ' + hpx.toString(),
+          const Duration(seconds: 8));
+      if (r == null) {
+        await new Future.delayed(const Duration(seconds: 1));
+        continue;
+      }
+      var s = r.toString();
+      if (s.startsWith('ERR')) {
+        log('Smalltalk browser: ' + s.substring(3).trim());
+        return;   // no world in the image — the tab stays empty until stimport
+      }
+      var handle = int.parse(s, onError: (_) => 0);
+      if (handle == 0) return;
+      if (gStBrowserView != null) {
+        gStBrowserView.removeFromSuperview();
+        gStBrowserView = null;
+      }
+      gStBrowserView = Cocoa.adoptHandle(handle);
+      host.addSubview(gStBrowserView);
+      return;
+    }
+    log('Smalltalk browser: the language isolate never became ready');
+  }();
 }
 
 void buildBrowserTab(Cocoa br) {
@@ -1715,6 +1766,7 @@ Future respawnLanguage(String why) async {
   gRespawning = false;
   log("language isolate restarted (declarations reloaded from the image)");
   guiEvent('languageRestarted', <String, String>{'why': why});
+  stBrowserEmbed();   // the embedded ST browser died with its isolate
   if (gLangIsolateId != null && gDbgIsLang) {   // the debugger was ON the language
     if (await vmsResolveTarget()) {              // isolate: follow it to the new one.
       gDbgScratch = gScratch;                    // (a demo session is left alone)

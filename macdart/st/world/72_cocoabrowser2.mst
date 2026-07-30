@@ -747,9 +747,11 @@ Object subclass: CocoaBrowser2 [
         ^btn
     ]
     CocoaBrowser2 class >> hostFrame [
-        "The shell's content host when CocoaUI startup ran; a standalone
-         default otherwise (MACDART hosts the browser in its own window)."
+        "Sprint 15: the workspace's Browser TAB sets BrowserTabFrame before
+         asking for the container; the shell's content host and a standalone
+         default remain as fallbacks."
         | host |
+        BrowserTabFrame isNil ifFalse: [ ^BrowserTabFrame ].
         host := CocoaUI contentHost.
         ^host isNil
             ifTrue: [ Array with: 0.0 with: 0.0 with: 980.0 with: 620.0 ]
@@ -1051,6 +1053,9 @@ Object subclass: CocoaBrowser2 [
 
     "── teardown (UI-worker rebuild, CG9) ──"
     CocoaBrowser2 class >> releaseView: v [ v isNil ifFalse: [ v isValid ifTrue: [ v release ] ] ]
+    CocoaBrowser2 class >> teardownIfAny [
+        Container isNil ifFalse: [ self teardown ]
+    ]
     CocoaBrowser2 class >> teardown [
         self releaseCatHandles.
         CatDelegate isNil ifFalse: [ CatDelegate isValid ifTrue: [ CatDelegate release ] ].

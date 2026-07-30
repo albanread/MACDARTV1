@@ -211,6 +211,32 @@ _hostSelectors(String src, String side) {
   return out;
 }
 
+// Sprint 15: build (or rebuild) the ST browser's container view sized for
+// the workspace's Browser tab and answer its RAW VIEW HANDLE (an int) — the
+// UI isolate parents it into the tab. ERR when the world is not imported.
+String _stBrowserHandle(String arg) {
+  if (!_decls.containsKey('Fraction')) {
+    return 'ERR the Smalltalk world is not in this image - run stimport '
+        '(or start-st-gui.sh)';
+  }
+  var parts = arg.trim().split(' ');
+  var w = parts.length > 0 ? parts[0] : '868';
+  var h = parts.length > 1 ? parts[1] : '420';
+  var r = stRun('BrowserTabFrame := { 0.0. 0.0. ' + w + '. ' + h + ' }.');
+  if (r.startsWith('ERR')) return r;
+  try {
+    stInvokeStatic('CocoaBrowser2', 'teardownIfAny', []);
+  } catch (e) {}
+  try {
+    var container = stInvokeStatic('CocoaBrowser2', 'containerView', []);
+    stInvokeStatic('CocoaBrowser2', 'doRefresh', []);
+    var wrap = stSend(container, 'objcHandle', []);
+    return (wrap as Cocoa).handle.toString();
+  } catch (e) {
+    return 'ERR ' + e.toString();
+  }
+}
+
 String _hostCall(String verb, List args) {
   if (verb == 'packageTree') {
     var st = <String>[]; var da = <String>[];
@@ -243,6 +269,17 @@ String _hostCall(String verb, List args) {
     });
     return out.toString();
   }
+  // WRITE verbs (before the class-existence guard: newClass/acceptClass
+  // carry source text, and the others do their own lookups).
+  if (verb == 'saveMethod') return _hostSaveMethod(args[0].toString(), args[1].toString(), args[2].toString());
+  if (verb == 'removeMethod') return _hostRemoveMethod(args[0].toString(), args[1].toString(), args[2].toString());
+  if (verb == 'newClass') return _hostAcceptWhole(args[0].toString(), 'created');
+  if (verb == 'acceptClass') return _hostAcceptWhole(args[0].toString(), 'accepted');
+  if (verb == 'setComment') return _hostSetComment(args[0].toString(), args[1].toString());
+  if (verb == 'removeClass') {
+    var r = _remove(args[0].toString());
+    return r.startsWith('removed') ? 'OK ' + r : 'ERR ' + r;
+  }
   var cls = args.isNotEmpty ? args[0].toString() : '';
   var src = _decls.containsKey(cls) ? _decls[cls] : null;
   if (src == null) return 'ERR no such class ' + cls;
@@ -266,15 +303,6 @@ String _hostCall(String verb, List args) {
     }
     return 'ERR no source for ' + cls + '>>' + sel;
   }
-  if (verb == 'saveMethod') return _hostSaveMethod(cls, args[1].toString(), args[2].toString());
-  if (verb == 'removeMethod') return _hostRemoveMethod(cls, args[1].toString(), args[2].toString());
-  if (verb == 'newClass') return _hostAcceptWhole(args[0].toString(), 'created');
-  if (verb == 'acceptClass') return _hostAcceptWhole(args[0].toString(), 'accepted');
-  if (verb == 'setComment') return _hostSetComment(cls, args[1].toString());
-  if (verb == 'removeClass') {
-    var r = _remove(cls);
-    return r.startsWith('removed') ? 'OK ' + r : 'ERR ' + r;
-  }
   return 'ERR unknown host verb ' + verb;
 }
 
@@ -296,7 +324,28 @@ String _hostAcceptWhole(String text, String what) {
 String _hostSaveMethod(String cls, String side, String text) {
   var src = _decls.containsKey(cls) ? _decls[cls] : null;
   if (src == null) return 'ERR no class ' + cls;
-  if (!_isStAny(src)) return 'ERR ' + cls + ' is a Dart class';
+  if (!_isStAny(src)) {
+    // Sprint 15: a DART class — splice by member signature, through the
+    // same checked accept (the browser edits BOTH languages).
+    var t2 = text.trim();
+    if (t2.isEmpty) return 'ERR empty method source';
+    var sig = _memberSig(t2);
+    if (sig.isEmpty) return 'ERR cannot read a Dart member signature from the text';
+    var out = null;
+    for (var m in _splitMembers(src)) {
+      if (_memberSig(m) == sig) {
+        out = src.replaceFirst(m.trim(), t2);
+        break;
+      }
+    }
+    if (out == null) {
+      var close = src.lastIndexOf('}');
+      if (close < 0) return 'ERR cannot find the class closing brace';
+      out = src.substring(0, close) + '  ' + t2 + '\n' + src.substring(close);
+    }
+    var err = _acceptOne(out);
+    return err.isEmpty ? 'OK ' + sig : 'ERR ' + err;
+  }
   var t = text.trim();
   if (t.isEmpty) return 'ERR empty method source';
   var probe = t.split('\n')[0].trim();
@@ -447,6 +496,7 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'appbuild') out = _appBuild(arg);
       else if (cmd == 'appevent') out = _appEvent(arg);
       else if (cmd == 'stimport') out = _stImport(arg);
+      else if (cmd == 'stbrowser') out = _stBrowserHandle(arg.toString());
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();
     } catch (e) {

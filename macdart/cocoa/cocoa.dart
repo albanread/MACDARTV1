@@ -960,6 +960,12 @@ class Cocoa {
   /// Look up a class by name — the receiver for class methods (not finalized).
   static Cocoa cls(String name) => new Cocoa._adopt(_getClass(name));
 
+  /// Wrap a raw ObjC handle WITHOUT taking ownership (no retain, no
+  /// finalizer). Sprint 15: how a view built by one isolate (the language
+  /// isolate's ST browser) is parented by another (the UI isolate's tab) —
+  /// the view hierarchy retains it; the builder keeps ownership.
+  static Cocoa adoptHandle(int h) => new Cocoa._adopt(h);
+
   /// The raw ObjC id (0 if nil / released).
   int get handle => _handle;
   bool get isNil => _handle == 0;

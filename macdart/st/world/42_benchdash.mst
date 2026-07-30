@@ -101,16 +101,22 @@ Object subclass: BenchmarkDashboard [
     "Run aBlock `reps` times; answer {coldMs. warmMedianMs}: the first run alone
      (cold, with compilation) then the median of the rest (warm)."
     BenchmarkDashboard class >> time: aBlock reps: reps [
-        | t0 cold warm |
+        "cold = first run (includes JIT compile). warm = BEST of the rest:
+         the median right after cold catches the optimizer's re-compilation
+         churn window and can read 2-3x the steady state (fib read 18ms when
+         steady-state was 7); min is the standard steady-state estimator."
+        | t0 cold best |
         t0 := Smalltalk millisecondClock.
         aBlock value.
         cold := Smalltalk millisecondClock - t0.
-        warm := OrderedCollection new.
+        best := nil.
         (reps - 1) timesRepeat: [
+            | w |
             t0 := Smalltalk millisecondClock.
             aBlock value.
-            warm add: Smalltalk millisecondClock - t0 ].
-        ^Array with: cold with: (self median: warm)
+            w := Smalltalk millisecondClock - t0.
+            (best isNil or: [ w < best ]) ifTrue: [ best := w ] ].
+        ^Array with: cold with: (best isNil ifTrue: [ 0 ] ifFalse: [ best ])
     ]
     BenchmarkDashboard class >> median: aCollection [
         | sorted n |
@@ -136,7 +142,7 @@ Object subclass: BenchmarkDashboard [
     ]
     BenchmarkDashboard class >> row: name block: aBlock [
         | t |
-        t := self time: aBlock reps: 6.
+        t := self time: aBlock reps: 8.
         ^Array with: name with: (t at: 1) with: (t at: 2)
     ]
 

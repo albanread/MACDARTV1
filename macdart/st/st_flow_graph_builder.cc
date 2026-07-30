@@ -184,6 +184,20 @@ typedef ZoneGrowableArray<PushArgumentInstr*>* ArgumentArray;
 // ---------------------------------------------------------------------------
 class StGraphBuilder {
  public:
+  // Scope-only entry (var-descriptor path): recover the marker and populate
+  // pf's node_sequence scope + AllocateVariables — the front of Build(), with
+  // no graph. The stack-walker/GC/debugger recompute an unoptimized ST
+  // method's LocalVarDescriptors through here, NOT the kernel ScopeBuilder.
+  void PrepareScopesOnly() {
+    Node* node = reinterpret_cast<Node*>(pf_->function().kernel_function());
+    ASSERT(node != NULL);
+    if (MethodNode* method = dynamic_cast<MethodNode*>(node)) {
+      PrepareScope(method);
+    } else if (BlockNode* block = dynamic_cast<BlockNode*>(node)) {
+      PrepareClosureScope(block);
+    }
+  }
+
   StGraphBuilder(ParsedFunction* pf,
                  const ZoneGrowableArray<const ICData*>& ic_data_array,
                  intptr_t osr_id)
@@ -2397,6 +2411,17 @@ FlowGraph* BuildGraph(ParsedFunction* pf,
   }
   ASSERT(graph != NULL);
   return graph;
+}
+
+// Populate `pf`'s scope for an ST function WITHOUT building a graph — the
+// var-descriptor recompute path (compiler.cc ComputeLocalVarDescriptors).
+// Without this, that path routes an ST method's marker into the kernel
+// ScopeBuilder and segvs (the profiler/GC/debugger walking an unoptimized ST
+// frame). An empty ic_data array suffices; scope prep never reads it.
+void PrepareScopes(ParsedFunction* pf) {
+  ZoneGrowableArray<const ICData*>* ic = new ZoneGrowableArray<const ICData*>();
+  StGraphBuilder builder(pf, *ic, /*osr_id=*/-1 /*Compiler::kNoOSRDeoptId*/);
+  builder.PrepareScopesOnly();
 }
 
 }  // namespace st

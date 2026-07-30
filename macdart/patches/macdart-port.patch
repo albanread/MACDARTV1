@@ -318,40 +318,6 @@
  /*
   * ========
   * Timeline
---- a/runtime/vm/compiler.cc
-+++ b/runtime/vm/compiler.cc
-@@ -45,6 +45,17 @@
- #include "vm/timeline.h"
- #include "vm/timer.h"
- 
-+// MACDART: the Smalltalk (.mst) IL builder (macdart/st/st_flow_graph_builder.cc,
-+// tracked outside the gitignored runtime tree). ST-marked functions route here
-+// instead of the dormant kernel builder — see BuildFlowGraph below and
-+// ST_PLAN.md Sprint 3. Declared at file scope; compiler.cc is `namespace dart`.
-+namespace st {
-+::dart::FlowGraph* BuildGraph(
-+    ::dart::ParsedFunction*,
-+    const ::dart::ZoneGrowableArray<const ::dart::ICData*>&,
-+    intptr_t);
-+}  // namespace st
-+
- namespace dart {
- 
- DEFINE_FLAG(bool,
-@@ -135,6 +146,13 @@
-     const ZoneGrowableArray<const ICData*>& ic_data_array,
-     intptr_t osr_id) {
-   if (UseKernelFrontEndFor(parsed_function)) {
-+    // MACDART: an ST-marked function carries a non-NULL kernel_function_ slot
-+    // (reused as the Smalltalk marker, ST_PLAN.md §2.2). The noSuchMethod /
-+    // invokeField dispatcher kinds also reach here but with a NULL marker and
-+    // stay on the kernel builder below.
-+    if (parsed_function->function().kernel_function() != NULL) {
-+      return st::BuildGraph(parsed_function, ic_data_array, osr_id);
-+    }
-     kernel::TreeNode* node = static_cast<kernel::TreeNode*>(
-         parsed_function->function().kernel_function());
-     kernel::FlowGraphBuilder builder(node, parsed_function, ic_data_array, NULL,
 --- a/runtime/lib/type_patch.dart	2026-07-25 09:31:56.890865745 +0100
 +++ b/runtime/lib/type_patch.dart	2026-07-29 21:49:46.423514394 +0100
 @@ -10,7 +10,22 @@
@@ -549,3 +515,52 @@
    // Perform platform specific initialization.
    if (!Platform::Initialize()) {
      Log::PrintErr("Initialization failed\n");
+--- a/runtime/vm/compiler.cc	2026-07-25 09:31:56.962975982 +0100
++++ b/runtime/vm/compiler.cc	2026-07-30 13:13:59.625742054 +0100
+@@ -45,6 +45,21 @@
+ #include "vm/timeline.h"
+ #include "vm/timer.h"
+ 
++// MACDART: the Smalltalk (.mst) IL builder (macdart/st/st_flow_graph_builder.cc,
++// tracked outside the gitignored runtime tree). ST-marked functions route here
++// instead of the dormant kernel builder — see BuildFlowGraph below and
++// ST_PLAN.md Sprint 3. Declared at file scope; compiler.cc is `namespace dart`.
++namespace st {
++::dart::FlowGraph* BuildGraph(
++    ::dart::ParsedFunction*,
++    const ::dart::ZoneGrowableArray<const ::dart::ICData*>&,
++    intptr_t);
++// Scope-only prep for the ST var-descriptor path (ComputeLocalVarDescriptors):
++// route an ST method here instead of the kernel ScopeBuilder, which segvs on
++// the ST marker (the profiler/GC/debugger walking an unoptimized ST frame).
++void PrepareScopes(::dart::ParsedFunction*);
++}  // namespace st
++
+ namespace dart {
+ 
+ DEFINE_FLAG(bool,
+@@ -135,6 +150,13 @@
+     const ZoneGrowableArray<const ICData*>& ic_data_array,
+     intptr_t osr_id) {
+   if (UseKernelFrontEndFor(parsed_function)) {
++    // MACDART: an ST-marked function carries a non-NULL kernel_function_ slot
++    // (reused as the Smalltalk marker, ST_PLAN.md §2.2). The noSuchMethod /
++    // invokeField dispatcher kinds also reach here but with a NULL marker and
++    // stay on the kernel builder below.
++    if (parsed_function->function().kernel_function() != NULL) {
++      return st::BuildGraph(parsed_function, ic_data_array, osr_id);
++    }
+     kernel::TreeNode* node = static_cast<kernel::TreeNode*>(
+         parsed_function->function().kernel_function());
+     kernel::FlowGraphBuilder builder(node, parsed_function, ic_data_array, NULL,
+@@ -1593,7 +1615,9 @@
+       Parser::ParseFunction(parsed_function);
+       parsed_function->AllocateVariables();
+     } else {
+-      parsed_function->EnsureKernelScopes();
++      // MACDART: the marker is an st::Node (V1 has no real kernel), so the
++      // kernel ScopeBuilder would segv on it. Route to the ST scope builder.
++      ::st::PrepareScopes(parsed_function);
+     }
+     const LocalVarDescriptors& var_descs = LocalVarDescriptors::Handle(
+         parsed_function->node_sequence()->scope()->GetVarDescriptors(function));

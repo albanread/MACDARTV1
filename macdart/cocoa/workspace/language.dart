@@ -243,11 +243,9 @@ final List<Map> _kStDemos = <Map>[
   {'name': 'Mandelbrot', 'cls': 'Mandelbrot', 'sel': 'pixelsForWidth:height:',
    'kind': 'rgba', 'inst': true,
    'blurb': 'the set rendered per-pixel into a Pixmap (35/36) — a blit'},
-  // Benchmarks (42_benchdash) is deferred: its multi-second suite run gets
-  // sampled by the vm-service profiler, which walks an ST method's frame
-  // through the kernel ScopeBuilder and segvs (ComputeLocalVarDescriptors) —
-  // an ST-engine/optimizer hardening item, not a demo-bridge one. The vector
-  // path itself is proven by Waves.
+  {'name': 'Benchmarks', 'cls': 'BenchmarkDashboard',
+   'sel': 'chartForWidth:height:', 'kind': 'json', 'inst': false,
+   'blurb': 'live cold-vs-warm perf chart (42) — runs the suite, ~seconds'},
 ];
 
 // Invoke a demo's producer selector — class-side (stInvokeStatic) or on a

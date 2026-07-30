@@ -4054,7 +4054,7 @@ void runStDemo(String name) {
   gDemoTitle = "Smalltalk " + name;
   demoStatus('Smalltalk: ' + name + ' …');
   askQuiet('stdemo', name + ' ' + kDemoW.toInt().toString() + ' ' +
-      kDemoH.toInt().toString(), const Duration(seconds: 30)).then((r) {
+      kDemoH.toInt().toString(), const Duration(seconds: 90)).then((r) {
     if (r == null) { demoStatus('ST demo: timed out'); return; }
     if (r is String) {                           // an ERR string
       demoStatus('ST demo: ' + r);

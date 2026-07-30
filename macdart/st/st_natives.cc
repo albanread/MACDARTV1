@@ -37,6 +37,25 @@
 namespace dart {
 namespace bin {
 
+// A miss — no such class, no such method, a bad argument — must raise a
+// CATCHABLE Dart error. It used to be reported with Dart_NewApiError, and an
+// ApiError returned from a native is an UNHANDLED error: it terminates the
+// isolate, so the caller's try/catch never runs.
+//
+// That made two promises in the code untrue. cocoa.dart's stDivide probes for
+// the world's Fraction class inside a try/catch and documents "a plain double
+// otherwise" — a fallback it could never reach; an inexact `3 / 2` in a
+// standalone .mst killed the process instead. And `42 become: 43` died on the
+// lookup rather than reaching become:'s own refusal. Both found by
+// st/test/type_conformance.mst, which now covers them.
+//
+// Dart_ThrowException does not return; every call site keeps its `return` for
+// shape. Must be called OUTSIDE any TransitionNativeToVM scope — all sites are.
+static void STThrow(const char* msg) {
+  Dart_ThrowException(Dart_NewStringFromCString(msg));
+}
+
+
 // Parse+load the ST PRELUDE (st_prelude.h) into this isolate's `st:prelude`
 // library, once — keyed on the library's presence, so it is per-isolate
 // correct. Caller holds the VM transition + HANDLESCOPE. Returns false (with
@@ -197,8 +216,7 @@ void ST_invokeStatic(Dart_NativeArguments args) {
   const char* sel_c = NULL;
   if (Dart_IsError(Dart_StringToCString(cls_h, &cls_c)) ||
       Dart_IsError(Dart_StringToCString(sel_h, &sel_c))) {
-    Dart_SetReturnValue(
-        args, Dart_NewApiError("stInvokeStatic: bad class/selector argument"));
+    STThrow("stInvokeStatic: bad class/selector argument");
     return;
   }
   intptr_t n = 0;
@@ -296,7 +314,7 @@ void ST_invokeStatic(Dart_NativeArguments args) {
   }
 
   if (!err.empty()) {
-    Dart_SetReturnValue(args, Dart_NewApiError(err.c_str()));
+    STThrow(err.c_str());
     return;
   }
   Dart_SetReturnValue(args, result_handle);
@@ -317,7 +335,7 @@ void ST_new(Dart_NativeArguments args) {
   Dart_Handle cls_h = Dart_GetNativeArgument(args, 0);
   const char* cls_c = NULL;
   if (Dart_IsError(Dart_StringToCString(cls_h, &cls_c)) || cls_c == NULL) {
-    Dart_SetReturnValue(args, Dart_NewApiError("stNew: bad class argument"));
+    STThrow("stNew: bad class argument");
     return;
   }
   const std::string cls_name(cls_c);
@@ -339,7 +357,7 @@ void ST_new(Dart_NativeArguments args) {
     }
   }
   if (!err.empty()) {
-    Dart_SetReturnValue(args, Dart_NewApiError(err.c_str()));
+    STThrow(err.c_str());
     return;
   }
   Dart_SetReturnValue(args, result_handle);
@@ -354,7 +372,7 @@ static void STSendCommon(Dart_NativeArguments args, bool probe) {
   Dart_Handle list_h = Dart_GetNativeArgument(args, 2);
   const char* sel_c = NULL;
   if (Dart_IsError(Dart_StringToCString(sel_h, &sel_c)) || sel_c == NULL) {
-    Dart_SetReturnValue(args, Dart_NewApiError("stSend: bad selector argument"));
+    STThrow("stSend: bad selector argument");
     return;
   }
   intptr_t n = 0;
@@ -412,7 +430,7 @@ static void STSendCommon(Dart_NativeArguments args, bool probe) {
     }
   }
   if (!err.empty()) {
-    Dart_SetReturnValue(args, Dart_NewApiError(err.c_str()));
+    STThrow(err.c_str());
     return;
   }
   if (probe) {
@@ -514,8 +532,7 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
   Dart_Handle list_h = Dart_GetNativeArgument(args, 2);
   const char* sel_c = NULL;
   if (Dart_IsError(Dart_StringToCString(sel_h, &sel_c)) || sel_c == NULL) {
-    Dart_SetReturnValue(args,
-                        Dart_NewApiError("stClassSend: bad selector argument"));
+    STThrow("stClassSend: bad selector argument");
     return;
   }
   intptr_t n = 0;
@@ -638,7 +655,7 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
     }
   }
   if (!err.empty()) {
-    Dart_SetReturnValue(args, Dart_NewApiError(err.c_str()));
+    STThrow(err.c_str());
     return;
   }
   if (probe) {
@@ -860,7 +877,7 @@ void ST_asSymbol(Dart_NativeArguments args) {
   Dart_Handle s_h = Dart_GetNativeArgument(args, 0);
   const char* s_c = NULL;
   if (Dart_IsError(Dart_StringToCString(s_h, &s_c)) || s_c == NULL) {
-    Dart_SetReturnValue(args, Dart_NewApiError("stAsSymbol: bad argument"));
+    STThrow("stAsSymbol: bad argument");
     return;
   }
   const std::string text(s_c);
@@ -1097,7 +1114,7 @@ void ST_becomeForward(Dart_NativeArguments args) {
     }
   }
   if (!err.empty()) {
-    Dart_SetReturnValue(args, Dart_NewApiError(err.c_str()));
+    STThrow(err.c_str());
     return;
   }
   Dart_SetReturnValue(args, b_h);
@@ -1161,7 +1178,7 @@ void ST_become(Dart_NativeArguments args) {
     }
   }
   if (!err.empty()) {
-    Dart_SetReturnValue(args, Dart_NewApiError(err.c_str()));
+    STThrow(err.c_str());
     return;
   }
   Dart_SetReturnValue(args, Dart_Null());

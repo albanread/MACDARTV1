@@ -488,6 +488,19 @@ stListIncludes(l, x) => l.contains(x);
 stListAppend(l, x) { l.add(x); return l; }  // literal-array build chain
 stSplitByChar(s, code) => s.toString().split(new String.fromCharCode(code));
 stStringWith(c) => c.toString();  // a Character IS a 1-char string here
+stStrLf() => '\n';
+stStrTab() => '\t';
+stStrCr() => '\r';
+stStrSpace() => ' ';
+
+/// 1-based copyFrom:to: — Dart Strings slice as STRINGS (the world's
+/// species-based fallback rebuilt them as char Lists, so 'OK'-prefix reply
+/// checks never matched).
+stCopyFromTo(c, a, b) {
+  if (c is String) return c.substring(a - 1, b);
+  if (c is List) return c.sublist(a - 1, b);
+  return stSend(c, 'copyFrom:to:', [a, b]);
+}
 
 /// Parse-check `.mst` source WITHOUT loading it: returns '' when it parses,
 /// else "ERR: line:col: message" — the editor's cheap pre-Accept validation.
@@ -652,6 +665,14 @@ stHostComment(svc, cls) => _stHost('comment', [cls]);
 stHostClassSource(svc, cls) => _stHost('classSource', [cls]);
 stHostMethodSource(svc, cls, side, sel) =>
     _stHost('methodSource', [cls, side, sel]);
+stHostSaveMethod(svc, cls, side, text) =>
+    _stHost('saveMethod', [cls, side, text]);
+stHostRemoveMethod(svc, cls, side, sel) =>
+    _stHost('removeMethod', [cls, side, sel]);
+stHostNewClass(svc, text) => _stHost('newClass', [text]);
+stHostAcceptClass(svc, text) => _stHost('acceptClass', [text]);
+stHostSetComment(svc, cls, text) => _stHost('setComment', [cls, text]);
+stHostRemoveClass(svc, cls) => _stHost('removeClass', [cls]);
 
 /// `Worker classNamed:` — the engine's class lookup (a class VALUE or nil).
 stClassNamed(name) native "ST_classNamed";

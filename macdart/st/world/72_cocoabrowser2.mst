@@ -509,10 +509,10 @@ Object subclass: CocoaBrowser2 [
      §4.4 gate V1 uses, extracted so the nested uiDoit send can't greedily
      absorb a trailing ifFalse: (see world/66's own comment)."
     CocoaBrowser2 class >> liveReopen: reopenSource for: cls onDone: doneBlock onSkipped: skipBlock [
-        Worker uiDoit: '(Worker classNamed: #', cls, ') notNil' onReply: [ :loaded |
-            loaded = 'true'
-                ifTrue: [ Worker uiDoit: reopenSource onReply: doneBlock ]
-                ifFalse: [ skipBlock value ] ]
+        "MACDART: one VM, one image — the accept that just succeeded IS the
+         live state (it went through the workspace's checked accept, which
+         reloads the ST layer). Complete straight into the success branch."
+        doneBlock value: 'nil'
     ]
     CocoaBrowser2 class >> acceptMethod [
         | cls text reply sel reopen |
@@ -574,7 +574,7 @@ Object subclass: CocoaBrowser2 [
         EditMode := #newClass.
         self showSource: sc, ' subclass: NewClass [', String lf, String lf, ']'.
         self setEditable: true label: 'new class — edit, then Accept (image + live)'.
-        CocoaUI window onMain makeFirstResponder: SourceView.
+        CocoaUI window isNil ifFalse: [ CocoaUI window onMain makeFirstResponder: SourceView ].
     ]
     CocoaBrowser2 class >> newMethod [
         | template |
@@ -1034,7 +1034,12 @@ Object subclass: CocoaBrowser2 [
     CocoaBrowser2 class >> currentClassNames [ ^Classes isNil ifTrue: [ Array new: 0 ] ifFalse: [ Classes ] ]
     CocoaBrowser2 class >> currentProtocolNames [ ^Protocols isNil ifTrue: [ Array new: 0 ] ifFalse: [ Protocols ] ]
     CocoaBrowser2 class >> currentMethodNames [ ^Methods isNil ifTrue: [ Array new: 0 ] ifFalse: [ Methods ] ]
-    CocoaBrowser2 class >> sourceString [ ^SourceView isNil ifTrue: [ '' ] ifFalse: [ SourceView sendString: 'string' ] ]
+    CocoaBrowser2 class >> sourceString [
+        "MACDART: the text read must hop to main (MACVM ran main-inline)."
+        ^SourceView isNil
+            ifTrue: [ '' ]
+            ifFalse: [ STCocoa utf8: (SourceView onMain string) ]
+    ]
     CocoaBrowser2 class >> packageNames [
         | out ln pkgs |
         out := OrderedCollection new.

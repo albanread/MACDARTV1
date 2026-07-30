@@ -399,9 +399,10 @@ Object subclass: Worker [
         ^c
     ]
     Worker class >> uiDoit: aSource onReply: aBlock [
-        "Convenience: a Workspace ⌘P/⌘D — ship a selection as a #doit request
-         and run the continuation on the (String) result."
-        ^self uiRequest: #doit args: (Array with: aSource) onReply: aBlock
+        "MACDART: one VM, one image — a browser accept is ALREADY live (it
+         went through the workspace's checked accept), so the live-compile
+         round trip completes immediately with the success sentinel."
+        aBlock value: 'nil'
     ]
     Worker class >> uiRequest: aVerb args: anArray onReplyTimed: aBlock [
         "Like uiRequest:args:onReply: but hands the 2-arg block (result, ms):

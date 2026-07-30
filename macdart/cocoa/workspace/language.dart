@@ -266,7 +266,117 @@ String _hostCall(String verb, List args) {
     }
     return 'ERR no source for ' + cls + '>>' + sel;
   }
+  if (verb == 'saveMethod') return _hostSaveMethod(cls, args[1].toString(), args[2].toString());
+  if (verb == 'removeMethod') return _hostRemoveMethod(cls, args[1].toString(), args[2].toString());
+  if (verb == 'newClass') return _hostAcceptWhole(args[0].toString(), 'created');
+  if (verb == 'acceptClass') return _hostAcceptWhole(args[0].toString(), 'accepted');
+  if (verb == 'setComment') return _hostSetComment(cls, args[1].toString());
+  if (verb == 'removeClass') {
+    var r = _remove(cls);
+    return r.startsWith('removed') ? 'OK ' + r : 'ERR ' + r;
+  }
   return 'ERR unknown host verb ' + verb;
+}
+
+// --- the browser's WRITE flows (Sprint 14b) — every path funnels through
+// _acceptMany, the same checked accept the workspace buttons use (parse
+// check, store, reload, persist; refused source never reaches the image).
+String _acceptOne(String declText) {
+  var r = _acceptMany(<String>[declText]);
+  return r.startsWith('accepted') ? '' : r;
+}
+
+String _hostAcceptWhole(String text, String what) {
+  var name = _declName(text.trim());
+  var err = _acceptOne(text.trim());
+  if (err.isNotEmpty) return 'ERR ' + err;
+  return 'OK ' + what + ' ' + name.toString();
+}
+
+String _hostSaveMethod(String cls, String side, String text) {
+  var src = _decls.containsKey(cls) ? _decls[cls] : null;
+  if (src == null) return 'ERR no class ' + cls;
+  if (!_isStAny(src)) return 'ERR ' + cls + ' is a Dart class';
+  var t = text.trim();
+  if (t.isEmpty) return 'ERR empty method source';
+  var probe = t.split('\n')[0].trim();
+  if (!probe.endsWith('[')) {
+    return 'ERR a method starts \'selector ... [\' (got: ' + probe + ')';
+  }
+  var sig = probe.substring(0, probe.length - 1).trim();
+  var isCs = new RegExp(r'^\w+\s+class\s*>>').hasMatch(sig);
+  if (side == 'class' && !isCs) {
+    t = cls + ' class >> ' + t;
+    sig = cls + ' class >> ' + sig;
+  } else if (side != 'class' && isCs) {
+    return 'ERR class-side source while the instance side is selected';
+  }
+  var bare = sig
+      .replaceAll(new RegExp(r'^\w+\s+class\s*>>\s*'), '')
+      .replaceAll(new RegExp(r'\^\s*<[^>]*>\s*$'), '')
+      .replaceAll(new RegExp(r'<[^>]*>'), '')
+      .replaceAll(new RegExp(r'\s+'), ' ')
+      .trim();
+  var sel = _sigToSelector(bare);
+  var body = t.split('\n').map((s) => '    ' + s).join('\n');
+
+  var lines = src.split('\n');
+  var wantSide = (side == 'class') ? 'c' : 'i';
+  var hit = null;
+  for (var m in _stMemberIndex(lines)) {
+    if (m['side'] == wantSide && m['sel'] == sel) hit = m;
+  }
+  var out;
+  if (hit != null) {
+    out = lines.sublist(0, hit['start']).join('\n') + '\n' + body + '\n' +
+        lines.sublist(hit['end'] + 1).join('\n');
+  } else {
+    // insert before the decl's final closing bracket line
+    var close = -1;
+    for (var i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].trim() == ']') { close = i; break; }
+    }
+    if (close < 0) return 'ERR cannot find the class closing bracket';
+    out = lines.sublist(0, close).join('\n') + '\n' + body + '\n' +
+        lines.sublist(close).join('\n');
+  }
+  var err = _acceptOne(out);
+  return err.isEmpty ? 'OK ' + sel : 'ERR ' + err;
+}
+
+String _hostRemoveMethod(String cls, String side, String sel) {
+  var src = _decls.containsKey(cls) ? _decls[cls] : null;
+  if (src == null) return 'ERR no class ' + cls;
+  var lines = src.split('\n');
+  var wantSide = (side == 'class') ? 'c' : 'i';
+  var hit = null;
+  for (var m in _stMemberIndex(lines)) {
+    if (m['side'] == wantSide && m['sel'] == sel) hit = m;
+  }
+  if (hit == null) return 'ERR no such method ' + cls + '>>' + sel;
+  var out = lines.sublist(0, hit['start']).join('\n') + '\n' +
+      lines.sublist(hit['end'] + 1).join('\n');
+  var err = _acceptOne(out);
+  return err.isEmpty ? 'OK removed ' + sel : 'ERR ' + err;
+}
+
+String _hostSetComment(String cls, String comment) {
+  var src = _decls.containsKey(cls) ? _decls[cls] : null;
+  if (src == null) return 'ERR no class ' + cls;
+  var quoted = '"' + comment.replaceAll('"', '""') + '"';
+  var t = src.trimLeft();
+  var out;
+  if (t.startsWith('"')) {
+    var end = t.indexOf('"', 1);
+    while (end > 0 && end + 1 < t.length && t[end + 1] == '"') {
+      end = t.indexOf('"', end + 2);
+    }
+    out = (end < 0) ? (quoted + '\n' + t) : (quoted + t.substring(end + 1));
+  } else {
+    out = quoted + '\n' + t;
+  }
+  var err = _acceptOne(out);
+  return err.isEmpty ? 'OK comment saved' : 'ERR ' + err;
 }
 
 main(List args, SendPort uiPort) {
@@ -622,43 +732,85 @@ List _memberList(String className) {
   return out;
 }
 
-// Sprint 12: split a (possibly merged) ST class decl into members —
-// [side 'c'|'i', 'method', signature, source] per method. Line-based: a
-// method starts at a line ENDING in '[' at shallow indentation (world style)
-// and runs to the line before the next such header. Class-side headers carry
-// `class >>`. Ivar lines (`| a b |`) and headers are skipped.
-List<List> _stMembers(String src) {
-  var lines = src.split('\n');
-  var headers = <int>[];
-  for (var i = 0; i < lines.length; i++) {
+// Sprint 12/14: split a (possibly merged) ST class decl into members —
+// [side 'c'|'i', 'method', signature, source] per method. A member's source
+// runs from its header line to the line where ITS OWN bracket closes
+// (depth-tracked through 'strings', "comments", and $c literals) — slicing
+// to the next header leaked trailing comments, the class's closing bracket,
+// even the next merged chunk into the pane ("follow-on text").
+int _stMemberEndLine(List<String> lines, int start) {
+  var depth = 0;
+  var inStr = false, inCmt = false;
+  for (var li = start; li < lines.length; li++) {
+    var s = lines[li];
+    for (var i = 0; i < s.length; i++) {
+      var ch = s[i];
+      if (inStr) {
+        if (ch == "'") {
+          if (i + 1 < s.length && s[i + 1] == "'") { i++; } else { inStr = false; }
+        }
+        continue;
+      }
+      if (inCmt) {
+        if (ch == '"') inCmt = false;
+        continue;
+      }
+      if (ch == "'") { inStr = true; continue; }
+      if (ch == '"') { inCmt = true; continue; }
+      if (ch == r'$') { i++; continue; }        // $[ char literal
+      if (ch == '[') depth++;
+      if (ch == ']') {
+        depth--;
+        if (depth == 0) return li;
+      }
+    }
+  }
+  return lines.length - 1;
+}
+
+/// Every method in the decl: {side 'c'|'i', sel, sig, start, end} (line idx,
+/// inclusive). The shared index under _stMembers, methodSource, and the
+/// browser's Accept splices.
+List<Map> _stMemberIndex(List<String> lines) {
+  var out = <Map>[];
+  var i = 0;
+  while (i < lines.length) {
     var t = lines[i].trimRight();
-    if (!t.endsWith('[')) continue;
     var lt = t.trimLeft();
     var indent = t.length - lt.length;
-    if (indent > 4) continue;                      // nested block, not a method
-    if (lt.startsWith('"')) continue;
-    if (lt.contains('subclass:')) continue;
-    if (new RegExp(r'^\w+(\s+class)?\s+extend\s*\[$').hasMatch(lt)) continue;
-    headers.add(i);
-  }
-  var out = <List>[];
-  for (var h = 0; h < headers.length; h++) {
-    var a = headers[h];
-    var b = (h + 1 < headers.length) ? headers[h + 1] : lines.length;
-    // trim the trailing class-closing ']' line off the last member's chunk
-    var body = lines.sublist(a, b).join('\n');
-    var head = lines[a].trim();
+    var isHeader = t.endsWith('[') &&
+        indent <= 4 &&
+        !lt.startsWith('"') &&
+        !lt.contains('subclass:') &&
+        !new RegExp(r'^\w+(\s+class)?\s+extend\s*\[$').hasMatch(lt);
+    if (!isHeader) { i++; continue; }
+    var end = _stMemberEndLine(lines, i);
+    var head = lines[i].trim();
     var sig = head.substring(0, head.length - 1).trim();
     sig = sig.replaceAll(new RegExp(r'\^\s*<[^>]*>\s*$'), '');
     sig = sig.replaceAll(new RegExp(r'<[^>]*>'), '');
     sig = sig.replaceAll(new RegExp(r'\s+'), ' ').trim();
     var side = sig.contains('class >>') ? 'c' : 'i';
-    sig = sig.replaceAll(new RegExp(r'^\w+\s+class\s*>>\s*'), '');
-    if (sig.isEmpty) continue;
-    out.add([side, 'method', sig, body]);
+    var bare = sig.replaceAll(new RegExp(r'^\w+\s+class\s*>>\s*'), '');
+    if (bare.isNotEmpty) {
+      out.add({'side': side, 'sel': _sigToSelector(bare), 'sig': bare,
+               'start': i, 'end': end});
+    }
+    i = end + 1;
   }
   return out;
 }
+
+List<List> _stMembers(String src) {
+  var lines = src.split('\n');
+  var out = <List>[];
+  for (var m in _stMemberIndex(lines)) {
+    out.add([m['side'], 'method', m['sig'],
+             lines.sublist(m['start'], m['end'] + 1).join('\n')]);
+  }
+  return out;
+}
+
 
 String _kindOf(String s) {
   if (_isStDoit(s)) return 'st-doit';     // Smalltalk boot/do-it chunk
@@ -675,9 +827,6 @@ String _kindOf(String s) {
   return 'variable';
 }
 
-/// A declaration's text minus any comments in front of it — a documented class
-/// otherwise matches none of the patterns below and gets named from its own
-/// prose by the fallback.
 String _afterLeadingComments(String s) {
   var i = 0;
   while (i < s.length) {
@@ -713,8 +862,6 @@ String _declName(String d) {
   return 'anon' + _decls.length.toString();
 }
 
-// Split a class body into member declarations (fields / methods / constructors),
-// respecting strings/comments; a member ends at a depth-0 '}' or ';'.
 List<String> _splitMembers(String classSrc) {
   var b = classSrc.indexOf('{');
   var e = classSrc.lastIndexOf('}');
@@ -745,7 +892,6 @@ List<String> _splitMembers(String classSrc) {
   return out;
 }
 
-// A member's one-line signature (up to '{', '=>', or ';').
 String _memberSig(String m) {
   m = m.trim();
   var end = m.length;
@@ -757,47 +903,6 @@ String _memberSig(String m) {
   return m.substring(0, end).trim();
 }
 
-// --- the world (read-only, via dart:mirrors) --------------------------------
-// Browser categories: the editable user app, then the world's libraries.
-List _categories() {
-  // 'User App' = every image decl (bilingual); 'Smalltalk' = the ST layer
-  // alone — the world + user ST classes, without the Dart ones.
-  var out = <String>['User App', 'Smalltalk'];
-  out.addAll(_worldLibs());
-  return out;
-}
-
-List _worldLibs() {
-  var out = <String>[];
-  currentMirrorSystem().libraries.forEach((uri, lib) {
-    var u = uri.toString();
-    // Smalltalk libraries are NOT mirror-safe: their classes have no
-    // TokenStream, and ClassMirror.members routes through EnsureIsFinalized
-    // -> the Dart parser, which CRASHES the process. ST classes browse
-    // through the User App path (image decls) instead.
-    if (u.startsWith('st:')) return;
-    out.add(u);
-  });
-  out.sort();
-  return out;
-}
-
-List _worldClasses(String libUri) {
-  var out = <String>[];
-  if (libUri.startsWith('st:')) return out;   // mirror-unsafe (no TokenStream)
-  currentMirrorSystem().libraries.forEach((uri, lib) {
-    if (uri.toString() == libUri) {
-      lib.declarations.forEach((sym, decl) {
-        if (decl is ClassMirror) out.add(MirrorSystem.getName(sym));
-      });
-    }
-  });
-  out.sort();
-  return out;
-}
-
-// A member record: [side('i'|'c'), kind('var'|'method'), signature, source].
-// User-app members, parsed from the class source.
 List _classMembers2(String className) {
   var src = _decls[className];
   if (src == null) return const <List>[];

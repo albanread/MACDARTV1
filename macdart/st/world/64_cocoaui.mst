@@ -1104,9 +1104,9 @@ Object subclass: CocoaUI [
          must always show the latest line without the viewer scrolling for it."
         TranscriptText isNil ifTrue: [ TranscriptText := '' ].
         TranscriptText := aString , String lf , TranscriptText.
-        Transcript isNil ifFalse: [
-            Transcript onMain setString: TranscriptText.
-            Transcript onMain scrollRangeToVisible: (Array with: 0 with: 0) ].
+        "MACDART: the shell dock only exists under CocoaUI startup; route to
+         the workspace Transcript pane (the prelude class always resolves)."
+        Transcript showCr: aString.
     ]
 
     CocoaUI class >> clearTranscript [

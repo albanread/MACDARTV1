@@ -39,6 +39,8 @@
 #include "vm/ast.h"                   // SequenceNode
 #include "vm/class_finalizer.h"       // FinalizeClass (AllocateObject layout)
 #include "vm/flow_graph.h"            // FlowGraph
+#include "vm/compiler.h"              // Compiler::kNoOSRDeoptId
+#include "vm/flow_graph_builder.h"    // InlineExitCollector (ST inlining)
 #include "vm/intermediate_language.h" // all the *Instr, Value, Definition
 #include "vm/isolate.h"               // Isolate (closure-function table)
 #include "vm/object.h"                // Function, Class, Type, Integer, Bool...
@@ -200,13 +202,16 @@ class StGraphBuilder {
 
   StGraphBuilder(ParsedFunction* pf,
                  const ZoneGrowableArray<const ICData*>& ic_data_array,
-                 intptr_t osr_id)
+                 intptr_t osr_id,
+                 InlineExitCollector* exit_collector = NULL,
+                 intptr_t first_block_id = 1)
       : pf_(pf),
         thread_(Thread::Current()),
         zone_(thread_->zone()),
         ic_data_array_(ic_data_array),
         osr_id_(osr_id),
-        next_block_id_(1),
+        exit_collector_(exit_collector),
+        next_block_id_(first_block_id),
         stack_(NULL),
         pending_argument_count_(0),
         graph_entry_(NULL),
@@ -461,6 +466,10 @@ class StGraphBuilder {
     ASSERT(stack_ == NULL);
     ReturnInstr* return_instr =
         new (zone_) ReturnInstr(TokenPosition::kNoSource, value);
+    // Inlining: register every return with the exit collector so the inliner
+    // can rewrite it into a goto to the continuation (identical to
+    // kernel_to_il.cc's Return). NULL when compiling normally.
+    if (exit_collector_ != NULL) exit_collector_->AddExit(return_instr);
     Fragment instructions;
     instructions <<= return_instr;
     return instructions.closed();
@@ -606,6 +615,7 @@ class StGraphBuilder {
   Zone* zone_;
   const ZoneGrowableArray<const ICData*>& ic_data_array_;
   intptr_t osr_id_;
+  InlineExitCollector* exit_collector_;  // non-NULL when inlining this callee
   intptr_t next_block_id_;
   Value* stack_;
   intptr_t pending_argument_count_;
@@ -2071,6 +2081,16 @@ Fragment StGraphBuilder::TranslateClosure(BlockNode* block) {
           1 + a,
           String::Handle(zone_, Symbols::New(thread_, block->args[a].c_str())));
     }
+    // Finalize the signature type NOW (the parser does the same for its
+    // closures, parser.cc ~6963). Left unfinalized, the closure's function
+    // type reaches CompileType::Union once the INLINER starts splicing ST
+    // graphs (a phi unioning closure values) and TypeTest asserts
+    // IsFinalized() — the deltablue inlining crash.
+    Type& sig = Type::ZoneHandle(zone_, fn.SignatureType());
+    sig ^= ClassFinalizer::FinalizeType(
+        Class::Handle(zone_, pf_->function().Owner()), sig,
+        ClassFinalizer::kCanonicalize);
+    fn.SetSignatureType(sig);
     // Stage B: export every captured variable visible here (the method's
     // captured locals — or, inside a closure body, the restored outer vars,
     // which re-export to nested closures for free since the context is the
@@ -2202,6 +2222,14 @@ void StGraphBuilder::PrepareClosureScope(BlockNode* block) {
 
 FlowGraph* StGraphBuilder::BuildClosure(BlockNode* block) {
   in_closure_ = true;  // `^` in this body = non-local return (Stage C)
+  // v1: closures are not inlined (their capture/context restore prologue is
+  // not wired for the inliner's parameter substitution). Methods inline; a
+  // closure stays a real `call`. Bail cleanly if the inliner tries.
+  if (exit_collector_ != NULL) {
+    pf_->function().set_is_inlinable(false);
+    pf_->Bailout("st::BuildGraph", "ST closure not inlinable in v1");
+    UNREACHABLE();
+  }
   PrepareClosureScope(block);
 
   TargetEntryInstr* normal_entry = BuildTargetEntry();
@@ -2285,6 +2313,19 @@ Fragment StGraphBuilder::TranslateStatements(
 
 FlowGraph* StGraphBuilder::Build(MethodNode* method) {
   PrepareScope(method);
+
+  // INLINING BAILOUT: a method with the non-local-return try/catch wrapper (a
+  // ^-carrying closure) is not inlined in v1 — the exit collector expects
+  // plain ReturnInstrs, not the NLR CatchBlockEntry/ReThrow machinery. Mark it
+  // non-inlinable permanently (so future attempts skip it at CanBeInlined) and
+  // bail this attempt via the inliner's LongJumpScope. Simple methods — the
+  // hot getters/setters/dispatchers — inline. (Only reached when inlining;
+  // needs_nlr_ is set by PrepareScope's capture pass.)
+  if (exit_collector_ != NULL && needs_nlr_) {
+    pf_->function().set_is_inlinable(false);
+    pf_->Bailout("st::BuildGraph", "non-local return not inlinable");
+    UNREACHABLE();
+  }
 
   // Graph root: normal_entry (block id 1) wrapped in the GraphEntry (block 0).
   TargetEntryInstr* normal_entry = BuildTargetEntry();
@@ -2452,6 +2493,41 @@ FlowGraph* BuildGraph(ParsedFunction* pf,
   Node* node = reinterpret_cast<Node*>(pf->function().kernel_function());
   ASSERT(node != NULL);
   StGraphBuilder builder(pf, ic_data_array, osr_id);
+  FlowGraph* graph = NULL;
+  if (MethodNode* method = dynamic_cast<MethodNode*>(node)) {
+    graph = builder.Build(method);
+  } else if (BlockNode* block = dynamic_cast<BlockNode*>(node)) {
+    graph = builder.BuildClosure(block);
+  }
+  ASSERT(graph != NULL);
+  return graph;
+}
+
+// Inlining overload: build an ST callee graph for the inliner (returns route
+// through `exit_collector`; block ids start at `first_block_id` so they don't
+// collide with the caller's). The graph is otherwise identical — the inliner
+// runs SSA on it (adding ParameterInstr per num_direct_parameters, which our
+// param LoadLocals wire to) and substitutes the caller's actuals. NLR methods
+// and closures self-bail (see Build/BuildClosure) via the inliner's
+// LongJumpScope. This is what makes ST methods inlinable — the whole point of
+// closing the call-heavy gap with native Dart.
+FlowGraph* BuildGraph(ParsedFunction* pf,
+                      const ZoneGrowableArray<const ICData*>& ic_data_array,
+                      ::dart::InlineExitCollector* exit_collector,
+                      intptr_t first_block_id) {
+  // The inliner CACHES ParsedFunctions across call sites, but our scope prep
+  // (SetNodeSequence + AllocateVariables) runs once and is not idempotent — a
+  // second inline of the same method would re-set the cached scope and assert.
+  // Build with a FRESH ParsedFunction each time (the Function is shared, so
+  // set_is_inlinable on a bail still sticks; InlinedCallData keeps no
+  // ParsedFunction, only the callee_graph which references this fresh one).
+  Thread* thread = Thread::Current();
+  ParsedFunction* fresh = new (thread->zone()) ParsedFunction(
+      thread, Function::ZoneHandle(thread->zone(), pf->function().raw()));
+  Node* node = reinterpret_cast<Node*>(fresh->function().kernel_function());
+  ASSERT(node != NULL);
+  StGraphBuilder builder(fresh, ic_data_array, Compiler::kNoOSRDeoptId,
+                         exit_collector, first_block_id);
   FlowGraph* graph = NULL;
   if (MethodNode* method = dynamic_cast<MethodNode*>(node)) {
     graph = builder.Build(method);

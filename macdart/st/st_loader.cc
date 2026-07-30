@@ -240,7 +240,11 @@ dart::RawFunction* MakeStFunction(dart::Thread* thread,
         p, String::Handle(zone, Symbols::New(thread, m->args[a].c_str())));
   }
   fn.set_kernel_function(reinterpret_cast<void*>(static_cast<Node*>(m)));
-  fn.set_is_inlinable(false);
+  // ST methods ARE inlinable now (the inliner routes ST callees to
+  // st::BuildGraph with an exit collector — flow_graph_inliner.cc patch).
+  // Inlining the hot getters/setters/dispatchers is what closes the
+  // call-heavy gap with native Dart (richards/deltablue were ~10x). Methods
+  // that can't inline (non-local return) self-bail during the inline build.
   return fn.raw();
 }
 

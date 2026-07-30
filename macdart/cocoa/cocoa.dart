@@ -262,59 +262,72 @@ stNot(b) => b == true ? false : true;
 /// value-family sends: a real closure invokes directly (the optimizer inlines
 /// these helpers, restoring per-site monomorphic ICs); anything else — e.g. a
 /// DeltaBlue Variable with its own `value` method — goes to ST dispatch.
-stValue0(r) { if (r is Function) return r(); return r.value(); }
-stValue1(r, a) { if (r is Function) return r(a); return r.value_(a); }
-stValue2(r, a, b) { if (r is Function) return r(a, b); return r.value_value_(a, b); }
-stValue3(r, a, b, c) { if (r is Function) return r(a, b, c); return r.value_value_value_(a, b, c); }
-stValue4(r, a, b, c, d) { if (r is Function) return r(a, b, c, d); return r.value_value_value_value_(a, b, c, d); }
+stValue0(r) { if (r is Function) return r(); return _stValue0Slow(r); }
+_stValue0Slow(r) => r.value();
+stValue1(r, a) { if (r is Function) return r(a); return _stValue1Slow(r, a); }
+_stValue1Slow(r, a) => r.value_(a);
+stValue2(r, a, b) { if (r is Function) return r(a, b); return _stValue2Slow(r, a, b); }
+_stValue2Slow(r, a, b) => r.value_value_(a, b);
+stValue3(r, a, b, c) { if (r is Function) return r(a, b, c); return _stValue3Slow(r, a, b, c); }
+_stValue3Slow(r, a, b, c) => r.value_value_value_(a, b, c);
+stValue4(r, a, b, c, d) { if (r is Function) return r(a, b, c, d); return _stValue4Slow(r, a, b, c, d); }
+_stValue4Slow(r, a, b, c, d) => r.value_value_value_value_(a, b, c, d);
 
 /// ST `&`/`|`: Boolean non-short-circuit and/or (Dart 1.24 bool has no
 /// operator&). Ints keep bitwise semantics; anything else -> ST dispatch.
 stBoolAnd(a, b) {
   if (a is bool && b is bool) return a && b;
   if (a is int && b is int) return a & b;
-  return a & b;
+  return _stAmpSlow(a, b);
 }
+_stAmpSlow(a, b) => a & b;
 
 stBoolOr(a, b) {
   if (a is bool && b is bool) return a || b;
   if (a is int && b is int) return a | b;
-  return a | b;
+  return _stPipeSlow(a, b);
 }
+_stPipeSlow(a, b) => a | b;
 
 stAt1(c, k) {
   if (c is List) return c[k - 1]; // Smalltalk indexes from 1
   if (c is Map) return c[k];
   if (c is String) return c[k - 1]; // a Character = a 1-char string
-  return c.at_(k);
+  return _stAtSlow(c, k);
 }
+_stAtSlow(c, k) => c.at_(k);
 
 stAtPut1(c, k, v) {
   if (c is List) { c[k - 1] = v; return v; }
   if (c is Map) { c[k] = v; return v; }
-  return c.at_put_(k, v);
+  return _stAtPutSlow(c, k, v);
 }
+_stAtPutSlow(c, k, v) => c.at_put_(k, v);
 
 stSizeOf(c) {
   if (c is List || c is Map || c is String) return c.length;
-  return c.size();
+  return _stSizeSlow(c);
 }
+_stSizeSlow(c) => c.size();
 
 stAddU(c, x) {
   if (c is List) { c.add(x); return x; }   // ST add: answers the argument
-  return c.add_(x);
+  return _stAddSlow(c, x);
 }
+_stAddSlow(c, x) => c.add_(x);
 
 stDo(c, f) {
   if (c is List) { for (var e in c) f(e); return c; }
   if (c is Map) { for (var v in c.values) f(v); return c; }
-  return c.do_(f);
+  return _stDoSlow(c, f);
 }
+_stDoSlow(c, f) => c.do_(f);
 
 stIsEmptyU(c) {
   if (c is List || c is Map || c is String) return c.isEmpty;
-  return c.isEmpty();
+  return _stIsEmptySlow(c);
 }
+_stIsEmptySlow(c) => c.isEmpty();
 
 /// `self error: 'msg'` — construct and signal a prelude Error.
 stError(recv, msg) {
@@ -349,19 +362,27 @@ stDivide(a, b) {
     return a / b;
   }
   if (a is num && b is num) return a / b;
-  return a / b;
+  return _stDivSlow(a, b);
 }
+_stDivSlow(a, b) => a / b;
 
 // Numeric conversions/negation: Dart-num fast paths (the world kernel's
 // versions are <primitive:>-backed and must never be reached via the NSM
 // hook, whose ignored-pragma bodies would answer self).
-stAsDouble(r) => r is num ? r.toDouble() : r.asDouble();
-stTruncated(r) => r is num ? r.truncate() : r.truncated();
-stRounded(r) => r is num ? r.round() : r.rounded();
-stFloorU(r) => r is num ? r.floor() : r.floor();
-stCeilingU(r) => r is num ? r.ceil() : r.ceiling();
-stNegated(r) => r is num ? -r : r.negated();
-stSqrt(r) => r is num ? math.sqrt(r) : r.sqrt();
+stAsDouble(r) => r is num ? r.toDouble() : _stAsDoubleSlow(r);
+_stAsDoubleSlow(r) => r.asDouble();
+stTruncated(r) => r is num ? r.truncate() : _stTruncSlow(r);
+_stTruncSlow(r) => r.truncated();
+stRounded(r) => r is num ? r.round() : _stRoundSlow(r);
+_stRoundSlow(r) => r.rounded();
+stFloorU(r) => r is num ? r.floor() : _stFloorSlow(r);
+_stFloorSlow(r) => r.floor();
+stCeilingU(r) => r is num ? r.ceil() : _stCeilSlow(r);
+_stCeilSlow(r) => r.ceiling();
+stNegated(r) => r is num ? -r : _stNegSlow(r);
+_stNegSlow(r) => r.negated();
+stSqrt(r) => r is num ? math.sqrt(r) : _stSqrtSlow(r);
+_stSqrtSlow(r) => r.sqrt();
 
 // Ordering (Sprint 14): Dart Strings have no operator< — a miss walked
 // into the world's Magnitude circularity (whose primitive stubs answer
@@ -370,41 +391,48 @@ stSqrt(r) => r is num ? math.sqrt(r) : r.sqrt();
 stLess(a, b) {
   if (a is num && b is num) return a < b;
   if (a is String && b is String) return a.compareTo(b) < 0;
-  return a < b;
+  return _stLtSlow(a, b);
 }
+_stLtSlow(a, b) => a < b;
 stLessEq(a, b) {
   if (a is num && b is num) return a <= b;
   if (a is String && b is String) return a.compareTo(b) <= 0;
-  return a <= b;
+  return _stLeSlow(a, b);
 }
+_stLeSlow(a, b) => a <= b;
 stGreater(a, b) {
   if (a is num && b is num) return a > b;
   if (a is String && b is String) return a.compareTo(b) > 0;
-  return a > b;
+  return _stGtSlow(a, b);
 }
+_stGtSlow(a, b) => a > b;
 stGreaterEq(a, b) {
   if (a is num && b is num) return a >= b;
   if (a is String && b is String) return a.compareTo(b) >= 0;
-  return a >= b;
+  return _stGeSlow(a, b);
 }
+_stGeSlow(a, b) => a >= b;
 
 stMax(a, b) {
   if (a is num && b is num) return a > b ? a : b;
-  return a.max_(b);
+  return _stMaxSlow(a, b);
 }
+_stMaxSlow(a, b) => a.max_(b);
 
 stMin(a, b) {
   if (a is num && b is num) return a < b ? a : b;
-  return a.min_(b);
+  return _stMinSlow(a, b);
 }
+_stMinSlow(a, b) => a.min_(b);
 
 /// `'foo' asSymbol` — canonicalize through the VM symbol table, so runtime
 /// symbols are IDENTICAL to `#foo` literals (which are Symbols::New strings).
 _stInternNative(String s) native "ST_asSymbol";
 stAsSymbol(s) {
   if (s is String) return _stInternNative(s);
-  return s.asSymbol();
+  return _stAsSymSlow(s);
 }
+_stAsSymSlow(s) => s.asSymbol();
 
 /// Sorted copy of a Dart list (prelude asSortedCollection plumbing).
 stSortedOf(l) { var c = new List.from(l); c.sort(); return c; }
@@ -451,10 +479,10 @@ stDisplayOf(x) => x is String ? x : stPrintOf(x);
 stPrintOn(r, s) {
   if (r is num || r is String || r is bool || r == null || r is List ||
       r is Map || r is Function) {
-    return s.nextPutAll_(stPrintOf(r));
+    return _stNPASlow(s, stPrintOf(r));
   }
   var v = _stSendTry(r, 'printOn:', [s]);
-  if (v == null) return s.nextPutAll_(r.toString());
+  if (v == null) return _stNPASlow(s, r.toString());
   return v[0];
 }
 
@@ -514,8 +542,9 @@ stJoinRows(l) {
 stCopyFromTo(c, a, b) {
   if (c is String) return c.substring(a - 1, b);
   if (c is List) return c.sublist(a - 1, b);
-  return c.copyFrom_to_(a, b);
+  return _stCopySlow(c, a, b);
 }
+_stCopySlow(c, a, b) => c.copyFrom_to_(a, b);
 
 /// Parse-check `.mst` source WITHOUT loading it: returns '' when it parses,
 /// else "ERR: line:col: message" — the editor's cheap pre-Accept validation.
@@ -1033,3 +1062,5 @@ class Cocoa {
 
   String toString() => 'Cocoa(0x${handle.toRadixString(16)})';
 }
+
+_stNPASlow(s, t) => s.nextPutAll_(t);

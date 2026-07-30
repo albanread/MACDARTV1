@@ -107,6 +107,7 @@ String _stImport(String path) {
   }
   var classText = <String, StringBuffer>{};
   var classNames = <String>[];
+  var classCat = <String, String>{};   // name -> first defining file's stem
   var doitText = <String, String>{};
   for (var p in files) {
     var stem = p.split('/').last.replaceAll('.mst', '');
@@ -136,6 +137,7 @@ String _stImport(String path) {
           buf = new StringBuffer();
           classText[name] = buf;
           classNames.add(name);
+          classCat[name] = stem;          // its package = its file's stem
         } else {
           buf.write('\n\n"— from ' + stem + ' —"\n');
         }
@@ -161,8 +163,11 @@ String _stImport(String path) {
   });
   var err = _rebuildAndReload();
   if (err.isNotEmpty) return err;
-  classText.forEach((name, buf) { _imageUpsert(name, _decls[name]); });
-  doitText.forEach((name, text) { _imageUpsert(name, text); });
+  classText.forEach((name, buf) {
+    _imageUpsert(name, _decls[name],
+        classCat.containsKey(name) ? classCat[name] : 'world');
+  });
+  doitText.forEach((name, text) { _imageUpsert(name, text, 'boot'); });
   return 'imported ' + classNames.length.toString() + ' classes, ' +
       doitText.length.toString() + ' boot chunks from ' +
       files.length.toString() + ' files';
@@ -239,15 +244,35 @@ String _stBrowserHandle(String arg) {
 
 String _hostCall(String verb, List args) {
   if (verb == 'packageTree') {
-    var st = <String>[]; var da = <String>[];
+    // The world grouped by source-file stem (MACVM: a class's category IS
+    // its package); user-accepted ST and the Dart classes under 'image'.
+    var world = <String, List<String>>{};
+    var userSt = <String>[]; var da = <String>[];
     _decls.forEach((n, s) {
       var k = _kindOf(s);
-      if (k == 'st-class') st.add(n);
-      else if (k == 'class' || k == 'enum') da.add(n);
+      if (k == 'st-class') {
+        var cat = _declCat.containsKey(n) ? _declCat[n] : 'user';
+        if (cat == 'user') { userSt.add(n); }
+        else {
+          world.putIfAbsent(cat, () => <String>[]);
+          world[cat].add(n);
+        }
+      } else if (k == 'class' || k == 'enum') {
+        da.add(n);
+      }
     });
-    st.sort(); da.sort();
-    return 'image' + _us + 'smalltalk' + _us + st.join(' ') + '\n' +
-           'image' + _us + 'dart' + _us + da.join(' ') + '\n';
+    var out = new StringBuffer();
+    var stems = world.keys.toList()..sort();
+    for (var stem in stems) {
+      var cs = world[stem]..sort();
+      out.write('world' + _us + stem + _us + cs.join(' ') + '\n');
+    }
+    userSt.sort(); da.sort();
+    if (userSt.isNotEmpty) {
+      out.write('image' + _us + 'smalltalk' + _us + userSt.join(' ') + '\n');
+    }
+    out.write('image' + _us + 'dart' + _us + da.join(' ') + '\n');
+    return out.toString();
   }
   if (verb == 'browseRecords') {
     var out = new StringBuffer();
@@ -624,17 +649,28 @@ void _rememberWsValue(String name, String expr) {
 // --- the image (user-app source) --------------------------------------------
 void _loadFromImage() {
   _decls.clear();
-  var rows = _db.query('SELECT name, source FROM decls ORDER BY name', const []);
+  _declCat.clear();
+  var rows = _db.query(
+      'SELECT name, source, category FROM decls ORDER BY name', const []);
   if (rows != null) {
-    for (var r in rows) _decls[r[0]] = r[1];
+    for (var r in rows) {
+      _decls[r[0]] = r[1];
+      _declCat[r[0]] = (r.length > 2 && r[2] != null) ? r[2].toString() : 'user';
+    }
   }
   _rebuildAndReload();   // make the loaded declarations live
 }
 
-void _imageUpsert(String name, String source) {
+final Map<String, String> _declCat = <String, String>{};  // name -> package
+
+void _imageUpsert(String name, String source, [String category]) {
+  var cat = category != null
+      ? category
+      : (_declCat.containsKey(name) ? _declCat[name] : 'user');
+  _declCat[name] = cat;
   if (_db != null && _db.isOpen) {
     _db.exec('INSERT OR REPLACE INTO decls(name,kind,category,source) VALUES(?,?,?,?)',
-        [name, _kindOf(source), 'user', source]);
+        [name, _kindOf(source), cat, source]);
   }
 }
 

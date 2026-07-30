@@ -975,7 +975,7 @@ void browserAccept() {
   // just accepted, so "+ Method" (and the member panes) work straight away —
   // otherwise a freshly created class is left with nothing selected and the next
   // click on + Method just says "select a user class first".
-  var decls = splitTopLevel(text);
+  var decls = editorDecls(text);
   if (decls.isEmpty) { log("(nothing to accept)"); return; }
   var name = _classNameOf(decls[0]);
   guardedAccept(decls, "Accept", () {
@@ -1298,7 +1298,7 @@ void run(bool printIt) {
 // SQLite image, so they persist and survive a watchdog respawn — unlike Do It,
 // which evaluates transiently.
 void acceptEditor() {
-  var decls = splitTopLevel(gEditor.string().UTF8String());
+  var decls = editorDecls(gEditor.string().UTF8String());
   if (decls.isEmpty) { log("(nothing to accept)"); return; }
   guardedAccept(decls, "Accept", () {
     ask('acceptMany', decls).then((r) {
@@ -1315,6 +1315,64 @@ void acceptEditor() {
 // Split source into top-level declarations (class / enum / typedef / var /
 // function), respecting strings and comments. A unit ends at a top-level '}'
 // (depth returns to 0) or a top-level ';'.
+/// Split an editor buffer into top-level declarations, in the RIGHT language.
+/// Smalltalk source (an ST class/extend decl, after any leading "..."
+/// comments) must NOT go through the Dart splitter — its `"..."` comments read
+/// as unterminated Dart string literals (the "Save to Image refused" the user
+/// hit). ST buffers split on `[`/`]` class-bracket depth (respecting
+/// "comments", 'strings', and $c literals); a single loaded class returns as
+/// one decl.
+List<String> editorDecls(String s) {
+  return _wsIsSt(s) ? _splitStTopLevel(s) : splitTopLevel(s);
+}
+
+List<String> _splitStTopLevel(String s) {
+  var out = <String>[];
+  var n = s.length, i = 0, start = 0, depth = 0;
+  var seen = false;                 // a `[` has opened the current decl
+  while (i < n) {
+    var c = s.codeUnitAt(i);
+    if (c == 0x22) {                // "comment"
+      i++;
+      while (i < n) {
+        if (s.codeUnitAt(i) == 0x22) {
+          if (i + 1 < n && s.codeUnitAt(i + 1) == 0x22) { i += 2; continue; }
+          i++; break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (c == 0x27) {                // 'string'
+      i++;
+      while (i < n) {
+        if (s.codeUnitAt(i) == 0x27) {
+          if (i + 1 < n && s.codeUnitAt(i + 1) == 0x27) { i += 2; continue; }
+          i++; break;
+        }
+        i++;
+      }
+      continue;
+    }
+    if (c == 0x24 && i + 1 < n) { i += 2; continue; }   // $c literal
+    if (c == 0x5B) { depth++; seen = true; i++; continue; }   // [
+    if (c == 0x5D) {                                          // ]
+      i++;
+      if (depth > 0) depth--;
+      if (depth == 0 && seen) {
+        var d = s.substring(start, i).trim();
+        if (d.length > 0) out.add(d);
+        start = i; seen = false;
+      }
+      continue;
+    }
+    i++;
+  }
+  var tail = s.substring(start).trim();
+  if (tail.length > 0) out.add(tail);
+  return out;
+}
+
 List<String> splitTopLevel(String s) {
   var out = <String>[];
   var n = s.length, i = 0, start = 0, depth = 0;
@@ -2380,7 +2438,7 @@ void editorLoad() {
 
 // Editor -> image AND live (this is Accept: the image is the source of truth).
 void editorSaveImage() {
-  var decls = splitTopLevel(edText());
+  var decls = editorDecls(edText());
   if (decls.isEmpty) { log("editor: nothing to save"); return; }
   guardedAccept(decls, "Save to Image", () {
   ask('acceptMany', decls).then((r) {
@@ -2398,7 +2456,7 @@ void editorSaveImage() {
 // Editor -> live isolate ONLY. Try a class in the running world without
 // committing it: a respawn (or the next launch) re-reads the image and it is gone.
 void editorAddToWorld() {
-  var decls = splitTopLevel(edText());
+  var decls = editorDecls(edText());
   if (decls.isEmpty) { log("editor: nothing to add"); return; }
   guardedAccept(decls, "Add to World", () {
   ask('acceptLive', decls).then((r) {
@@ -2478,7 +2536,7 @@ void editorFileIn() {
     var src;
     try { src = new File(path).readAsStringSync(); }
     catch (e) { log("editor: file in failed — " + e.toString()); return; }
-    var decls = splitTopLevel(src);
+    var decls = editorDecls(src);
     if (decls.isEmpty) { log("editor: " + path + " has no top-level declarations"); return; }
     gEdFile = path; gEdClass = null;
     edSetText(src);
@@ -4858,7 +4916,7 @@ Future _installApp(String title, String path) async {
   var src;
   try { src = new File(path).readAsStringSync(); }
   catch (e) { log("✗ app — cannot read " + path); return; }
-  var decls = splitTopLevel(src);
+  var decls = editorDecls(src);
   if (decls.isEmpty) { log("✗ app — " + path + " has no declarations"); return; }
   var name;
   for (var d in decls) {
@@ -5568,7 +5626,7 @@ Future editorAnalyze() async {
 // copies already in the image.
 List<String> _bufferNames(String src) {
   var out = <String>[];
-  for (var d in splitTopLevel(src)) {
+  for (var d in editorDecls(src)) {
     var n = _classNameOf(d);
     if (n != null) out.add(n);
   }

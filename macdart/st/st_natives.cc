@@ -439,6 +439,40 @@ void ST_send(Dart_NativeArguments args) { STSendCommon(args, false); }
 // try/catch, which crashed the Release GUI inside stPrintOf's fallback).
 void ST_sendTry(Dart_NativeArguments args) { STSendCommon(args, true); }
 
+// stHasMethod(recv, selector) -> bool.  Sprint 13: a lookup-only probe (no
+// invoke, no prelude requirement) — does the receiver's class chain define
+// the (mangled) selector? The NSM hook uses it to decide whether a missed
+// send should be reified as a Smalltalk doesNotUnderstand:.
+void ST_hasMethod(Dart_NativeArguments args) {
+  Dart_Handle recv_h = Dart_GetNativeArgument(args, 0);
+  Dart_Handle sel_h = Dart_GetNativeArgument(args, 1);
+  const char* sel_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(sel_h, &sel_c)) || sel_c == NULL) {
+    Dart_SetReturnValue(args, Dart_NewBoolean(false));
+    return;
+  }
+  const std::string selector(sel_c);
+  Thread* thread = Thread::Current();
+  bool found = false;
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Object& recv = Object::Handle(zone, Api::UnwrapHandle(recv_h));
+    const String& sel = String::Handle(
+        zone, Symbols::New(thread, ::st::MangleSelector(selector).c_str()));
+    Function& fn = Function::Handle(zone);
+    Class& c = Class::Handle(zone, recv.clazz());
+    while (!c.IsNull()) {
+      if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+      fn ^= c.LookupDynamicFunction(sel);
+      if (!fn.IsNull()) { found = true; break; }
+      c ^= c.SuperClass();
+    }
+  }
+  Dart_SetReturnValue(args, Dart_NewBoolean(found));
+}
+
 // stClassSend(type, selector, args) -> result.  Sprint 11: the class-side
 // `self <sel>` dispatch — receiver is a CLASS VALUE (Type), target resolved at
 // runtime by walking its metaclass-shadow chain, so an inherited class-side

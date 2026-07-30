@@ -58,6 +58,21 @@ Object subclass: WriteStream [
     contents [ ^ STSystem joinList: buf ]
 ]
 
+"── The reified message (Sprint 13: doesNotUnderstand:) ──────────────
+ When a send misses everything — the receiver's chain AND the inherited
+ extension-holder protocol — and the receiver defines doesNotUnderstand:,
+ the runtime builds one of me (selector in keyword spelling, arguments as
+ an Array) and dispatches doesNotUnderstand: with it. The ObjcRef
+ passthrough (`pi processName`) is built on exactly this."
+Object subclass: STMessage [
+    | selector arguments |
+    setSelector: s arguments: a [ selector := s. arguments := a ]
+    selector [ ^selector ]
+    arguments [ ^arguments ]
+    argument [ ^arguments at: 1 ]
+    printOn: ws [ ws nextPutAll: 'message(' , selector , ')' ]
+]
+
 "── Global variables (Sprint 11c) ────────────────────────────────────
  The world image's globals (Transcript := TranscriptStream new,
  CharacterTable, ...) live as static Fields on this holder, created by

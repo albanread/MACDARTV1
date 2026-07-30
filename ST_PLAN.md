@@ -744,10 +744,35 @@ loudly). Stages A and C are modest; A is independently shippable.
   entry + a guarded call in `runtime/bin/main.cc` (patch hunk regenerated; all
   18 hunks dry-run clean against pristine 1.24.3).
 
-  **Next:** MACVM display/GUI primitive bridge (the 36_pixmap/43_gamepane tier
-  currently loads but cannot draw), `Smalltalk at:put:` system-dictionary protocol,
-  Behavior/reflection surface (`name`, `superclass`), performance pass on the NSM
-  dispatch path (direct method injection into _Smi/_Double/_OneByteString), and
+- **Sprint 13 (IN PROGRESS) — ONE Cocoa bridge, two language faces.** dartui and
+  the ST world each carry a Cocoa UI layer; there must be only one. The design:
+  the world's `Cocoa`/`ObjcRef`/`ObjcMainProxy` API (49_cocoa.mst — MACVM's C0/C3
+  bridge) is KEPT, its `<primitive: 23x>` bodies re-bound onto dart:cocoa's typed
+  marshaller (the vendored world is ours to adapt; the file keeps its API and
+  docs). One handle model: an ObjcRef holds the DART `Cocoa` wrapper in an ivar —
+  retain/release/GC policy stays with the proven Dart side.
+  - 13a slices: (1) `Cocoa.noSuchMethod` learns the ST mangle (a '_' in the
+    member name ⇒ all-positional, '_'→':' — `setTitle_` → `setTitle:`), so ST
+    sends reach ObjC through the same door as Dart sends; (2) helpers
+    stObjcClassNamed/stObjcSend/stObjcSendMain/stObjcUTF8/stObjcUnwrap; (3) the
+    MAIN-THREAD HOP: `Cocoa_sendMain` native — marshal on the isolate thread,
+    dispatch_sync the objc_msgSend onto the main queue, unmarshal back — which
+    makes MACVM's `ref onMain makeKeyAndOrderFront: nil` semantics real from the
+    LANGUAGE isolate (AppKit stays main-thread-only, exactly per their doc);
+    (4) real `doesNotUnderstand:` — the Object-NSM hook, after the holder walk,
+    reifies the missed send as a prelude STMessage (unmangled selector + args)
+    and dispatches it up the receiver's chain, which is what ObjcRef's
+    passthrough (`pi processName`) and ObjcMainProxy are built on; (5) the
+    vendored 49_cocoa.mst rewrite; (6) proof: MACVM's own doc example
+    (`(Cocoa classNamed: 'NSProcessInfo') send: 'processInfo'` → processName)
+    headless, then an ST-built window from the workspace via onMain.
+  - Later slices: the 63–74 CocoaUI tier (MACVM's ST IDE widgets) verified class
+    by class on the shared bridge; pixmap/gamepane mapping onto the dartui game
+    pane.
+
+  **Also next:** `Smalltalk at:put:` system-dictionary protocol, Behavior/
+  reflection surface (`name`, `superclass`), performance pass on the NSM dispatch
+  path (direct method injection into _Smi/_Double/_OneByteString), and
   extension-decl naming (a user `Integer extend [...]` accept currently replaces
   the imported Integer decl by name rather than merging into it).
 

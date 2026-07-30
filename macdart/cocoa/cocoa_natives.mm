@@ -9,6 +9,7 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <atomic>
+#include <memory>
 #include <dlfcn.h>
 #include <string.h>
 #include <unistd.h>
@@ -159,12 +160,16 @@ static Dart_Handle MakeCocoa(int64_t handle) {
 // Wrap an object return in a Cocoa. Non-+1-family results are retained so the
 // wrapper owns exactly one strong ref, released by ReleaseFinalizer on GC.
 // Classes and nil are wrapped plainly (never retained/released).
-static Dart_Handle WrapObject(id obj, const char* sel) {
+static Dart_Handle WrapObject(id obj, const char* sel,
+                              bool pre_owned = false) {
   if (obj == nil) return MakeCocoa(0);
   bool is_class = class_isMetaClass(object_getClass(obj));
   Dart_Handle cocoa = MakeCocoa((int64_t)obj);
   if (Dart_IsError(cocoa) || is_class) return cocoa;
-  if (!IsPlusOneFamily(sel)) [obj retain];
+  // pre_owned: the main-thread hop already retained (it MUST — an
+  // autoreleased result can be freed by the main pool before this thread
+  // touches it); exactly one owned reference exists either way.
+  if (!pre_owned && !IsPlusOneFamily(sel)) [obj retain];
   Dart_WeakPersistentHandle wph =
       Dart_NewWeakPersistentHandle(cocoa, (void*)obj, 0, ReleaseFinalizer);
   Dart_SetField(cocoa, WphName(), Dart_NewInteger((int64_t)wph));
@@ -192,7 +197,7 @@ static void PoisonReceiver(Dart_Handle receiver) {
 // Resolves the method's @encode, classifies it (AAPCS64 tokens), marshals each
 // Dart arg into the flat GPR/FPR buffers per its token, dispatches through the
 // fixed-shape shim, and returns the result as the matching Dart value.
-static void Cocoa_send(Dart_NativeArguments args) {
+static void CocoaSendCommon(Dart_NativeArguments args, bool on_main) {
   Dart_Handle receiver = Dart_GetNativeArgument(args, 0);
   Dart_Handle hf = Dart_GetField(receiver, HandleName());
   int64_t h = 0;
@@ -286,7 +291,72 @@ static void Cocoa_send(Dart_NativeArguments args) {
   else rk = SH_GPR;
 
   uint64_t out_gpr[2] = {0}; double out_fpr[4] = {0}; char err[256] = {0};
-  int ok = macdart_objc_send(target, sel, rk, gpr, fpr, stk, out_gpr, out_fpr, err, 256);
+  int ok;
+  bool hop_owned = false;   // the main-thread block already holds our ref
+  if (on_main && ![NSThread isMainThread]) {
+    // The C3 hop (Sprint 13): run the objc_msgSend ON THE MAIN THREAD —
+    // AppKit is main-thread-only. dispatch_async + a timed semaphore, NOT
+    // dispatch_sync: a headless host (the plain `dart` CLI) has no run loop
+    // draining the main queue, and this must FAIL CLEANLY there, exactly as
+    // MACVM's bridge doc specifies. The block owns a heap context, so a
+    // timed-out send that runs later scribbles on its own heap block, never
+    // on our dead stack frame.
+    struct MainSendCtx {
+      void* target; void* sel; int rk; int retain_obj;
+      uint64_t g[6]; double f[8]; uint64_t st[4];
+      uint64_t og[2]; double of[4]; char err[256]; int ok;
+    };
+    __block std::shared_ptr<MainSendCtx> ctx(new MainSendCtx());
+    ctx->target = (void*)target; ctx->sel = (void*)sel; ctx->rk = rk;
+    // An OBJECT result must be retained ON THE MAIN THREAD, inside this
+    // event, or the main autorelease pool can free it before we wrap it.
+    ctx->retain_obj = (ret_tok == TOK_OBJ) && !IsPlusOneFamily(sel_name);
+    memcpy(ctx->g, gpr, sizeof(ctx->g));
+    memcpy(ctx->f, fpr, sizeof(ctx->f));
+    memcpy(ctx->st, stk, sizeof(ctx->st));
+    ctx->err[0] = '\0'; ctx->ok = 0;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    std::shared_ptr<MainSendCtx> blk = ctx;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      @try {
+        blk->ok = macdart_objc_send(blk->target, blk->sel, blk->rk, blk->g,
+                                    blk->f, blk->st, blk->og, blk->of,
+                                    blk->err, 256);
+        if (blk->ok && blk->retain_obj && blk->og[0] != 0) {
+          [(id)blk->og[0] retain];
+        }
+      } @catch (NSException* e) {
+        snprintf(blk->err, sizeof(blk->err), "dart:cocoa: NSException %s: %s",
+                 [[e name] UTF8String] ?: "?",
+                 [[e reason] UTF8String] ?: "");
+        blk->ok = 0;
+      }
+      dispatch_semaphore_signal(done);
+    });
+    if (dispatch_semaphore_wait(
+            done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0) {
+      Dart_ThrowException(Dart_NewStringFromCString(
+          "dart:cocoa: sendMain — the main run loop is not draining "
+          "(headless host, or the UI thread is blocked)"));
+      return;
+    }
+    ok = ctx->ok;
+    hop_owned = true;
+    memcpy(out_gpr, ctx->og, sizeof(out_gpr));
+    memcpy(out_fpr, ctx->of, sizeof(out_fpr));
+    memcpy(err, ctx->err, sizeof(err));
+  } else {
+    // The design contract (49_cocoa.mst): a thrown NSException surfaces as
+    // an ordinary catchable error — the VM never dies for one.
+    @try {
+      ok = macdart_objc_send(target, sel, rk, gpr, fpr, stk, out_gpr,
+                             out_fpr, err, 256);
+    } @catch (NSException* e) {
+      snprintf(err, sizeof(err), "dart:cocoa: NSException %s: %s",
+               [[e name] UTF8String] ?: "?", [[e reason] UTF8String] ?: "");
+      ok = 0;
+    }
+  }
   if (!ok) {
     Dart_ThrowException(Dart_NewStringFromCString(err[0] ? err : "dart:cocoa: send failed"));
     return;
@@ -294,7 +364,7 @@ static void Cocoa_send(Dart_NativeArguments args) {
 
   // Deliver the result as the matching Dart value.
   if (ret_tok == TOK_OBJ) {                // id/Class -> retained Cocoa wrapper
-    Dart_Handle wrapped = WrapObject((id)out_gpr[0], sel_name);
+    Dart_Handle wrapped = WrapObject((id)out_gpr[0], sel_name, hop_owned);
     if (IsInitFamily(sel_name)) PoisonReceiver(receiver);
     Dart_SetReturnValue(args, wrapped);
   } else if (ret_tok == TOK_CSTR) {        // char* -> Dart String
@@ -520,6 +590,7 @@ void ST_classOf(Dart_NativeArguments args);
 void ST_loadFresh(Dart_NativeArguments args);
 void ST_outline(Dart_NativeArguments args);
 void ST_sendTry(Dart_NativeArguments args);
+void ST_hasMethod(Dart_NativeArguments args);
 void ST_asSymbol(Dart_NativeArguments args);
 void ST_gcScavenge(Dart_NativeArguments args);
 void ST_gcFull(Dart_NativeArguments args);
@@ -555,12 +626,23 @@ void Sqlite_close(Dart_NativeArguments args);
 void Sqlite_exec(Dart_NativeArguments args);
 void Sqlite_query(Dart_NativeArguments args);
 
+
+// Sprint 13: the two faces of one send path — Cocoa_sendMain hops the
+// objc_msgSend onto the main thread (AppKit work from the language isolate).
+static void Cocoa_send(Dart_NativeArguments args) {
+  CocoaSendCommon(args, false);
+}
+static void Cocoa_sendMain(Dart_NativeArguments args) {
+  CocoaSendCommon(args, true);
+}
+
 #define COCOA_NATIVE_LIST(V)                                                   \
   V(Cocoa_getpid, 0)                                                           \
   V(Cocoa_nsStringFromCString, 1)                                              \
   V(Cocoa_nsStringLength, 1)                                                   \
   V(Cocoa_nsStringUtf8, 1)                                                     \
   V(Cocoa_send, 3)                                                             \
+  V(Cocoa_sendMain, 3)                                                         \
   V(Cocoa_getClass, 1)                                                         \
   V(Cocoa_classExists, 1)                                                      \
   V(Cocoa_selectorInfo, 2)                                                     \
@@ -590,6 +672,7 @@ void Sqlite_query(Dart_NativeArguments args);
   V(ST_loadFresh, 1)                                                           \
   V(ST_outline, 1)                                                             \
   V(ST_sendTry, 3)                                                             \
+  V(ST_hasMethod, 2)                                                           \
   V(ST_asSymbol, 1)                                                            \
   V(ST_gcScavenge, 0)                                                          \
   V(ST_gcFull, 0)                                                              \

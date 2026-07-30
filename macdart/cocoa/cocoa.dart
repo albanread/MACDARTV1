@@ -97,6 +97,10 @@ stClassOf(r) native "ST_classOf";
 /// protocol's printOn: fallback must degrade, not crash the Release GUI).
 _stSendTry(recv, String sel, List args) native "ST_sendTry";
 
+/// Lookup-only probe: does the receiver's class chain define the selector?
+/// (No invoke, no prelude requirement — safe before any ST has loaded.)
+bool _stHasMethod(recv, String sel) native "ST_hasMethod";
+
 /// Public alias for the --with-st boot path (C++ enters via Dart_Invoke,
 /// which cannot reach the private installer).
 void stEnsureHooks() { _stEnsureHooks(); }
@@ -118,8 +122,22 @@ void _stEnsureHooks() {
     if (r != null) return r;
     return _stExtSendTry(t, sel, args);
   };
-  internal.VMLibraryHooks.stObjNSM =
-      (r, String sel, List args) => _stExtSendTry(r, sel, args);
+  internal.VMLibraryHooks.stObjNSM = (r, String sel, List args) {
+    var hit = _stExtSendTry(r, sel, args);
+    if (hit != null) return hit;
+    // Sprint 13: real doesNotUnderstand: — after the inherited protocol
+    // (the extension holders) misses, a receiver whose chain defines
+    // doesNotUnderstand: gets the send REIFIED as an STMessage (selector
+    // un-mangled back to its keyword spelling). This is what the world's
+    // ObjcRef passthrough and ObjcMainProxy are built on.
+    if (_stHasMethod(r, 'doesNotUnderstand:')) {
+      var stSel = sel.endsWith('_') ? sel.replaceAll('_', ':') : sel;
+      var msg = stNew('STMessage');
+      stSend(msg, 'setSelector:arguments:', [stSel, args]);
+      return _stSendTry(r, 'doesNotUnderstand:', [msg]);
+    }
+    return null;
+  };
 }
 
 /// Invoke a class-side (static) method [selector] on a loaded ST class
@@ -511,6 +529,62 @@ List cocoaNearestSelectors(String cls, String typo) =>
 /// object result — retained, released on GC), a String (char*), an int
 /// (integer id), a double, a List of numbers (struct), or null (void).
 dynamic _send(Cocoa receiver, String selector, List args) native "Cocoa_send";
+dynamic _sendMain(Cocoa receiver, String selector, List args)
+    native "Cocoa_sendMain";
+
+// --- Sprint 13: the ST face of the ONE Cocoa bridge -------------------------
+// The world's Cocoa/ObjcRef API (49_cocoa.mst) binds its former MACVM
+// primitives to these helpers; the handle an ObjcRef carries in its ivar IS
+// the Dart Cocoa wrapper, so retain/release/GC policy stays in one place.
+stObjcClassNamed(String name) {
+  var c = Cocoa.cls(name);
+  return c.isNil ? null : c;             // ST nil for an unknown class
+}
+
+/// Map an ST-side argument onto the bridge: Cocoa wrappers and scalars pass
+/// through; an ST ObjcRef contributes its wrapped handle (via its
+/// `objcHandle` accessor); anything else passes as-is.
+_stObjcArg(a) {
+  if (a is Cocoa || a == null || a is num || a is String || a is bool) {
+    return a;
+  }
+  var r = _stSendTry(a, 'objcHandle', []);
+  if (r != null && r[0] is Cocoa) return r[0];
+  return a;
+}
+
+List _stObjcArgs(args) {
+  var out = <dynamic>[];
+  if (args is List) {
+    for (var a in args) out.add(_stObjcArg(a));
+  }
+  return out;
+}
+
+/// Auto-shaped send on the isolate thread (headless-safe work).
+stObjcSend(h, String sel, args) {
+  if (h == null) throw 'Cocoa: send to a released or nil reference';
+  return (h as Cocoa).send(sel, _stObjcArgs(args));
+}
+
+/// The C3 hop: the same send with objc_msgSend on the MAIN thread (AppKit).
+stObjcSendMain(h, String sel, args) {
+  if (h == null) throw 'Cocoa: send to a released or nil reference';
+  return (h as Cocoa).sendMain(sel, _stObjcArgs(args));
+}
+
+stObjcIsRef(x) => x is Cocoa;
+int stObjcPoolPush() native "Cocoa_poolPush";
+stObjcPoolPop(p) native "Cocoa_poolPop";
+
+/// An ST String from a send result: NSString wrappers via UTF8String,
+/// Dart strings as-is.
+stObjcUTF8(x) {
+  if (x is String) return x;
+  var c = _stObjcArg(x);              // an ST ObjcRef unwraps to its Cocoa
+  if (c is Cocoa) return c.isNil ? null : c.send('UTF8String', const []);
+  return x == null ? null : x.toString();
+}
 int _retain(int handle) native "Cocoa_retain";
 void _release(int handle) native "Cocoa_release";
 int _poolPush() native "Cocoa_poolPush";
@@ -774,12 +848,28 @@ class Cocoa {
   dynamic send(String selector, [List args = const []]) =>
       _send(this, selector, _unwrap(args));
 
+  /// Same send, but the objc_msgSend runs ON THE MAIN THREAD (synchronously,
+  /// via dispatch_sync) — AppKit's window/view work is main-thread-only.
+  /// Sprint 13: the substance behind the ST world's `onMain` proxy.
+  dynamic sendMain(String selector, [List args = const []]) =>
+      _sendMain(this, selector, _unwrap(args));
+
   dynamic noSuchMethod(Invocation inv) {
     var name = MirrorSystem.getName(inv.memberName);
     var pos = inv.positionalArguments;
     var named = inv.namedArguments;
     String selector;
     var args = <dynamic>[];
+
+    // Sprint 13: an ST send arrives with its keyword selector MANGLED
+    // (':' -> '_' — `w setTitle: t` => setTitle_, `p colorWithRed: r green: g`
+    // => colorWithRed_green_) and every argument positional. A '_' in the
+    // member name never comes from dartui's own camelCase call sites, so it
+    // marks the ST road: un-mangle and send. (Rare underscore-bearing ObjC
+    // selectors remain reachable via send('the_sel:', [...]).)
+    if (name.contains('_') && named.isEmpty) {
+      return _send(this, name.replaceAll('_', ':'), _unwrap(pos));
+    }
 
     if (inv.isGetter || (pos.isEmpty && named.isEmpty)) {
       // A getter or a 0-argument method: bare selector, no colon.

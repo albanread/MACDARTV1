@@ -766,6 +766,7 @@ typedef void CocoaAction(Cocoa sender);
 typedef int RowCountFn();
 typedef String CellFn(int row);
 typedef void SelectFn(int row);
+typedef void GutterClickFn(int line);   // debugger gutter click -> 1-based line
 
 class _TableSource {
   final RowCountFn rowCount;
@@ -781,6 +782,9 @@ bool _cbDispatchRegistered = false;
 void _registerCallbackDispatch(Function f) native "Cocoa_registerCallbackDispatch";
 int _makeActionTarget(int ticket) native "Cocoa_makeActionTarget";
 void _wireAction(int control, int target) native "Cocoa_wireAction";
+int _attachGutter(int scrollView, int ticket) native "Cocoa_attachGutter";
+void _gutterSetLines(int gutter, String breaksCsv, int paused)
+    native "Cocoa_gutterSetLines";
 
 // The single entry every native callback funnels through (see cocoa_callbacks.mm).
 // kind: 0 action, 1 textDidChange, 2 tableRowCount, 3 tableValue(arg=row),
@@ -789,6 +793,7 @@ dynamic _cocoaDispatch(int ticket, int kind, int arg) {
   var h = _cbHandlers[ticket];
   if (h == null) return null;
   if (kind <= 1) { if (h is CocoaAction) h(new Cocoa._adopt(arg)); return null; }
+  if (kind == 5) { if (h is GutterClickFn) h(arg); return null; }  // gutter click
   if (h is _TableSource) {
     if (kind == 2) return h.rowCount();
     if (kind == 3) return h.cellAt(arg);
@@ -821,6 +826,29 @@ Cocoa onAction(Cocoa control, CocoaAction fn) {
   var target = new Cocoa._adopt(_makeActionTarget(ticket));
   _wireAction(control.handle, target.handle);
   return target;
+}
+
+/// Attach a debugger-style breakpoint gutter (a vertical NSRulerView) to
+/// [scrollView] (the enclosing scroll view of a source text view). A click in
+/// the gutter calls [onLineClick] with the 1-based source line. Returns the
+/// gutter handle — pass it to [gutterSetLines] to paint the dots. Keep it alive.
+Cocoa attachGutter(Cocoa scrollView, GutterClickFn onLineClick) {
+  _ensureDispatch();
+  var ticket = _cbNext++;
+  _cbHandlers[ticket] = onLineClick;
+  return new Cocoa._adopt(_attachGutter(scrollView.handle, ticket));
+}
+
+/// Repaint [gutter]: a red dot on each line in [breakLines], a caret on
+/// [pausedLine] (0 for none).
+void gutterSetLines(Cocoa gutter, List<int> breakLines, int pausedLine) {
+  if (gutter == null) return;
+  var csv = new StringBuffer();
+  for (var i = 0; i < breakLines.length; i++) {
+    if (i > 0) csv.write(',');
+    csv.write(breakLines[i]);
+  }
+  _gutterSetLines(gutter.handle, csv.toString(), pausedLine);
 }
 
 /// Wire [textView]'s text-change notification (`textDidChange:`) to [fn] — e.g.

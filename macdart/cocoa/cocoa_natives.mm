@@ -769,6 +769,8 @@ void ST_become(Dart_NativeArguments args);
 void Cocoa_registerCallbackDispatch(Dart_NativeArguments args);
 void Cocoa_makeActionTarget(Dart_NativeArguments args);
 void Cocoa_wireAction(Dart_NativeArguments args);
+void Cocoa_attachGutter(Dart_NativeArguments args);
+void Cocoa_gutterSetLines(Dart_NativeArguments args);
 void Cocoa_applySpans(Dart_NativeArguments args);
 void Cocoa_keyWatch(Dart_NativeArguments args);
 void Cocoa_keyCapture(Dart_NativeArguments args);
@@ -852,6 +854,8 @@ static void Cocoa_sendMain(Dart_NativeArguments args) {
   V(Cocoa_registerCallbackDispatch, 1)                                         \
   V(Cocoa_makeActionTarget, 1)                                                 \
   V(Cocoa_wireAction, 2)                                                       \
+  V(Cocoa_attachGutter, 2)                                                     \
+  V(Cocoa_gutterSetLines, 3)                                                   \
   V(Cocoa_applySpans, 2)                                                       \
   V(Cocoa_keyWatch, 0)                                                         \
   V(Cocoa_keyCapture, 1)                                                       \

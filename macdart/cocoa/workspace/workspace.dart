@@ -1999,6 +1999,20 @@ Future<String> handle(String line) async {
       return gDbgQuiet ? "quiet (pauses leave the current tab)" : "surfacing";
     }
     case 'dbgsource': return gDbgSrc == null ? "" : gDbgSrc.string().UTF8String();
+    case 'dbgstscript': {
+      // Point the debugger at the ST script that DEFINES a class (so the
+      // gutter click-sets real .mst breakpoints). arg = class name.
+      var cls = arg.trim();
+      if (cls.isEmpty) return "ERR: dbgstscript <ClassName>";
+      var sid = await _dbgFindStScript(cls);
+      if (sid == null) return "ERR: no ST script defines " + cls;
+      return await dbgLoadStScript(sid, cls);
+    }
+    case 'dbggutter': {                    // the gutter's current dots, for tests
+      var lines = <int>[];
+      for (var b in gDbgBreaks) lines.add(b.line);
+      return "breaks=" + lines.join(',') + " paused=" + gDbgPauseLine.toString();
+    }
     // "paused at <fn>:<line>, K frames" — the line is what lets a stepping
     // agent VERIFY the step moved (top-frame names rarely change mid-function).
     case 'dbgstate': {
@@ -3201,6 +3215,12 @@ Future dbgReResolve() async {
 // image is written into — so that is what the source pane shows. Line numbers
 // here are the numbers the VM uses, which is why they are displayed.
 Cocoa gDbgSrc, gDbgStack, gDbgLocals, gDbgStatusLbl, gDbgEvalField;
+Cocoa gDbgGutter;                     // the graphical breakpoint gutter (Sprint 16)
+int gDbgPauseLine = 0;                // paused source line, for the gutter caret
+// ST source mode: when set, the debug pane shows an ST script's source (fetched
+// over vm-service, not a file) and the gutter sets breakpoints in it.
+String gDbgStScriptId;                // the ST script under debug (null = Dart scratch)
+String gDbgStSource;                  // its source text
 List gDbgFrames = <dynamic>[];        // [functionName, frameJson]
 List<int> gDbgFrameLines = <int>[];   // per-frame source line (0 = unknown)
 Map gDbgTokenTables = <String, dynamic>{};   // scriptId -> tokenPosTable, per attach
@@ -3297,6 +3317,13 @@ void buildDebugTab(Cocoa db) {
   var mf = _mono(12.0);
   if (!mf.isNil) gDbgSrc.setFont(mf);
   anchorScroll(gDbgSrc, kWidthSizable + kHeightSizable);
+  // Sprint 16: the graphical breakpoint gutter — click a line to toggle a
+  // breakpoint (Dart scratch or, in ST mode, an .mst script). Replaces the
+  // old text "*" marker with a real IDE ruler (red dot + paused-line caret).
+  var dbgScroll = gDbgSrc.enclosingScrollView();
+  if (!dbgScroll.isNil) {
+    gDbgGutter = attachGutter(dbgScroll, (line) { dbgGutterToggle(line); });
+  }
 
   // stack over locals, so selecting a frame changes what you are looking at
   var right = browserPane(split, 284.0, 358.0);
@@ -3371,6 +3398,9 @@ Future dbgAttach() async {
   await vmsCall('streamListen', <String, dynamic>{'streamId': 'Debug'});
   gDbgBreaks = <DbgBreak>[];                              // breakpoints belonged to the old target
   gDbgTokenTables = <String, dynamic>{};                  // and so did its scripts
+  gDbgPauseLine = 0;                                      // no stale caret from the old target
+  gDbgStScriptId = null; gDbgStSource = null;             // reset ST source mode
+  dbgRepaintGutter();
   dbgLoadSource();
   dbgStatus("attached to " + _dbgIsoLabel(chosen[1].toString(), chosen[0].toString()) +
       (gDbgIsLang ? "  (language isolate)" : "  — raw-line breakpoints") +
@@ -3380,23 +3410,93 @@ Future dbgAttach() async {
 
 // The source the VM sees: the scratch file, with the VM's own line numbers.
 void dbgLoadSource() {
-  if (gDbgScratch == null) return;
   String src;
-  try { src = new File(gDbgScratch).readAsStringSync(); }
-  catch (e) { dbgStatus("cannot read " + gDbgScratch); return; }
+  if (gDbgStScriptId != null) {
+    // ST source mode: the pane shows an .mst script (fetched over vm-service,
+    // not a file). The graphical gutter carries the breakpoint markers.
+    src = gDbgStSource != null ? gDbgStSource : "";
+  } else {
+    if (gDbgScratch == null) return;
+    try { src = new File(gDbgScratch).readAsStringSync(); }
+    catch (e) { dbgStatus("cannot read " + gDbgScratch); return; }
+  }
   var lines = src.split('\n');
   var out = new StringBuffer();
   for (var i = 0; i < lines.length; i++) {
     var n = (i + 1).toString();
     while (n.length < 4) n = " " + n;
-    out.write(_dbgHasBreakAt(i + 1) ? "*" : " ");
+    // The graphical gutter (Sprint 16) draws breakpoint dots; the text keeps
+    // just the line number for reference.
+    out.write(" ");
     out.write(n);
     out.write("  ");
     out.write(lines[i]);
     out.write("\n");
   }
   gDbgSrc.setString(out.toString());
+  dbgRepaintGutter();
   repaint();
+}
+
+/// The AUTHORITATIVE script of the live class [cls] — its Class object's
+/// location.script (via getClassList), which is the same script the paused
+/// frame reports. (A source-text search across libraries could pick a stale
+/// combined-image layer whose line numbers are shifted from the live one, so
+/// the gutter dots and the paused caret would disagree.)
+Future<String> _dbgFindStScript(String cls) async {
+  if (gLangIsolateId == null) return null;
+  var cl = await vmsCall('getClassList', <String, dynamic>{'isolateId': gLangIsolateId});
+  if (cl == null || cl['classes'] == null) return null;
+  for (var c in cl['classes']) {
+    if (c['name'] != null && c['name'].toString() == cls) {
+      var obj = await vmsCall('getObject', <String, dynamic>{
+        'isolateId': gLangIsolateId, 'objectId': c['id']});
+      var loc = (obj != null) ? obj['location'] : null;
+      var scr = (loc != null) ? loc['script'] : null;
+      if (scr != null && scr['id'] != null) return scr['id'].toString();
+    }
+  }
+  return null;
+}
+
+/// Point the debugger's source pane at an ST script (an st:mst/N id) — fetch
+/// its source over the vm-service and switch breakpoints to it, so gutter
+/// clicks set REAL Smalltalk breakpoints. Pass the class name to scroll to it.
+Future<String> dbgLoadStScript(String scriptId, [String scrollToDecl]) async {
+  if (gLangIsolateId == null) return "ERR: attach the language isolate first";
+  var sc = await vmsCall('getObject', <String, dynamic>{
+    'isolateId': gLangIsolateId, 'objectId': scriptId});
+  if (sc == null || sc['source'] == null) return "ERR: script has no source";
+  gDbgStScriptId = scriptId;
+  gDbgStSource = sc['source'].toString();
+  gLangScriptId = scriptId;      // breakpoints now land in the ST script
+  gDbgIsLang = false;            // raw-line breakpoints (ST source is stable here)
+  dbgLoadSource();
+  var msg = "debugging ST script " + (sc['uri'] == null ? scriptId : sc['uri'].toString());
+  if (scrollToDecl != null) {
+    var idx = gDbgStSource.indexOf('subclass: ' + scrollToDecl);
+    if (idx < 0) idx = gDbgStSource.indexOf(scrollToDecl);
+    if (idx >= 0) {
+      var line = 1;
+      for (var i = 0; i < idx; i++) if (gDbgStSource.codeUnitAt(i) == 0x0A) line++;
+      dbgScrollToLine(line);
+      msg = msg + " — " + scrollToDecl + " at line " + line.toString();
+    }
+  }
+  dbgStatus(msg);
+  return msg;
+}
+
+/// Scroll the debug source so [line] is visible (1-based).
+void dbgScrollToLine(int line) {
+  if (gDbgSrc == null) return;
+  var text = gDbgSrc.string().UTF8String();
+  var pos = 0, cur = 1;
+  while (cur < line && pos < text.length) {
+    if (text.codeUnitAt(pos) == 0x0A) cur++;
+    pos++;
+  }
+  gDbgSrc.scrollRangeToVisible([pos, 0]);
 }
 
 /// The 1-based line the caret sits on in the source pane.
@@ -3453,6 +3553,44 @@ Future dbgToggleBreak() async {
   await dbgAddBreak(dbgCaretLine(), '');
 }
 
+/// A gutter click: toggle a breakpoint at [line] — remove it if one is already
+/// there, else arm one. Fire-and-forget (the gutter callback is synchronous).
+void dbgGutterToggle(int line) {
+  if (_dbgHasBreakAt(line)) {
+    dbgRemoveBreakAt(line);
+  } else {
+    dbgAddBreak(line, '');
+  }
+}
+
+/// Remove the breakpoint at [line] (both in the VM and our anchored list).
+Future dbgRemoveBreakAt(int line) async {
+  var kept = <DbgBreak>[];
+  var removed = 0;
+  for (var b in gDbgBreaks) {
+    if (b.line == line) {
+      if (gLangIsolateId != null && b.vmId != null) {
+        await vmsCall('removeBreakpoint', <String, dynamic>{
+          'isolateId': gLangIsolateId, 'breakpointId': b.vmId});
+      }
+      removed++;
+    } else {
+      kept.add(b);
+    }
+  }
+  gDbgBreaks = kept;
+  if (removed > 0) { dbgStatus("removed breakpoint at line " + line.toString()); }
+  dbgLoadSource();
+}
+
+/// Repaint the gutter from the current breakpoints + paused line.
+void dbgRepaintGutter() {
+  if (gDbgGutter == null) return;
+  var lines = <int>[];
+  for (var b in gDbgBreaks) lines.add(b.line);
+  gutterSetLines(gDbgGutter, lines, gDbgPaused ? gDbgPauseLine : 0);
+}
+
 /// The Break If button: the condition is whatever is typed in the eval field,
 /// the line is the caret's — the two things already on screen.
 Future dbgBreakIf() async {
@@ -3498,6 +3636,8 @@ Future dbgResume(String step) async {
   // stay stopped until user code is genuinely running again.
   if (gDbgPaused) { gDbgPaused = false; debugRelease(); }
   gDbgFrames = <dynamic>[];
+  gDbgPauseLine = 0;              // clear the gutter caret
+  dbgRepaintGutter();
   gDbgStack.reloadData();
   dbgStatus(step == null ? "running" : "stepping " + step);
 }
@@ -3571,7 +3711,9 @@ Future _dbgMaybeConditionalPause(String kind, Map e) async {
     b.hits++;
   }
   if (gDbgIsLang) _tripPauseGates();
-  dbgOnPaused(kind);
+  // A breakpoint pause knows its exact line (the dot you clicked); the ST
+  // frame's tokenPos->line can drift a few lines, so prefer the breakpoint's.
+  dbgOnPaused(kind, (b != null) ? b.line : 0);
 }
 
 /// Forget a pause whose isolate no longer exists (it was killed or restarted).
@@ -3618,7 +3760,7 @@ Future<int> _dbgFrameLine(Map frame) async {
   return _dbgLineForToken(table, t is int ? t : 0);
 }
 
-Future dbgOnPaused(String kind) async {
+Future dbgOnPaused(String kind, [int hitLine = 0]) async {
   var stk = await vmsCall('getStack', <String, dynamic>{'isolateId': gLangIsolateId});
   gDbgFrames = <dynamic>[];
   if (stk != null && stk['frames'] != null) {
@@ -3631,6 +3773,23 @@ Future dbgOnPaused(String kind) async {
   for (var f in gDbgFrames) {
     gDbgFrameLines.add(await _dbgFrameLine(f[1]));
   }
+  // Sprint 16: if the top frame is in an .mst script, show that ST source in
+  // the pane (so you SEE where you paused), then mark the paused line in the
+  // gutter and scroll to it.
+  var top = gDbgFrames.isEmpty ? null : gDbgFrames[0][1];
+  var scr = (top != null && top['location'] != null) ? top['location']['script'] : null;
+  if (scr != null && scr['uri'] != null &&
+      scr['uri'].toString().startsWith('st:') && scr['id'] != null) {
+    // Show the .mst source where we paused (its line comes from _dbgFrameLine's
+    // tokenPosTable lookup — the service's tokenPos is table-keyed, not a raw
+    // byte offset, so trust that value rather than recomputing).
+    await dbgLoadStScript(scr['id'].toString());
+  }
+  gDbgPauseLine = (hitLine > 0)
+      ? hitLine
+      : (gDbgFrameLines.isNotEmpty ? gDbgFrameLines[0] : 0);
+  dbgRepaintGutter();
+  if (gDbgPauseLine > 0) dbgScrollToLine(gDbgPauseLine);
   gDbgStack.reloadData();
   gDbgFrame = 0;
   dbgShowVars(0);

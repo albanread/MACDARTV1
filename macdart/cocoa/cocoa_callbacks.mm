@@ -17,6 +17,111 @@
 
 #include "include/dart_api.h"
 
+// The debugger gutter (Sprint 16): a vertical NSRulerView on the debug source
+// scroll view. It draws a red breakpoint dot on each armed line and a caret on
+// the paused line, and a click toggles a breakpoint there — routed to Dart
+// through the ordinary callback funnel (kind 5, arg = the clicked 1-based line).
+// A real subclass (drawing + a mouseDown that needs the layout manager), so it
+// lives at global scope; the click hop into Dart is the one namespace bridge.
+namespace dart {
+namespace bin {
+void GutterDispatchLine(id gutter, int64_t line);  // -> _cocoaDispatch(kind 5)
+}
+}
+
+@interface MacdartGutter : NSRulerView {
+ @public
+  NSMutableSet* breaks_;    // NSNumber(line) with a breakpoint
+  NSInteger paused_;        // the paused line, or 0
+}
+@end
+
+@implementation MacdartGutter
+
+- (CGFloat)requiredThickness { return 18.0; }
+
+// The y (in this ruler's flipped coords) of the top of a 1-based source line.
+- (CGFloat)yForLine:(NSInteger)line {
+  NSTextView* tv = (NSTextView*)[self clientView];
+  if (tv == nil) return -1;
+  NSLayoutManager* lm = [tv layoutManager];
+  NSString* text = [tv string];
+  NSUInteger ci = 0;
+  NSInteger cur = 1;
+  NSUInteger len = [text length];
+  while (cur < line && ci < len) {
+    if ([text characterAtIndex:ci] == '\n') cur++;
+    ci++;
+  }
+  if (cur != line) return -1;
+  NSUInteger glyph = [lm glyphIndexForCharacterAtIndex:ci];
+  NSRect r = [lm lineFragmentRectForGlyphAtIndex:glyph effectiveRange:NULL];
+  NSRect visible = [[self scrollView] contentView].bounds;
+  return NSMinY(r) + [tv textContainerInset].height - NSMinY(visible);
+}
+
+- (void)drawHashMarksAndLabelsInRect:(NSRect)rect {
+  [[NSColor colorWithCalibratedWhite:0.16 alpha:1.0] setFill];
+  NSRectFill([self bounds]);
+  CGFloat w = [self bounds].size.width;
+  // paused-line band
+  if (paused_ > 0) {
+    CGFloat y = [self yForLine:paused_];
+    if (y >= 0) {
+      [[NSColor colorWithCalibratedRed:0.85 green:0.7 blue:0.15 alpha:0.9] set];
+      NSBezierPath* tri = [NSBezierPath bezierPath];
+      [tri moveToPoint:NSMakePoint(3, y + 3)];
+      [tri lineToPoint:NSMakePoint(w - 4, y + 7)];
+      [tri lineToPoint:NSMakePoint(3, y + 11)];
+      [tri closePath];
+      [tri fill];
+    }
+  }
+  // breakpoint dots
+  [[NSColor colorWithCalibratedRed:0.86 green:0.22 blue:0.22 alpha:1.0] set];
+  for (NSNumber* n in breaks_) {
+    CGFloat y = [self yForLine:[n integerValue]];
+    if (y < 0) continue;
+    NSRect dot = NSMakeRect(w * 0.5 - 5, y + 2, 10, 10);
+    [[NSBezierPath bezierPathWithOvalInRect:dot] fill];
+  }
+}
+
+- (void)mouseDown:(NSEvent*)event {
+  NSTextView* tv = (NSTextView*)[self clientView];
+  if (tv == nil) return;
+  NSLayoutManager* lm = [tv layoutManager];
+  NSTextContainer* tc = [tv textContainer];
+  NSRect visible = [[self scrollView] contentView].bounds;
+  NSPoint p = [self convertPoint:[event locationInWindow] fromView:nil];
+  CGFloat yInText = p.y + NSMinY(visible) - [tv textContainerInset].height;
+  NSUInteger glyph =
+      [lm glyphIndexForPoint:NSMakePoint(2, yInText) inTextContainer:tc];
+  NSUInteger ch = [lm characterIndexForGlyphAtIndex:glyph];
+  NSString* text = [tv string];
+  NSInteger line = 1;
+  NSUInteger len = [text length];
+  for (NSUInteger i = 0; i < ch && i < len; i++) {
+    if ([text characterAtIndex:i] == '\n') line++;
+  }
+  dart::bin::GutterDispatchLine(self, (int64_t)line);
+}
+
+- (void)setBreaksJoined:(NSString*)joined paused:(NSInteger)paused {
+  if (breaks_ == nil) breaks_ = [[NSMutableSet alloc] init];
+  [breaks_ removeAllObjects];
+  paused_ = paused;
+  if (joined != nil && [joined length] > 0) {
+    for (NSString* part in [joined componentsSeparatedByString:@","]) {
+      NSInteger v = [part integerValue];
+      if (v > 0) [breaks_ addObject:[NSNumber numberWithInteger:v]];
+    }
+  }
+  [self setNeedsDisplay:YES];
+}
+
+@end
+
 namespace dart {
 namespace bin {
 
@@ -194,6 +299,52 @@ void Cocoa_makeActionTarget(Dart_NativeArguments args) {
     g_ticket_of[(void*)obj] = ticket;
   }
   Dart_SetReturnValue(args, Dart_NewInteger((int64_t)obj));
+}
+
+// The gutter's mouseDown hop into Dart: same funnel as every callback (kind 5,
+// arg = clicked line). The gutter registered its ticket in g_ticket_of at
+// creation, so Dispatch resolves it.
+void GutterDispatchLine(id gutter, int64_t line) {
+  Dart_EnterScope();
+  Dart_Handle r = Dispatch(gutter, 5, line);
+  if (r != NULL && Dart_IsError(r)) {
+    fprintf(stderr, "dart:cocoa gutter callback: %s\n", Dart_GetError(r));
+  }
+  Dart_ExitScope();
+}
+
+// Cocoa_attachGutter(int scrollView, int ticket) -> the gutter handle. Creates
+// a MacdartGutter, makes it the scroll view's vertical ruler, and points its
+// clientView at the document text view. The ticket routes clicks to Dart.
+void Cocoa_attachGutter(Dart_NativeArguments args) {
+  int64_t sv = 0, ticket = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &sv);
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 1), &ticket);
+  NSScrollView* scroll = (NSScrollView*)sv;
+  MacdartGutter* gutter =
+      [[MacdartGutter alloc] initWithScrollView:scroll orientation:NSVerticalRuler];
+  [gutter setClientView:[scroll documentView]];
+  [scroll setVerticalRulerView:gutter];
+  [scroll setHasVerticalRuler:YES];
+  [scroll setRulersVisible:YES];
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_ticket_of[(void*)gutter] = ticket;
+  }
+  Dart_SetReturnValue(args, Dart_NewInteger((int64_t)gutter));
+}
+
+// Cocoa_gutterSetLines(int gutter, String breaksCsv, int pausedLine): repaint
+// the dots. breaksCsv is "3,7,12" (empty for none); paused 0 for no arrow.
+void Cocoa_gutterSetLines(Dart_NativeArguments args) {
+  int64_t g = 0, paused = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &g);
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 2), &paused);
+  const char* csv = NULL;
+  Dart_Handle s = Dart_GetNativeArgument(args, 1);
+  if (Dart_IsString(s)) Dart_StringToCString(s, &csv);
+  NSString* joined = csv ? [NSString stringWithUTF8String:csv] : @"";
+  [(MacdartGutter*)g setBreaksJoined:joined paused:(NSInteger)paused];
 }
 
 // _wireAction(int control, int target): [control setTarget:target];

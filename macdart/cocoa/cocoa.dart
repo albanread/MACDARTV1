@@ -273,13 +273,13 @@ stValue4(r, a, b, c, d) { if (r is Function) return r(a, b, c, d); return r.valu
 stBoolAnd(a, b) {
   if (a is bool && b is bool) return a && b;
   if (a is int && b is int) return a & b;
-  return stSend(a, '&', [b]);
+  return a & b;
 }
 
 stBoolOr(a, b) {
   if (a is bool && b is bool) return a || b;
   if (a is int && b is int) return a | b;
-  return stSend(a, '|', [b]);
+  return a | b;
 }
 
 stAt1(c, k) {
@@ -313,7 +313,7 @@ stDo(c, f) {
 
 stIsEmptyU(c) {
   if (c is List || c is Map || c is String) return c.isEmpty;
-  return stSend(c, 'isEmpty', []);
+  return c.isEmpty();
 }
 
 /// `self error: 'msg'` — construct and signal a prelude Error.
@@ -349,19 +349,19 @@ stDivide(a, b) {
     return a / b;
   }
   if (a is num && b is num) return a / b;
-  return stSend(a, '/', [b]);
+  return a / b;
 }
 
 // Numeric conversions/negation: Dart-num fast paths (the world kernel's
 // versions are <primitive:>-backed and must never be reached via the NSM
 // hook, whose ignored-pragma bodies would answer self).
-stAsDouble(r) => r is num ? r.toDouble() : stSend(r, 'asDouble', []);
-stTruncated(r) => r is num ? r.truncate() : stSend(r, 'truncated', []);
-stRounded(r) => r is num ? r.round() : stSend(r, 'rounded', []);
-stFloorU(r) => r is num ? r.floor() : stSend(r, 'floor', []);
-stCeilingU(r) => r is num ? r.ceil() : stSend(r, 'ceiling', []);
-stNegated(r) => r is num ? -r : stSend(r, 'negated', []);
-stSqrt(r) => r is num ? math.sqrt(r) : stSend(r, 'sqrt', []);
+stAsDouble(r) => r is num ? r.toDouble() : r.asDouble();
+stTruncated(r) => r is num ? r.truncate() : r.truncated();
+stRounded(r) => r is num ? r.round() : r.rounded();
+stFloorU(r) => r is num ? r.floor() : r.floor();
+stCeilingU(r) => r is num ? r.ceil() : r.ceiling();
+stNegated(r) => r is num ? -r : r.negated();
+stSqrt(r) => r is num ? math.sqrt(r) : r.sqrt();
 
 // Ordering (Sprint 14): Dart Strings have no operator< — a miss walked
 // into the world's Magnitude circularity (whose primitive stubs answer
@@ -370,32 +370,32 @@ stSqrt(r) => r is num ? math.sqrt(r) : stSend(r, 'sqrt', []);
 stLess(a, b) {
   if (a is num && b is num) return a < b;
   if (a is String && b is String) return a.compareTo(b) < 0;
-  return stSend(a, '<', [b]);
+  return a < b;
 }
 stLessEq(a, b) {
   if (a is num && b is num) return a <= b;
   if (a is String && b is String) return a.compareTo(b) <= 0;
-  return stSend(a, '<=', [b]);
+  return a <= b;
 }
 stGreater(a, b) {
   if (a is num && b is num) return a > b;
   if (a is String && b is String) return a.compareTo(b) > 0;
-  return stSend(a, '>', [b]);
+  return a > b;
 }
 stGreaterEq(a, b) {
   if (a is num && b is num) return a >= b;
   if (a is String && b is String) return a.compareTo(b) >= 0;
-  return stSend(a, '>=', [b]);
+  return a >= b;
 }
 
 stMax(a, b) {
   if (a is num && b is num) return a > b ? a : b;
-  return stSend(a, 'max:', [b]);
+  return a.max_(b);
 }
 
 stMin(a, b) {
   if (a is num && b is num) return a < b ? a : b;
-  return stSend(a, 'min:', [b]);
+  return a.min_(b);
 }
 
 /// `'foo' asSymbol` — canonicalize through the VM symbol table, so runtime
@@ -403,7 +403,7 @@ stMin(a, b) {
 _stInternNative(String s) native "ST_asSymbol";
 stAsSymbol(s) {
   if (s is String) return _stInternNative(s);
-  return stSend(s, 'asSymbol', []);
+  return s.asSymbol();
 }
 
 /// Sorted copy of a Dart list (prelude asSortedCollection plumbing).
@@ -451,10 +451,10 @@ stDisplayOf(x) => x is String ? x : stPrintOf(x);
 stPrintOn(r, s) {
   if (r is num || r is String || r is bool || r == null || r is List ||
       r is Map || r is Function) {
-    return stSend(s, 'nextPutAll:', [stPrintOf(r)]);
+    return s.nextPutAll_(stPrintOf(r));
   }
   var v = _stSendTry(r, 'printOn:', [s]);
-  if (v == null) return stSend(s, 'nextPutAll:', [r.toString()]);
+  if (v == null) return s.nextPutAll_(r.toString());
   return v[0];
 }
 
@@ -514,7 +514,7 @@ stJoinRows(l) {
 stCopyFromTo(c, a, b) {
   if (c is String) return c.substring(a - 1, b);
   if (c is List) return c.sublist(a - 1, b);
-  return stSend(c, 'copyFrom:to:', [a, b]);
+  return c.copyFrom_to_(a, b);
 }
 
 /// Parse-check `.mst` source WITHOUT loading it: returns '' when it parses,

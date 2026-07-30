@@ -778,10 +778,23 @@ loudly). Stages A and C are modest; A is independently shippable.
     65_cocoadelegate.mst bound (#action minted; sync data-source roles
     refused with a clear error until the sync reverse hop exists). Sender
     crosses as nil; rooting UI refs is the caller's job (globals/registry).
-  - Later slices: the SYNC reverse hop (data sources: numberOfRowsInTableView:
-    must RETURN a value — the hard one), the 63–74 CocoaUI tier (MACVM's ST
-    IDE widgets) verified class by class on the shared bridge, pixmap/gamepane
-    mapping onto the dartui game pane.
+  - **13c ✓ — ST tables work (the snapshot data source).** The sync-hop
+    deadlock is DISSOLVED, not fought: AppKit's synchronous data-source
+    questions answer from an NSMutableArray snapshot held INSIDE the ObjC
+    STTableSource (no VM entry — the `reloadData` cycle "language waits on
+    main waits on language" cannot form); ST pushes rows with an ordinary
+    async-safe `setRows:` send, and selection changes return through the
+    async post, now carrying an int64 arg (the row; 0-based/-1, raw AppKit
+    shape). MACVM's own note — "a data source answers from its local
+    snapshot" — pointed here. Verified live: an ST-built NSTableView
+    showing ST rows; selecting rows drives `tableViewSelectionDidChange:`
+    in an ST receiver (`ST TABLE picked row 2`).
+  - Later slices: the 63–74 CocoaUI tier (MACVM's ST IDE widgets) verified
+    class by class on the shared bridge — tables/buttons/windows now have
+    everything they need; a TRUE sync reverse hop only if a future role
+    demands a computed return value (windowShouldClose: — likely bindable
+    as policy-push instead); pixmap/gamepane mapping onto the dartui game
+    pane.
 
   **Also next:** `Smalltalk at:put:` system-dictionary protocol, Behavior/
   reflection surface (`name`, `superclass`), performance pass on the NSM dispatch

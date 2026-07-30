@@ -766,9 +766,22 @@ loudly). Stages A and C are modest; A is independently shippable.
     vendored 49_cocoa.mst rewrite; (6) proof: MACVM's own doc example
     (`(Cocoa classNamed: 'NSProcessInfo') send: 'processInfo'` → processName)
     headless, then an ST-built window from the workspace via onMain.
-  - Later slices: the 63–74 CocoaUI tier (MACVM's ST IDE widgets) verified class
-    by class on the shared bridge; pixmap/gamepane mapping onto the dartui game
-    pane.
+  - **13b ✓ — callbacks INTO Smalltalk; buttons work** (verified with real
+    mouse clicks): STActionTarget trampoline holds only (raw Dart port,
+    ticket) — the MACVM C4 contract — and posts [ticket, selector] via
+    Dart_PostCObject from the main thread, fire-and-forget; the language
+    isolate's action port dispatches through the world's own MacvmDelegate
+    registry (kept verbatim) → `perform: selector withArguments:` → the ST
+    handler, which does its UI work back through onMain. String→SEL
+    marshaling (TOK_SEL for @encode ':') makes `setAction: 'macvmAction:'`
+    work verbatim; perform:/perform:withArguments: universal helpers;
+    65_cocoadelegate.mst bound (#action minted; sync data-source roles
+    refused with a clear error until the sync reverse hop exists). Sender
+    crosses as nil; rooting UI refs is the caller's job (globals/registry).
+  - Later slices: the SYNC reverse hop (data sources: numberOfRowsInTableView:
+    must RETURN a value — the hard one), the 63–74 CocoaUI tier (MACVM's ST
+    IDE widgets) verified class by class on the shared bridge, pixmap/gamepane
+    mapping onto the dartui game pane.
 
   **Also next:** `Smalltalk at:put:` system-dictionary protocol, Behavior/
   reflection surface (`name`, `superclass`), performance pass on the NSM dispatch

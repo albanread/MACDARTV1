@@ -1168,12 +1168,55 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
         return instructions;
       }
       // Unresolved `self new`/`self basicNew` (no user class-side override):
-      // a DIRECT allocation from the runtime thisCls via the lightweight
-      // stBasicNew native — skips the general class-send's string-keyed
-      // library scan + shadow walk (the 200k-alloc hot path). Full thisCls
-      // correctness: an inherited factory allocates the receiving subclass.
+      // GUARDED INLINE ALLOCATION. The runtime thisCls is compared (one
+      // StrictCompare — Types are canonical) against the compile-time owner's
+      // instance class: equal — every call that NAMES the class, i.e. the hot
+      // 99% — allocates inline with AllocateObject, no native transition;
+      // different (an INHERITED factory: thisCls = a subclass) takes the
+      // stBasicNew native, which allocates the receiving subclass correctly.
       if ((node->selector == "new" || node->selector == "basicNew") &&
           node->args.empty()) {
+        const Class& shadow = Class::Handle(zone_, pf_->function().Owner());
+        Class& inst_cls = Class::Handle(zone_);
+        {
+          const String& sn = String::Handle(zone_, shadow.Name());
+          const char* sc = sn.ToCString();   // "Foo class" -> "Foo"
+          size_t len = strlen(sc);
+          if (len > 6 && strcmp(sc + len - 6, " class") == 0) {
+            std::string base(sc, len - 6);
+            inst_cls = FindStClassByName(thread_, base.c_str());
+          }
+        }
+        if (!inst_cls.IsNull()) {
+          if (!inst_cls.is_finalized()) {
+            ClassFinalizer::FinalizeClass(inst_cls);
+          }
+          const Type& owner_type = Type::ZoneHandle(
+              zone_, Type::NewNonParameterizedType(inst_cls));
+          Fragment instructions = LoadLocal(locals_["self"]);  // thisCls
+          instructions += Constant(owner_type);
+          TargetEntryInstr* fast = NULL;
+          TargetEntryInstr* slow = NULL;
+          instructions += BranchIfStrictEqual(&fast, &slow);
+          Fragment fast_f(fast);
+          fast_f += AllocateObject(inst_cls);
+          fast_f += StoreLocal(value_temp_);
+          fast_f += Drop();
+          Fragment slow_f(slow);
+          slow_f += LoadLocal(locals_["self"]);
+          slow_f += PushArgument();
+          slow_f += StaticCall(
+              Function::ZoneHandle(zone_, LookupCocoaFunction("stBasicNew")),
+              1);
+          slow_f += StoreLocal(value_temp_);
+          slow_f += Drop();
+          JoinEntryInstr* join = BuildJoinEntry();
+          fast_f += Goto(join);
+          slow_f += Goto(join);
+          Fragment result(instructions.entry, join);
+          result += LoadLocal(value_temp_);
+          return result;
+        }
         Fragment instructions = LoadLocal(locals_["self"]);  // thisCls
         instructions += PushArgument();
         instructions += StaticCall(

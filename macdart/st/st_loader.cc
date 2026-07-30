@@ -14,6 +14,7 @@
 // resolves the super chain and finalizes the declaration types.
 
 #include "st_loader.h"
+#include <cctype>
 
 #include <stdio.h>
 #include <string.h>
@@ -91,6 +92,158 @@ void AggregateIvars(ClassAgg* agg,
   }
 }
 
+// --- ivar AUTO-VIVIFICATION (MACVM dialect semantics) -----------------------
+// MACVM creates an instance variable for any lowercase name a method ASSIGNS
+// that is not otherwise bound (arg, temp, block arg/temp, classvar, global).
+// world/14_association.mst relies on it: `key := k.` with NO `| key value |`
+// declaration anywhere. Without this pass those stores compiled to the
+// unsupported-assignment fallback and Association silently held nils forever.
+// One walk per method collects both assigned and locally-bound names; the
+// subtraction (minus declared ivars/classvars, capitalized names excluded)
+// appends new ivars in first-assignment order.
+void CollectAssignsAndBound(Node* n,
+                            std::vector<std::string>* assigned,
+                            std::set<std::string>* bound) {
+  if (n == NULL) return;
+  if (auto* a = dynamic_cast<AssignNode*>(n)) {
+    assigned->push_back(a->name);
+    CollectAssignsAndBound(a->value.get(), assigned, bound);
+  } else if (auto* r = dynamic_cast<ReturnNode*>(n)) {
+    CollectAssignsAndBound(r->value.get(), assigned, bound);
+  } else if (auto* b = dynamic_cast<BlockNode*>(n)) {
+    for (const auto& s : b->args) bound->insert(s);
+    for (const auto& s : b->temps) bound->insert(s);
+    for (auto& s : b->statements) {
+      CollectAssignsAndBound(s.get(), assigned, bound);
+    }
+  } else if (auto* m = dynamic_cast<MessageNode*>(n)) {
+    CollectAssignsAndBound(m->receiver.get(), assigned, bound);
+    for (auto& a2 : m->args) CollectAssignsAndBound(a2.get(), assigned, bound);
+  } else if (auto* c = dynamic_cast<CascadeNode*>(n)) {
+    CollectAssignsAndBound(c->receiver.get(), assigned, bound);
+    for (auto& msg : c->messages) {
+      CollectAssignsAndBound(msg.get(), assigned, bound);
+    }
+  } else if (auto* d = dynamic_cast<DynArrayNode*>(n)) {
+    for (auto& e : d->elements) CollectAssignsAndBound(e.get(), assigned, bound);
+  }
+}
+
+// The full ivar context of `agg`: its own + every INHERITED ivar — supers in
+// this program via the table, and supers already LIVE (cross-load subclassing)
+// via the registered class's field lists. Without the inherited set, a
+// subclass assigning an inherited ivar (deltablue: BinaryConstraint writes
+// AbstractConstraint's `strength`) would be re-declared and conflict.
+void CollectInheritedIvars(dart::Thread* thread,
+                           ClassTable* table,
+                           const std::string& super_name,
+                           std::set<std::string>* known) {
+  std::string cur = super_name;
+  std::set<std::string> seen;   // cycle guard
+  while (!cur.empty() && !seen.count(cur)) {
+    seen.insert(cur);
+    bool in_table = false;
+    for (auto& e : table->entries()) {
+      if (e.name == cur) {
+        for (const auto& iv : e.ivars) known->insert(iv);
+        for (const auto& cv : e.class_vars) known->insert(cv);
+        // Unary METHOD names conflict with a same-named field at finalization
+        // (deltablue's `strength`); treat them as taken too.
+        for (const auto& me : e.methods) {
+          if (!me.is_static &&
+              me.node->selector.find(':') == std::string::npos) {
+            known->insert(me.node->selector);
+          }
+        }
+        cur = e.has_super ? e.super : "";
+        in_table = true;
+        break;
+      }
+    }
+    if (in_table) continue;
+    // Not in this program: a live class from an earlier load (or a bridge
+    // root, whose Dart fields can never collide with ST lowercase names).
+    dart::Zone* zone = thread->zone();
+    const dart::Class& live = dart::Class::Handle(
+        zone, FindStClassByName(thread, cur.c_str()));
+    if (live.IsNull()) break;
+    dart::Class& c = dart::Class::Handle(zone, live.raw());
+    dart::Array& fields = dart::Array::Handle(zone);
+    dart::Field& f = dart::Field::Handle(zone);
+    dart::String& n = dart::String::Handle(zone);
+    dart::Array& funcs = dart::Array::Handle(zone);
+    dart::Function& fn = dart::Function::Handle(zone);
+    while (!c.IsNull()) {
+      fields = c.fields();
+      if (!fields.IsNull()) {
+        for (intptr_t i = 0; i < fields.Length(); i++) {
+          f ^= fields.At(i);
+          n = f.name();
+          known->insert(std::string(n.ToCString()));
+        }
+      }
+      funcs = c.functions();
+      if (!funcs.IsNull()) {
+        for (intptr_t i = 0; i < funcs.Length(); i++) {
+          fn ^= funcs.At(i);
+          n = fn.name();
+          std::string fname(n.ToCString());
+          if (fname.find('_') == std::string::npos) known->insert(fname);
+        }
+      }
+      c = c.SuperClass();
+    }
+    break;
+  }
+}
+
+void AutoVivifyIvars(dart::Thread* thread, ClassTable* table, ClassAgg* agg,
+                     bool allow_reopen) {
+  // NEVER let vivification flip the loader's append-vs-replace decision
+  // (the declared-ivars.empty() check). A redecl that will APPEND to a LIVE
+  // class (reopen mode: extends, and MACVM's redecl-by-subclass: in
+  // 19_printing/57/59) must not grow ivars — 19's OrderedCollection redecl
+  // grew vivified ivars, flipped to REPLACEMENT, and re-registered OC with
+  // only the printing methods (no add: — the library_bench dNU). In FRESH
+  // mode (allow_reopen false: image reloads) every definition creates, so
+  // everything vivifies.
+  if (!agg->has_super) return;                    // extend-form reopen
+  if (allow_reopen && agg->ivars.empty()) {
+    dart::Zone* zone = thread->zone();
+    const dart::Class& live = dart::Class::Handle(
+        zone, FindStClassByName(thread, agg->name.c_str()));
+    if (!live.IsNull()) return;                   // subclass:-form reopen
+  }
+  std::set<std::string> known(agg->ivars.begin(), agg->ivars.end());
+  for (const auto& cv : agg->class_vars) known.insert(cv);
+  // NOTE: a class's OWN method may share its name with an own field
+  // (Association: method `value`, ivar `value`) — only INHERITED method
+  // names are field-forbidden, and those come via CollectInheritedIvars.
+  // For an extend without a super clause (a cross-load reopen), inherit from
+  // the LIVE same-name class — its field list already includes the chain.
+  CollectInheritedIvars(thread, table,
+                        agg->has_super ? agg->super : agg->name, &known);
+  for (const auto& entry : agg->methods) {
+    if (entry.is_static) continue;   // instance-side state only
+    MethodNode* m = entry.node;
+    std::vector<std::string> assigned;
+    std::set<std::string> bound;
+    for (const auto& s : m->args) bound.insert(s);
+    for (const auto& s : m->temps) bound.insert(s);
+    for (auto& st : m->statements) {
+      CollectAssignsAndBound(st.get(), &assigned, &bound);
+    }
+    for (const auto& name : assigned) {
+      if (name.empty() || !islower(static_cast<unsigned char>(name[0]))) {
+        continue;                    // capitalized = global/class, never ivar
+      }
+      if (bound.count(name) || known.count(name)) continue;
+      known.insert(name);
+      agg->ivars.push_back(name);    // vivified, first-assignment order
+    }
+  }
+}
+
 // Sprint 11c: the WORLD-IMAGE bridge. Kernel classes whose instances on this
 // VM are Dart natives (int, double, String, bool, nil, List, closures, class
 // values) cannot be instantiated as ST classes — their definitions become
@@ -162,6 +315,15 @@ void Aggregate(ProgramNode* program, ClassTable* table) {
       agg.methods.push_back(
           MethodEntry{em->method.get(), em->method->is_class_side});
     }
+  }
+}
+
+// MACVM dialect: assigned-but-undeclared lowercase names become ivars. Runs
+// AFTER Aggregate with a Thread (inherited-ivar lookups may consult live
+// classes from earlier loads).
+void AutoVivifyAll(dart::Thread* thread, ClassTable* table, bool allow_reopen) {
+  for (auto& agg : table->entries()) {
+    AutoVivifyIvars(thread, table, &agg, allow_reopen);
   }
 }
 
@@ -296,6 +458,7 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
 
   ClassTable table;
   Aggregate(program, &table);
+  AutoVivifyAll(dart::Thread::Current(), &table, allow_reopen);
 
   // Sprint 11b: bare top-level statements (MACVM "do-its" — e.g. the file's
   // own benchmark driver line) are collected IN ORDER into a synthesized

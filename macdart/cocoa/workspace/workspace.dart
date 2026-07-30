@@ -286,11 +286,20 @@ void switchTab(int i) {
   // key-view loop, which for the Browser is the Categories table — Cut/Copy/
   // Paste would be greyed out until the user clicked the source pane. Put focus
   // on the tab's text view instead.
-  var focus = (i == 0) ? gEditor : (i == 1) ? gBrowserSrc
+  // The Browser tab (i==1) is now the EMBEDDED ST browser (Sprint 15a); the
+  // old Dart-browser focus target (gBrowserSrc) and refresh (openBrowser) are
+  // dead — gBrowserSrc/gCatTable were never built, so both were a
+  // NoSuchMethod on null. Focus and refresh belong to the embedded view now:
+  // re-embed if it is missing (world imported after boot, or a lost isolate),
+  // else ask it to refresh from the image.
+  var focus = (i == 0) ? gEditor
             : (i == 3) ? gFindField : (i == 4) ? gEdText
             : (i == 5) ? gDbgSrc : (i == 8) ? gProfSrc : null;
   if (focus != null) gWindow.makeFirstResponder(focus);
-  if (i == 1) openBrowser();
+  if (i == 1) {
+    if (gStBrowserView == null) stBrowserEmbed();
+    else ask('doit', 'st> CocoaBrowser2 doRefresh. nil').then((_) {});
+  }
   if (i == 4) editorRefreshClasses();
   if (i == 5) dbgRefreshIsolates();    // fresh isolate list on entering the tab
   if (i == 5 && gLangIsolateId != null) dbgLoadSource();

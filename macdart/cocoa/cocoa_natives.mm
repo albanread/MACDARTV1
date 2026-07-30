@@ -6,6 +6,7 @@
 // through the fixed-shape shim + the noSuchMethod ergonomic layer come in later
 // phases; see MACDART/COCOA_PLAN.md.
 #import <Foundation/Foundation.h>
+#include <malloc/malloc.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <atomic>
@@ -343,18 +344,36 @@ static void CocoaSendCommon(Dart_NativeArguments args, bool on_main) {
   Dart_StringToCString(Dart_GetNativeArgument(args, 1), &sel_name);
   SEL sel = sel_registerName(sel_name);
 
-  // DIAGNOSTIC GUARD: a nonzero handle far below any mappable address is not
-  // a pointer — a corrupted/reused _handle. objc_msgSend on it is the segv
-  // that has been killing the GUI. Name the selector and refuse the send
-  // (throw a catchable Dart error) instead of taking the process down.
-  if (h != 0 && (uint64_t)h < 0x100000000ULL) {
-    char buf[256];
-    snprintf(buf, sizeof(buf),
-             "dart:cocoa: BAD HANDLE 0x%llx for selector '%s' — refusing send",
-             (unsigned long long)h, sel_name ? sel_name : "?");
-    fprintf(stderr, "%s\n", buf);
-    Dart_ThrowException(Dart_NewStringFromCString(buf));
-    return;
+  // LIVENESS GUARD: objc_msgSend on a freed/dangling/garbage handle is the
+  // segv that abort()s the GUI. Validate the handle first and throw a
+  // CATCHABLE Dart error instead — a stale send reports to the Transcript,
+  // it never takes the process down. Three cases:
+  //  * arm64 TAGGED pointer (bit 63 set): a real object with no heap block —
+  //    objc_msgSend is always safe (NSNumber/short-NSString/NSDate). Allow.
+  //  * a live malloc block (malloc_size > 0): a heap instance. Allow.
+  //  * a pointer into a loaded image (dladdr resolves it): a CLASS or
+  //    metaclass — classes live in the binary's __objc_data, NOT the heap,
+  //    so malloc_size is 0 for them; `Cocoa.cls(...).alloc()` (how the whole
+  //    workspace window is built) must pass. Allow.
+  //  * none of the above: freed/dangling/garbage — the segv that abort()s the
+  //    GUI. Refuse with a CATCHABLE error instead. Both malloc_size and
+  //    dladdr are safe to call on ANY pointer (no deref of the target).
+  if (h != 0) {
+    const uint64_t uh = (uint64_t)h;
+    const bool tagged = (uh & 0x8000000000000000ULL) != 0;
+    if (!tagged && uh >= 0x1000ULL && malloc_size((void*)h) == 0) {
+      Dl_info info;
+      if (dladdr((void*)h, &info) == 0) {   // not heap, not an image → dead
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "dart:cocoa: STALE HANDLE 0x%llx for selector '%s' — refusing "
+                 "send (a released/dangling Cocoa reference)",
+                 (unsigned long long)uh, sel_name ? sel_name : "?");
+        fprintf(stderr, "%s\n", buf);
+        Dart_ThrowException(Dart_NewStringFromCString(buf));
+        return;
+      }
+    }
   }
 
   // Resolve the concrete method's type encoding (object_getClass handles both

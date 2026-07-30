@@ -744,7 +744,7 @@ loudly). Stages A and C are modest; A is independently shippable.
   entry + a guarded call in `runtime/bin/main.cc` (patch hunk regenerated; all
   18 hunks dry-run clean against pristine 1.24.3).
 
-- **Sprint 13 (IN PROGRESS) — ONE Cocoa bridge, two language faces.** dartui and
+- **Sprint 13a ✓ — ONE Cocoa bridge, two language faces.** dartui and
   the ST world each carry a Cocoa UI layer; there must be only one. The design:
   the world's `Cocoa`/`ObjcRef`/`ObjcMainProxy` API (49_cocoa.mst — MACVM's C0/C3
   bridge) is KEPT, its `<primitive: 23x>` bodies re-bound onto dart:cocoa's typed

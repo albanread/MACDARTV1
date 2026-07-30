@@ -137,7 +137,7 @@ String _stImport(String path) {
           buf = new StringBuffer();
           classText[name] = buf;
           classNames.add(name);
-          classCat[name] = stem;          // its package = its file's stem
+          classCat[name] = _worldCategoryOf(stem);  // system category
         } else {
           buf.write('\n\n"— from ' + stem + ' —"\n');
         }
@@ -240,6 +240,38 @@ String _stBrowserHandle(String arg) {
   } catch (e) {
     return 'ERR ' + e.toString();
   }
+}
+
+
+/// Sprint 15: real SYSTEM CATEGORIES for the world — the file stems are
+/// load-order artifacts; classes browse under Smalltalk-80-style groups.
+/// Stored per decl in the DB category column (re-categorizable later).
+String _worldCategoryOf(String stem) {
+  var n = stem.split('_')[0];
+  const kernel = const ['01', '02', '03', '04a', '05', '32', '54'];
+  const numbers = const ['06', '07', '08', '23', '23a', '27', '51'];
+  const text = const ['09', '12', '13', '41', '53', '57', '58a'];
+  const collections = const ['10', '11', '14', '15', '16', '17', '21', '22',
+                             '25', '26', '29', '39', '40', '52', '55', '56'];
+  const streams = const ['18', '24', '31', '62a'];
+  const system = const ['20', '33', '34', '47', '59', '61', '61a', '62', '74'];
+  const net = const ['61c', '61d', '75'];
+  const support = const ['04', '19', '28', '30', '58'];
+  const graphics = const ['35', '36', '37', '38', '43', '44', '45', '46',
+                          '48', '48a', '70'];
+  const ui = const ['42', '49', '49a', '50', '60', '63', '64', '65', '66',
+                    '67', '68', '69', '71', '72', '73'];
+  if (kernel.contains(n)) return 'Kernel';
+  if (numbers.contains(n)) return 'Numbers';
+  if (text.contains(n)) return 'Text';
+  if (collections.contains(n)) return 'Collections';
+  if (streams.contains(n)) return 'Streams';
+  if (system.contains(n)) return 'System';
+  if (net.contains(n)) return 'Networking';
+  if (support.contains(n)) return 'Support';
+  if (graphics.contains(n)) return 'Graphics';
+  if (ui.contains(n)) return 'Interface';
+  return 'World-Other';
 }
 
 String _hostCall(String verb, List args) {

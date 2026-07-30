@@ -343,14 +343,14 @@ Object subclass: CocoaBrowser2 [
     CocoaBrowser2 class >> classClicked [
         | row |
         ClassTable isNil ifTrue: [ ^self ].
-        row := ClassTable onMain clickedRow.
+        row := ClassTable onMain selectedRow.
         (row < 0 or: [ Classes isNil or: [ row >= Classes size ] ]) ifTrue: [ ^self ].
         self selectClass: (Classes at: row + 1).
     ]
     CocoaBrowser2 class >> protocolClicked [
         | row p |
         ProtoTable isNil ifTrue: [ ^self ].
-        row := ProtoTable onMain clickedRow.
+        row := ProtoTable onMain selectedRow.
         (row < 0 or: [ Protocols isNil or: [ row >= Protocols size ] ]) ifTrue: [ ^self ].
         p := Protocols at: row + 1.
         SelectedProtocol := p = '(all)' ifTrue: [ nil ] ifFalse: [ p ].
@@ -360,7 +360,7 @@ Object subclass: CocoaBrowser2 [
     CocoaBrowser2 class >> methodClicked [
         | row |
         MethTable isNil ifTrue: [ ^self ].
-        row := MethTable onMain clickedRow.
+        row := MethTable onMain selectedRow.
         (row < 0 or: [ Methods isNil or: [ row >= Methods size ] ]) ifTrue: [ ^self ].
         SelectedMethod := Methods at: row + 1.
         SourceMode := #source. self syncModeSeg. self renderSource.
@@ -838,7 +838,7 @@ Object subclass: CocoaBrowser2 [
     CocoaBrowser2 class >> catClicked [
         | row node pkg |
         CatOutline isNil ifTrue: [ ^self ].
-        row := CatOutline onMain clickedRow.
+        row := CatOutline onMain selectedRow.
         (row < 0 or: [ CatNodes isNil or: [ row >= CatNodes size ] ]) ifTrue: [ ^self ].
         node := CatNodes at: row + 1.
         (node at: 1) == #pkg ifFalse: [ ^self ].
@@ -1007,6 +1007,17 @@ Object subclass: CocoaBrowser2 [
                     self clearClassSelection. self deferReload: ClassTable. ^self ] ] ].
     ]
     CocoaBrowser2 class >> scriptSelectClass: aName [ self selectClass: aName ]
+    CocoaBrowser2 class >> scriptClickCategory: i [
+        "Headless reproduction of a REAL category click: select the row on
+         the actual table, then run the click handler."
+        CatOutline isNil ifTrue: [ ^'no table' ].
+        CatOutline onMain selectRowIndexes:
+            ((Cocoa classNamed: 'NSIndexSet') onMain indexSetWithIndex: i)
+            byExtendingSelection: false.
+        self catClicked.
+        ^'sel: ' , SelectedPackageName printString , ' classes: ' ,
+            (Classes isNil ifTrue: [ 'nil' ] ifFalse: [ Classes size printString ])
+    ]
     CocoaBrowser2 class >> scriptSelectProtocol: aName [
         | i |
         Protocols isNil ifTrue: [ ^self ].

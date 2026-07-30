@@ -817,12 +817,19 @@ Fragment StGraphBuilder::TranslateLiteral(LiteralNode* node) {
     case LiteralNode::Kind::kFloat:
       return Constant(Double::ZoneHandle(
           zone_, Double::New(strtod(node->text.c_str(), NULL), Heap::kOld)));
-    case LiteralNode::Kind::kSymbol:
-      // Sprint 11b: a Symbol is an INTERNED string — the VM symbol table
-      // gives one canonical object per spelling, so `#foo == #foo` holds by
-      // identity everywhere (StrictCompare ==, Dictionary keys, ...).
-      return Constant(String::ZoneHandle(
-          zone_, Symbols::New(thread_, node->text.c_str())));
+    case LiteralNode::Kind::kSymbol: {
+      // A Symbol is a DISTINCT interned class (StSymbol) — `String subclass:
+      // Symbol` in the world, but Dart's String can't be subclassed, so it is
+      // its own class that forwards String protocol and whose `=` is identity.
+      // stSymbol(name) interns, so `#foo == #foo` holds by identity, and the
+      // distinct class is what lets `=` tell a Symbol from a String.
+      Fragment f = Constant(String::ZoneHandle(
+          zone_, String::New(node->text.c_str(), Heap::kOld)));
+      f += PushArgument();
+      f += StaticCall(
+          Function::ZoneHandle(zone_, LookupCocoaFunction("stSymbol")), 1);
+      return f;
+    }
     case LiteralNode::Kind::kChar:
       // A Character is a 1-char string (the stCharValue convention).
       return Constant(String::ZoneHandle(
@@ -1095,14 +1102,27 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
     instructions += Fragment(compare);
     return instructions;
   }
-  if (node->selector == "~=" && node->args.size() == 1) {
-    // a ~= b  ==  (a = b) not
+  // `=` value equality — the representation fix. Routes to stEquals, which
+  // recovers class identity: numbers numeric, Symbol identity, String element,
+  // real ST objects to their OWN `=` method (Fraction, user classes). `==`
+  // stays a StrictCompare (identity) above; this is the value side.
+  if (node->selector == "=" && node->args.size() == 1) {
     Fragment instructions = TranslateExpression(node->receiver.get());
     instructions += PushArgument();
     instructions += TranslateExpression(node->args[0].get());
     instructions += PushArgument();
-    const String& eq = String::ZoneHandle(zone_, Symbols::New(thread_, "=="));
-    instructions += InstanceCall(eq, Token::kEQ, 2, 2);
+    instructions += StaticCall(
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stEquals")), 2);
+    return instructions;
+  }
+  if (node->selector == "~=" && node->args.size() == 1) {
+    // a ~= b  ==  (a = b) not  — value inequality (was identity; now stEquals)
+    Fragment instructions = TranslateExpression(node->receiver.get());
+    instructions += PushArgument();
+    instructions += TranslateExpression(node->args[0].get());
+    instructions += PushArgument();
+    instructions += StaticCall(
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stEquals")), 2);
     instructions += PushArgument();
     instructions += StaticCall(
         Function::ZoneHandle(zone_, LookupCocoaFunction("stNot")), 1);

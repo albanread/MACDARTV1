@@ -123,6 +123,15 @@ void _stEnsureHooks() {
     return _stExtSendTry(t, sel, args);
   };
   internal.VMLibraryHooks.stObjNSM = (r, String sel, List args) {
+    // A Symbol IS a String (subclass): its own protocol is a short list; every
+    // other message forwards to the spelling, so all String protocol answers.
+    if (r is StSymbol) {
+      if (sel == 'isSymbol') return true;
+      if (sel == 'asSymbol' || sel == 'yourself') return r;
+      if (sel == 'hash' || sel == 'identityHash') return r.hashCode;
+      if (sel == '=' || sel == '==') return identical(r, args[0]);
+      return stSend(r.name, sel, args);        // forward String protocol
+    }
     var hit = _stExtSendTry(r, sel, args);
     if (hit != null) return hit;
     // Sprint 13: real doesNotUnderstand: — after the inherited protocol
@@ -138,6 +147,51 @@ void _stEnsureHooks() {
     }
     return null;
   };
+}
+
+// --- native Symbol (representation fix, phase 1) ----------------------------
+// A Smalltalk Symbol is `String subclass: Symbol` — it answers all String
+// protocol but its `=` is IDENTITY (the interned-string contract). Dart's
+// String cannot be subclassed, so Symbol is a DISTINCT class that carries the
+// spelling and FORWARDS String protocol to it (via the stObjNSM hook below),
+// while `==`/`=`/hash are its own. Distinct class identity is what lets `=`
+// tell a Symbol from a String — the whole point.
+class StSymbol {
+  final String name;
+  StSymbol._(this.name);
+  bool operator ==(o) => identical(this, o);   // interned -> identity is `=`
+  int get hashCode => name.hashCode;            // hashes with its spelling
+  toString() => name;                           // join/marshal see the chars
+}
+
+final Map<String, StSymbol> _stSymbolTable = <String, StSymbol>{};
+
+/// The canonical Symbol for [name] — interned, so `#foo == #foo` by identity.
+StSymbol stSymbol(String name) =>
+    _stSymbolTable.putIfAbsent(name, () => new StSymbol._(name));
+
+bool stIsSymbol(x) => x is StSymbol;
+
+/// ST `=` with recovered class identity — the representation fix. `==` stays a
+/// StrictCompare (identity) in the builder; this is `=` (value). Fast path:
+/// identical objects (incl. interned Symbols and equal Smis) and numbers.
+/// Slow path: a Symbol's `=` is identity (so `#foo = 'foo'` is false); a String
+/// compares elements, treating a Symbol as its spelling (so `'foo' = #foo` is
+/// true); any real ST object dispatches to its OWN `=` method — which is what
+/// finally makes Fraction and every user-defined `=` work.
+stEquals(a, b) {
+  if (identical(a, b)) return true;
+  if (a is num) return a == b;
+  return _stEqualsSlow(a, b);
+}
+_stEqualsSlow(a, b) {
+  if (a is StSymbol) return false;              // identity already failed
+  if (a is String) {
+    if (b is StSymbol) return a == b.name;      // 'foo' = #foo  -> true
+    if (b is String) return a == b;
+    return false;
+  }
+  return stSend(a, '=', [b]);                   // Fraction / user classes
 }
 
 /// Invoke a class-side (static) method [selector] on a loaded ST class
@@ -290,6 +344,7 @@ stBoolOr(a, b) {
 _stPipeSlow(a, b) => a | b;
 
 stAt1(c, k) {
+  if (c is StSymbol) return c.name[k - 1];
   if (c is List) return c[k - 1]; // Smalltalk indexes from 1
   if (c is Map) return c[k];
   if (c is String) return c[k - 1]; // a Character = a 1-char string
@@ -305,6 +360,7 @@ stAtPut1(c, k, v) {
 _stAtPutSlow(c, k, v) => c.at_put_(k, v);
 
 stSizeOf(c) {
+  if (c is StSymbol) return c.name.length;
   if (c is List || c is Map || c is String) return c.length;
   return _stSizeSlow(c);
 }
@@ -317,6 +373,7 @@ stAddU(c, x) {
 _stAddSlow(c, x) => c.add_(x);
 
 stDo(c, f) {
+  if (c is StSymbol) { for (var i = 0; i < c.name.length; i++) f(c.name[i]); return c; }
   if (c is List) { for (var e in c) f(e); return c; }
   if (c is Map) { for (var v in c.values) f(v); return c; }
   return _stDoSlow(c, f);
@@ -324,6 +381,7 @@ stDo(c, f) {
 _stDoSlow(c, f) => c.do_(f);
 
 stIsEmptyU(c) {
+  if (c is StSymbol) return c.name.isEmpty;
   if (c is List || c is Map || c is String) return c.isEmpty;
   return _stIsEmptySlow(c);
 }
@@ -389,24 +447,28 @@ _stSqrtSlow(r) => r.sqrt();
 // self) and overflowed the stack. Nums stay fast, Strings compare
 // lexically, everything else is real ST dispatch.
 stLess(a, b) {
+  if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
   if (a is num && b is num) return a < b;
   if (a is String && b is String) return a.compareTo(b) < 0;
   return _stLtSlow(a, b);
 }
 _stLtSlow(a, b) => a < b;
 stLessEq(a, b) {
+  if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
   if (a is num && b is num) return a <= b;
   if (a is String && b is String) return a.compareTo(b) <= 0;
   return _stLeSlow(a, b);
 }
 _stLeSlow(a, b) => a <= b;
 stGreater(a, b) {
+  if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
   if (a is num && b is num) return a > b;
   if (a is String && b is String) return a.compareTo(b) > 0;
   return _stGtSlow(a, b);
 }
 _stGtSlow(a, b) => a > b;
 stGreaterEq(a, b) {
+  if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
   if (a is num && b is num) return a >= b;
   if (a is String && b is String) return a.compareTo(b) >= 0;
   return _stGeSlow(a, b);
@@ -462,6 +524,7 @@ class STWriteBuffer {
 /// text. (The catch intentionally narrows only the no-method case in
 /// spirit — a printOn: that itself signals is pathological.)
 stPrintOf(x) {
+  if (x is StSymbol) return "#" + x.name;        // Smalltalk prints symbols as #foo
   if (x is String) return "'" + x + "'";
   if (x is num || x is bool || x == null || x is List || x is Map) {
     return x.toString();
@@ -473,7 +536,7 @@ stPrintOf(x) {
   return ws.contents();
 }
 
-stDisplayOf(x) => x is String ? x : stPrintOf(x);
+stDisplayOf(x) => x is String ? x : (x is StSymbol ? x.name : stPrintOf(x));
 
 /// `x printOn: aStream` with a bridged x: write its text into the stream.
 stPrintOn(r, s) {
@@ -540,6 +603,7 @@ stJoinRows(l) {
 /// species-based fallback rebuilt them as char Lists, so 'OK'-prefix reply
 /// checks never matched).
 stCopyFromTo(c, a, b) {
+  if (c is StSymbol) c = c.name;
   if (c is String) return c.substring(a - 1, b);
   if (c is List) return c.sublist(a - 1, b);
   return _stCopySlow(c, a, b);

@@ -69,9 +69,19 @@ Object subclass: MacvmDelegate [
      through onMain). The synchronous data-source roles (#table/#outline/
      #window/#text — a callback that must RETURN a value to AppKit) are not
      yet bound; they need the sync reverse hop (design §4 Layer C6)."
+    "MACDART #table role: a SNAPSHOT source. AppKit's synchronous questions
+     (numberOfRowsInTableView:, objectValue...) answer from an NSMutableArray
+     of row strings held INSIDE the ObjC source — they never enter a VM, so
+     the reloadData deadlock cycle (language waits on main waits on language)
+     cannot form. The ST side pushes data with `src setRows: anNSArray` and
+     `table reloadData` (both onMain), and the ticket's receiver gets
+     `tableViewSelectionDidChange: rowIndex` asynchronously (0-based, -1 =
+     no selection — the raw AppKit shape, per the receiver contract above)."
     MacvmDelegate class >> primNewDelegate: aRole ticket: ticket [
         aRole = #action ifTrue: [
             ^ObjcRef onHandle: (STCocoa actionTargetTicket: ticket) ].
+        aRole = #table ifTrue: [
+            ^ObjcRef onHandle: (STCocoa tableSourceTicket: ticket) ].
         ^self error: 'delegate role not yet bound on MACDART: ' , aRole printString
     ]
 

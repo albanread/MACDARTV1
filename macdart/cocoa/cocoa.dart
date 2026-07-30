@@ -580,6 +580,7 @@ stObjcIsRef(x) => x is Cocoa;
 /// posts arrive there as [ticket, selector] and dispatch through the world's
 /// own MacvmDelegate registry (ticket -> receiver, pure Smalltalk).
 _stMakeActionTarget(port, int ticket) native "Cocoa_makeActionTarget";
+_stMakeTableSource(port, int ticket) native "Cocoa_makeTableSource";
 var stActionPort;
 stObjcActionTarget(int ticket) {
   if (stActionPort == null) {
@@ -589,12 +590,23 @@ stObjcActionTarget(int ticket) {
   return _stMakeActionTarget(stActionPort, ticket);
 }
 
+/// Sprint 13c: the SNAPSHOT table source — rows live ObjC-side (AppKit's
+/// synchronous questions never enter a VM); selection changes come back
+/// through the same async post as actions, carrying the row index.
+stObjcTableSource(int ticket) {
+  if (stActionPort == null) {
+    throw 'Cocoa: no action host — the workspace language isolate installs '
+        'the action port (tables need the GUI, not a headless CLI)';
+  }
+  return _stMakeTableSource(stActionPort, ticket);
+}
+
 /// One posted action, dispatched: MacvmDelegate looks the ticket up and
 /// performs the selector on the registered receiver (sender crosses as nil —
 /// wrap-on-post would root an ObjC object against a maybe-dead isolate).
-stActionDispatch(ticket, String sel) {
+stActionDispatch(ticket, String sel, arg) {
   return stInvokeStatic('MacvmDelegate', 'dispatchTicket:selector:arguments:',
-      [ticket, sel, [null]]);
+      [ticket, sel, [arg]]);
 }
 
 /// ST `perform:` — dynamic dispatch by selector string.

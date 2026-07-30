@@ -181,8 +181,9 @@ main(List args, SendPort uiPort) {
   var stActions = new ReceivePort();
   stActions.listen((msg) {
     try {
-      if (msg is List && msg.length == 2) {
-        stActionDispatch(msg[0], msg[1].toString());
+      if (msg is List && msg.length >= 2) {
+        stActionDispatch(msg[0], msg[1].toString(),
+            msg.length > 2 ? msg[2] : null);
       }
     } catch (e) {
       _ui.send(<dynamic>['tr', 'action handler error: ' + e.toString()]);

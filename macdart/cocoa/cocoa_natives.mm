@@ -46,29 +46,85 @@ extern "C" void objc_autoreleasePoolPop(void*);
 }
 @end
 
-static void STPostAction(Dart_Port port, int64_t ticket, const char* sel) {
+static void STPostAction(Dart_Port port, int64_t ticket, const char* sel,
+                         int64_t arg) {
   if (port == ILLEGAL_PORT) return;
-  Dart_CObject t, s, msg;
+  Dart_CObject t, s, a, msg;
   t.type = Dart_CObject_kInt64;
   t.value.as_int64 = ticket;
   s.type = Dart_CObject_kString;
   s.value.as_string = const_cast<char*>(sel);
-  Dart_CObject* elems[2] = {&t, &s};
+  a.type = Dart_CObject_kInt64;
+  a.value.as_int64 = arg;
+  Dart_CObject* elems[3] = {&t, &s, &a};
   msg.type = Dart_CObject_kArray;
-  msg.value.as_array.length = 2;
+  msg.value.as_array.length = 3;
   msg.value.as_array.values = elems;
   Dart_PostCObject(port, &msg);  // a dead port is a no-op — fails closed
 }
 
 @implementation STActionTarget
 - (void)macvmAction:(id)sender {
-  STPostAction(port_, ticket_, "macvmAction:");
+  STPostAction(port_, ticket_, "macvmAction:", 0);
 }
 - (void)macvmDoIt:(id)sender {
-  STPostAction(port_, ticket_, "macvmDoIt:");
+  STPostAction(port_, ticket_, "macvmDoIt:", 0);
 }
 - (void)macvmPrintIt:(id)sender {
-  STPostAction(port_, ticket_, "macvmPrintIt:");
+  STPostAction(port_, ticket_, "macvmPrintIt:", 0);
+}
+@end
+
+
+// --- Sprint 13c: the SNAPSHOT table source -----------------------------
+// AppKit's data-source questions (numberOfRowsInTableView:, objectValue...)
+// are SYNCHRONOUS on the main thread. Routing them into the language
+// isolate would deadlock the moment ST does `tbl onMain reloadData` (the
+// language thread blocks on main; main would block on language). So the
+// snapshot LIVES HERE: an NSMutableArray of row strings the ST side pushes
+// via setRows: (an ordinary async-safe bridge send); the questions answer
+// from it without ever entering a VM. Selection changes go OUT through the
+// same async post as button actions, carrying the row index.
+// Foundation types only: table/column parameters are plain `id` (the class
+// is an informal data source; AppKit dispatches by respondsToSelector:).
+@interface STTableSource : NSObject {
+ @public
+  Dart_Port port_;
+  int64_t ticket_;
+  NSMutableArray* rows_;
+}
+@end
+
+@implementation STTableSource
+- (instancetype)init {
+  self = [super init];
+  if (self) rows_ = [[NSMutableArray alloc] init];
+  return self;
+}
+- (void)dealloc {
+  [rows_ release];
+  [super dealloc];
+}
+- (void)setRows:(id)rows {
+  [rows_ removeAllObjects];
+  if (rows != nil) [rows_ addObjectsFromArray:rows];
+}
+- (long)numberOfRowsInTableView:(id)tv {
+  return (long)[rows_ count];
+}
+- (id)tableView:(id)tv objectValueForTableColumn:(id)col row:(long)row {
+  if (row < 0 || (unsigned long)row >= [rows_ count]) return nil;
+  return [rows_ objectAtIndex:(unsigned long)row];
+}
+- (void)tableViewSelectionDidChange:(id)notification {
+  // performSelector: is object-return only — an NSInteger through it is a
+  // misread on arm64. Cast objc_msgSend for the integer read.
+  id tv = ((id (*)(id, SEL))objc_msgSend)(notification,
+                                          sel_registerName("object"));
+  long row = tv ? ((long (*)(id, SEL))objc_msgSend)(
+                      tv, sel_registerName("selectedRow"))
+                : -1;
+  STPostAction(port_, ticket_, "tableViewSelectionDidChange:", (int64_t)row);
 }
 @end
 
@@ -133,6 +189,17 @@ static void Cocoa_makeActionTarget(Dart_NativeArguments args) {
   t->ticket_ = ticket;
   // "new" family: the alloc ref IS the wrapper's owned ref (no extra retain).
   Dart_SetReturnValue(args, WrapObject(t, "newActionTarget", false));
+}
+
+// Cocoa_makeTableSource(SendPort, int ticket) -> a wrapped, owned source.
+static void Cocoa_makeTableSource(Dart_NativeArguments args) {
+  Dart_Port port = ILLEGAL_PORT;
+  Dart_SendPortGetId(Dart_GetNativeArgument(args, 0), &port);
+  int64_t ticket = IntArg(args, 1);
+  STTableSource* t = [[STTableSource alloc] init];
+  t->port_ = port;
+  t->ticket_ = ticket;
+  Dart_SetReturnValue(args, WrapObject(t, "newTableSource", false));
 }
 
 // --- object wrapping: retain-on-wrap + release-on-GC finalizer -------------
@@ -707,6 +774,7 @@ static void Cocoa_sendMain(Dart_NativeArguments args) {
   V(Cocoa_send, 3)                                                             \
   V(Cocoa_sendMain, 3)                                                         \
   V(Cocoa_makeActionTarget, 2)                                                 \
+  V(Cocoa_makeTableSource, 2)                                                  \
   V(Cocoa_getClass, 1)                                                         \
   V(Cocoa_classExists, 1)                                                      \
   V(Cocoa_selectorInfo, 2)                                                     \

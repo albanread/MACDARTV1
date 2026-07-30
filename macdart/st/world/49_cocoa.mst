@@ -68,6 +68,7 @@ Object subclass: STCocoa [
     STCocoa class >> poolPush [ <stprim: stObjcPoolPush> ]
     STCocoa class >> poolPop: p [ <stprim: stObjcPoolPop> ]
     STCocoa class >> actionTargetTicket: t [ <stprim: stObjcActionTarget> ]
+    STCocoa class >> tableSourceTicket: t [ <stprim: stObjcTableSource> ]
 ]
 
 "I am a Smalltalk handle on one Objective-C object, minted only by the

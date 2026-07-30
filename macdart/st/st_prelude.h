@@ -94,6 +94,7 @@ Object subclass: STSystem [
     STSystem class >> joinList: l [ <stprim: stJoinList> ]
     STSystem class >> displayOf: x [ <stprim: stDisplayOf> ]
     STSystem class >> printOf: x [ <stprim: stPrintOf> ]
+    STSystem class >> split: s by: charCode [ <stprim: stSplitByChar> ]
 ]
 
 "── The collection bridge (Sprint 11: corpus breadth) ────────────────

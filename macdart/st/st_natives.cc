@@ -439,6 +439,35 @@ void ST_send(Dart_NativeArguments args) { STSendCommon(args, false); }
 // try/catch, which crashed the Release GUI inside stPrintOf's fallback).
 void ST_sendTry(Dart_NativeArguments args) { STSendCommon(args, true); }
 
+// stClassNamed(name) -> the class VALUE (canonical Type) or null. Sprint 14:
+// `Worker classNamed:` binds here — the engine's own lookup instead of a
+// ClassMirror sweep.
+void ST_classNamed(Dart_NativeArguments args) {
+  Dart_Handle name_h = Dart_GetNativeArgument(args, 0);
+  const char* name_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(name_h, &name_c)) || name_c == NULL) {
+    Dart_SetReturnValue(args, Dart_Null());
+    return;
+  }
+  const std::string name(name_c);
+  Thread* thread = Thread::Current();
+  Dart_Handle result = Dart_Null();
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Class& cls =
+        Class::Handle(zone, ::st::FindStClassByName(thread, name.c_str()));
+    if (!cls.IsNull()) {
+      if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
+      const Type& type =
+          Type::Handle(zone, Type::NewNonParameterizedType(cls));
+      result = Api::NewHandle(thread, type.raw());
+    }
+  }
+  Dart_SetReturnValue(args, result);
+}
+
 // stHasMethod(recv, selector) -> bool.  Sprint 13: a lookup-only probe (no
 // invoke, no prelude requirement) — does the receiver's class chain define
 // the (mangled) selector? The NSM hook uses it to decide whether a missed

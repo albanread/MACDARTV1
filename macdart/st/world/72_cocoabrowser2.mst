@@ -47,7 +47,7 @@
  Remove round out the editing set. I run in the UI worker VM and read and
  write through the host service."
 Object subclass: CocoaBrowser2 [
-    <classVars: Tree Records Svc Side SourceMode EditMode ShellSuper RemoveArmed
+    <classVars: Tree Records Svc Side SourceMode EditMode ShellSuper RemoveArmed CatRows CatNodes
                 SelectedPackage SelectedPackageName SelectedClass SelectedProtocol SelectedMethod
                 Classes Protocols Methods
                 CatHandles CatHandleList ActionDelegates SourceTextDelegate
@@ -90,19 +90,18 @@ Object subclass: CocoaBrowser2 [
     "── host service (image reads AND writes: saveMethodFor:/newClassFrom:/
      removeClassNamed:/removeMethodFor:/setCommentFor:/acceptEditorClass: all
      go through the same vetted flows V1 uses) ──"
+    "MACDART: the host service is PURE SMALLTALK (STHostService, 63) — the
+     image data lives in the same isolate the browser runs in, so a 'host
+     read' is a local call; its onMain answers itself (no hop needed)."
     CocoaBrowser2 class >> hostService [
-        Svc isNil ifTrue: [
-            Svc := ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init ].
+        Svc isNil ifTrue: [ Svc := STHostService new ].
         ^Svc
     ]
     CocoaBrowser2 class >> readReply: ns [
-        "V1 parity (review drift finding): a nil reply surfaces as an ERR the
-         write-callers' errorOf: shows, never a silent empty string."
-        | text |
+        "MACDART: STHostService answers Smalltalk Strings directly — no
+         NSString unwrap, no release. A nil still surfaces as an ERR."
         ns isNil ifTrue: [ ^'ERR no host service' ].
-        text := ns sendString: 'description'.
-        ns release.
-        ^text
+        ^ns
     ]
     CocoaBrowser2 class >> sideString [
         ^Side == #class ifTrue: [ 'class' ] ifFalse: [ 'instance' ]
@@ -124,31 +123,38 @@ Object subclass: CocoaBrowser2 [
         Records := self parseRecords: (self readReply: (self hostService onMain browseRecords)).
     ]
     CocoaBrowser2 class >> parseTree: text [
-        "Lines `list US package US c1 c2 …` (US = 31), lists grouped. Build an
-         Array of list-nodes {listName. Array of package-nodes {pkgName. classes}}."
-        | lists byName |
+        "MACDART: index loops only (to:do: bodies inline into the method) —
+         a real closure nested in another real closure that captures its
+         locals is the engine's one deferred case, and the original's
+         do:-in-do:/at:ifAbsent: shapes tripped it."
+        | lines lists line f found |
+        lines := self linesOf: text.
         lists := OrderedCollection new.
-        byName := Dictionary new.
-        (self linesOf: text) do: [ :line |
-            | f listNode |
+        1 to: lines size do: [ :li |
+            line := lines at: li.
             line isEmpty ifFalse: [
                 f := self fieldsOf: line.
                 f size >= 2 ifTrue: [
-                    listNode := byName at: (f at: 1) ifAbsent: [
-                        | ln | ln := Array with: (f at: 1) with: OrderedCollection new.
-                        byName at: (f at: 1) put: ln. lists add: ln. ln ].
-                    (listNode at: 2) add: (Array with: (f at: 2)
+                    found := nil.
+                    1 to: lists size do: [ :k |
+                        ((lists at: k) at: 1) = (f at: 1) ifTrue: [ found := lists at: k ] ].
+                    found isNil ifTrue: [
+                        found := Array with: (f at: 1) with: OrderedCollection new.
+                        lists add: found ].
+                    (found at: 2) add: (Array with: (f at: 2)
                         with: (self tokensOf: (f size >= 3 ifTrue: [ f at: 3 ] ifFalse: [ '' ]))) ] ] ].
-        lists do: [ :ln | ln at: 2 put: (ln at: 2) asArray ].
+        1 to: lists size do: [ :k |
+            (lists at: k) at: 2 put: ((lists at: k) at: 2) asArray ].
         ^lists asArray
     ]
     CocoaBrowser2 class >> parseRecords: text [
         "Flat browseRecords -> Dictionary className -> {superclass. instSels. classSels}
-         (the superclass is needed for the live-reopen an Accept ships)."
-        | dict |
+         (index loops — see parseTree:)."
+        | dict lines line f |
         dict := Dictionary new.
-        (self linesOf: text) do: [ :line |
-            | f |
+        lines := self linesOf: text.
+        1 to: lines size do: [ :li |
+            line := lines at: li.
             line isEmpty ifFalse: [
                 f := self fieldsOf: line.
                 f size >= 6 ifTrue: [
@@ -166,32 +172,20 @@ Object subclass: CocoaBrowser2 [
     ]
 
     "── pure string helpers (self-contained; V2 does not lean on V1) ──"
+    "MACDART: the per-character accumulators were O(n^2) over our records
+     text and blew the workspace watchdog — one engine split is O(n)."
     CocoaBrowser2 class >> linesOf: text [
-        | out cur lf |
-        out := OrderedCollection new. cur := ''. lf := Character value: 10.
-        text do: [ :ch |
-            ch = lf ifTrue: [ out add: cur. cur := '' ]
-                    ifFalse: [ cur := cur , (String with: ch) ] ].
-        cur isEmpty ifFalse: [ out add: cur ].
-        ^out asArray
+        ^STSystem split: text by: 10
     ]
     CocoaBrowser2 class >> fieldsOf: aString [
         "Split on the unit separator (31) — returns every field, unpadded."
-        | parts cur us |
-        parts := OrderedCollection new. cur := ''. us := Character value: 31.
-        aString do: [ :ch |
-            ch = us ifTrue: [ parts add: cur. cur := '' ]
-                    ifFalse: [ cur := cur , (String with: ch) ] ].
-        parts add: cur.
-        ^parts asArray
+        ^STSystem split: aString by: 31
     ]
     CocoaBrowser2 class >> tokensOf: aString [
-        | out cur space |
-        out := OrderedCollection new. cur := ''. space := Character value: 32.
-        aString do: [ :ch |
-            ch = space ifTrue: [ cur isEmpty ifFalse: [ out add: cur. cur := '' ] ]
-                       ifFalse: [ cur := cur , (String with: ch) ] ].
-        cur isEmpty ifFalse: [ out add: cur ].
+        | out |
+        out := OrderedCollection new.
+        (STSystem split: aString by: 32) do: [ :t |
+            t isEmpty ifFalse: [ out add: t ] ].
         ^out asArray
     ]
     CocoaBrowser2 class >> splitPath: aString [
@@ -657,8 +651,24 @@ Object subclass: CocoaBrowser2 [
 
     "── deferred reloads (never reload synchronously from a callback) ──"
     CocoaBrowser2 class >> deferReload: aView [
+        "MACDART: our #table sources are SNAPSHOTS — push this pane's current
+         model rows first, then reload (same-isolate, so a direct reload is
+         safe; the original deferred to escape a sync host callback we no
+         longer have)."
         aView isNil ifTrue: [ ^self ].
-        aView onMain performSelector: 'reloadData' withObject: nil afterDelay: 0.0
+        aView == ClassTable ifTrue: [ self pushRows: Classes to: ClassDelegate ].
+        aView == ProtoTable ifTrue: [ self pushRows: Protocols to: ProtoDelegate ].
+        aView == MethTable ifTrue: [ self pushRows: Methods to: MethDelegate ].
+        aView == CatOutline ifTrue: [ self pushRows: CatRows to: CatDelegate ].
+        aView onMain reloadData
+    ]
+    CocoaBrowser2 class >> pushRows: anArray to: aDelegate [
+        | ns |
+        aDelegate isNil ifTrue: [ ^self ].
+        ns := (Cocoa classNamed: 'NSMutableArray') onMain array.
+        anArray isNil ifFalse: [
+            anArray do: [ :s | ns onMain addObject: (Cocoa nsString: s) ] ].
+        aDelegate onMain setRows: (ns objcHandle).
     ]
 
     "── install a freshly-fetched model (TOP-LEVEL: direct reload + expand ok) ──"
@@ -668,19 +678,20 @@ Object subclass: CocoaBrowser2 [
          the user's place — the V1 model (installSnapshot keeps its selection;
          it NEVER re-selects from a reply continuation, which is what corrupted
          walk_frames into a SIGSEGV recover loop)."
-        self releaseCatHandles.
-        CatOutline isNil ifFalse: [
-            CatOutline onMain reloadData.
-            Tree isNil ifFalse: [
-                1 to: Tree size do: [ :i | CatOutline onMain expandItem: (self catHandleFor: (i - 1) printString) ] ] ].
+        self rebuildCatModel.
+        self deferReload: CatOutline.
         self disarmRemove.
         self reselectAfterRefresh.
         self deferReload: ClassTable. self deferReload: ProtoTable. self deferReload: MethTable.
     ]
     CocoaBrowser2 class >> classesInPackage: aName [
+        | ln pkgs |
         aName isNil ifTrue: [ ^Array new: 0 ].
         Tree isNil ifTrue: [ ^Array new: 0 ].
-        Tree do: [ :ln | (ln at: 2) do: [ :pkg | (pkg at: 1) = aName ifTrue: [ ^pkg at: 2 ] ] ].
+        1 to: Tree size do: [ :i |
+            ln := Tree at: i. pkgs := ln at: 2.
+            1 to: pkgs size do: [ :j |
+                ((pkgs at: j) at: 1) = aName ifTrue: [ ^(pkgs at: j) at: 2 ] ] ].
         ^Array new: 0
     ]
     CocoaBrowser2 class >> reselectAfterRefresh [
@@ -736,10 +747,18 @@ Object subclass: CocoaBrowser2 [
         aView onMain addSubview: btn.
         ^btn
     ]
-    CocoaBrowser2 class >> buildView [
-        | host frame w h topH cw |
+    CocoaBrowser2 class >> hostFrame [
+        "The shell's content host when CocoaUI startup ran; a standalone
+         default otherwise (MACDART hosts the browser in its own window)."
+        | host |
         host := CocoaUI contentHost.
-        frame := host onMain frame.
+        ^host isNil
+            ifTrue: [ Array with: 0.0 with: 0.0 with: 980.0 with: 620.0 ]
+            ifFalse: [ host onMain frame ]
+    ]
+    CocoaBrowser2 class >> buildView [
+        | frame w h topH cw |
+        frame := self hostFrame.
         w := frame at: 3. h := frame at: 4.
         topH := h - self sourcePaneHeight.
         Side := #instance. SourceMode := #comment.
@@ -782,18 +801,52 @@ Object subclass: CocoaBrowser2 [
         CatPane := ((Cocoa classNamed: 'NSView') onMain alloc) onMain initWithFrame: rect.
         CatPane onMain setAutoresizesSubviews: true.
         CatScroll := self newScrollIn: (Array with: 0.0 with: 0.0 with: w with: h).
-        CatOutline := ((Cocoa classNamed: 'NSOutlineView') onMain alloc) onMain
+        "MACDART: a FLAT snapshot table instead of the outline — our #table
+         sources answer from an ObjC-side snapshot (no sync VM entry), and
+         the two-level category tree flattens losslessly (packages indented
+         under their list)."
+        CatOutline := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
             initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
         CatCol := self newTableColumnId: 'cat'.
         CatOutline onMain addTableColumn: CatCol.
-        CatOutline onMain setOutlineTableColumn: CatCol.
         CatOutline onMain setHeaderView: nil.
-        CatDelegate := MacvmDelegate outlineSourceOn: self.
+        CatDelegate := MacvmDelegate tableSourceOn: self.
         CatOutline onMain setDataSource: CatDelegate.
-        CatOutline onMain setDelegate: CatDelegate.
         CatOutline onMain setColumnAutoresizingStyle: 1.
+        CatCol onMain setEditable: false.
+        self wireAction: CatOutline to: [ self catClicked ].
         CatScroll onMain setDocumentView: CatOutline.
         CatPane onMain addSubview: CatScroll.
+    ]
+    CocoaBrowser2 class >> rebuildCatModel [
+        "Flatten Tree -> parallel label/node arrays: a list row {#list. name},
+         a package row {#pkg. pkgNode} (label indented)."
+        | rows nodes ln pkgs pkg |
+        rows := OrderedCollection new. nodes := OrderedCollection new.
+        Tree isNil ifFalse: [
+            1 to: Tree size do: [ :i |
+                ln := Tree at: i.
+                rows add: (ln at: 1). nodes add: (Array with: #list with: ln).
+                pkgs := ln at: 2.
+                1 to: pkgs size do: [ :j |
+                    pkg := pkgs at: j.
+                    rows add: '    ' , (pkg at: 1).
+                    nodes add: (Array with: #pkg with: pkg) ] ] ].
+        CatRows := rows asArray. CatNodes := nodes asArray.
+    ]
+    CocoaBrowser2 class >> catClicked [
+        | row node pkg |
+        CatOutline isNil ifTrue: [ ^self ].
+        row := CatOutline onMain clickedRow.
+        (row < 0 or: [ CatNodes isNil or: [ row >= CatNodes size ] ]) ifTrue: [ ^self ].
+        node := CatNodes at: row + 1.
+        (node at: 1) == #pkg ifFalse: [ ^self ].
+        pkg := node at: 2.
+        SelectedPackage := pkg.
+        SelectedPackageName := pkg at: 1.
+        Classes := pkg at: 2.
+        self clearClassSelection.
+        self deferReload: ClassTable.
     ]
     CocoaBrowser2 class >> buildClassListPane: rect [
         | w h brh |
@@ -942,9 +995,12 @@ Object subclass: CocoaBrowser2 [
 
     "── scripting/automation (rusttcl `gui doit` — I drive + screenshot) ──"
     CocoaBrowser2 class >> scriptSelectPackage: aName [
+        | ln pkgs pkg |
         Tree isNil ifTrue: [ ^self ].
-        Tree do: [ :ln |
-            (ln at: 2) do: [ :pkg |
+        1 to: Tree size do: [ :i |
+            ln := Tree at: i. pkgs := ln at: 2.
+            1 to: pkgs size do: [ :j |
+                pkg := pkgs at: j.
                 (pkg at: 1) = aName ifTrue: [
                     SelectedPackage := pkg. SelectedPackageName := aName. Classes := pkg at: 2.
                     self clearClassSelection. self deferReload: ClassTable. ^self ] ] ].
@@ -980,9 +1036,12 @@ Object subclass: CocoaBrowser2 [
     CocoaBrowser2 class >> currentMethodNames [ ^Methods isNil ifTrue: [ Array new: 0 ] ifFalse: [ Methods ] ]
     CocoaBrowser2 class >> sourceString [ ^SourceView isNil ifTrue: [ '' ] ifFalse: [ SourceView sendString: 'string' ] ]
     CocoaBrowser2 class >> packageNames [
-        | out |
+        | out ln pkgs |
         out := OrderedCollection new.
-        Tree isNil ifFalse: [ Tree do: [ :ln | (ln at: 2) do: [ :pkg | out add: (pkg at: 1) ] ] ].
+        Tree isNil ifFalse: [
+            1 to: Tree size do: [ :i |
+                ln := Tree at: i. pkgs := ln at: 2.
+                1 to: pkgs size do: [ :j | out add: ((pkgs at: j) at: 1) ] ] ].
         ^out asArray
     ]
 

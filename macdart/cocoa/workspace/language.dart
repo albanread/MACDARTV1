@@ -168,6 +168,107 @@ String _stImport(String path) {
       files.length.toString() + ' files';
 }
 
+
+// --- Sprint 14: the browser host (STHostService's data, over the image) ----
+// Wire formats per CocoaBrowser2's own parsers: US (char 31) separated
+// fields, LF lines, space-separated token lists.
+final String _us = new String.fromCharCode(31);
+
+String _sigToSelector(String sig) {
+  // 'from: a to: b' -> 'from:to:';  '+ x' -> '+';  'size' -> 'size'
+  if (!sig.contains(':')) {
+    var t = sig.trim().split(' ');
+    return t[0];
+  }
+  var out = new StringBuffer();
+  for (var tok in sig.split(' ')) {
+    if (tok.endsWith(':')) out.write(tok);
+  }
+  return out.toString();
+}
+
+String _stSuperOf(String src) {
+  var m = _stClassRe.firstMatch(src);
+  return m == null ? 'Object' : m.group(1);
+}
+
+String _leadingComment(String src) {
+  var t = src.trimLeft();
+  if (!t.startsWith('"')) return '';
+  var end = t.indexOf('"', 1);
+  while (end > 0 && end + 1 < t.length && t[end + 1] == '"') {
+    end = t.indexOf('"', end + 2);          // "" escapes
+  }
+  return end < 0 ? '' : t.substring(1, end);
+}
+
+_hostSelectors(String src, String side) {
+  var out = <String>[];
+  for (var m in _stMembers(src)) {
+    if (m[0] != (side == 'class' ? 'c' : 'i')) continue;
+    out.add(_sigToSelector(m[2].toString()));
+  }
+  return out;
+}
+
+String _hostCall(String verb, List args) {
+  if (verb == 'packageTree') {
+    var st = <String>[]; var da = <String>[];
+    _decls.forEach((n, s) {
+      var k = _kindOf(s);
+      if (k == 'st-class') st.add(n);
+      else if (k == 'class' || k == 'enum') da.add(n);
+    });
+    st.sort(); da.sort();
+    return 'image' + _us + 'smalltalk' + _us + st.join(' ') + '\n' +
+           'image' + _us + 'dart' + _us + da.join(' ') + '\n';
+  }
+  if (verb == 'browseRecords') {
+    var out = new StringBuffer();
+    _decls.forEach((n, s) {
+      var k = _kindOf(s);
+      if (k == 'st-class') {
+        out.write(n + _us + _stSuperOf(s) + _us + _us + _us +
+            _hostSelectors(s, 'instance').join(' ') + _us +
+            _hostSelectors(s, 'class').join(' ') + '\n');
+      } else if (k == 'class' || k == 'enum') {
+        var sels = <String>[];
+        for (var m in _splitMembers(s)) {
+          var sig = _memberSig(m);
+          if (sig.length > 0) sels.add(sig);
+        }
+        out.write(n + _us + 'Object' + _us + _us + _us +
+            sels.join(' ') + _us + '\n');
+      }
+    });
+    return out.toString();
+  }
+  var cls = args.isNotEmpty ? args[0].toString() : '';
+  var src = _decls.containsKey(cls) ? _decls[cls] : null;
+  if (src == null) return 'ERR no such class ' + cls;
+  if (verb == 'comment') {
+    var c = _leadingComment(src);
+    return c.isEmpty ? '"' + cls + '"' : c;
+  }
+  if (verb == 'classSource') return src;
+  if (verb == 'methodSource') {
+    var side = args[1].toString();
+    var sel = args[2].toString();
+    if (_isStAny(src)) {
+      for (var m in _stMembers(src)) {
+        if (m[0] != (side == 'class' ? 'c' : 'i')) continue;
+        if (_sigToSelector(m[2].toString()) == sel) return m[3].toString();
+      }
+    } else {
+      for (var m in _splitMembers(src)) {
+        if (_memberSig(m) == sel) return m;
+      }
+    }
+    return 'ERR no source for ' + cls + '>>' + sel;
+  }
+  return 'ERR unknown host verb ' + verb;
+}
+
 main(List args, SendPort uiPort) {
   _ui = uiPort;
   // Smalltalk `Transcript show:`/`cr` lines land in the GUI Transcript.
@@ -190,6 +291,7 @@ main(List args, SendPort uiPort) {
     }
   });
   stActionPort = stActions.sendPort;
+  stHostHook = (verb, argv) => _hostCall(verb.toString(), argv);
 
   _scratch = args[0];
   if (args.length > 1 && args[1] != null && (args[1] as String).length > 0) {

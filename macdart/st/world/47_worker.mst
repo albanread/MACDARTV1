@@ -193,12 +193,9 @@ Object subclass: Worker [
                            with: (target perform: (p at: 3) withArguments: (p at: 4)))
     ]
     Worker class >> classNamed: aSymbol [
-        "Resolve a class by name in this worker's world, via the allClasses
-         reflection sweep (34_tools.mst) — O(classes), fine for RPC."
-        | want |
-        want := aSymbol asString.
-        ClassMirror allClasses do: [ :c | c name asString = want ifTrue: [ ^c ] ].
-        ^nil
+        "MACDART: the engine's own class lookup (a class VALUE or nil),
+         replacing the ClassMirror reflection sweep."
+        <stprim: stClassNamed>
     ]
     Worker class >> reply: aPayload [
         "Answer the peer that sent the message being dispatched, echoing its

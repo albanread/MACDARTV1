@@ -362,6 +362,31 @@ stCeilingU(r) => r is num ? r.ceil() : stSend(r, 'ceiling', []);
 stNegated(r) => r is num ? -r : stSend(r, 'negated', []);
 stSqrt(r) => r is num ? math.sqrt(r) : stSend(r, 'sqrt', []);
 
+// Ordering (Sprint 14): Dart Strings have no operator< — a miss walked
+// into the world's Magnitude circularity (whose primitive stubs answer
+// self) and overflowed the stack. Nums stay fast, Strings compare
+// lexically, everything else is real ST dispatch.
+stLess(a, b) {
+  if (a is num && b is num) return a < b;
+  if (a is String && b is String) return a.compareTo(b) < 0;
+  return stSend(a, '<', [b]);
+}
+stLessEq(a, b) {
+  if (a is num && b is num) return a <= b;
+  if (a is String && b is String) return a.compareTo(b) <= 0;
+  return stSend(a, '<=', [b]);
+}
+stGreater(a, b) {
+  if (a is num && b is num) return a > b;
+  if (a is String && b is String) return a.compareTo(b) > 0;
+  return stSend(a, '>', [b]);
+}
+stGreaterEq(a, b) {
+  if (a is num && b is num) return a >= b;
+  if (a is String && b is String) return a.compareTo(b) >= 0;
+  return stSend(a, '>=', [b]);
+}
+
 stMax(a, b) {
   if (a is num && b is num) return a > b ? a : b;
   return stSend(a, 'max:', [b]);
@@ -461,6 +486,8 @@ stListInsertFirst(l, x) { l.insert(0, x); return x; }
 stListRemove(l, x) { l.remove(x); return x; }
 stListIncludes(l, x) => l.contains(x);
 stListAppend(l, x) { l.add(x); return l; }  // literal-array build chain
+stSplitByChar(s, code) => s.toString().split(new String.fromCharCode(code));
+stStringWith(c) => c.toString();  // a Character IS a 1-char string here
 
 /// Parse-check `.mst` source WITHOUT loading it: returns '' when it parses,
 /// else "ERR: line:col: message" — the editor's cheap pre-Accept validation.
@@ -608,6 +635,26 @@ stActionDispatch(ticket, String sel, arg) {
   return stInvokeStatic('MacvmDelegate', 'dispatchTicket:selector:arguments:',
       [ticket, sel, [arg]]);
 }
+
+/// Sprint 14: the browser HOST hook — the workspace language isolate
+/// installs a closure (verb, args) -> String over its image decls; the
+/// STHostService prims below route through it. Null hook = clear ERR.
+var stHostHook;
+_stHost(String verb, List args) {
+  if (stHostHook == null) return 'ERR no image host in this isolate';
+  var r = stHostHook(verb, args);
+  return r == null ? '' : r.toString();
+}
+
+stHostPackageTree(svc) => _stHost('packageTree', const []);
+stHostBrowseRecords(svc) => _stHost('browseRecords', const []);
+stHostComment(svc, cls) => _stHost('comment', [cls]);
+stHostClassSource(svc, cls) => _stHost('classSource', [cls]);
+stHostMethodSource(svc, cls, side, sel) =>
+    _stHost('methodSource', [cls, side, sel]);
+
+/// `Worker classNamed:` — the engine's class lookup (a class VALUE or nil).
+stClassNamed(name) native "ST_classNamed";
 
 /// ST `perform:` — dynamic dispatch by selector string.
 stPerform1(r, sel) => stSend(r, stDisplayOf(sel), []);

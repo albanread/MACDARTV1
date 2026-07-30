@@ -85,6 +85,8 @@ static const HelperRewrite kHelperRewrites[] = {
     {"sqrt", "stSqrt", 0},
     {"perform:", "stPerform1", 1},
     {"perform:withArguments:", "stPerform2", 2},
+    {"<", "stLess", 1},   {"<=", "stLessEq", 1},
+    {">", "stGreater", 1}, {">=", "stGreaterEq", 1},
 };
 static const HelperRewrite* FindHelperRewrite(const std::string& sel,
                                               size_t argc) {
@@ -967,6 +969,7 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
             {"String", "new:", "stStringNew", 1},
             {"String", "new", "stStringNew0", 0},
             {"Character", "value:", "stCharValue", 1},
+            {"String", "with:", "stStringWith", 1},
         };
         for (size_t i = 0;
              i < sizeof(kBridgedClassSends) / sizeof(kBridgedClassSends[0]);

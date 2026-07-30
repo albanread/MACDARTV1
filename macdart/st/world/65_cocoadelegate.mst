@@ -82,6 +82,11 @@ Object subclass: MacvmDelegate [
             ^ObjcRef onHandle: (STCocoa actionTargetTicket: ticket) ].
         aRole = #table ifTrue: [
             ^ObjcRef onHandle: (STCocoa tableSourceTicket: ticket) ].
+        aRole = #text ifTrue: [
+            "v1: an inert target — it answers none of the text-delegate
+             selectors, so AppKit's respondsToSelector: probes skip them
+             (live recolor/dirty-tracking quietly absent)."
+            ^ObjcRef onHandle: (STCocoa actionTargetTicket: ticket) ].
         ^self error: 'delegate role not yet bound on MACDART: ' , aRole printString
     ]
 

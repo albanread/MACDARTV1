@@ -789,12 +789,27 @@ loudly). Stages A and C are modest; A is independently shippable.
     snapshot" — pointed here. Verified live: an ST-built NSTableView
     showing ST rows; selecting rows drives `tableViewSelectionDidChange:`
     in an ST receiver (`ST TABLE picked row 2`).
-  - Later slices: the 63–74 CocoaUI tier (MACVM's ST IDE widgets) verified
-    class by class on the shared bridge — tables/buttons/windows now have
-    everything they need; a TRUE sync reverse hop only if a future role
-    demands a computed return value (windowShouldClose: — likely bindable
-    as policy-push instead); pixmap/gamepane mapping onto the dartui game
-    pane.
+  - **Sprint 14 ✓ — MACVM's OWN Smalltalk browser runs inside dartui.**
+    CocoaBrowser2 (the four-pane Smalltalk-80 browser) builds, fills, and
+    drives on the shared bridge, browsing the live bilingual image:
+    packages [smalltalk, dart] → 172 classes → protocols → method source in
+    the pane, both sides, all three modes. STHostService is PURE SMALLTALK
+    (the data lives in the browser's own isolate — each host read is a
+    <stprim:> answered by language.dart's image hook in their exact wire
+    formats); the category outline became a flat snapshot table; deferReload:
+    pushes pane models into the snapshot sources. Engine lessons banked:
+    nested-closure-in-closure (the one deferred case) hit at runtime by the
+    parsers' do:-in-do:/at:ifAbsent: shapes → inlined to:do: index loops are
+    the safe form; per-character splitters were O(n²) → STSystem split:by:;
+    String ordering missed into the world's Magnitude circularity →
+    universal </<=/>/>= helpers (num fast path, compareTo for Strings);
+    `String with:` bridged. Worker classNamed: → ST_classNamed. Writes are
+    read-only v1 (Accept says so; edit via the workspace Browser).
+  - Later slices: browser WRITE flows (Accept → the image, through the
+    workspace's checked accept path), the remaining CocoaUI views (66 V1
+    browser, 68 editor, 69 outliner, 71 help — same recipe), the CocoaUI
+    shell itself as an alternative frontend, pixmap/gamepane mapping onto
+    the dartui game pane.
 
   **Also next:** `Smalltalk at:put:` system-dictionary protocol, Behavior/
   reflection surface (`name`, `superclass`), performance pass on the NSM dispatch

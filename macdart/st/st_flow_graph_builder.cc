@@ -969,6 +969,7 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
         } kBridgedClassSends[] = {
             {"String", "new:", "stStringNew", 1},
             {"String", "new", "stStringNew0", 0},
+            {"ByteArray", "new:", "stNewByteArray", 1},
             {"Character", "value:", "stCharValue", 1},
             {"String", "with:", "stStringWith", 1},
             {"String", "lf", "stStrLf", 0},

@@ -1528,6 +1528,11 @@ void buildMenu() {
     var title = d[0], path = d[1];
     menuItem(demos, title, "", (s) => runDemoAt(title, path));
   }
+  // Sprint 15b: the Smalltalk graphics tier, rendered into the SAME pane — its
+  // HTML5-canvas / pixmap output is translated to the pane's draw-ops. The
+  // list comes from the language isolate (present iff the world is imported).
+  menuSep(demos);
+  stAddDemoMenu(demos);
   menuSep(demos);
   menuItem(demos, "Stop Demo", ".", (s) => stopDemo("stopped"));
   menuItem(demos, "Rescan Demos Folder", "", (s) {
@@ -2350,6 +2355,7 @@ Future<String> handle(String line) async {
           const Duration(seconds: 180));
       return r == null ? 'ERR: stimport timed out' : r.toString();
     }
+    case 'stdemo': runStDemo(arg.trim().isEmpty ? 'Waves' : arg.trim()); return "ok";
     case 'kill': await respawnLanguage("manual kill"); return "ok";
     case 'quit':
       Cocoa.cls("NSApplication").sharedApplication().terminate(null); return "ok";
@@ -3911,6 +3917,162 @@ void renderInto(Cocoa _img, double _w, double _h, List cmds) {
 }
 
 /// The Demos-tab canvas: render into gDemoImage, then show it on the Demos tab.
+// --- Sprint 15b: ST demos into the demos pane -------------------------------
+// The ST graphics tier emits HTML5-canvas JSON (["clearRect",..],["fillStyle",
+// "#rgb"],["fillRect",..],["fillText",..],["beginPath"],["moveTo",..],["lineTo",
+// ..],["stroke"], font/lineWidth/textAlign). This is the ONE translator from
+// that vocabulary into the demos pane's native draw-ops (clear/rect/line/text)
+// — so every existing ST canvas demo renders unchanged, no ST rewrite.
+// Canvas y is baseline-down and top-left origin, which is exactly what
+// renderInto already flips; colours parse from #rgb / #rrggbb / rgb()/rgba().
+
+List<double> _cssColor(String c, List<double> fallback) {
+  var s = c.trim().toLowerCase();
+  if (s.startsWith('#')) {
+    s = s.substring(1);
+    if (s.length == 3) {
+      s = s[0] + s[0] + s[1] + s[1] + s[2] + s[2];
+    }
+    if (s.length >= 6) {
+      var r = int.parse(s.substring(0, 2), radix: 16, onError: (_) => -1);
+      var g = int.parse(s.substring(2, 4), radix: 16, onError: (_) => -1);
+      var b = int.parse(s.substring(4, 6), radix: 16, onError: (_) => -1);
+      if (r >= 0 && g >= 0 && b >= 0) {
+        return <double>[r / 255.0, g / 255.0, b / 255.0];
+      }
+    }
+    return fallback;
+  }
+  if (s.startsWith('rgb')) {
+    var lp = s.indexOf('('), rp = s.indexOf(')');
+    if (lp >= 0 && rp > lp) {
+      var nums = s.substring(lp + 1, rp).split(',');
+      if (nums.length >= 3) {
+        var r = double.parse(nums[0].trim(), (_) => -1.0);
+        var g = double.parse(nums[1].trim(), (_) => -1.0);
+        var b = double.parse(nums[2].trim(), (_) => -1.0);
+        if (r >= 0 && g >= 0 && b >= 0) {
+          return <double>[r / 255.0, g / 255.0, b / 255.0];
+        }
+      }
+    }
+    return fallback;
+  }
+  const named = const {
+    'black': const [0.0, 0.0, 0.0], 'white': const [1.0, 1.0, 1.0],
+    'red': const [1.0, 0.0, 0.0], 'green': const [0.0, 0.5, 0.0],
+    'blue': const [0.0, 0.0, 1.0], 'gray': const [0.5, 0.5, 0.5],
+    'grey': const [0.5, 0.5, 0.5],
+  };
+  return named.containsKey(s) ? new List<double>.from(named[s]) : fallback;
+}
+
+double _fontPx(String font) {
+  // "12px monospace" / "bold 14px ..." -> 12 / 14; default 13.
+  var m = new RegExp(r'(\d+(?:\.\d+)?)px').firstMatch(font);
+  return m != null ? double.parse(m.group(1), (_) => 13.0) : 13.0;
+}
+
+/// Translate an HTML5-canvas JSON batch into demos-pane draw-ops.
+List stCanvasToOps(String jsonBatch) {
+  var cmds;
+  try { cmds = JSON.decode(jsonBatch); }
+  catch (e) { return <dynamic>[<dynamic>['clear', 0.07, 0.07, 0.09],
+      <dynamic>['text', 8.0, 8.0, 'ST demo: bad canvas JSON', 13.0, 0.9, 0.4, 0.4]]; }
+  if (cmds is! List) return <dynamic>[];
+  var ops = <dynamic>[<dynamic>['clear', 0.07, 0.07, 0.09]];
+  var fill = <double>[0.85, 0.85, 0.9];
+  var stroke = <double>[0.5, 0.5, 0.5];
+  var lw = 1.0;
+  var size = 13.0;
+  var path = <List<double>>[];        // accumulated moveTo/lineTo points
+  for (var c in cmds) {
+    if (c is! List || c.isEmpty) continue;
+    var op = c[0].toString();
+    if (op == 'clearRect') {
+      // a full-canvas clear is already emitted; a partial one -> a filled rect
+      // in the background colour (rare in these demos).
+    } else if (op == 'fillStyle') {
+      fill = _cssColor(c[1].toString(), fill);
+    } else if (op == 'strokeStyle') {
+      stroke = _cssColor(c[1].toString(), stroke);
+    } else if (op == 'lineWidth') {
+      lw = (c[1] as num).toDouble();
+    } else if (op == 'font') {
+      size = _fontPx(c[1].toString());
+    } else if (op == 'fillRect') {
+      ops.add(<dynamic>['rect', (c[1] as num).toDouble(), (c[2] as num).toDouble(),
+          (c[3] as num).toDouble(), (c[4] as num).toDouble(),
+          fill[0], fill[1], fill[2], true]);
+    } else if (op == 'strokeRect') {
+      ops.add(<dynamic>['rect', (c[1] as num).toDouble(), (c[2] as num).toDouble(),
+          (c[3] as num).toDouble(), (c[4] as num).toDouble(),
+          stroke[0], stroke[1], stroke[2], false]);
+    } else if (op == 'fillText') {
+      // canvas y is the text baseline; the pane's text y is the top -> lift.
+      ops.add(<dynamic>['text', (c[2] as num).toDouble(),
+          (c[3] as num).toDouble() - size, c[1].toString(), size,
+          fill[0], fill[1], fill[2]]);
+    } else if (op == 'beginPath') {
+      path = <List<double>>[];
+    } else if (op == 'moveTo' || op == 'lineTo') {
+      path.add(<double>[(c[1] as num).toDouble(), (c[2] as num).toDouble()]);
+    } else if (op == 'stroke') {
+      for (var k = 1; k < path.length; k++) {
+        ops.add(<dynamic>['line', path[k - 1][0], path[k - 1][1],
+            path[k][0], path[k][1], stroke[0], stroke[1], stroke[2], lw]);
+      }
+    }
+  }
+  return ops;
+}
+
+// Append the Smalltalk demos to the Demos menu (the list is served by the
+// language isolate — empty/greyed until the world is imported). Async, so the
+// menu builds immediately and fills a beat later.
+void stAddDemoMenu(Cocoa demos) {
+  var header = menuItem(demos, "Smalltalk", "", (s) {});
+  header.setEnabled(false);
+  askQuiet('stdemos', '', const Duration(seconds: 6)).then((r) {
+    if (r is! List) return;
+    for (var d in r) {
+      if (d is! List || d.length < 3) continue;
+      var name = d[0].toString();
+      var have = d[2] == true;
+      var it = menuItem(demos, "  " + name, "", (s) => runStDemo(name));
+      if (!have) it.setEnabled(false);
+    }
+  });
+}
+
+// Run a registered ST demo: ask the language isolate for its payload, render
+// into the demos pane, switch to it. One-shot (a frame); the language isolate
+// is never held (askQuiet bypasses the do-it watchdog — the perf chart runs
+// the whole suite and legitimately takes seconds).
+void runStDemo(String name) {
+  switchTab(6);                                  // the Demos tab
+  gDemoTitle = "Smalltalk " + name;
+  demoStatus('Smalltalk: ' + name + ' …');
+  askQuiet('stdemo', name + ' ' + kDemoW.toInt().toString() + ' ' +
+      kDemoH.toInt().toString(), const Duration(seconds: 30)).then((r) {
+    if (r == null) { demoStatus('ST demo: timed out'); return; }
+    if (r is String) {                           // an ERR string
+      demoStatus('ST demo: ' + r);
+      log('x ST demo ' + name + ' - ' + r);
+      return;
+    }
+    if (r is! List || r.isEmpty) { demoStatus('ST demo: no payload'); return; }
+    var kind = r[0].toString();
+    if (kind == 'json') {
+      renderDemo(stCanvasToOps(r[1].toString()));
+    } else if (kind == 'blit') {
+      renderDemo(<dynamic>[<dynamic>['clear', 0.07, 0.07, 0.09],
+          <dynamic>['blit', 0.0, 0.0, kDemoW, kDemoH, r[3].toString()]]);
+    }
+    demoStatus('Smalltalk: ' + name);
+  });
+}
+
 void renderDemo(List cmds) {
   if (gDemoImage == null) return;
   renderInto(gDemoImage, kDemoW, kDemoH, cmds);

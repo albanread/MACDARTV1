@@ -480,6 +480,7 @@ stGcStats() native "ST_gcStats";
 // List plumbing for the prelude's OrderedCollection/Array (via <stprim:>).
 stNewList() => new List();
 stNewListSized(n) => new List(n);
+stNewByteArray(n) => new List<int>.filled(n, 0);  // ByteArray new: n (0-filled)
 stNewMap() => new Map();
 stListRemoveFirst(l) => l.removeAt(0);
 stListInsertFirst(l, x) { l.insert(0, x); return x; }

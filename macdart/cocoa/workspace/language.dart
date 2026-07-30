@@ -8,6 +8,8 @@ import 'dart:cocoa';       // wsEval / wsReload / Db
 import 'dart:async';       // scheduleMicrotask — the app surface's auto-flush
 import 'dart:isolate';
 import 'dart:io';
+import 'dart:convert';     // BASE64 — ST pixmap RGBA -> BMP for the demos pane
+import 'dart:typed_data';  // Uint8List — the BMP buffer
 import 'dart:mirrors';
 
 // ===BEGIN USER===
@@ -223,6 +225,110 @@ _hostSelectors(String src, String side) {
     out.add(_sigToSelector(m[2].toString()));
   }
   return out;
+}
+
+// --- Sprint 15b: ST demos into the dartui demos pane ------------------------
+// The ST graphics tier (world files 35/37/42) emits HTML5-canvas-style JSON
+// batches; the pixmap tier (36) emits raw RGBA. This isolate RUNS the demo
+// (it owns the ST engine) and hands the UI isolate a ready-to-render payload:
+//   ['json', canvasJsonString]   — vector, the UI translates to draw-ops
+//   ['blit', w, h, base64Bmp]    — a bitmap, one blit op
+// Each entry is {class, class-side selector, kind}. All one-shot (a frame),
+// so a demo never ties up the language isolate — the UI drives animation by
+// re-asking. Anything registered here must exist in the image (world imported).
+final List<Map> _kStDemos = <Map>[
+  {'name': 'Waves', 'cls': 'WaveChart', 'sel': 'commandsForWidth:height:',
+   'kind': 'json', 'inst': true,
+   'blurb': 'damped sine field (37_waves.mst) — vector canvas'},
+  {'name': 'Mandelbrot', 'cls': 'Mandelbrot', 'sel': 'pixelsForWidth:height:',
+   'kind': 'rgba', 'inst': true,
+   'blurb': 'the set rendered per-pixel into a Pixmap (35/36) — a blit'},
+  // Benchmarks (42_benchdash) is deferred: its multi-second suite run gets
+  // sampled by the vm-service profiler, which walks an ST method's frame
+  // through the kernel ScopeBuilder and segvs (ComputeLocalVarDescriptors) —
+  // an ST-engine/optimizer hardening item, not a demo-bridge one. The vector
+  // path itself is proven by Waves.
+];
+
+// Invoke a demo's producer selector — class-side (stInvokeStatic) or on a
+// fresh instance (`new` then send), per the demo's `inst` flag.
+_stDemoInvoke(Map demo, int w, int h) {
+  if (demo['inst'] == true) {
+    var obj = stInvokeStatic(demo['cls'], 'new', []);
+    return stSend(obj, demo['sel'], [w, h]);
+  }
+  return stInvokeStatic(demo['cls'], demo['sel'], [w, h]);
+}
+
+List _stDemoList() {
+  var out = <List>[];
+  for (var d in _kStDemos) {
+    out.add(<dynamic>[d['name'], d['blurb'], _decls.containsKey(d['cls'])]);
+  }
+  return out;
+}
+
+// `stdemo <name> <w> <h>` -> the payload for that demo at that size.
+_stDemo(String arg) {
+  var parts = arg.trim().split(' ');
+  var name = parts.isNotEmpty ? parts[0] : '';
+  var w = parts.length > 1 ? int.parse(parts[1], onError: (_) => 840) : 840;
+  var h = parts.length > 2 ? int.parse(parts[2], onError: (_) => 360) : 360;
+  Map demo = null;
+  for (var d in _kStDemos) { if (d['name'] == name) demo = d; }
+  if (demo == null) return 'ERR unknown demo ' + name;
+  if (!_decls.containsKey(demo['cls'])) {
+    return 'ERR ' + demo['cls'] + ' not in the image (import the world)';
+  }
+  try {
+    if (demo['kind'] == 'json') {
+      var js = _stDemoInvoke(demo, w, h);
+      // The world's WriteStream (18) builds into a String via at:put:, but
+      // Dart Strings are immutable, so `contents` comes back as a List of
+      // 1-char pieces — join it into the real JSON text.
+      var jstr = (js is List) ? js.join('') : js.toString();
+      return <dynamic>['json', jstr];
+    }
+    var bytes = _stDemoInvoke(demo, w, h);
+    return <dynamic>['blit', w, h, _rgbaToBmpBase64(bytes as List, w, h)];
+  } catch (e) {
+    return 'ERR ' + e.toString();
+  }
+}
+
+/// RGBA (row-major, top-down) -> base64 of a 24-bit bottom-up BGR BMP — the one
+/// format NSImage decodes natively (same encoder as demos/pixmap.dart, fed the
+/// ST pixel buffer with its alpha dropped).
+String _rgbaToBmpBase64(List px, int width, int height) {
+  var rowSize = (3 * width + 3) & ~3;
+  var imageSize = rowSize * height;
+  var out = new Uint8List(54 + imageSize);
+  var b = new ByteData.view(out.buffer);
+  out[0] = 0x42; out[1] = 0x4D;
+  b.setUint32(2, 54 + imageSize, Endianness.LITTLE_ENDIAN);
+  b.setUint32(10, 54, Endianness.LITTLE_ENDIAN);
+  b.setUint32(14, 40, Endianness.LITTLE_ENDIAN);
+  b.setUint32(18, width, Endianness.LITTLE_ENDIAN);
+  b.setUint32(22, height, Endianness.LITTLE_ENDIAN);
+  b.setUint16(26, 1, Endianness.LITTLE_ENDIAN);
+  b.setUint16(28, 24, Endianness.LITTLE_ENDIAN);
+  b.setUint32(34, imageSize, Endianness.LITTLE_ENDIAN);
+  b.setUint32(38, 2835, Endianness.LITTLE_ENDIAN);
+  b.setUint32(42, 2835, Endianness.LITTLE_ENDIAN);
+  var o = 54;
+  var n = px.length;
+  for (var y = height - 1; y >= 0; y--) {
+    var i = y * width * 4;                 // RGBA source stride
+    for (var x = 0; x < width; x++) {
+      var r = (i < n) ? (px[i] as int) : 0;
+      var g = (i + 1 < n) ? (px[i + 1] as int) : 0;
+      var bl = (i + 2 < n) ? (px[i + 2] as int) : 0;
+      out[o] = bl & 0xff; out[o + 1] = g & 0xff; out[o + 2] = r & 0xff;
+      o += 3; i += 4;
+    }
+    o += rowSize - width * 3;
+  }
+  return BASE64.encode(out);
 }
 
 // Sprint 15: build (or rebuild) the ST browser's container view sized for
@@ -643,6 +749,8 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'appevent') out = _appEvent(arg);
       else if (cmd == 'stimport') out = _stImport(arg);
       else if (cmd == 'stbrowser') out = _stBrowserHandle(arg.toString());
+      else if (cmd == 'stdemo') out = _stDemo(arg.toString());
+      else if (cmd == 'stdemos') out = _stDemoList();
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();
     } catch (e) {

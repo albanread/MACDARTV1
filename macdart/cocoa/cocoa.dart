@@ -493,6 +493,19 @@ stStrTab() => '\t';
 stStrCr() => '\r';
 stStrSpace() => ' ';
 
+/// One-hop table snapshot: rows joined on US (char 31) for setRowsJoined:.
+stJoinRows(l) {
+  if (l == null) return '';
+  var out = new StringBuffer();
+  var first = true;
+  for (var e in (l as List)) {
+    if (!first) out.write(new String.fromCharCode(31));
+    out.write(e == null ? '' : e.toString());
+    first = false;
+  }
+  return out.toString();
+}
+
 /// 1-based copyFrom:to: — Dart Strings slice as STRINGS (the world's
 /// species-based fallback rebuilt them as char Lists, so 'OK'-prefix reply
 /// checks never matched).

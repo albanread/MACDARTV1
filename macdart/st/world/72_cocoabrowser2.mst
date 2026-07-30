@@ -663,12 +663,11 @@ Object subclass: CocoaBrowser2 [
         aView onMain reloadData
     ]
     CocoaBrowser2 class >> pushRows: anArray to: aDelegate [
-        | ns |
+        "ONE main-thread hop per snapshot (US-joined; the source splits
+         ObjC-side) — per-row hops starved the language isolate and froze
+         the workspace window's own event handling."
         aDelegate isNil ifTrue: [ ^self ].
-        ns := (Cocoa classNamed: 'NSMutableArray') onMain array.
-        anArray isNil ifFalse: [
-            anArray do: [ :s | ns onMain addObject: (Cocoa nsString: s) ] ].
-        aDelegate onMain setRows: (ns objcHandle).
+        aDelegate onMain setRowsJoined: (STCocoa joinRows: anArray).
     ]
 
     "── install a freshly-fetched model (TOP-LEVEL: direct reload + expand ok) ──"

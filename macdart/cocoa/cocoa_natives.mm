@@ -109,6 +109,19 @@ static void STPostAction(Dart_Port port, int64_t ticket, const char* sel,
   [rows_ removeAllObjects];
   if (rows != nil) [rows_ addObjectsFromArray:rows];
 }
+- (void)setRowsJoined:(id)joined {
+  // ONE hop for a whole snapshot: rows arrive US-joined (char 31) in a
+  // single NSString and split here — the per-row onMain chatter (a hop per
+  // addObject: plus one per nsString:) starved the language isolate and,
+  // with it, the workspace's own event handling.
+  [rows_ removeAllObjects];
+  if (joined == nil) return;
+  NSString* s = (NSString*)joined;
+  if ([s length] == 0) return;
+  NSArray* parts =
+      [s componentsSeparatedByString:[NSString stringWithFormat:@"%c", 31]];
+  [rows_ addObjectsFromArray:parts];
+}
 - (long)numberOfRowsInTableView:(id)tv {
   return (long)[rows_ count];
 }

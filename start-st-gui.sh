@@ -78,11 +78,14 @@ if [ "$ready" != 1 ]; then
   exit 1
 fi
 
-# The world is present when its Fraction decl is in the image.
-present="$(python3 "$CTL" --port "$PORT" lang classsrc Fraction 2>/dev/null | head -c 8)"
-if [ -n "$present" ] && [ "$REIMPORT" != 1 ]; then
-  echo "st: world already in the image"
+# The world is CURRENT when the image signature matches the vendored files
+# (count-bytes). A bare presence check left images stale across updates.
+WANT_SIG="$(ls "$WORLD"/*.mst 2>/dev/null | wc -l | tr -d ' ')-$(cat "$WORLD"/*.mst 2>/dev/null | wc -c | tr -d ' ')"
+HAVE_SIG="$(sqlite3 "$HOME/.macdart/workspace.sqlite" "SELECT value FROM meta WHERE key='stworld_sig'" 2>/dev/null || true)"
+if [ "$HAVE_SIG" = "$WANT_SIG" ] && [ "$REIMPORT" != 1 ]; then
+  echo "st: world already in the image (current: $WANT_SIG)"
 else
+  if [ -n "$HAVE_SIG" ]; then echo "st: image world is stale ($HAVE_SIG -> $WANT_SIG) - re-importing"; fi
   echo "st: importing the world from ${WORLD} ..."
   result="$(python3 "$CTL" --port "$PORT" --timeout 300 stimport "$WORLD")"
   case "$result" in

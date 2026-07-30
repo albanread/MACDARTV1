@@ -163,6 +163,15 @@ String _stImport(String path) {
   });
   var err = _rebuildAndReload();
   if (err.isNotEmpty) return err;
+  // Version stamp: the launcher compares this against the vendored world and
+  // re-imports on mismatch (a presence check alone left images STALE).
+  if (_db != null && _db.isOpen) {
+    var bytes = 0;
+    for (var p in files) bytes += new File(p).lengthSync();
+    _db.exec('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)');
+    _db.exec('INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)',
+        ['stworld_sig', files.length.toString() + '-' + bytes.toString()]);
+  }
   classText.forEach((name, buf) {
     _imageUpsert(name, _decls[name],
         classCat.containsKey(name) ? classCat[name] : 'world');
@@ -274,6 +283,29 @@ String _worldCategoryOf(String stem) {
   return 'World-Other';
 }
 
+/// The displayed/matchable NAME of a mirror member sig: 'int get inDays' ->
+/// 'inDays'; 'String toString()' -> 'toString'; operators as-is.
+String _dartMemberName(String sig) {
+  var s = sig.trim();
+  var g = s.indexOf(' get ');
+  if (g >= 0) return s.substring(g + 5).trim();
+  var st = s.indexOf(' set ');
+  if (st >= 0) return s.substring(st + 5).trim().split('(')[0].trim();
+  var p = s.indexOf('(');
+  if (p >= 0) {
+    var head = s.substring(0, p).trim();
+    var sp = head.lastIndexOf(' ');
+    return sp >= 0 ? head.substring(sp + 1) : head;
+  }
+  var sp = s.lastIndexOf(' ');
+  return sp >= 0 ? s.substring(sp + 1) : s;
+}
+
+const List<String> _kMirrorLibs = const [
+  'dart:core', 'dart:cocoa', 'dart:collection', 'dart:async', 'dart:math',
+  'dart:convert', 'dart:io', 'dart:isolate', 'dart:typed_data',
+];
+
 String _hostCall(String verb, List args) {
   if (verb == 'packageTree') {
     // The world grouped by source-file stem (MACVM: a class's category IS
@@ -304,10 +336,38 @@ String _hostCall(String verb, List args) {
       out.write('image' + _us + 'smalltalk' + _us + userSt.join(' ') + '\n');
     }
     out.write('image' + _us + 'dart' + _us + da.join(' ') + '\n');
+    // The LIVE snapshot core, via mirrors — READ-ONLY (the user's tier 1).
+    // Name collisions with image/world decls are skipped (the flat records
+    // dictionary is keyed by bare class name; the editable side wins).
+    var taken = new Set<String>();
+    _decls.forEach((n, s) { taken.add(n); });
+    for (var uri in _kMirrorLibs) {
+      var cs = <String>[];
+      for (var n in _worldClasses(uri)) {
+        if (!taken.contains(n.toString())) cs.add(n.toString());
+      }
+      cs.sort();
+      out.write('core' + _us + uri + _us + cs.join(' ') + '\n');
+    }
     return out.toString();
   }
   if (verb == 'browseRecords') {
     var out = new StringBuffer();
+    // Mirror-backed records first, so image decls of the same name OVERWRITE
+    // them in the parsed dictionary (last line wins; editable side rules).
+    var taken = new Set<String>();
+    _decls.forEach((n, s) { taken.add(n); });
+    for (var uri in _kMirrorLibs) {
+      for (var cn in _worldClasses(uri)) {
+        if (taken.contains(cn.toString())) continue;
+        var inst = <String>[]; var stat = <String>[];
+        for (var m in _worldClassMembers(uri + '|' + cn.toString())) {
+          (m[0] == 'c' ? stat : inst).add(_dartMemberName(m[2].toString()));
+        }
+        out.write(cn.toString() + _us + 'Object' + _us + _us + _us +
+            inst.join(' ') + _us + stat.join(' ') + '\n');
+      }
+    }
     _decls.forEach((n, s) {
       var k = _kindOf(s);
       if (k == 'st-class') {
@@ -339,7 +399,29 @@ String _hostCall(String verb, List args) {
   }
   var cls = args.isNotEmpty ? args[0].toString() : '';
   var src = _decls.containsKey(cls) ? _decls[cls] : null;
-  if (src == null) return 'ERR no such class ' + cls;
+  if (src == null) {
+    // A LIVE snapshot-core class (mirrors): read-only synthesized views.
+    for (var uri in _kMirrorLibs) {
+      if (_worldClasses(uri).contains(cls)) {
+        if (verb == 'comment') return '"' + cls + ' - ' + uri + ' (read-only)"';
+        if (verb == 'classSource') return _worldClassSrc(uri + '|' + cls);
+        if (verb == 'methodSource') {
+          var want = args[2].toString();
+          for (var m in _worldClassMembers(uri + '|' + cls)) {
+            var sig = m[2].toString();
+            if (sig == want || _dartMemberName(sig) == want) {
+              var body = m[3].toString().trim();
+              return (body.isEmpty ? sig + ';' : body) + '\n\n// ' + uri +
+                  ' - snapshot core, read-only (mirrors carry signatures, '
+                  'not bodies)';
+            }
+          }
+          return 'ERR no such member ' + cls + '.' + want;
+        }
+      }
+    }
+    return 'ERR no such class ' + cls;
+  }
   if (verb == 'comment') {
     var c = _leadingComment(src);
     return c.isEmpty ? '"' + cls + '"' : c;
@@ -380,7 +462,14 @@ String _hostAcceptWhole(String text, String what) {
 
 String _hostSaveMethod(String cls, String side, String text) {
   var src = _decls.containsKey(cls) ? _decls[cls] : null;
-  if (src == null) return 'ERR no class ' + cls;
+  if (src == null) {
+    for (var uri in _kMirrorLibs) {
+      if (_worldClasses(uri).contains(cls)) {
+        return 'ERR ' + uri + ' is snapshot core - read-only';
+      }
+    }
+    return 'ERR no class ' + cls;
+  }
   if (!_isStAny(src)) {
     // Sprint 15: a DART class — splice by member signature, through the
     // same checked accept (the browser edits BOTH languages).
@@ -1050,6 +1139,36 @@ bool _isMethod(String m) {
 }
 
 // World class members via mirrors, same record format (source = signature, r/o).
+
+List _worldLibs() {
+  var out = <String>[];
+  currentMirrorSystem().libraries.forEach((uri, lib) {
+    var u = uri.toString();
+    // Smalltalk libraries are NOT mirror-safe: their classes have no
+    // TokenStream, and ClassMirror.members routes through EnsureIsFinalized
+    // -> the Dart parser, which CRASHES the process. ST classes browse
+    // through the User App path (image decls) instead.
+    if (u.startsWith('st:')) return;
+    out.add(u);
+  });
+  out.sort();
+  return out;
+}
+
+List _worldClasses(String libUri) {
+  var out = <String>[];
+  if (libUri.startsWith('st:')) return out;   // mirror-unsafe (no TokenStream)
+  currentMirrorSystem().libraries.forEach((uri, lib) {
+    if (uri.toString() == libUri) {
+      lib.declarations.forEach((sym, decl) {
+        if (decl is ClassMirror) out.add(MirrorSystem.getName(sym));
+      });
+    }
+  });
+  out.sort();
+  return out;
+}
+
 List _worldClassMembers(String qualified) {   // "libUri|ClassName"
   if (qualified.startsWith('st:')) return const <List>[];  // mirror-unsafe
   var parts = qualified.split('|');

@@ -1123,6 +1123,42 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
   if (VariableNode* sv = dynamic_cast<VariableNode*>(node->receiver.get())) {
     if (sv->name == "self" && this_var_ == NULL && locals_.count("self") &&
         node->args.size() <= 5) {
+      // FAST PATH (perf): resolve the class-side method in the owner's
+      // metaclass-shadow chain at compile time and emit a DIRECT StaticCall
+      // (thisCls as arg 0) instead of the runtime stClassSend helper — a
+      // native transition + shadow-chain walk + InvokeFunction per call.
+      // Recursive class-side `self fib:` was ~480x MACVM before this. Correct
+      // for inherited `self new` too: the resolved `new`'s body sees
+      // self = thisCls (arg 0) and allocates the RECEIVING class. The one
+      // divergence — a subclass overriding a class-side method that a
+      // superclass self-sends still reaches the compile-time-resolved
+      // (superclass) method — is a rare pattern, absent from the corpus.
+      const String& msel = String::ZoneHandle(
+          zone_,
+          Symbols::New(thread_, ::st::MangleSelector(node->selector).c_str()));
+      Function& fn = Function::ZoneHandle(zone_);
+      {
+        Class& c = Class::Handle(zone_, pf_->function().Owner());
+        while (!c.IsNull()) {
+          if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+          fn ^= c.LookupStaticFunction(msel);
+          if (!fn.IsNull()) break;
+          c ^= c.SuperClass();
+        }
+      }
+      if (!fn.IsNull()) {
+        Fragment instructions = LoadLocal(locals_["self"]);  // thisCls arg 0
+        instructions += PushArgument();
+        for (size_t i = 0; i < node->args.size(); i++) {
+          instructions += TranslateExpression(node->args[i].get());
+          instructions += PushArgument();
+        }
+        instructions +=
+            StaticCall(fn, 1 + static_cast<intptr_t>(node->args.size()));
+        return instructions;
+      }
+      // Unresolved (new/basicNew/signal desugars, or a class-side closure
+      // whose owner isn't the shadow): the runtime class-send handles it.
       char helper[16];
       snprintf(helper, sizeof(helper), "stClassSend%d",
                static_cast<int>(node->args.size()));

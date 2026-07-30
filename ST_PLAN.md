@@ -805,11 +805,24 @@ loudly). Stages A and C are modest; A is independently shippable.
     universal </<=/>/>= helpers (num fast path, compareTo for Strings);
     `String with:` bridged. Worker classNamed: → ST_classNamed. Writes are
     read-only v1 (Accept says so; edit via the workspace Browser).
-  - Later slices: browser WRITE flows (Accept → the image, through the
-    workspace's checked accept path), the remaining CocoaUI views (66 V1
-    browser, 68 editor, 69 outliner, 71 help — same recipe), the CocoaUI
-    shell itself as an alternative frontend, pixmap/gamepane mapping onto
-    the dartui game pane.
+  - **Sprint 14b ✓ — the browser EDITS.** Accept is live end-to-end
+    (Fraction>>printOn: edited in the browser → `(1/3) printString` =>
+    'F1/3' instantly; reverted the same way). Every write funnels through
+    the workspace's CHECKED accept (_acceptMany) — image and live VM stay
+    in lock-step by construction. Member slicing is now bracket-exact (a
+    depth scanner through 'strings'/"comments"/$c literals; the shared
+    _stMemberIndex feeds the pane, methodSource, and the Accept splices —
+    fixes the "follow-on text" leak). Write verbs: saveMethod (replace or
+    insert; auto class-side prefix), removeMethod, newClass/acceptClass,
+    setComment, removeClass — replies in their OK/ERR protocol. Seams
+    closed: copyFrom:to: (world species fallback made char Lists of Dart
+    Strings), String lf / Character lf/tab/cr/space bridged, sourceString
+    reads on MAIN, appendTranscript: → workspace Transcript, liveReopen/
+    uiDoit short-circuit to success (one VM: the accept IS live).
+  - Later slices: the remaining CocoaUI views (66 V1 browser, 68 editor,
+    69 outliner, 71 help — same recipe), the CocoaUI shell itself as an
+    alternative frontend, pixmap/gamepane mapping onto the dartui game
+    pane.
 
   **Also next:** `Smalltalk at:put:` system-dictionary protocol, Behavior/
   reflection surface (`name`, `superclass`), performance pass on the NSM dispatch

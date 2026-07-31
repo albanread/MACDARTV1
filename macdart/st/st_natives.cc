@@ -1742,6 +1742,31 @@ void ST_become(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, Dart_Null());
 }
 
+// stShallowCopy(obj): a fresh instance of the same class with every field
+// copied — the working `shallowCopy` the world's <primitive: 247> body only
+// pretended to be (it fell through to `^self`, so `x copy` ALIASED x: mutating
+// an OrderedCollection copy also changed the original). The Dart helper handles
+// the native/immutable receivers (String -> a mutable copy, List/Map -> a
+// fresh container, Symbol/Character/Boolean/nil -> self); only a plain ST
+// instance reaches here. A non-instance (should not happen) answers itself.
+void ST_shallowCopy(Dart_NativeArguments args) {
+  Dart_Handle obj_h = Dart_GetNativeArgument(args, 0);
+  Thread* thread = Thread::Current();
+  Dart_Handle result = obj_h;
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Object& obj = Object::Handle(zone, Api::UnwrapHandle(obj_h));
+    if (obj.IsInstance() && !obj.IsNull()) {
+      const Instance& copy =
+          Instance::Handle(zone, ShallowCopy(thread, Instance::Cast(obj)));
+      result = Api::NewHandle(thread, copy.raw());
+    }
+  }
+  Dart_SetReturnValue(args, result);
+}
+
 }  // namespace bin
 }  // namespace dart
 

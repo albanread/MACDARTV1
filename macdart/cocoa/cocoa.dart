@@ -153,6 +153,10 @@ void _stEnsureHooks() {
     if (r is StSymbol) {
       if (sel == 'isSymbol') return const [true];
       if (sel == 'asSymbol' || sel == 'yourself') return [r];
+      // A Symbol is unique: copying answers the receiver (else `#foo copy ==
+      // #foo` fails). Without this, copy's `postCopy` step forwarded to the
+      // spelling and demoted #foo to the String 'foo'.
+      if (sel == 'copy' || sel == 'shallowCopy' || sel == 'postCopy') return [r];
       if (sel == 'hash' || sel == 'identityHash') return [r.hashCode];
       if (sel == '=' || sel == '==') return [identical(r, args[0])];
       // isKindOf:/class must see the SYMBOL, not its spelling — a Symbol is-a
@@ -318,6 +322,26 @@ _stMutProtocol(StMutableString r, String sel, List args) {
   switch (sel) {
     case 'asString': case 'yourself': case 'contents': return r;
     case 'isString': return true;
+    // A mutable string stays MUTABLE and INDEPENDENT across a copy — else the
+    // `postCopy` step of `copy` forwarded to the immutable spelling and handed
+    // back a read-only String that at:put: silently ignored.
+    case 'copy': case 'shallowCopy':
+      return new StMutableString(r.units.toList(growable: true));
+    case 'postCopy': return r;
+    // In-place mutators must run on the buffer, not the immutable spelling a
+    // forward would hand them (that copy silently absorbed the writes).
+    case 'replaceAll_with_': {           // every elem = old -> new, in place
+      var oldC = _stCode(args[0]), newC = _stCode(args[1]);
+      for (var i = 0; i < r.units.length; i++) {
+        if (r.units[i] == oldC) r.units[i] = newC;
+      }
+      return r;
+    }
+    case 'atAllPut_': {                   // fill with one Character
+      var c = _stCode(args[0]);
+      for (var i = 0; i < r.units.length; i++) r.units[i] = c;
+      return r;
+    }
     case 'asSymbol': return stSymbol(r.toString());
     case 'printString': return "'" + r.toString() + "'";
     case 'displayString': return r.toString();
@@ -1217,6 +1241,33 @@ stStringNewWithAll(n, c) {
 /// `[:a :b | ...] numArgs` — the block's declared argument count.
 int stBlockNumArgs(block) native "ST_blockNumArgs";
 stCharValue(c) => stChar(c);   // Character value: n -> the flyweight Character
+
+/// A plain ST instance clone (fresh object, fields copied) — the native the
+/// world's `shallowCopy` <primitive: 247> body only faked.
+_stShallowCopyNative(r) native "ST_shallowCopy";
+
+/// `shallowCopy` — a REAL shallow copy, the thing `copy` (shallowCopy postCopy)
+/// depends on. The world's primitive was ignored, so `x copy` answered x and
+/// mutating the "copy" hit the original (an OrderedCollection copy shared its
+/// original's elements; a String copy could not be at:put:'d — it was still the
+/// read-only literal). Immutable/value receivers answer self (matching the
+/// world's Symbol/Boolean/nil/Character overrides); a native String copies into
+/// a MUTABLE StMutableString so it can be modified; List/Map get a fresh
+/// container (which is what a collection's postCopy deep-copies through); a
+/// plain ST instance goes to the native clone.
+stShallowCopy(r) {
+  if (r == null || r is num || r is bool) return r;
+  if (r is StSymbol || r is StChar) return r;
+  if (r is String) {
+    return new StMutableString(r.codeUnits.toList(growable: true));
+  }
+  if (r is StMutableString) {
+    return new StMutableString(r.units.toList(growable: true));
+  }
+  if (r is List) return r.toList(growable: true);
+  if (r is Map) return new Map.from(r);
+  return _stShallowCopyNative(r);
+}
 
 // Array with:* constructors.
 stList1(a) => [a];

@@ -87,6 +87,11 @@ static const HelperRewrite kHelperRewrites[] = {
     // both wrong for negatives, and Fraction had neither. Route through the
     // floored helpers; the corpus's dead <primitive:4/5> bodies never run.
     {"//", "stFloorDiv", 1},    {"\\\\", "stFloorMod", 1},
+    // `shallowCopy` — the world's <primitive: 247> body fell through to
+    // `^self`, so every `copy` (= shallowCopy postCopy) aliased its receiver.
+    // Route to a real clone; the immutable overrides (Symbol/Boolean/nil/
+    // Character = ^self) are honoured inside the helper.
+    {"shallowCopy", "stShallowCopy", 0},
     {"asDouble", "stAsDouble", 0}, {"asFloat", "stAsDouble", 0},
     {"asInteger", "stTruncated", 0}, {"truncated", "stTruncated", 0},
     {"rounded", "stRounded", 0},   {"floor", "stFloorU", 0},

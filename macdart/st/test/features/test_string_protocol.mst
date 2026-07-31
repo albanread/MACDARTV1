@@ -1,0 +1,121 @@
+"Feature test: the full String / Symbol / Character protocol, one assertion per
+ method with human-verified expected values (the test IS the spec). Born from a
+ live sweep of every string method; it pins the bugs that sweep found and fixed:
+   * `copy`/`shallowCopy` was a no-op (primitive 247 fell through to ^self), so
+     a String copy stayed read-only and `replaceAll:with:` could not mutate,
+     an OrderedCollection copy shared its original's elements, and #sym copy
+     was demoted to a String;
+   * String>>collect: answered an OrderedCollection, not a String (species)."
+STestCase subclass: TestStringProtocol [
+    tests [
+        "── size / access ──"
+        self check: 'hello' size is: 5 label: 'size'.
+        self check: ('hello' at: 1) is: $h label: 'at:'.
+        self check: 'hello' first is: $h label: 'first'.
+        self check: 'hello' last is: $o label: 'last'.
+        self assert: '' isEmpty label: 'isEmpty'.
+        self assert: 'x' notEmpty label: 'notEmpty'.
+        self check: ('hello' copyFrom: 2 to: 4) is: 'ell' label: 'copyFrom:to:'.
+        self check: 'hello' reverse is: 'olleh' label: 'reverse'.
+        self check: 'hello' reversed is: 'olleh' label: 'reversed'.
+
+        "── case ──"
+        self check: 'Hello' asUppercase is: 'HELLO' label: 'asUppercase'.
+        self check: 'Hello' asLowercase is: 'hello' label: 'asLowercase'.
+        self check: 'hello' capitalized is: 'Hello' label: 'capitalized'.
+
+        "── conversions ──"
+        self check: '42' asInteger is: 42 label: 'asInteger'.
+        self check: '-42' asInteger is: -42 label: 'asInteger neg'.
+        self check: '3.5' asNumber is: 3.5 label: 'asNumber'.
+        self check: 'foo' asSymbol is: #foo label: 'asSymbol'.
+        self check: 'abc' asArray is: #($a $b $c) label: 'asArray'.
+
+        "── concatenation / compare ──"
+        self check: ('ab', 'cd') is: 'abcd' label: 'comma concat'.
+        self assert: ('abc' = 'abc') label: 'equal'.
+        self deny: ('abc' = 'abd') label: 'unequal'.
+        self assert: ('abc' < 'abd') label: 'less than'.
+        self assert: ('abd' > 'abc') label: 'greater than'.
+        self assert: ('ABC' sameAs: 'abc') label: 'sameAs: (case-insensitive)'.
+        self check: 'abc' hash is: 'abc' hash label: 'hash stable'.
+
+        "── search ──"
+        self check: ('hello' indexOf: $l) is: 3 label: 'indexOf:'.
+        self check: ('hello' indexOf: $z) is: 0 label: 'indexOf: absent'.
+        self assert: ('hello' includes: $e) label: 'includes:'.
+        self assert: ('hello world' includesSubstring: 'o w') label: 'includesSubstring:'.
+        self assert: ('hello' startsWith: 'he') label: 'startsWith:'.
+        self assert: ('hello' endsWith: 'lo') label: 'endsWith:'.
+        self check: ('hello' occurrencesOf: $l) is: 2 label: 'occurrencesOf:'.
+
+        "── trimming / splitting ──"
+        self check: '  hi  ' trimSeparators is: 'hi' label: 'trimSeparators'.
+        self check: '  hi  ' trimBlanks is: 'hi' label: 'trimBlanks'.
+        self check: ('a b c' substrings) size is: 3 label: 'substrings'.
+        self check: ('a,b,c' substrings: ',') size is: 3 label: 'substrings:'.
+        self check: ('a,b,c' tokenize: ',') size is: 3 label: 'tokenize:'.
+        self check: ('a b c' subStrings) size is: 3 label: 'subStrings (alias)'.
+
+        "── enumeration (species matters) ──"
+        self check: ('abc' inject: 0 into: [:a :c | a + 1]) is: 3 label: 'inject:into:'.
+        self check: ('hello' select: [:c | c isVowel]) is: 'eo' label: 'select: -> String'.
+        self check: ('hello' reject: [:c | c isVowel]) is: 'hll' label: 'reject: -> String'.
+        self check: ('abc' collect: [:c | c asUppercase]) is: 'ABC' label: 'collect: -> String (species)'.
+        self check: ('hello' detect: [:c | c isVowel]) is: $e label: 'detect:'.
+        self assert: ('abc' allSatisfy: [:c | c isLetter]) label: 'allSatisfy:'.
+        self assert: ('abc' anySatisfy: [:c | c isVowel]) label: 'anySatisfy:'.
+
+        "── copy + in-place mutation (the primitive-247 bug) ──"
+        self check: ('hello' copy replaceAll: $l with: $L) is: 'heLLo'
+            label: 'replaceAll:with: mutates a copy'.
+        self check: ('hello' copyReplaceAll: 'l' with: 'L') is: 'heLLo'
+            label: 'copyReplaceAll:with:'.
+        self deny: ('hello' copy == 'hello' copy) label: 'copy is a fresh object'.
+        self assert: (self copyIndependent) label: 'a String copy is independent + mutable'.
+        self assert: (self ocCopyIndependent) label: 'an OrderedCollection copy is independent'.
+
+        "── printing ──"
+        self check: 'hi' printString is: '''hi''' label: 'printString quotes'.
+        self check: 'hi' displayString is: 'hi' label: 'displayString'.
+
+        "── Character ──"
+        self check: $A asInteger is: 65 label: 'Character asInteger'.
+        self check: $A value is: 65 label: 'Character value'.
+        self check: $a asUppercase is: $A label: 'Character asUppercase'.
+        self check: $A asLowercase is: $a label: 'Character asLowercase'.
+        self assert: $a isVowel label: 'isVowel'.
+        self assert: $5 isDigit label: 'isDigit'.
+        self assert: $A isLetter label: 'isLetter'.
+        self assert: (Character value: 32) isSeparator label: 'isSeparator'.
+        self check: $7 digitValue is: 7 label: 'digitValue'.
+        self assert: ($a < $b) label: 'Character <'.
+        self assert: ($a = $a) label: 'Character ='.
+        self check: $a asString is: 'a' label: 'Character asString'.
+        self check: (Character value: 65) is: $A label: 'Character value:'.
+        self assert: ($a copy = $a) label: 'Character copy is itself'.
+
+        "── Symbol ──"
+        self check: #foo asString is: 'foo' label: 'Symbol asString'.
+        self check: #foo size is: 3 label: 'Symbol size'.
+        self check: (#foo at: 1) is: $f label: 'Symbol at:'.
+        self assert: (#foo = #foo) label: 'Symbol ='.
+        self assert: (#foo == #foo) label: 'Symbol identity'.
+        self assert: #foo isSymbol label: 'isSymbol'.
+        self assert: (#foo asSymbol == #foo) label: 'asSymbol is idempotent'.
+        self assert: (#foo copy == #foo) label: 'Symbol copy is itself (identity)'.
+    ]
+
+    copyIndependent [
+        | s |
+        s := 'hello' copy.
+        s at: 1 put: $X.
+        ^(s = 'Xello') and: [ 'hello' = 'hello' ]   "the literal is untouched"
+    ]
+    ocCopyIndependent [
+        | a b |
+        a := OrderedCollection new. a add: 1; add: 2.
+        b := a copy. b add: 3.
+        ^(a size = 2) and: [ b size = 3 ]
+    ]
+]

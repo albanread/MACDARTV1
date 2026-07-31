@@ -227,13 +227,18 @@ re-Accept any class in the image.
   doubleAt:/signedLongAt: (+put:), ST bounds/base checks → catchable, backed by
   6 peek/poke natives (byte/f64/i64, reject addr<=0). VERIFIED end-to-end on the
   corpus's `Time>>millisecondClockValue` (clock_gettime → mmap timespec →
-  signedLongAt:) → real epoch ms. Remaining stage b: the
-  kqueue/non-blocking sockets subset → DNS + ping callable from the
-  workspace (61c/61d/75). Stage c: **Accelerate — framework linked/dlopen'd,
-  double peek/poke landed, vDSP FFT + BLAS dgemm probed, A/B'd against pure
-  ST, FFT demo in the demos pane.** WIRE/BRIDGE-DART keep the few spots
-  where Dart's library is simply better (SystemDictionary stprims, DateTime
-  conveniences, Random). Blocking IO / Worker (62/62a, prim 220) deferred.
+  signedLongAt:) → real epoch ms. Stage c **DONE (2026-07-31, 2824f0b)**: an arm64 AAPCS64 asm trampoline
+  (ffi_call_aapcs) — GPR x0-x7 + FPR d0-d7 + >8-arg stack spill — so fp-register
+  scalars and argument spill work. Accelerate is fully live: it dlopens via FFI,
+  vDSP (reductions/scale/FFT) runs on a+b (its doubles pass by pointer through
+  the mmap'd NativeFloatArray), and **cblas_dgemm** (2 fp scalars + 4 spilled
+  words) computes a correct 2x2 product via NativeMatrix. Also fixed a stEquals
+  nil bug (`nil = x`) it surfaced. **M4 CORE COMPLETE.** Remaining M4 (optional):
+  the kqueue/non-blocking sockets subset → DNS + ping from the workspace
+  (61c/61d/75); an FFT demo in the demos pane. WIRE/BRIDGE-DART keep the few
+  spots where Dart's library is simply better (SystemDictionary stprims,
+  DateTime conveniences, Random). Blocking IO / Worker (62/62a, prim 220)
+  deferred.
 - **M5 — Reflection & tools.** allClasses (prim 98 native class-table walk),
   selectorsOf:/primitiveOf: verified, mirrors matrix, browser deep features
   (senders/implementors via D1's send index, in-image).

@@ -1,0 +1,50 @@
+"Feature test: the collection protocol — Array, Interval, OrderedCollection,
+ Set, Dictionary, Bag. Expected values are the human-verified spec (standard
+ Smalltalk-80 collection semantics), not an oracle diff."
+STestCase subclass: TestCollections [
+    tests [
+        "--- literal Array ---"
+        self check: #(10 20 30) size is: 3 label: 'array size'.
+        self check: (#(10 20 30) at: 2) is: 20 label: 'array at:'.
+        self check: #(10 20 30) first is: 10 label: 'array first'.
+        self check: #(10 20 30) last is: 30 label: 'array last'.
+        self check: (#(1 2 3) , #(4 5)) size is: 5 label: 'array concat size'.
+        self check: (#(3 1 2) includes: 2) is: true label: 'array includes:'.
+        self check: (#(3 1 2) indexOf: 1) is: 2 label: 'array indexOf:'.
+
+        "--- enumeration ---"
+        self check: (#(1 2 3 4) inject: 0 into: [ :a :b | a + b ]) is: 10 label: 'inject sum'.
+        self check: (#(1 2 3) collect: [ :x | x * x ]) is: #(1 4 9) label: 'collect'.
+        self check: (#(1 2 3 4 5) select: [ :x | x even ]) size is: 2 label: 'select even'.
+        self check: (#(1 2 3 4 5) reject: [ :x | x even ]) size is: 3 label: 'reject even'.
+        self check: (#(5 3 9 1) detect: [ :x | x > 4 ]) is: 5 label: 'detect'.
+        self check: (#(1 2 3 4) count: [ :x | x > 2 ]) is: 2 label: 'count:'.
+
+        "--- Interval ---"
+        self check: (1 to: 5) size is: 5 label: 'interval size'.
+        self check: (1 to: 10) asArray last is: 10 label: 'interval asArray'.
+        self check: ((1 to: 100) inject: 0 into: [ :a :b | a + b ]) is: 5050 label: 'interval sum 1..100'.
+        self check: (2 to: 10 by: 2) asArray is: #(2 4 6 8 10) label: 'interval by:'.
+
+        "--- OrderedCollection ---"
+        self check: (self oc: #(1 2 3)) size is: 3 label: 'oc size'.
+        self check: ((self oc: #(1 2 3)) addFirst: 0; yourself) first is: 0 label: 'oc addFirst:'.
+        self check: ((self oc: #(1 2 3)) removeLast) is: 3 label: 'oc removeLast'.
+
+        "--- Set (dedup) ---"
+        self check: (self setOf: #(1 2 2 3 3 3)) size is: 3 label: 'set dedup size'.
+        self check: ((self setOf: #(1 2 3)) includes: 2) is: true label: 'set includes:'.
+
+        "--- Dictionary ---"
+        self check: (self dictAB) size is: 2 label: 'dict size'.
+        self check: ((self dictAB) at: #a) is: 1 label: 'dict at:'.
+        self check: ((self dictAB) at: #z ifAbsent: [ -1 ]) is: -1 label: 'dict at:ifAbsent:'.
+        self check: ((self dictAB) includesKey: #b) is: true label: 'dict includesKey:'.
+
+        "--- sorting ---"
+        self check: (#(3 1 4 1 5 9 2 6) asSortedCollection asArray) is: #(1 1 2 3 4 5 6 9) label: 'asSortedCollection'.
+    ]
+    oc: anArray [ | c | c := OrderedCollection new. anArray do: [ :e | c add: e ]. ^c ]
+    setOf: anArray [ | s | s := Set new. anArray do: [ :e | s add: e ]. ^s ]
+    dictAB [ | d | d := Dictionary new. d at: #a put: 1. d at: #b put: 2. ^d ]
+]

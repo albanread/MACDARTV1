@@ -14,6 +14,9 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MACDART="$(cd "$HERE/../.." && pwd)"
 MACVM="${MACVM:-$HOME/claudeprojects/MACVM/target/release/macvm}"
+# MACVM resolves its world (world/world.list) relative to CWD, so it must run
+# from the repo root — else it loads no world and every corpus probe fails.
+MACVMDIR="${MACVMDIR:-$(cd "$(dirname "$MACVM")/../.." 2>/dev/null && pwd)}"
 
 DART="${DART:-}"
 if [ -z "$DART" ]; then
@@ -25,14 +28,14 @@ fi
 [ -x "$MACVM" ] || { echo "ab.sh: no macvm oracle at $MACVM" >&2; exit 1; }
 [ $# -ge 1 ]    || { echo "usage: ab.sh probe.mst ..." >&2; exit 2; }
 
-# MACDART prints a one-line "st: world loaded …" banner on stderr; drop it.
-norm() { grep -vE "^st: world loaded"; }
+# Strip each VM's own boot chatter so only the probe's Transcript output remains.
+norm() { grep -vE "^st: world loaded|^warning:|world\.list|^\[macvm\]"; }
 
 fails=0
 for f in "$@"; do
   name="$(basename "$f")"
-  a="$("$MACVM" run "$f" 2>&1)"
-  arc=$?
+  a="$( ( cd "$MACVMDIR" && "$MACVM" run "$f" ) 2>&1 | norm)"
+  arc=${PIPESTATUS[0]}
   b="$("$DART" --with-st "$HERE/run_mst.dart" "$f" 2>&1 | norm)"
   if [ $arc -ne 0 ] && echo "$a" | grep -qiE "unknown|no such|primitive|platform"; then
     printf "  \033[33mSKIP\033[0m  %s (macvm can't run it)\n" "$name"; continue

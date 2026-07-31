@@ -54,6 +54,18 @@ if [ -f "$HERE/primitive_coverage.dart" ]; then
   fi
 else skip "tier2 primitive coverage (driver not present)"; fi
 
+# tier 2b — self-validating feature suites (STestCase; each asserts known-correct
+# baked-in values — the test IS the spec, no external oracle). run_features.dart
+# exits 0 only when every suite is green.
+if [ -f "$HERE/run_features.dart" ]; then
+  f="$("$DART" --with-st "$HERE/run_features.dart" 2>&1)"
+  if [ $? -eq 0 ] && echo "$f" | grep -qE "ALL GREEN"; then
+    pass "tier2b feature suites ($(echo "$f" | grep -oE '[0-9]+ suite\(s\)' | tail -1), all green)"
+  else
+    fail "tier2b feature suites"; echo "$f" | grep -iE "FAIL|CRASH|ABORTED" | head -6 | sed 's/^/        /'
+  fi
+else skip "tier2b feature suites (driver not present)"; fi
+
 # tier 3 — per-class protocol probes (populated in M1+)
 if compgen -G "$HERE/probes/*.mst" >/dev/null 2>&1; then
   t3f=0

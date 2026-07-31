@@ -1,0 +1,38 @@
+"framework.mst — a tiny SUnit-style base for MACDART feature tests. Each test
+ case SUBCLASSES STestCase and fills `tests`, asserting KNOWN-CORRECT values
+ (the human-verified spec — no external oracle). Non-fatal: an assertion that
+ fails or a test that raises is recorded and the suite keeps going. `run`
+ answers the failure count so a driver can sum + exit on it."
+Object subclass: STestCase [
+    | pass fail |
+    STestCase class >> run [ ^self new runSuite ]
+    runSuite [
+        pass := 0. fail := 0.
+        [ self tests ] on: Error do: [ :e |
+            fail := fail + 1.
+            Transcript showCr: '  ABORTED ', self class name, ': ', e messageText ].
+        Transcript showCr: (fail = 0 ifTrue: [ '  ok   ' ] ifFalse: [ '  FAIL ' ]),
+            self class name, '  (', pass printString, ' pass, ', fail printString, ' fail)'.
+        ^fail
+    ]
+    tests [ ^self error: self class name, ' must define tests' ]
+
+    "actual = expected (value equality), labelled."
+    check: actual is: expected label: label [
+        actual = expected
+            ifTrue: [ pass := pass + 1 ]
+            ifFalse: [ fail := fail + 1.
+                Transcript showCr: '    FAIL ', label,
+                    ': got <', actual printString, '> want <', expected printString, '>' ]
+    ]
+    assert: aBool label: label [ ^self check: aBool is: true label: label ]
+    deny: aBool label: label [ ^self check: aBool is: false label: label ]
+
+    "aBlock must raise anExcClass."
+    should: aBlock raise: anExcClass label: label [
+        | raised |
+        raised := false.
+        [ aBlock value ] on: anExcClass do: [ :e | raised := true ].
+        self check: raised is: true label: label
+    ]
+]

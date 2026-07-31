@@ -1,0 +1,40 @@
+"Feature test: the exception protocol — signal / on:do: / ensure: / messageText.
+ Expected values are the human-verified spec (Smalltalk exception semantics).
+ KNOWN GAPS (documented, not asserted here): Exception>>return:/retry (ANSI
+ resumption), the ZeroDivide class, and native Dart errors (RangeError from an
+ out-of-range at:) surfacing as a catchable ST Error."
+STestCase subclass: TestExceptions [
+    tests [
+        "--- on:do: catches a signalled error, handler value replaces ---"
+        self check: (self caught) is: 'caught' label: 'on:do: catches Error'.
+        self check: (self messageOf) is: 'boom' label: 'exception messageText'.
+        self check: (self handlerValue) is: 42 label: 'handler value replaces body'.
+        self check: (self noRaiseValue) is: 5 label: 'no raise -> body value'.
+
+        "--- self error: raises a catchable Error ---"
+        self check: (self viaError) is: 'custom' label: 'self error: messageText'.
+
+        "--- ensure: runs on BOTH normal and exceptional exit ---"
+        self check: (self ensureNormal) is: 'body-ensure' label: 'ensure: on normal exit'.
+        self check: (self ensureRaise) is: 'ran' label: 'ensure: on exceptional exit'.
+
+        "--- a signal raised inside a nested block is still caught ---"
+        self check: (self nestedRaise) is: 'caught-deep' label: 'catch through nested block'.
+
+        "--- Error new signal: works as a two-step construct ---"
+        self check: (self viaNew) is: 'made' label: 'Error new signal:'.
+
+        "--- should:raise: helper ---"
+        self should: [ Error signal: 'x' ] raise: Error label: 'signal: raises Error'.
+        self should: [ self error: 'y' ] raise: Error label: 'error: raises Error'.
+    ]
+    caught [ ^[ Error signal: 'boom'. 'not reached' ] on: Error do: [ :e | 'caught' ] ]
+    messageOf [ ^[ Error signal: 'boom' ] on: Error do: [ :e | e messageText ] ]
+    handlerValue [ ^[ Error signal: 'x'. 0 ] on: Error do: [ :e | 42 ] ]
+    noRaiseValue [ ^[ 5 ] on: Error do: [ :e | 999 ] ]
+    viaError [ ^[ self error: 'custom' ] on: Error do: [ :e | e messageText ] ]
+    ensureNormal [ | s | s := 'body'. [ s := s ] ensure: [ s := s , '-ensure' ]. ^s ]
+    ensureRaise [ | s | s := ''. [ [ Error signal: 'x' ] ensure: [ s := 'ran' ] ] on: Error do: [ :e | nil ]. ^s ]
+    nestedRaise [ ^[ [ Error signal: 'deep' ] value ] on: Error do: [ :e | 'caught-deep' ] ]
+    viaNew [ ^[ Error new signal: 'made' ] on: Error do: [ :e | e messageText ] ]
+]

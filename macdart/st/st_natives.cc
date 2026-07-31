@@ -460,6 +460,26 @@ void ST_send(Dart_NativeArguments args) { STSendCommon(args, false); }
 // try/catch, which crashed the Release GUI inside stPrintOf's fallback).
 void ST_sendTry(Dart_NativeArguments args) { STSendCommon(args, true); }
 
+// stGetField(recv, name) -> the value of the dart:core GETTER `name` on recv.
+// The universal send (stSendExt) uses this as the LAST resort for a unary ST
+// selector on a NATIVE receiver whose name is a dart:core getter that no ST
+// method overrode — `#(1 2 3) first`, `aList reversed`, `7 sign` — where the
+// getter IS the intended Smalltalk value. Dart's own getter-call semantics
+// (`o.name()` -> `(o.name).call()`) would otherwise crash on the result; a
+// plain field read does not. A missing getter returns an error handle, which
+// propagates as the honest doesNotUnderstand.
+void ST_getField(Dart_NativeArguments args) {
+  Dart_Handle recv = Dart_GetNativeArgument(args, 0);
+  Dart_Handle name_h = Dart_GetNativeArgument(args, 1);
+  const char* name_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(name_h, &name_c)) || name_c == NULL) {
+    Dart_SetReturnValue(args, Dart_Null());
+    return;
+  }
+  Dart_SetReturnValue(args,
+                      Dart_GetField(recv, Dart_NewStringFromCString(name_c)));
+}
+
 // stClassNamed(name) -> the class VALUE (canonical Type) or null. Sprint 14:
 // `Worker classNamed:` binds here — the engine's own lookup instead of a
 // ClassMirror sweep.

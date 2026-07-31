@@ -819,8 +819,19 @@ Fragment StGraphBuilder::TranslateExpression(Node* node) {
 
 Fragment StGraphBuilder::TranslateLiteral(LiteralNode* node) {
   switch (node->kind) {
-    case LiteralNode::Kind::kInt:
-      return IntConstant(ParseStInt(node->text));
+    case LiteralNode::Kind::kInt: {
+      // Radix literals (`16rFF`) aren't decimal — parse straight to int64
+      // (the corpus's radix literals are masks/colors, always < 2^32). Plain
+      // decimals go through the VM's own Integer::New(String), which promotes
+      // past int64 to Bigint instead of clamping — so `30 factorial`'s value
+      // can be written as a literal (guide §5.D: honour Dart's integer tower).
+      if (node->text.find('r') != std::string::npos) {
+        return IntConstant(ParseStInt(node->text));
+      }
+      const String& s =
+          String::Handle(zone_, String::New(node->text.c_str(), Heap::kOld));
+      return Constant(Integer::ZoneHandle(zone_, Integer::New(s, Heap::kOld)));
+    }
     case LiteralNode::Kind::kNil:
       return NullConstant();
     case LiteralNode::Kind::kTrue:
@@ -991,6 +1002,31 @@ Fragment StGraphBuilder::TranslateAssign(AssignNode* node) {
     }
   }
   return Unsupported(node, "assignment to non-local");
+}
+
+// Dart's native number types expose these as GETTERS (0-arg properties), not
+// methods. An ST unary send of the same name to a NATIVE receiver (7 sign,
+// 3.0 isNaN) would otherwise compile to a plain InstanceCall and be hijacked by
+// Dart's getter-CALL semantics — `o.name()` resolves the getter then invokes
+// the result, i.e. `(7.sign).call()`, which crashes ("int has no method call")
+// and never reaches the ST method that should run (Number>>sign). The builder
+// forces these through stSend, which does real ST dispatch for both native and
+// ST receivers and never consults a Dart getter. Only names that are BOTH a
+// dart:core getter AND a plausible ST selector need listing: `sign` is the one
+// the corpus actually sends (14 sites), the rest are defensive against the same
+// trap. (Found by the self-validating feature-test suite: `7 sign`.)
+static bool IsCoreGetterCollision(const std::string& sel) {
+  // num/double getters:
+  if (sel == "sign" || sel == "isNaN" || sel == "isInfinite" ||
+      sel == "isFinite" || sel == "isNegative" || sel == "bitLength") {
+    return true;
+  }
+  // List / Iterable getters (a literal #(...) array is a Dart _List, so
+  // `#(1 2 3) first` and the corpus's `SequenceableCollection>>reverse` — which
+  // sends `reversed` — hit the same trap). size/isEmpty are NOT here: they are
+  // already handled by the universal stSizeOf/stIsEmptyU helper rewrites.
+  return sel == "first" || sel == "last" || sel == "single" ||
+         sel == "reversed";
 }
 
 Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
@@ -1312,6 +1348,24 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
       instructions += Getter(getter);
       return instructions;
     }
+  }
+
+  // A unary selector that collides with a dart:core GETTER (7 sign) must NOT
+  // become a plain InstanceCall — on a native receiver Dart would resolve the
+  // getter and getter-CALL its result. Route it through stSend(recv, sel, [])
+  // so ST dispatch runs (Number>>sign) for native AND ST receivers alike.
+  if (node->args.empty() && IsCoreGetterCollision(node->selector)) {
+    Fragment instructions = TranslateExpression(node->receiver.get());
+    instructions += PushArgument();
+    instructions += Constant(String::ZoneHandle(
+        zone_, Symbols::New(thread_, node->selector.c_str())));
+    instructions += PushArgument();
+    instructions += StaticCall(
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stNewList")), 0);
+    instructions += PushArgument();
+    instructions += StaticCall(
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stSendExt")), 3);
+    return instructions;
   }
 
   Fragment instructions = TranslateExpression(node->receiver.get());

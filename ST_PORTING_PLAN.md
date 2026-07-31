@@ -168,6 +168,7 @@ and editable in the Browser tab; no bare-primitive throw reachable from it.
 | 0 | 86/86 parse+load, world boots, zero load errors | debug + release |
 | 1 | `type_conformance` (38) — language semantics, NO world | both |
 | 2 | `primitive_coverage` — bare-primitive census, world loaded | both |
+| 2b | `run_features` — self-validating feature suites (SUnit, no oracle) | both |
 | 3 | protocol matrix probes — per-class, world loaded | both |
 | 4 | A/B differential vs MACVM | release |
 | 5 | apps exact: richards, deltablue 224874, library_bench 11/11 | release |
@@ -277,3 +278,52 @@ land independently — Accel (4c) does not wait on sockets (4b).
 8. Symbol-vs-String at native boundaries: audit remaining `String`-typed
    natives a symbol can reach (`classNamed:` pattern; getClass/classExists/
    selectorInfo).
+
+## 9. Self-validating feature suites (tier 2b) — the test IS the spec
+
+MACVM is **not** a reliable oracle, so the feature tier does not diff against
+it. Each `st/test/features/test_*.mst` subclasses `STestCase` (a tiny SUnit)
+and asserts human-verified known-correct values. `run_features.dart` loads the
+framework + every suite and exits nonzero on any red; `run_all.sh` gates on it.
+Current: **6 suites / 128 assertions green** — numerics, collections, strings,
+control, exceptions, reflection.
+
+### 9a. Bugs the suites found and FIXED (engine, this round)
+
+1. **Large-integer literals clamped to int64.** The builder parsed every int
+   literal with `strtoll` → `9223372036854775807` for anything bigger. Now plain
+   decimals go through the VM's own `Integer::New(const String&)` (Bigint past
+   int64); radix literals still take the int64 path. (`st_flow_graph_builder.cc`
+   `TranslateLiteral`.)
+2. **Getter-collision — the big one.** An ST unary send whose selector is a
+   dart:core GETTER on a native receiver (`7 sign`, `#(1 2 3) first`, the
+   corpus's `reverse` → `reversed`) compiled to a plain `InstanceCall` and was
+   hijacked by Dart's getter-CALL semantics — `(7.sign).call()` — crashing
+   "int has no method call". Fix: a denylist of colliding names routes through
+   the new **universal `stSendExt`** (ext-chain → ST class chain → for a NATIVE
+   receiver only, the Dart getter read as a plain field via `ST_getField`).
+   ST overrides still win; the getter is the intended value only as a last
+   resort. (`IsCoreGetterCollision`, `cocoa.dart stSendExt`, `ST_getField`.)
+3. **Fraction↔int comparison infinite recursion.** `0 < (3/4)` looped forever:
+   Dart `int.<` is `other > this`, the corpus `Fraction>>` is `^aNumber < self`
+   — a 2-cycle. The num-vs-ST-numeric slow paths now derive all four orderings
+   from the ST object's WORKING forward `<` (`cocoa.dart _stLtSlow` et al.).
+4. **Dart-List collection equality.** `#(1 4 9) = #(1 4 9)` threw (a literal
+   array is a Dart `_List`, no ST `=`). `_stEqualsSlow` now compares two Lists
+   element-wise, recursively (Array>>= semantics).
+
+### 9b. Gaps the suites found, still OPEN (documented, not yet fixed)
+
+- `nil ifNil:` / `nil ifNotNil:` — a literal nil bypasses the ST NSM hook
+  (Dart `null` throws NoSuchMethod directly). `ifNotNil:` works on non-nil
+  receivers (all over the corpus). Fix = inline the `ifNil:` family in the
+  builder like `ifTrue:`.
+- Exception `return:` and `retry` (ANSI resumption) are unimplemented and raise
+  an uncatchable Dart NoSuchMethod; `ZeroDivide` resolves to nil; native Dart
+  errors (`RangeError` from an out-of-range `at:`) are not catchable ST Errors.
+- `respondsTo:` fails (`primitive failed`) on native receivers.
+- Class-side `superclass`/`name` on native classes (Integer superclass → nil).
+- `collect:`/`select:` on a literal array return a raw Dart `List` (Dart-style
+  `printString`), not an ST Array.
+- Native `Character`/`Symbol` report their impl class (`StChar`/`StSymbol`),
+  and `String new:withAll:`, block `numArgs` are unimplemented.

@@ -753,6 +753,7 @@ void ST_classOf(Dart_NativeArguments args);
 void ST_loadFresh(Dart_NativeArguments args);
 void ST_outline(Dart_NativeArguments args);
 void ST_sendTry(Dart_NativeArguments args);
+void ST_getField(Dart_NativeArguments args);
 void ST_hasMethod(Dart_NativeArguments args);
 void ST_classNamed(Dart_NativeArguments args);
 void ST_asSymbol(Dart_NativeArguments args);
@@ -855,6 +856,7 @@ static void Cocoa_sendMain(Dart_NativeArguments args) {
   V(ST_loadFresh, 1)                                                           \
   V(ST_outline, 1)                                                             \
   V(ST_sendTry, 3)                                                             \
+  V(ST_getField, 2)                                                            \
   V(ST_hasMethod, 2)                                                           \
   V(ST_classNamed, 1)                                                          \
   V(ST_asSymbol, 1)                                                            \

@@ -370,6 +370,13 @@ _stEqualsSlow(a, b) {
     if (b is String) return a == b;
     return false;                               // 'a' = $a  -> false
   }
+  if (a is List) {                              // a literal #(...) is a Dart
+    if (b is! List || a.length != b.length) return false;  // List, with no ST
+    for (var i = 0; i < a.length; i++) {        // `=` — compare element-wise
+      if (!stEquals(a[i], b[i])) return false;  // (Array>>= semantics),
+    }                                           // recursively so nested arrays
+    return true;                                // and ST elements compare too.
+  }
   return stSend(a, '=', [b]);                   // Fraction / user classes
 }
 
@@ -406,6 +413,32 @@ dynamic stNew(String className) native "ST_new";
 /// Send instance method [selector] with [args] to an ST [receiver] (Sprint 5);
 /// the first call lazily compiles the method body. Returns the result.
 dynamic stSend(receiver, String selector, List args) native "ST_send";
+
+dynamic _stGetField(receiver, String name) native "ST_getField";
+
+/// Universal ST send for selectors that collide with a dart:core GETTER (`7
+/// sign`, `#(1 2 3) first`, `aList reversed`). A plain InstanceCall would let
+/// Dart resolve the getter and getter-CALL its result — `(7.sign).call()` — and
+/// crash. Dispatch in Smalltalk-correct order: (1) the native ext-chain
+/// (Integer ext, Array ext, ... — an ST override wins), (2) the receiver's own
+/// ST class chain (an ST object: Fraction>>sign, OrderedCollection>>first), (3)
+/// only for a NATIVE receiver, the dart:core getter itself, read as a plain
+/// field so it is NOT invoked — there the getter is the intended ST value
+/// (List.first, num.sign). Non-native misses fall to stSend for an honest DNU.
+stSendExt(receiver, String selector, List args) {
+  var hit = _stExtSendTry(receiver, selector, args); // [result] box, or null
+  if (hit != null) return hit[0];
+  var box = _stSendTry(receiver, selector, args); // ST class chain, no throw
+  if (box != null) return box[0];
+  if (args.isEmpty &&
+      (receiver is num ||
+          receiver is String ||
+          receiver is List ||
+          receiver is bool)) {
+    return _stGetField(receiver, selector);
+  }
+  return stSend(receiver, selector, args); // throws the proper doesNotUnderstand
+}
 
 // --- Smalltalk non-local return (ST_PLAN.md closures Stage C) ---------------
 // A `^expr` inside a FIRST-CLASS closure returns from the closure's HOME
@@ -783,7 +816,17 @@ stLess(a, b) {
   if (a is String && b is String) return a.compareTo(b) < 0;
   return _stLtSlow(a, b);
 }
-_stLtSlow(a, b) => a < b;
+// A native number vs an ST numeric object (a Fraction, a ScaledDecimal) can't
+// go through Dart's own operator: `int.<` is `other > this`, and the corpus's
+// `Fraction>>` is `^aNumber < self` — two reversals that form an infinite
+// 2-cycle (`0 < (3/4)` → `(3/4) > 0` → `0 < (3/4)` → stack overflow). Only the
+// ST object's FORWARD `<` does real work (cross-multiplication), so derive all
+// four from it: with lt = (b < a) and eq = (a = b) — both computed on the ST
+// side, which terminates — a<b ⟺ ¬lt∧¬eq, a≤b ⟺ ¬lt, a>b ⟺ lt, a≥b ⟺ lt∨eq.
+_stLtSlow(a, b) {
+  if (a is num && b is! num) return !stLess(b, a) && !stEquals(a, b);
+  return a < b;
+}
 stLessEq(a, b) {
   if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
   if (a is StChar) a = a.code; if (b is StChar) b = b.code;
@@ -791,7 +834,10 @@ stLessEq(a, b) {
   if (a is String && b is String) return a.compareTo(b) <= 0;
   return _stLeSlow(a, b);
 }
-_stLeSlow(a, b) => a <= b;
+_stLeSlow(a, b) {
+  if (a is num && b is! num) return !stLess(b, a);
+  return a <= b;
+}
 stGreater(a, b) {
   if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
   if (a is StChar) a = a.code; if (b is StChar) b = b.code;
@@ -799,7 +845,10 @@ stGreater(a, b) {
   if (a is String && b is String) return a.compareTo(b) > 0;
   return _stGtSlow(a, b);
 }
-_stGtSlow(a, b) => a > b;
+_stGtSlow(a, b) {
+  if (a is num && b is! num) return stLess(b, a);
+  return a > b;
+}
 stGreaterEq(a, b) {
   if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
   if (a is StChar) a = a.code; if (b is StChar) b = b.code;
@@ -807,7 +856,10 @@ stGreaterEq(a, b) {
   if (a is String && b is String) return a.compareTo(b) >= 0;
   return _stGeSlow(a, b);
 }
-_stGeSlow(a, b) => a >= b;
+_stGeSlow(a, b) {
+  if (a is num && b is! num) return stLess(b, a) || stEquals(a, b);
+  return a >= b;
+}
 
 stMax(a, b) {
   if (a is num && b is num) return a > b ? a : b;

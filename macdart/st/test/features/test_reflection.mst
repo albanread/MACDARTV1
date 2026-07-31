@@ -1,0 +1,34 @@
+"Feature test: reflection / class introspection. Expected values are the
+ human-verified spec. KNOWN GAPS (documented, not asserted): respondsTo: on a
+ native receiver, class-side superclass/name on native classes, and native
+ Character/Symbol reporting their Dart impl class name (StChar/StSymbol)."
+STestCase subclass: TestReflection [
+    tests [
+        "--- instance -> class -> name ---"
+        self check: 3 class name is: 'SmallInteger' label: 'SmallInteger class name'.
+        self check: 'hi' class name is: 'String' label: 'String class name'.
+        self check: true class name is: 'True' label: 'True class name'.
+        self check: false class name is: 'False' label: 'False class name'.
+        self check: nil class name is: 'UndefinedObject' label: 'nil class name'.
+        self check: (3/4) class name is: 'Fraction' label: 'Fraction class name'.
+        self check: OrderedCollection new class name is: 'OrderedCollection' label: 'OC class name'.
+
+        "--- class identity ---"
+        self assert: (3 class == 4 class) label: 'same class identity'.
+        self deny: (3 class == 'x' class) label: 'different class identity'.
+
+        "--- isKindOf: walks the superclass chain ---"
+        self assert: (3 isKindOf: Integer) label: 'int isKindOf: Integer'.
+        self assert: (3 isKindOf: Number) label: 'int isKindOf: Number (inherited)'.
+        self assert: (3 isKindOf: Object) label: 'int isKindOf: Object (root)'.
+        self deny: (3 isKindOf: String) label: 'int not isKindOf: String'.
+        self assert: ('hi' isKindOf: String) label: 'string isKindOf: String'.
+        self assert: (OrderedCollection new isKindOf: Collection) label: 'OC isKindOf: Collection'.
+
+        "--- ClassMirror sweep (M5) ---"
+        self assert: (self allClassNames includes: 'OrderedCollection') label: 'allClasses includes OrderedCollection'.
+        self assert: (self allClassNames includes: 'Fraction') label: 'allClasses includes Fraction'.
+        self assert: (self allClassNames size > 50) label: 'allClasses is a populated world'.
+    ]
+    allClassNames [ ^(ClassMirror allClasses) collect: [ :c | c name ] ]
+]

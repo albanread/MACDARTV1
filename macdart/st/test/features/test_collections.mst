@@ -17,6 +17,10 @@ STestCase subclass: TestCollections [
         self check: (#(1 2 3) collect: [ :x | x * x ]) is: #(1 4 9) label: 'collect'.
         self check: (#(1 2 3 4 5) select: [ :x | x even ]) size is: 2 label: 'select even'.
         self check: (#(1 2 3 4 5) reject: [ :x | x even ]) size is: 3 label: 'reject even'.
+        "select:/reject: preserve species — an Array answers an Array (like collect:)"
+        self check: (#(1 2 3 4 5) select: [ :x | x odd ]) is: #(1 3 5) label: 'array select: -> Array'.
+        self check: (#(1 2 3 4 5) reject: [ :x | x odd ]) is: #(2 4) label: 'array reject: -> Array'.
+        self check: (#(1 2 3 4) select: [ :x | x even ]) class name is: 'Array' label: 'array select: species is Array'.
         self check: (#(5 3 9 1) detect: [ :x | x > 4 ]) is: 5 label: 'detect'.
         self check: (#(1 2 3 4) count: [ :x | x > 2 ]) is: 2 label: 'count:'.
 

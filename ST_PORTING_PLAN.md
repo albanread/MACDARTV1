@@ -344,12 +344,21 @@ control, exceptions, reflection.
    (ST objects, native ops like `#+`) and the ext holders (native receivers).
    `76_reflection.mst` reopens `Object>>respondsTo:` at it. (`cocoa.dart` +
    `st_natives.cc` + `76_reflection.mst`.)
+9. **`Array>>select:`/`reject:` answer an Array (species).** `Collection`'s base
+   `select:` deliberately builds an `OrderedCollection` (its untyped model
+   stripped the species machinery), and `Array` overrode only `collect:` — so
+   `#(1 2) collect:` was an Array but `#(1 2) select:` an OrderedCollection, an
+   inconsistency inside one class. New overlay `77_array_species.mst` reopens
+   `Array>>select:`/`reject:` to answer `asArray`, matching Squeak/ANSI and the
+   existing `collect:`. Array receivers only — OrderedCollection/Set/Interval
+   keep the OrderedCollection-returning base (no corpus `select:` runs on an
+   Array, so nothing relies on the old return).
 
 ### 9b. Gaps the suites found, still OPEN (documented, not yet fixed)
 
 - Class-side `superclass`/`name` on native classes (Integer superclass → nil).
-- `select:`/`reject:` on an Array return an OrderedCollection, not an Array
-  (species); `printOn:` sent directly to a bare Dart Array with a fresh ST
-  WriteStream mis-dispatches (arrays nested in ST collections print fine).
+- `String`/`Interval` `select:`/`reject:` still answer an OrderedCollection, not
+  their own species; `printOn:` sent directly to a bare Dart Array with a fresh
+  ST WriteStream mis-dispatches (arrays nested in ST collections print fine).
 - Native `Character`/`Symbol` report their impl class (`StChar`/`StSymbol`),
   and `String new:withAll:`, block `numArgs` are unimplemented.

@@ -1,0 +1,22 @@
+"77_array_species.mst — MACDART: Array>>select:/reject: answer an Array.
+
+ 21_collections_ext.mst deliberately gives the abstract Collection a select:/
+ reject:/collect: that always build a plain OrderedCollection (its untyped model
+ stripped the species machinery). Array already keeps its OWN collect: override
+ (10_array.mst) that answers an Array — so as shipped `#(1 2) collect:` is an
+ Array but `#(1 2) select:` is an OrderedCollection, an inconsistency inside the
+ one class. This overlay finishes the species contract for Array the same way
+ (Squeak/ANSI: Array>>select: answers an Array), by collecting into an
+ OrderedCollection then answering its asArray. Loads after 10/21 (file 77), so
+ reopen replaces Collection's inherited select:/reject: for Array receivers only;
+ OrderedCollection/Set/Interval keep the OrderedCollection-returning versions."
+
+Array >> select: aBlock [
+    | r |
+    r := OrderedCollection new.
+    self do: [:each | (aBlock value: each) ifTrue: [ r add: each ] ].
+    ^r asArray
+]
+Array >> reject: aBlock [
+    ^self select: [:each | (aBlock value: each) not ]
+]

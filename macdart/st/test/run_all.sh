@@ -33,7 +33,7 @@ echo "Transcript showCr: 'boot'." > "$HERE/.boot.st"
 boot="$("$DART" --with-st "$HERE/run_mst.dart" "$HERE/.boot.st" 2>&1)"
 rm -f "$HERE/.boot.st"
 if echo "$boot" | grep -q "world loaded" && ! echo "$boot" | grep -qiE "error|exception|ERR:"; then
-  pass "tier0 world boot (86 files, clean)"
+  pass "tier0 world boot (87 files, clean)"
 else
   fail "tier0 world boot"; echo "$boot" | tail -3 | sed 's/^/        /'
 fi

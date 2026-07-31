@@ -1,0 +1,131 @@
+"Feature test: the full number protocol — Magnitude / SmallInteger / bignum /
+ Double / Fraction / Number-ext, one assertion per method with human-verified
+ expected values (the test IS the spec). Born from a live sweep of every
+ number method; it pins the four bugs that sweep found and fixed:
+   * `//` and `\\` are FLOORED and divisor-signed (were truncating/Euclidean),
+   * Fraction `ceiling`/`//` (were wrong / a DNU),
+   * `printString:` radix (was a null-capture crash — the nested-closure fix),
+   * the arc spellings arcTan/arcSin/arcCos.
+ Keep exact where exact (integers, dyadic fractions); transcendentals compare
+ within 1e-10 via `close:to:`."
+STestCase subclass: TestNumberProtocol [
+    close: a to: b [ ^(a - b) abs < 0.0000000001 ]
+
+    tests [
+        "── Magnitude / Number core ──"
+        self check: -7 abs is: 7 label: 'abs'.
+        self check: (5 between: 1 and: 10) is: true label: 'between:and:'.
+        self assert: 0 isZero label: 'isZero'.
+        self check: (3 max: 9) is: 9 label: 'max:'.
+        self check: (3 min: 9) is: 3 label: 'min:'.
+        self check: 5 negated is: -5 label: 'negated'.
+        self check: 7 sign is: 1 label: 'sign +'.
+        self check: -7 sign is: -1 label: 'sign -'.
+        self check: 0 sign is: 0 label: 'sign 0'.
+        self check: 12 squared is: 144 label: 'squared'.
+        self check: (1 to: 5) size is: 5 label: 'to: (Interval)'.
+
+        "── predicates ──"
+        self assert: 3 isInteger label: 'isInteger'.
+        self deny: 3 isDouble label: 'isDouble on int'.
+        self assert: 3.5 isDouble label: 'isDouble on double'.
+        self assert: (1/3) isFraction label: 'isFraction'.
+        self deny: 3 isString label: 'isString on int'.
+        self deny: 3 isNil label: 'isNil on int'.
+
+        "── SmallInteger ──"
+        self check: 65 asCharacter is: $A label: 'asCharacter'.
+        self check: 3 asDouble is: 3.0 label: 'asDouble'.
+        self check: (12 bitAnd: 10) is: 8 label: 'bitAnd:'.
+        self check: (12 bitOr: 3) is: 15 label: 'bitOr:'.
+        self check: (12 bitXor: 10) is: 6 label: 'bitXor:'.
+        self check: (1 bitShift: 10) is: 1024 label: 'bitShift: +'.
+        self check: (1024 bitShift: -10) is: 1 label: 'bitShift: -'.
+        self assert: 4 even label: 'even'.
+        self deny: 4 odd label: 'odd'.
+        self check: (48 gcd: 36) is: 12 label: 'gcd:'.
+        self check: 42 hash is: 42 hash label: 'hash stable'.
+
+        "── bignum (Dart 1.x arbitrary-precision int) ──"
+        self check: 111111111 * 111111111 is: 12345678987654321 label: 'big *'.
+        self check: (2 raisedTo: 64) is: 18446744073709551616 label: 'big pow'.
+        self check: ((2 raisedTo: 60) byteAt: 8) is: 16 label: 'big byteAt:'.
+        self assert: (2 raisedTo: 64) negated < 0 label: 'big negated < 0'.
+
+        "── Double ──"
+        self assert: (self close: 0.5 sin to: 0.479425538604203) label: 'sin'.
+        self assert: (self close: 0.5 cos to: 0.8775825618903728) label: 'cos'.
+        self assert: (self close: 0.5 tan to: 0.5463024898437905) label: 'tan'.
+        self assert: (self close: 1.0 atan to: 0.7853981633974483) label: 'atan'.
+        self assert: (self close: 1.0 arcTan to: 0.7853981633974483) label: 'arcTan'.
+        self assert: (self close: 0.5 arcSin to: 0.5235987755982988) label: 'arcSin'.
+        self assert: (self close: 0.5 arcCos to: 1.0471975511965976) label: 'arcCos'.
+        self assert: (self close: 1 exp to: 2.718281828459045) label: 'exp'.
+        self assert: (self close: 2 ln to: 0.6931471805599453) label: 'ln'.
+        self assert: (self close: 100 log to: 2.0) label: 'log'.
+        self check: 2.25 sqrt is: 1.5 label: 'sqrt (double)'.
+        self assert: (self close: 25 sqrt to: 5.0) label: 'sqrt (int)'.
+        self check: 3.7 floor is: 3 label: 'floor'.
+        self check: 3.2 ceiling is: 4 label: 'ceiling'.
+        self check: 3.5 rounded is: 4 label: 'rounded'.
+        self check: 3.9 truncated is: 3 label: 'truncated'.
+        self check: -3.2 floor is: -4 label: 'floor (neg)'.
+        self check: -3.7 ceiling is: -3 label: 'ceiling (neg)'.
+        self check: -3.9 truncated is: -3 label: 'truncated (neg)'.
+
+        "── FLOORED division (the bug the sweep found) ──"
+        self check: (17 // 5) is: 3 label: '// positive'.
+        self check: (-7 // 2) is: -4 label: '// floors toward -inf'.
+        self check: (7 // -2) is: -4 label: '// neg divisor floors'.
+        self check: (-7 // -2) is: 3 label: '// both negative'.
+        self check: (17 \\ 5) is: 2 label: '\\ positive'.
+        self check: (-7 \\ 2) is: 1 label: '\\ sign of +divisor'.
+        self check: (7 \\ -2) is: -1 label: '\\ sign of -divisor'.
+        self check: ((2 raisedTo: 70) negated // 3) is:
+            -393530540239137101142 label: '// large negative floors'.
+
+        "── Fraction ──"
+        self check: (3/4) numerator is: 3 label: 'numerator'.
+        self check: (3/4) denominator is: 4 label: 'denominator'.
+        self check: (1/4) asDouble is: 0.25 label: 'Fraction asDouble'.
+        self check: (7/2) asInteger is: 3 label: 'Fraction asInteger'.
+        self check: (7/2) truncated is: 3 label: 'Fraction truncated'.
+        self check: (7/2) floor is: 3 label: 'Fraction floor'.
+        self check: (7/2) ceiling is: 4 label: 'Fraction ceiling'.
+        self check: (7/2) rounded is: 4 label: 'Fraction rounded'.
+        self check: (-7/2) floor is: -4 label: 'Fraction floor (neg)'.
+        self check: (-7/2) ceiling is: -3 label: 'Fraction ceiling (neg)'.
+        self check: (3/4) negated is: (-3/4) label: 'Fraction negated'.
+        self check: (-3/4) abs is: (3/4) label: 'Fraction abs'.
+        self check: (2/3) squared is: (4/9) label: 'Fraction squared'.
+        self check: (2/3) reciprocal is: (3/2) label: 'Fraction reciprocal'.
+        self check: ((7/2) // 2) is: 1 label: 'Fraction // (was a DNU)'.
+        self assert: ((1/3) < (1/2)) label: 'Fraction <'.
+
+        "── Number ext ──"
+        self check: 10 factorial is: 3628800 label: 'factorial'.
+        self assert: 97 isPrime label: 'isPrime'.
+        self check: (4 lcm: 6) is: 12 label: 'lcm:'.
+        self check: (-7 quo: 2) is: -3 label: 'quo: truncates'.
+        self check: (-7 rem: 2) is: -1 label: 'rem: sign of dividend'.
+        self check: (2 raisedTo: 16) is: 65536 label: 'raisedTo: int'.
+        self check: (2 raisedTo: -3) is: (1/8) label: 'raisedTo: neg -> Fraction'.
+        self assert: (self close: (4 raisedTo: (1/2)) to: 2.0) label: 'raisedTo: fraction'.
+        self check: 4 reciprocal is: (1/4) label: 'int reciprocal -> Fraction'.
+        self check: 3 asFloat is: 3.0 label: 'asFloat'.
+        self check: (2 ** 8) is: 256 label: '** delegates to raisedTo:'.
+
+        "── mixed native-int / Fraction (exact via the coercion hook) ──"
+        self check: (2 + (1/3)) is: (7/3) label: 'int + Fraction'.
+        self check: (2 - (1/3)) is: (5/3) label: 'int - Fraction'.
+        self check: (2 * (2/3)) is: (4/3) label: 'int * Fraction'.
+        self check: (2 / (1/3)) is: 6 label: 'int / Fraction exact'.
+        self check: (7 // (2/3)) is: 10 label: 'int // Fraction floors'.
+        self assert: (2 > (1/3)) label: 'int > Fraction'.
+
+        "── radix printing (the nested-closure-capture fix) ──"
+        self check: (255 printString: 16) is: 'ff' label: 'printString: 16'.
+        self check: (5 printString: 2) is: '101' label: 'printString: 2'.
+        self check: (-42 printString: 16) is: '-2a' label: 'printString: neg'.
+    ]
+]

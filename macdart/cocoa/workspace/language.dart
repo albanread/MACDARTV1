@@ -891,12 +891,20 @@ String _stDoit(String code) {
   var body;
   // A STATEMENT period is a dot not followed by a digit (else `0.5 sin` reads
   // as two statements, runs verbatim without ^, and answers the class name —
-  // the STDoItN bug). String literals are blanked first so 'a.b' can't fake one.
-  var blanked = code.replaceAll(new RegExp(r"'[^']*'"), "''");
+  // the STDoItN bug). String literals are blanked first so 'a.b' can't fake
+  // one, and ONE trailing period is a TERMINATOR, not a separator — `0.5 cos.`
+  // is still a single expression and must wrap (the terminator is dropped from
+  // the wrapped form; `^ ( expr . )` would not parse).
+  var expr = code.trimRight();
+  var blanked = expr.replaceAll(new RegExp(r"'[^']*'"), "''");
+  if (blanked.endsWith('.')) {
+    blanked = blanked.substring(0, blanked.length - 1);
+    expr = expr.substring(0, expr.length - 1);
+  }
   var hasStatements = blanked.contains(new RegExp(r'\.(?!\d)'));
   if (code.contains('^')) body = code;
   else if (code.startsWith('|') || hasStatements) body = code;
-  else body = '^ ( ' + code + ' )';
+  else body = '^ ( ' + expr + ' )';
   var src = 'Object subclass: ' + cls + ' [ ' + cls +
       ' class >> doIt [ ' + body + ' ] ]';
   var r = stLoad(src);

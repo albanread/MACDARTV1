@@ -30,7 +30,9 @@
 #include <string.h>
 
 #include <map>
+#include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "st_ast.h"
@@ -80,6 +82,11 @@ static const HelperRewrite kHelperRewrites[] = {
     {"printOn:", "stPrintOn", 1},
     {"class", "stClassOf", 0},
     {"/", "stDivide", 1},
+    // Smalltalk `//` and `\\` are FLOORED (toward -inf), and `\\` takes the
+    // sign of the DIVISOR — Dart's `~/` (truncating) and `%` (Euclidean) are
+    // both wrong for negatives, and Fraction had neither. Route through the
+    // floored helpers; the corpus's dead <primitive:4/5> bodies never run.
+    {"//", "stFloorDiv", 1},    {"\\\\", "stFloorMod", 1},
     {"asDouble", "stAsDouble", 0}, {"asFloat", "stAsDouble", 0},
     {"asInteger", "stTruncated", 0}, {"truncated", "stTruncated", 0},
     {"rounded", "stRounded", 0},   {"floor", "stFloorU", 0},
@@ -616,6 +623,20 @@ class StGraphBuilder {
   void MarkCapturedInClosures(Node* node);
   void MarkFreeNames(Node* node);
 
+  // A block's own parameter/temp captured by a NESTED closure must live in the
+  // shared method context, not the block's frame — else the inner closure
+  // reads it as a "global" (null). This pass finds those names: `ancestor` =
+  // names bound by enclosing value-position blocks (crossing one is a closure
+  // boundary), `current` = names bound in the block frame being scanned;
+  // a reference whose name is in `ancestor` is captured-across and hoisted.
+  void CollectHoistedBlockParams(Node* node,
+                                 const std::set<std::string>& ancestor,
+                                 std::set<std::string> current,
+                                 std::set<std::string>* out);
+  // Copies (raw incoming block param -> its shared-context slot) done in the
+  // closure prologue, for hoisted params. Filled by PrepareClosureScope.
+  std::vector<std::pair<LocalVariable*, LocalVariable*> > block_param_copies_;
+
   // Stage C: resolve a dart:cocoa top-level helper (stNlrThrow/Home/Value).
   RawFunction* LookupCocoaFunction(const char* name);
 
@@ -715,6 +736,28 @@ void StGraphBuilder::PrepareScope(MethodNode* method) {
   // scope BEFORE AllocateVariables (which assigns frame slots once).
   for (size_t i = 0; i < method->statements.size(); i++) {
     CollectLocals(method->statements[i].get(), scope);
+  }
+  // A block param/temp captured by a NESTED closure has to live in the shared
+  // method context (a `[:s | coll do: [:e | s ...]]` — streamContents: — read
+  // `s` as null otherwise). Give each such name a captured method-context slot
+  // here; the owning block's prologue copies its incoming arg into it. (Skip a
+  // name that is already a method local — a block param shadowing one is a rare
+  // case left on the frame.)
+  {
+    std::set<std::string> hoist;
+    for (size_t i = 0; i < method->statements.size(); i++) {
+      CollectHoistedBlockParams(method->statements[i].get(),
+                                std::set<std::string>(),
+                                std::set<std::string>(), &hoist);
+    }
+    for (std::set<std::string>::iterator it = hoist.begin(); it != hoist.end();
+         ++it) {
+      if (locals_.count(*it)) continue;
+      LocalVariable* v = MakeLocal(*it);
+      v->set_is_captured();
+      scope->AddVariable(v);
+      locals_[*it] = v;
+    }
   }
   // Stage B: mark every method local referenced under a CLOSURE block as
   // captured — BEFORE AllocateVariables, which then assigns those variables
@@ -1584,8 +1627,10 @@ std::string StGraphBuilder::DartSelector(const std::string& s) {
   if (s == "bitAnd:") return "&";   // Dart int operator methods
   if (s == "bitOr:") return "|";
   if (s == "bitXor:") return "^";
-  if (s == "//") return "~/";       // floored vs truncating: same for positives
-  if (s == "\\\\") return "%";
+  // (// and \\ route through the stFloorDiv/stFloorMod helper rewrites above —
+  // they are FLOORED; the old ~/ and % mappings truncated and were wrong for
+  // negatives. Left unmapped here so any stray path is a visible miss, not a
+  // silently-wrong operator.)
   // Any remaining keyword selector targets an ST-defined method: use the
   // canonical mangled name the loader registered (':' -> '_').
   if (s.find(':') != std::string::npos) return ::st::MangleSelector(s);
@@ -1873,6 +1918,65 @@ void StGraphBuilder::MarkFreeNames(Node* node) {
     for (size_t i = 0; i < d->elements.size(); i++) {
       MarkFreeNames(d->elements[i].get());
     }
+  }
+}
+
+// Find block params/temps captured across a closure boundary (see the header
+// note). An INLINED control-flow block shares the current frame, so its
+// params add to `current`; a VALUE-position block is a real closure, so
+// entering it makes today's `current` part of the next frame's `ancestor`.
+void StGraphBuilder::CollectHoistedBlockParams(
+    Node* node, const std::set<std::string>& ancestor,
+    std::set<std::string> current, std::set<std::string>* out) {
+  if (node == NULL) return;
+  if (VariableNode* v = dynamic_cast<VariableNode*>(node)) {
+    if (ancestor.count(v->name)) out->insert(v->name);
+  } else if (AssignNode* a = dynamic_cast<AssignNode*>(node)) {
+    if (ancestor.count(a->name)) out->insert(a->name);
+    CollectHoistedBlockParams(a->value.get(), ancestor, current, out);
+  } else if (ReturnNode* r = dynamic_cast<ReturnNode*>(node)) {
+    CollectHoistedBlockParams(r->value.get(), ancestor, current, out);
+  } else if (MessageNode* m = dynamic_cast<MessageNode*>(node)) {
+    if (IsInlinableControlFlow(m)) {
+      // Operand blocks share THIS frame — their params extend `current`.
+      Node* parts[1 + 8];
+      size_t np = 0;
+      parts[np++] = m->receiver.get();
+      for (size_t i = 0; i < m->args.size() && np < 9; i++)
+        parts[np++] = m->args[i].get();
+      for (size_t i = 0; i < np; i++) {
+        if (BlockNode* b = dynamic_cast<BlockNode*>(parts[i])) {
+          std::set<std::string> cur2 = current;
+          for (size_t k = 0; k < b->args.size(); k++) cur2.insert(b->args[k]);
+          for (size_t k = 0; k < b->temps.size(); k++) cur2.insert(b->temps[k]);
+          for (size_t s = 0; s < b->statements.size(); s++)
+            CollectHoistedBlockParams(b->statements[s].get(), ancestor, cur2,
+                                      out);
+        } else {
+          CollectHoistedBlockParams(parts[i], ancestor, current, out);
+        }
+      }
+    } else {
+      CollectHoistedBlockParams(m->receiver.get(), ancestor, current, out);
+      for (size_t i = 0; i < m->args.size(); i++)
+        CollectHoistedBlockParams(m->args[i].get(), ancestor, current, out);
+    }
+  } else if (BlockNode* b = dynamic_cast<BlockNode*>(node)) {
+    // A real closure: everything `current` holds is now an ancestor for it.
+    std::set<std::string> anc2 = ancestor;
+    anc2.insert(current.begin(), current.end());
+    std::set<std::string> cur2;
+    for (size_t k = 0; k < b->args.size(); k++) cur2.insert(b->args[k]);
+    for (size_t k = 0; k < b->temps.size(); k++) cur2.insert(b->temps[k]);
+    for (size_t s = 0; s < b->statements.size(); s++)
+      CollectHoistedBlockParams(b->statements[s].get(), anc2, cur2, out);
+  } else if (CascadeNode* c = dynamic_cast<CascadeNode*>(node)) {
+    CollectHoistedBlockParams(c->receiver.get(), ancestor, current, out);
+    for (size_t i = 0; i < c->messages.size(); i++)
+      CollectHoistedBlockParams(c->messages[i].get(), ancestor, current, out);
+  } else if (DynArrayNode* d = dynamic_cast<DynArrayNode*>(node)) {
+    for (size_t i = 0; i < d->elements.size(); i++)
+      CollectHoistedBlockParams(d->elements[i].get(), ancestor, current, out);
   }
 }
 
@@ -2507,19 +2611,53 @@ void StGraphBuilder::PrepareClosureScope(BlockNode* block) {
     }
   }
 
+  // Which of THIS block's params/temps are captured by a nested closure? Those
+  // names were restored above as shared-context vars (the method allocated the
+  // slot); keep those bindings and route the incoming value through them,
+  // rather than shadowing with a fresh frame local the inner closure can't see.
+  std::set<std::string> hoisted;
+  for (size_t i = 0; i < block->statements.size(); i++) {
+    std::set<std::string> anc;
+    for (size_t k = 0; k < block->args.size(); k++) anc.insert(block->args[k]);
+    for (size_t k = 0; k < block->temps.size(); k++) anc.insert(block->temps[k]);
+    CollectHoistedBlockParams(block->statements[i].get(), anc,
+                              std::set<std::string>(), &hoisted);
+  }
+  block_param_copies_.clear();
+
   intptr_t pos = 0;
   LocalVariable* closure_var = MakeLocal(":closure");
   scope->InsertParameterAt(pos++, closure_var);
   closure_var_ = closure_var;
   for (size_t i = 0; i < block->args.size(); i++) {
-    LocalVariable* v = MakeLocal(block->args[i]);
+    const std::string& nm = block->args[i];
+    // A hoisted param the enclosing frame exported: the incoming arg needs a
+    // raw frame slot (`:cp<i>`) to be read from, then copied into its context
+    // slot by the prologue; references to `nm` keep the restored context var.
+    if (hoisted.count(nm) && locals_.count(nm) &&
+        locals_[nm]->is_captured()) {
+      char buf[32];
+      snprintf(buf, sizeof(buf), ":cp%ld", static_cast<long>(i));
+      LocalVariable* raw = MakeLocal(buf);
+      scope->InsertParameterAt(pos++, raw);
+      block_param_copies_.push_back(std::make_pair(raw, locals_[nm]));
+      continue;
+    }
+    LocalVariable* v = MakeLocal(nm);
     scope->InsertParameterAt(pos++, v);
-    locals_[block->args[i]] = v;
+    locals_[nm] = v;
   }
   for (size_t i = 0; i < block->temps.size(); i++) {
-    LocalVariable* v = MakeLocal(block->temps[i]);
+    const std::string& nm = block->temps[i];
+    // A hoisted temp already lives in the shared context (restored above); a
+    // fresh frame local would shadow it and hide writes from nested closures.
+    if (hoisted.count(nm) && locals_.count(nm) &&
+        locals_[nm]->is_captured()) {
+      continue;
+    }
+    LocalVariable* v = MakeLocal(nm);
     scope->AddVariable(v);
-    locals_[block->temps[i]] = v;
+    locals_[nm] = v;
   }
   for (size_t i = 0; i < block->statements.size(); i++) {
     CollectLocals(block->statements[i].get(), scope);
@@ -2558,6 +2696,18 @@ FlowGraph* StGraphBuilder::BuildClosure(BlockNode* block) {
     body += LoadField(Closure::context_offset());
     body += StoreLocal(pf_->current_context_var());
     body += Drop();
+  }
+
+  // Copy each hoisted param's incoming value (a raw frame slot) into its shared
+  // context slot, so a nested closure that captures the param sees the argument
+  // this activation was called with (the streamContents: `[:s | ... s ...]`
+  // fix). Mirrors the method prologue's captured-parameter copy.
+  for (size_t i = 0; i < block_param_copies_.size(); i++) {
+    LocalVariable* raw = block_param_copies_[i].first;
+    LocalVariable* ctx = block_param_copies_[i].second;
+    body += LoadLocal(pf_->current_context_var());
+    body += LoadLocal(raw);
+    body += StoreInstanceField(Context::variable_offset(ctx->index()));
   }
 
   body += InlineBlockValue(block);  // the last statement's value (or nil);

@@ -841,6 +841,44 @@ _stDivSlow(a, b) {
   return a / b;
 }
 
+// Smalltalk `//` and `\\` are FLOORED, not truncated — the whole family of
+// bugs the number sweep found lived in the builder mapping `//`->`~/` and
+// `\\`->`%`: Dart's `~/` truncates toward zero (`-7 // 2` gave -3, must be -4)
+// and Dart's `%` is Euclidean/non-negative (`7 \\ -2` gave 1, must be -1 —
+// `\\` follows the sign of the DIVISOR). Fraction had no `//` at all (a raw
+// DNU on `~/`). These helpers implement the real thing for every numeric type
+// and are the rewrite-table targets, so the dead <primitive:4/5> bodies never
+// matter. (Dart 1.x ints are arbitrary-precision, so SmallInteger and big
+// powers are both `is int` — one fast path covers them; a genuine ST
+// LargeInteger/Fraction is the exact-quotient fallback, which floors without
+// re-entering `//`.)
+int _floorDivInt(int a, int b) {
+  var q = a ~/ b;
+  var r = a - q * b;               // truncated remainder — sign of a
+  if (r != 0 && ((r < 0) != (b < 0))) q -= 1;   // opposite signs -> round down
+  return q;
+}
+stFloorDiv(a, b) {
+  if (a is int && b is int) return _floorDivInt(a, b);
+  if (a is num && b is num) return (a / b).floor();   // `//` answers an Integer
+  var q = stDivide(a, b);          // exact quotient: int / Fraction (no loop)
+  if (q is int) return q;
+  if (q is num) return q.floor();
+  var p = _stSendTry(q, 'numerator', const []);
+  var d = _stSendTry(q, 'denominator', const []);
+  if (p != null && d != null && p[0] is int && d[0] is int) {
+    return _floorDivInt(p[0], d[0]);
+  }
+  return stSend(q, 'floor', []);
+}
+stFloorMod(a, b) {
+  // a \\ b = a - (a // b) * b — always the sign of b (or zero).
+  if (a is int && b is int) return a - _floorDivInt(a, b) * b;
+  if (a is num && b is num) return a - (a / b).floor() * b;
+  var q = stFloorDiv(a, b);
+  return (a - q * b);              // mixed num/ST resolves via the NSM hook
+}
+
 // Numeric conversions/negation: Dart-num fast paths (the world kernel's
 // versions are <primitive:>-backed and must never be reached via the NSM
 // hook, whose ignored-pragma bodies would answer self).

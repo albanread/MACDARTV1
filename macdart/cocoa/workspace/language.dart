@@ -909,9 +909,36 @@ String _stDoit(String code) {
   }
 }
 
+// Does a do-it read as DART? Markers only — anything unmarked gets offered to
+// the ST parser first (below), so `25 sqrt` works without an st> prefix.
+// Deliberately NOT markers: `;` (an ST cascade), `//` (ST integer division).
+bool _doitLooksDart(String s) {
+  if (s.contains('=>')) return true;
+  if (new RegExp(r'(^|\s)(var|final|new|return|await|for|while|if|throw)\s')
+      .hasMatch(s)) return true;
+  if (new RegExp(r'\w\s*\(').hasMatch(s)) return true;   // a call — f(x)
+  if (_wsVarDecl.hasMatch(s) || _wsAssign.hasMatch(s)) return true;
+  if (new RegExp(r'^\s*[A-Za-z_$]\w*\s*;?\s*$').hasMatch(s)) {
+    return true;   // a bare name: a workspace VARIABLE first (ST tried on miss)
+  }
+  return false;
+}
+
 String _doit(String code) {
   var t = code.trimLeft();
   if (t.startsWith('st>')) return _stDoit(t.substring(3).trim());
+  // The BILINGUAL workspace: plain Smalltalk runs without a prefix. If the
+  // text carries no Dart markers and parses clean as ST, it IS Smalltalk —
+  // `25 sqrt` must answer 5.0, never Dart's parse-the-prefix-and-ignore-the-
+  // rest 25. An ST attempt that fails at run time falls through to Dart, so a
+  // Dart expression that happens to parse as ST still gets its Dart meaning.
+  if (!_doitLooksDart(t)) {
+    var chk = stCheck(t.trim());
+    if (chk.isEmpty) {
+      var sv = _stDoit(t.trim());
+      if (!sv.startsWith('ERR')) return sv;
+    }
+  }
   var m = _wsVarDecl.firstMatch(code);
   if (m != null) {
     var err = _declareWsVar(m.group(1));

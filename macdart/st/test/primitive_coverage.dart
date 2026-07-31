@@ -169,16 +169,18 @@ void runProbes() {
   probe('ByteArray>>replaceFrom:to:with:', 'replaceFrom:to:with:',
         () => st('baReplace'), 8);
 
-  // LargeInteger's byte protocol presumes a byte-addressable representation
-  // that Dart's Mint/Bigint does not expose the same way — a design call, not
-  // a table entry.
-  openProbe('LargeInteger>>size', 'big size is not self',
-        () => st('liSizeNotSelf'), true, 'LargeInteger byte protocol unmapped');
+  // LargeInteger byte protocol: size = magnitude byte count, byteAt: = the
+  // 1-based little-endian byte, read off the Dart int (07a_largeint_bytes.mst).
+  probe('LargeInteger>>size', 'big size is not self',
+        () => st('liSizeNotSelf'), true);
+  probe('LargeInteger>>byteAt:', 'big byteAt: 1 is a byte',
+        () { var v = st('liByteAt'); return v is int && v >= 0 && v < 256; }, true);
+  // hash stays SELF, by design: MACDART maps every int to SmallInteger, whose
+  // hash is self (Smalltalk SmallInteger>>hash); there is no distinct
+  // LargeInteger to hash differently (2^60 is a Dart Smi). A documented
+  // deviation, not a gap.
   openProbe('LargeInteger>>hash', 'big hash is not self',
-        () => st('liHashNotSelf'), true, 'LargeInteger byte protocol unmapped');
-  openProbe('LargeInteger>>byteAt:', 'big byteAt: 1 is a byte',
-        () { var v = st('liByteAt'); return v is int && v >= 0 && v < 256; }, true,
-        'LargeInteger byte protocol unmapped');
+        () => st('liHashNotSelf'), true, 'integer hash is self across Smi/Bigint');
 
   // asSymbol interns through stSymbol / _stSymbolTable — the SAME table the
   // #abc literal uses — so a computed symbol is IDENTICAL to the literal.

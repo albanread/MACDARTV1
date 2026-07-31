@@ -596,8 +596,17 @@ stSizeOf(c) {
   if (c is StMutableString) return c.units.length;
   if (c is StSymbol) return c.name.length;
   if (c is List || c is Map || c is String) return c.length;
+  if (c is int) return stIntByteSize(c);   // Integer>>size = magnitude byte count
   return _stSizeSlow(c);
 }
+
+/// LargeInteger byte protocol (little-endian, 1-based, index 1 = least
+/// significant — the corpus's own convention). A Dart int (Mint/Bigint) is
+/// immutable, so these are the READS; byteAt:put: (construction) is unused
+/// because MACDART does bignum arithmetic natively. The 07a overlay <stprim:>s
+/// LargeInteger>>byteAt:/hash onto these; size rides the stSizeOf helper above.
+int stIntByteSize(n) { n = n.abs(); return n == 0 ? 0 : (n.bitLength + 7) ~/ 8; }
+int stIntByteAt(n, i) => (n.abs() >> (8 * (i - 1))) & 0xFF;
 _stSizeSlow(c) => c.size();
 
 stAddU(c, x) {

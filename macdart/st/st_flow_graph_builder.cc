@@ -830,10 +830,17 @@ Fragment StGraphBuilder::TranslateLiteral(LiteralNode* node) {
           Function::ZoneHandle(zone_, LookupCocoaFunction("stSymbol")), 1);
       return f;
     }
-    case LiteralNode::Kind::kChar:
-      // A Character is a 1-char string (the stCharValue convention).
-      return Constant(String::ZoneHandle(
+    case LiteralNode::Kind::kChar: {
+      // A Character is a DISTINCT flyweight class (not a 1-char string) — so
+      // `$a == $a` holds (shared Latin-1 instance) and `$a = 'a'` is false.
+      // stCharLit(glyph) answers the flyweight for the glyph's code point.
+      Fragment f = Constant(String::ZoneHandle(
           zone_, String::New(node->text.c_str(), Heap::kOld)));
+      f += PushArgument();
+      f += StaticCall(
+          Function::ZoneHandle(zone_, LookupCocoaFunction("stCharLit")), 1);
+      return f;
+    }
     case LiteralNode::Kind::kArray:
     case LiteralNode::Kind::kByteArray: {
       // Sprint 11c: `#(...)` / `#[...]` build a Dart List by a pure stack

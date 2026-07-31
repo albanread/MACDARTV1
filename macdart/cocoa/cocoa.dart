@@ -125,12 +125,20 @@ void _stEnsureHooks() {
   internal.VMLibraryHooks.stObjNSM = (r, String sel, List args) {
     // A Symbol IS a String (subclass): its own protocol is a short list; every
     // other message forwards to the spelling, so all String protocol answers.
+    // The hook contract: return a 1-element LIST [result] on a hit (noSuchMethod
+    // unboxes r[0]), null to fall through. A bare value would be `[0]`-indexed.
     if (r is StSymbol) {
-      if (sel == 'isSymbol') return true;
-      if (sel == 'asSymbol' || sel == 'yourself') return r;
-      if (sel == 'hash' || sel == 'identityHash') return r.hashCode;
-      if (sel == '=' || sel == '==') return identical(r, args[0]);
-      return stSend(r.name, sel, args);        // forward String protocol
+      if (sel == 'isSymbol') return const [true];
+      if (sel == 'asSymbol' || sel == 'yourself') return [r];
+      if (sel == 'hash' || sel == 'identityHash') return [r.hashCode];
+      if (sel == '=' || sel == '==') return [identical(r, args[0])];
+      return [stSend(r.name, sel, args)];      // forward String protocol
+    }
+    if (r is StChar) {
+      var v = _stCharProtocol(r, sel, args);
+      if (!identical(v, _noStChar)) return [v];
+      // not Character protocol — a Character IS NOT a String, so anything else
+      // is a genuine doesNotUnderstand (fall through to the reify path).
     }
     var hit = _stExtSendTry(r, sel, args);
     if (hit != null) return hit;
@@ -172,6 +180,77 @@ StSymbol stSymbol(String name) =>
 
 bool stIsSymbol(x) => x is StSymbol;
 
+// --- native Character (representation fix, phase 2) -------------------------
+// A Smalltalk Character is a distinct class ordered by code point, NOT a
+// 1-char string. Latin-1 (0..255) is a shared FLYWEIGHT so `$a == $a` holds by
+// identity (09_character.mst's documented promise), and being its own class is
+// what makes `$a = 'a'` false. Its `toString` is the character, so it drops
+// into a WriteStream / join / marshal as the glyph.
+class StChar {
+  final int code;
+  const StChar._(this.code);
+  bool operator ==(o) => o is StChar && o.code == code;  // value = by code point
+  int get hashCode => code;
+  toString() => new String.fromCharCode(code);
+}
+
+final List<StChar> _stCharTable =
+    new List<StChar>.generate(256, (i) => new StChar._(i));
+
+/// The Character for [code] — the shared flyweight for Latin-1, else a fresh
+/// instance (so `$a == $a` but `$λ == $λ` need not, exactly as documented).
+StChar stChar(int code) =>
+    (code >= 0 && code < 256) ? _stCharTable[code] : new StChar._(code);
+
+bool stIsChar(x) => x is StChar;
+
+/// `\$a` literal -> the flyweight Character (the code from the parser's glyph).
+StChar stCharLit(String glyph) => stChar(glyph.codeUnitAt(0));
+
+/// The Character protocol answered directly (the receiver is an StChar, not a
+/// String, so String forwarding would be wrong). Returns a sentinel _noStChar
+/// when the selector isn't Character protocol, so the caller falls through.
+const _noStChar = const Object();
+_stCharProtocol(StChar r, String sel, List args) {
+  var c = r.code;
+  switch (sel) {
+    case 'asInteger': case 'value': case 'codePoint': case 'asciiValue':
+      return c;
+    case 'asCharacter': case 'yourself': return r;
+    case 'isCharacter': return true;
+    case 'asString': case 'printString': return r.toString();  // printString handled in stPrintOf too
+    case 'asSymbol': return stSymbol(r.toString());
+    case 'hash': case 'identityHash': return c;
+    case 'asUppercase':
+      return stChar(new String.fromCharCode(c).toUpperCase().codeUnitAt(0));
+    case 'asLowercase':
+      return stChar(new String.fromCharCode(c).toLowerCase().codeUnitAt(0));
+    case 'isDigit': return c >= 48 && c <= 57;
+    case 'isLetter':
+      return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+    case 'isUppercase': return c >= 65 && c <= 90;
+    case 'isLowercase': return c >= 97 && c <= 122;
+    case 'isVowel':
+      return c==97||c==101||c==105||c==111||c==117||c==65||c==69||c==73||c==79||c==85;
+    case 'isSpace': case 'isSeparator':
+      return c == 32 || c == 9 || c == 10 || c == 13 || c == 12;
+    case 'isLetterOrDigit': case 'isAlphaNumeric':
+      return (c>=48&&c<=57)||(c>=65&&c<=90)||(c>=97&&c<=122);
+    case 'digitValue':
+      if (c >= 48 && c <= 57) return c - 48;
+      if (c >= 65 && c <= 90) return c - 55;   // A..Z -> 10..35
+      if (c >= 97 && c <= 122) return c - 87;
+      return -1;
+    case '<': return args[0] is StChar ? c < args[0].code : stSend(r, '<', args);
+    case '<=': return args[0] is StChar ? c <= args[0].code : stSend(r, '<=', args);
+    case '>': return args[0] is StChar ? c > args[0].code : stSend(r, '>', args);
+    case '>=': return args[0] is StChar ? c >= args[0].code : stSend(r, '>=', args);
+    case '=': return stEquals(r, args[0]);
+    case '==': return identical(r, args[0]);
+  }
+  return _noStChar;
+}
+
 /// ST `=` with recovered class identity — the representation fix. `==` stays a
 /// StrictCompare (identity) in the builder; this is `=` (value). Fast path:
 /// identical objects (incl. interned Symbols and equal Smis) and numbers.
@@ -186,10 +265,11 @@ stEquals(a, b) {
 }
 _stEqualsSlow(a, b) {
   if (a is StSymbol) return false;              // identity already failed
+  if (a is StChar) return b is StChar && a.code == b.code;  // $a = 'a' -> false
   if (a is String) {
     if (b is StSymbol) return a == b.name;      // 'foo' = #foo  -> true
     if (b is String) return a == b;
-    return false;
+    return false;                               // 'a' = $a  -> false
   }
   return stSend(a, '=', [b]);                   // Fraction / user classes
 }
@@ -344,10 +424,10 @@ stBoolOr(a, b) {
 _stPipeSlow(a, b) => a | b;
 
 stAt1(c, k) {
-  if (c is StSymbol) return c.name[k - 1];
+  if (c is StSymbol) return stChar(c.name.codeUnitAt(k - 1));
   if (c is List) return c[k - 1]; // Smalltalk indexes from 1
   if (c is Map) return c[k];
-  if (c is String) return c[k - 1]; // a Character = a 1-char string
+  if (c is String) return stChar(c.codeUnitAt(k - 1));  // a Character, not a 1-char string
   return _stAtSlow(c, k);
 }
 _stAtSlow(c, k) => c.at_(k);
@@ -373,7 +453,8 @@ stAddU(c, x) {
 _stAddSlow(c, x) => c.add_(x);
 
 stDo(c, f) {
-  if (c is StSymbol) { for (var i = 0; i < c.name.length; i++) f(c.name[i]); return c; }
+  if (c is StSymbol) { for (var i = 0; i < c.name.length; i++) f(stChar(c.name.codeUnitAt(i))); return c; }
+  if (c is String) { for (var i = 0; i < c.length; i++) f(stChar(c.codeUnitAt(i))); return c; }
   if (c is List) { for (var e in c) f(e); return c; }
   if (c is Map) { for (var v in c.values) f(v); return c; }
   return _stDoSlow(c, f);
@@ -429,7 +510,7 @@ _stDivSlow(a, b) => a / b;
 // hook, whose ignored-pragma bodies would answer self).
 stAsDouble(r) => r is num ? r.toDouble() : _stAsDoubleSlow(r);
 _stAsDoubleSlow(r) => r.asDouble();
-stTruncated(r) => r is num ? r.truncate() : _stTruncSlow(r);
+stTruncated(r) => r is num ? r.truncate() : (r is StChar ? r.code : _stTruncSlow(r));  // asInteger of a Character = its code
 _stTruncSlow(r) => r.truncated();
 stRounded(r) => r is num ? r.round() : _stRoundSlow(r);
 _stRoundSlow(r) => r.rounded();
@@ -448,6 +529,7 @@ _stSqrtSlow(r) => r.sqrt();
 // lexically, everything else is real ST dispatch.
 stLess(a, b) {
   if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
+  if (a is StChar) a = a.code; if (b is StChar) b = b.code;
   if (a is num && b is num) return a < b;
   if (a is String && b is String) return a.compareTo(b) < 0;
   return _stLtSlow(a, b);
@@ -455,6 +537,7 @@ stLess(a, b) {
 _stLtSlow(a, b) => a < b;
 stLessEq(a, b) {
   if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
+  if (a is StChar) a = a.code; if (b is StChar) b = b.code;
   if (a is num && b is num) return a <= b;
   if (a is String && b is String) return a.compareTo(b) <= 0;
   return _stLeSlow(a, b);
@@ -462,6 +545,7 @@ stLessEq(a, b) {
 _stLeSlow(a, b) => a <= b;
 stGreater(a, b) {
   if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
+  if (a is StChar) a = a.code; if (b is StChar) b = b.code;
   if (a is num && b is num) return a > b;
   if (a is String && b is String) return a.compareTo(b) > 0;
   return _stGtSlow(a, b);
@@ -469,6 +553,7 @@ stGreater(a, b) {
 _stGtSlow(a, b) => a > b;
 stGreaterEq(a, b) {
   if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
+  if (a is StChar) a = a.code; if (b is StChar) b = b.code;
   if (a is num && b is num) return a >= b;
   if (a is String && b is String) return a.compareTo(b) >= 0;
   return _stGeSlow(a, b);
@@ -524,6 +609,7 @@ class STWriteBuffer {
 /// text. (The catch intentionally narrows only the no-method case in
 /// spirit — a printOn: that itself signals is pathological.)
 stPrintOf(x) {
+  if (x is StChar) return r"$" + x.toString();     // Smalltalk prints a char as $a
   if (x is StSymbol) return "#" + x.name;        // Smalltalk prints symbols as #foo
   if (x is String) return "'" + x + "'";
   if (x is num || x is bool || x == null || x is List || x is Map) {
@@ -536,7 +622,7 @@ stPrintOf(x) {
   return ws.contents();
 }
 
-stDisplayOf(x) => x is String ? x : (x is StSymbol ? x.name : stPrintOf(x));
+stDisplayOf(x) => x is String ? x : (x is StSymbol ? x.name : (x is StChar ? x.toString() : stPrintOf(x)));
 
 /// `x printOn: aStream` with a bridged x: write its text into the stream.
 stPrintOn(r, s) {
@@ -556,7 +642,7 @@ stGcFull() native "ST_gcFull";
 // the universal helpers; a Character is a 1-char string.
 stStringNew(n) => new List(n);
 stStringNew0() => [];
-stCharValue(c) => new String.fromCharCode(c);
+stCharValue(c) => stChar(c);   // Character value: n -> the flyweight Character
 
 // Array with:* constructors.
 stList1(a) => [a];

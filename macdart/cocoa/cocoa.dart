@@ -134,6 +134,11 @@ void _stEnsureHooks() {
       if (sel == '=' || sel == '==') return [identical(r, args[0])];
       return [stSend(r.name, sel, args)];      // forward String protocol
     }
+    if (r is StMutableString) {
+      var v = _stMutProtocol(r, sel, args);
+      if (!identical(v, _noStMut)) return [v];
+      return [stSend(r.toString(), sel, args)];   // read protocol via the string
+    }
     if (r is StChar) {
       var v = _stCharProtocol(r, sel, args);
       if (!identical(v, _noStChar)) return [v];
@@ -204,6 +209,72 @@ StChar stChar(int code) =>
 
 bool stIsChar(x) => x is StChar;
 
+// --- mutable String (representation fix, phase 3) ---------------------------
+// Smalltalk strings are MUTABLE; Dart strings are not. The hybrid: an immutable
+// literal stays a fast Dart String, but `String new:` / at:put: / WriteStream's
+// backing use StMutableString — a real growable code-unit buffer whose
+// `toString` is the string, so it reads and marshals as one. (Was a bare Dart
+// List, so `contents` answered a char-list — the "bad canvas JSON" bug.)
+class StMutableString {
+  List<int> units;
+  StMutableString(this.units);
+  int get length => units.length;
+  toString() => new String.fromCharCodes(units);
+  bool operator ==(o) {
+    if (o is StMutableString) {
+      if (o.units.length != units.length) return false;
+      for (var i = 0; i < units.length; i++) if (o.units[i] != units[i]) return false;
+      return true;
+    }
+    if (o is String) return toString() == o;
+    return false;
+  }
+  int get hashCode => toString().hashCode;
+}
+
+bool stIsMutStr(x) => x is StMutableString;
+
+/// The code unit for a value written INTO a string: a Character, an int code,
+/// or a 1-char string (legacy). Anything else is a bug the caller surfaces.
+int _stCode(v) {
+  if (v is StChar) return v.code;
+  if (v is int) return v;
+  if (v is String && v.length >= 1) return v.codeUnitAt(0);
+  if (v is StMutableString && v.units.isNotEmpty) return v.units[0];
+  return 32;
+}
+
+/// The Character/String-building protocol on a mutable string (replaceFrom:to:
+/// with:, asString/contents, concatenation, do:); the reads a Symbol-style
+/// forward would miss because it is a distinct class. Returns _noStMut to fall
+/// through. (Reads like size/at: go through the universal helpers below.)
+const _noStMut = const Object();
+_stMutProtocol(StMutableString r, String sel, List args) {
+  switch (sel) {
+    case 'asString': case 'yourself': case 'contents': return r;
+    case 'isString': return true;
+    case 'asSymbol': return stSymbol(r.toString());
+    case 'printString': return "'" + r.toString() + "'";
+    case 'displayString': return r.toString();
+    case 'hash': return r.hashCode;
+    case 'reversed': case 'reverse':
+      return new StMutableString(r.units.reversed.toList());
+    // NB: selectors arrive MANGLED (noSuchMethod hands us the Dart method
+    // name, `:` -> `_`), so keyword cases match the underscore form.
+    case 'replaceFrom_to_with_': {          // memcpy: dst[a..b] := src[1..]
+      var a = args[0], b = args[1], src = args[2];
+      for (var i = a; i <= b; i++) r.units[i - 1] = _stCode(stAt1(src, i - a + 1));
+      return r;
+    }
+    case 'replaceFrom_to_with_startingAt_': {
+      var a = args[0], b = args[1], src = args[2], s = args[3];
+      for (var i = a; i <= b; i++) r.units[i - 1] = _stCode(stAt1(src, s + i - a));
+      return r;
+    }
+  }
+  return _noStMut;
+}
+
 /// `\$a` literal -> the flyweight Character (the code from the parser's glyph).
 StChar stCharLit(String glyph) => stChar(glyph.codeUnitAt(0));
 
@@ -258,6 +329,16 @@ _stCharProtocol(StChar r, String sel, List args) {
 /// compares elements, treating a Symbol as its spelling (so `'foo' = #foo` is
 /// true); any real ST object dispatches to its OWN `=` method — which is what
 /// finally makes Fraction and every user-defined `=` work.
+/// A string-ish value (Dart String, native mutable String, Symbol, Character)
+/// as a real Dart String; null for anything that is not string-ish.
+String _stStr(x) {
+  if (x is String) return x;
+  if (x is StMutableString) return x.toString();
+  if (x is StSymbol) return x.name;
+  if (x is StChar) return x.toString();
+  return null;
+}
+
 stEquals(a, b) {
   if (identical(a, b)) return true;
   if (a is num) return a == b;
@@ -266,12 +347,35 @@ stEquals(a, b) {
 _stEqualsSlow(a, b) {
   if (a is StSymbol) return false;              // identity already failed
   if (a is StChar) return b is StChar && a.code == b.code;  // $a = 'a' -> false
+  if (a is StMutableString) {                   // (String new:..) = 'abc'
+    var s = _stStr(b); return s != null && s is String && a.toString() == s;
+  }
   if (a is String) {
     if (b is StSymbol) return a == b.name;      // 'foo' = #foo  -> true
+    if (b is StMutableString) return a == b.toString();
     if (b is String) return a == b;
     return false;                               // 'a' = $a  -> false
   }
   return stSend(a, '=', [b]);                   // Fraction / user classes
+}
+
+/// `,` concatenation. String+String is the hot path (plain Dart `+`). Any pair
+/// of string-ish operands (mutable String / Symbol / Character mixed with a
+/// literal) coerces to a Dart String; List,List concatenates; anything else is
+/// sent on as a real ST `,` message so world collections keep their own method.
+stConcat(a, b) {
+  if (a is String && b is String) return a + b;
+  var sa = _stStr(a);
+  if (sa != null) {
+    var sb = _stStr(b);
+    if (sb != null) return sa + sb;
+  }
+  if (a is List) {
+    var r = new List.from(a);
+    if (b is List) r.addAll(b); else r.add(b);
+    return r;
+  }
+  return stSend(a, ',', [b]);
 }
 
 /// Invoke a class-side (static) method [selector] on a loaded ST class
@@ -424,6 +528,7 @@ stBoolOr(a, b) {
 _stPipeSlow(a, b) => a | b;
 
 stAt1(c, k) {
+  if (c is StMutableString) return stChar(c.units[k - 1]);
   if (c is StSymbol) return stChar(c.name.codeUnitAt(k - 1));
   if (c is List) return c[k - 1]; // Smalltalk indexes from 1
   if (c is Map) return c[k];
@@ -433,6 +538,7 @@ stAt1(c, k) {
 _stAtSlow(c, k) => c.at_(k);
 
 stAtPut1(c, k, v) {
+  if (c is StMutableString) { c.units[k - 1] = _stCode(v); return v; }
   if (c is List) { c[k - 1] = v; return v; }
   if (c is Map) { c[k] = v; return v; }
   return _stAtPutSlow(c, k, v);
@@ -440,6 +546,7 @@ stAtPut1(c, k, v) {
 _stAtPutSlow(c, k, v) => c.at_put_(k, v);
 
 stSizeOf(c) {
+  if (c is StMutableString) return c.units.length;
   if (c is StSymbol) return c.name.length;
   if (c is List || c is Map || c is String) return c.length;
   return _stSizeSlow(c);
@@ -453,6 +560,7 @@ stAddU(c, x) {
 _stAddSlow(c, x) => c.add_(x);
 
 stDo(c, f) {
+  if (c is StMutableString) { for (var i = 0; i < c.units.length; i++) f(stChar(c.units[i])); return c; }
   if (c is StSymbol) { for (var i = 0; i < c.name.length; i++) f(stChar(c.name.codeUnitAt(i))); return c; }
   if (c is String) { for (var i = 0; i < c.length; i++) f(stChar(c.codeUnitAt(i))); return c; }
   if (c is List) { for (var e in c) f(e); return c; }
@@ -462,6 +570,7 @@ stDo(c, f) {
 _stDoSlow(c, f) => c.do_(f);
 
 stIsEmptyU(c) {
+  if (c is StMutableString) return c.units.isEmpty;
   if (c is StSymbol) return c.name.isEmpty;
   if (c is List || c is Map || c is String) return c.isEmpty;
   return _stIsEmptySlow(c);
@@ -609,6 +718,7 @@ class STWriteBuffer {
 /// text. (The catch intentionally narrows only the no-method case in
 /// spirit — a printOn: that itself signals is pathological.)
 stPrintOf(x) {
+  if (x is StMutableString) return "'" + x.toString() + "'";
   if (x is StChar) return r"$" + x.toString();     // Smalltalk prints a char as $a
   if (x is StSymbol) return "#" + x.name;        // Smalltalk prints symbols as #foo
   if (x is String) return "'" + x + "'";
@@ -622,7 +732,7 @@ stPrintOf(x) {
   return ws.contents();
 }
 
-stDisplayOf(x) => x is String ? x : (x is StSymbol ? x.name : (x is StChar ? x.toString() : stPrintOf(x)));
+stDisplayOf(x) => x is String ? x : (x is StMutableString ? x.toString() : (x is StSymbol ? x.name : (x is StChar ? x.toString() : stPrintOf(x))));
 
 /// `x printOn: aStream` with a bridged x: write its text into the stream.
 stPrintOn(r, s) {
@@ -638,10 +748,11 @@ stPrintOn(r, s) {
 stGcFull() native "ST_gcFull";
 
 // Bridged String/Character constructors: a "new" ST String is a MUTABLE char
-// buffer (Dart strings are immutable) — a List speaking at:put:/size through
-// the universal helpers; a Character is a 1-char string.
-stStringNew(n) => new List(n);
-stStringNew0() => [];
+// buffer (Dart strings are immutable) — an StMutableString speaking at:put:/
+// size/replaceFrom: (its `toString` IS the string, so it reads and marshals as
+// one); a Character value: answers the flyweight Character.
+stStringNew(n) => new StMutableString(new List<int>.filled(n, 32, growable: true));  // n spaces, mutable
+stStringNew0() => new StMutableString(<int>[]);
 stCharValue(c) => stChar(c);   // Character value: n -> the flyweight Character
 
 // Array with:* constructors.

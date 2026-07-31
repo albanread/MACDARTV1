@@ -1135,6 +1135,19 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
         Function::ZoneHandle(zone_, LookupCocoaFunction("stNot")), 1);
     return instructions;
   }
+  // `,` concatenation — routed through stConcat so a native mutable String
+  // (or Symbol/Character) concatenates with a literal String without tripping
+  // Dart's String.+ type check, and so Array,Array works too. String+String
+  // stays the fast Dart `+` inside the helper.
+  if (node->selector == "," && node->args.size() == 1) {
+    Fragment instructions = TranslateExpression(node->receiver.get());
+    instructions += PushArgument();
+    instructions += TranslateExpression(node->args[0].get());
+    instructions += PushArgument();
+    instructions += StaticCall(
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stConcat")), 2);
+    return instructions;
+  }
   {
     const HelperRewrite* hr =
         FindHelperRewrite(node->selector, node->args.size());

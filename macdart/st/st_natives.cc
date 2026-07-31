@@ -585,8 +585,23 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
           len = 0;
         }
         if (len >= 0) {
-          const Array& made = Array::Handle(zone, Array::New(len));
-          result_handle = Api::NewHandle(thread, made.raw());
+          if (cls_name == "String ext") {
+            // A mutable String, via dart:cocoa's stStringNew(len).
+            const Library& cocoa = Library::Handle(
+                zone, Library::LookupLibrary(
+                          thread, String::Handle(zone, String::New("dart:cocoa"))));
+            const Function& mk = Function::Handle(
+                zone, cocoa.LookupFunctionAllowPrivate(
+                          String::Handle(zone, String::New("stStringNew"))));
+            const Array& a = Array::Handle(zone, Array::New(1));
+            a.SetAt(0, Smi::Handle(zone, Smi::New(len)));
+            const Object& made =
+                Object::Handle(zone, DartEntry::InvokeFunction(mk, a));
+            result_handle = Api::NewHandle(thread, made.raw());
+          } else {
+            const Array& made = Array::Handle(zone, Array::New(len));
+            result_handle = Api::NewHandle(thread, made.raw());
+          }
           hit = true;
         }
       }
@@ -855,6 +870,12 @@ void ST_classOf(Dart_NativeArguments args) {
       candidates = kArrC;
     } else if (recv.IsClosure()) {
       candidates = kClosC;
+    } else {
+      // A native Character/Symbol/mutable-String (dart:cocoa classes) reports
+      // the world class it stands in for, so class-based dispatch works.
+      const Class& rc = Class::Handle(zone, recv.clazz());
+      const std::string rcn(String::Handle(zone, rc.Name()).ToCString());
+      if (rcn == "StMutableString") candidates = kStrC;
     }
     Class& cls = Class::Handle(zone);
     if (candidates != NULL) {

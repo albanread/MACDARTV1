@@ -76,12 +76,31 @@ class ClassTable {
   std::map<std::string, size_t> index_;
 };
 
+// In-load LAST WINS: a later chunk for the same class and selector REPLACES the
+// earlier method, matching the cross-load reopen rule. Without this, a source
+// that holds a class body AND a same-selector `Cls >> sel [...]` further down —
+// exactly what the image's import produces when it merges an overlay file
+// (80_gamepane_wiring) into the class's decl — registered TWO Functions and
+// lookup found the ORIGINAL, so the overlay was silently dead in the GUI while
+// the per-file world boot (separate loads) applied it fine.
+void AddMethod(ClassAgg* agg, MethodEntry e) {
+  for (auto& m : agg->methods) {
+    if (m.is_static == e.is_static &&
+        m.node->selector == e.node->selector) {
+      fprintf(stderr, "[lastwins] %s%s >> %s\n", agg->name.c_str(),
+              e.is_static ? " class" : "", e.node->selector.c_str());
+      m = e;
+      return;
+    }
+  }
+  agg->methods.push_back(e);
+}
+
 void AggregateMethods(ClassAgg* agg,
                       std::vector<std::unique_ptr<MethodNode>>* methods,
                       bool force_static) {
   for (auto& m : *methods) {
-    agg->methods.push_back(
-        MethodEntry{m.get(), force_static || m->is_class_side});
+    AddMethod(agg, MethodEntry{m.get(), force_static || m->is_class_side});
   }
 }
 
@@ -312,8 +331,8 @@ void Aggregate(ProgramNode* program, ClassTable* table) {
       AggregateMethods(&agg, &ex->methods, /*force_static=*/ex->is_class_side);
     } else if (auto* em = dynamic_cast<ExtMethodNode*>(n)) {
       ClassAgg& agg = table->GetOrAdd(em->class_name);
-      agg.methods.push_back(
-          MethodEntry{em->method.get(), em->method->is_class_side});
+      AddMethod(&agg,
+                MethodEntry{em->method.get(), em->method->is_class_side});
     }
   }
 }
@@ -509,7 +528,7 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
         agg.super = "Object";
         agg.has_super = true;
       }
-      agg.methods.push_back(MethodEntry{cd->methods[0].get(), true});
+      AddMethod(&agg, MethodEntry{cd->methods[0].get(), true});
       program->items.push_back(std::move(cd));
       if (has_toplevel != 0) *has_toplevel = true;
     }

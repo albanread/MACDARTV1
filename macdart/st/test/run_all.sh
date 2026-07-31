@@ -33,7 +33,7 @@ echo "Transcript showCr: 'boot'." > "$HERE/.boot.st"
 boot="$("$DART" --with-st "$HERE/run_mst.dart" "$HERE/.boot.st" 2>&1)"
 rm -f "$HERE/.boot.st"
 if echo "$boot" | grep -q "world loaded" && ! echo "$boot" | grep -qiE "error|exception|ERR:"; then
-  pass "tier0 world boot (89 files, clean)"
+  pass "tier0 world boot (90 files, clean)"
 else
   fail "tier0 world boot"; echo "$boot" | tail -3 | sed 's/^/        /'
 fi
@@ -65,6 +65,17 @@ if [ -f "$HERE/run_features.dart" ]; then
     fail "tier2b feature suites"; echo "$f" | grep -iE "FAIL|CRASH|ABORTED" | head -6 | sed 's/^/        /'
   fi
 else skip "tier2b feature suites (driver not present)"; fi
+
+# tier 2b-game — the ST game wire, asserted headless (GamePane primitives ->
+# gp* draw ops; Breakout/Worms boot and draw frames through it, no GUI needed).
+if [ -f "$HERE/gamepane_wire.dart" ]; then
+  gw="$("$DART" --with-st "$HERE/gamepane_wire.dart" 2>&1)"
+  if echo "$gw" | grep -qE "WIRE GREEN"; then
+    pass "tier2b game wire ($(echo "$gw" | grep -cE '^  ok ') checks)"
+  else
+    fail "tier2b game wire"; echo "$gw" | grep -iE "FAIL" | head -4 | sed 's/^/        /'
+  fi
+else skip "tier2b game wire (driver not present)"; fi
 
 # tier 3 — per-class protocol probes (populated in M1+)
 if compgen -G "$HERE/probes/*.mst" >/dev/null 2>&1; then

@@ -1519,12 +1519,25 @@ void buildMenu() {
   // Demos: standalone programs from demos/ beside the UI source, each spawned
   // into its own isolate, drawing on the Demos tab's canvas through this
   // isolate. The menu IS the folder — drop a file in, Rescan, run it.
+  // The PLAYABLE games are filed under their own Games menu (below); Demos
+  // keeps the visual/benchmark pieces (Copper is an effect, so it stays).
   var demos = subMenu(mainMenu, "Demos");
   var found = scanDemos();
-  if (found.isEmpty) {
+  var dartGames = <List>[];
+  var shows = <List>[];
+  for (var d in found) {
+    var base = d[1].toString().split('/').last;
+    if (base.contains('brickout') || base.contains('invaders') ||
+        base.contains('pong')) {
+      dartGames.add(d);
+    } else {
+      shows.add(d);
+    }
+  }
+  if (shows.isEmpty) {
     menuItem(demos, "(no demos found in demos/)", "", (s) {});
   }
-  for (var d in found) {
+  for (var d in shows) {
     var title = d[0], path = d[1];
     menuItem(demos, title, "", (s) => runDemoAt(title, path));
   }
@@ -1539,6 +1552,21 @@ void buildMenu() {
     buildMenu();   // setMainMenu: replaces the bar, so this rescans cleanly
     log("demos rescanned — " + scanDemos().length.toString() + " found");
   });
+
+  // Games: the playable ones. Dart games run in their own isolates exactly as
+  // demos do; the Smalltalk games are the world's 44_breakout/48a_worms driven
+  // one tick at a time by the language isolate over the same pane wire
+  // (GAMEPANE_PLAN.md §8 — arrows steer, space/Z = A, X = B).
+  var games = subMenu(mainMenu, "Games");
+  for (var d in dartGames) {
+    var title = d[0], path = d[1];
+    menuItem(games, title, "", (s) => runDemoAt(title, path));
+  }
+  if (dartGames.isNotEmpty) menuSep(games);
+  menuItem(games, "Smalltalk Breakout", "", (s) => runStGame("Breakout"));
+  menuItem(games, "Smalltalk Worms", "", (s) => runStGame("Worms"));
+  menuSep(games);
+  menuItem(games, "Stop Game", "", (s) => stopDemo("stopped"));
 
   // Apps: your own Cocoa apps, running on the App pane. The examples in apps/
   // are filed into the image (through the usual compile gate) and then run —
@@ -1797,6 +1825,15 @@ Future spawnLanguage() async {
       return;
     }
     if (msg is List && msg.length > 3 && msg[0] == 'appui') onAppPush(msg);
+    // An ST game (GAMEPANE_PLAN.md §8): the language isolate acts as a pull
+    // demo, pushing the same ['port',ctl]/['draw',cmds]/['done',s] envelope a
+    // demo isolate sends — feed those into the demo machinery unchanged.
+    if (gStGameActive && msg is List && msg.isNotEmpty &&
+        (msg[0] == 'draw' || msg[0] == 'port' || msg[0] == 'status' ||
+         msg[0] == 'done')) {
+      _onDemoMsg(msg);
+      return;
+    }
     // Smalltalk `Transcript show: ...; cr` lines from the language isolate.
     if (msg is List && msg.length == 2 && msg[0] == 'tr') log(msg[1].toString());
   });
@@ -2370,6 +2407,7 @@ Future<String> handle(String line) async {
       return r == null ? 'ERR: stimport timed out' : r.toString();
     }
     case 'stdemo': runStDemo(arg.trim().isEmpty ? 'Waves' : arg.trim()); return "ok";
+    case 'stgame': runStGame(arg.trim().isEmpty ? 'Breakout' : arg.trim()); return "ok";
     case 'kill': await respawnLanguage("manual kill"); return "ok";
     case 'quit':
       Cocoa.cls("NSApplication").sharedApplication().terminate(null); return "ok";
@@ -4321,6 +4359,12 @@ Future runDemoAt(String title, String path) async {
 }
 
 void stopDemo(String why) {
+  if (gStGameActive) {
+    // An ST game has no demo isolate to kill — tell the language isolate to
+    // end its tick loop and run the game's onReset: instead.
+    gStGameActive = false;
+    askQuiet('stgamestop', '', const Duration(seconds: 5));
+  }
   if (gDemoIso != null) {
     try { gDemoIso.kill(priority: Isolate.IMMEDIATE); } catch (e) {}
   }
@@ -4338,6 +4382,32 @@ void stopDemo(String why) {
     log("demo " + why + " — " + gDemoTitle);
   }
   gDemoTitle = null;
+}
+
+// --- Smalltalk games (GAMEPANE_PLAN.md §8: the language-isolate driver) ------
+// The language isolate launches the game, then acts as a pull demo: its
+// ['port'/'draw'/'done'] pushes arrive on gFromLang and are fed into
+// _onDemoMsg above while this flag is up (see spawnLanguage's listener).
+bool gStGameActive = false;
+
+void runStGame(String name) {
+  stopDemo(null);                       // replaces any demo OR prior ST game
+  gStGameActive = true;
+  gDemoTitle = "Smalltalk " + name;     // keyCapture keys off this on tab 6
+  switchTab(6);
+  keyCapture(true);
+  demoStatus('Smalltalk ' + name + ' …');
+  askQuiet('stgame', name, const Duration(seconds: 30)).then((r) {
+    if (r == 'ok') {
+      demoStatus('Smalltalk ' + name + ' — arrows to play, Stop Demo to end');
+      log("st game: " + name);
+      return;
+    }
+    gStGameActive = false;
+    var err = r == null ? 'timed out' : r.toString();
+    demoStatus('ST game: ' + err);
+    log("x st game " + name + " - " + err);
+  });
 }
 
 void onDemoMsg(msg) {

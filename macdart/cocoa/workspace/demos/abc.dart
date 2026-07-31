@@ -12,6 +12,10 @@
 // durations (2, 3/2, /2, //), dotted pairs > <, rests z/x, chords [ceg],
 // triplets (3, bar lines (reset accidentals), and one level of |: ... :|
 // repeats (textually expanded). Velocity fixed at 80, channel 0.
+//
+// TWIN: dart:cocoa carries a private copy of this parser (_stAbcParse in
+// cocoa.dart) for the ST game wire — the language isolate can only import
+// dart: libraries. Any change to the subset here must be mirrored there.
 library abc;
 
 class AbcTune {

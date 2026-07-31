@@ -297,6 +297,105 @@ _stDemo(String arg) {
   }
 }
 
+// --- the ST game driver (GAMEPANE_PLAN.md §8: the language-isolate driver) ---
+// An ST game rides the Metal pane by making THIS isolate a pull demo: `stgame`
+// launches the game (its setup fills dart:cocoa's command buffer through the
+// 80_gamepane_wiring overlay), then pushes the same envelope a Dart game's
+// GamePane ctor sends — ['port', tick] and ['draw', [gpopen + setup]] — and
+// answers every UI tick with one stepped frame. Ticks arrive on a DEDICATED
+// port (the stActions pattern), so the control plane and its watchdog are
+// untouched; each step is sub-ms ST, so browsing stays fluid while you play.
+final List<Map> _kStGames = <Map>[
+  {'name': 'Breakout', 'cls': 'Breakout', 'sel': 'launch',
+   'blurb': 'brick-breaking with sound (44_breakout.mst)'},
+  {'name': 'Worms', 'cls': 'Worms', 'sel': 'launch',
+   'blurb': 'three growing worms, you drive one (48a_worms.mst)'},
+];
+
+ReceivePort _stGameTick;               // the pull-tick port while a game runs
+const int _kStGameW = 320, _kStGameH = 240;  // both shipped games' native size
+
+// macOS virtual keycodes -> GamePane's abstract key BITS (43_gamepane.mst:
+// left 0, right 1, up 2, down 3, A 4, B 5). Arrows plus space/Z for A, X for B.
+int _stGameMask(List keycodes) {
+  var mask = 0;
+  for (var k in keycodes) {
+    if (k == 123) mask |= 1;
+    else if (k == 124) mask |= 2;
+    else if (k == 126) mask |= 4;
+    else if (k == 125) mask |= 8;
+    else if (k == 49 || k == 6) mask |= 16;
+    else if (k == 7) mask |= 32;
+  }
+  return mask;
+}
+
+void _stGameCleanup() {
+  if (_stGameTick != null) { _stGameTick.close(); _stGameTick = null; }
+  // Fire the game's onReset: block and clear StepBlock/Keys, then the wire.
+  try { stInvokeStatic('GamePane', 'reset', []); } catch (e) {}
+  stGpReset();
+}
+
+// `stgame <name>` -> 'ok' and the pane opens, or an ERR string.
+_stGame(String arg) {
+  var name = arg.trim().split(' ')[0];
+  Map game = null;
+  for (var g in _kStGames) { if (g['name'] == name) game = g; }
+  if (game == null) return 'ERR unknown game ' + name;
+  if (!_decls.containsKey(game['cls'])) {
+    return 'ERR ' + game['cls'] + ' not in the image (import the world)';
+  }
+  _stGameCleanup();                    // a re-launch replaces any prior run
+  try {
+    stInvokeStatic(game['cls'], game['sel'], []);
+  } catch (e) {
+    stGpReset();
+    return 'ERR ' + e.toString();
+  }
+  if (!stGpIsRunning()) {
+    stGpReset();
+    return 'ERR ' + name + ' never sent GamePane>>run';
+  }
+  var setup = stGpTake();
+  _stGameTick = new ReceivePort();
+  _stGameTick.listen(_stGameOnTick);
+  _ui.send(<dynamic>['port', _stGameTick.sendPort]);
+  var first = <List>[<dynamic>['gpopen', _kStGameW, _kStGameH]];
+  for (var c in setup) first.add(c);
+  _ui.send(<dynamic>['draw', first]);  // gpopen is SETUP, not a frame
+  return 'ok';
+}
+
+// One UI tick: keystate in, one stepped frame out.
+void _stGameOnTick(gs) {
+  if (_stGameTick == null) return;     // stopped between ticks
+  var keys = (gs is List && gs.isNotEmpty && gs[0] is List)
+      ? gs[0] as List : const [];
+  try {
+    stInvokeStatic('GamePane', 'stepWithKeys:', [_stGameMask(keys)]);
+  } catch (e) {
+    _ui.send(<dynamic>['done', 'ST game error: ' + e.toString()]);
+    _stGameCleanup();
+    return;
+  }
+  _ui.send(<dynamic>['draw', stGpTake()]);
+  if (!stGpIsRunning()) {              // the game sent GamePane>>stop
+    _ui.send(<dynamic>['done', 'game over']);
+    _stGameCleanup();
+  }
+}
+
+_stGameStop(String arg) { _stGameCleanup(); return 'ok'; }
+
+_stGameList() {
+  var out = <List>[];
+  for (var g in _kStGames) {
+    out.add(<dynamic>[g['name'], g['blurb'], _decls.containsKey(g['cls'])]);
+  }
+  return out;
+}
+
 /// RGBA (row-major, top-down) -> base64 of a 24-bit bottom-up BGR BMP — the one
 /// format NSImage decodes natively (same encoder as demos/pixmap.dart, fed the
 /// ST pixel buffer with its alpha dropped).
@@ -752,6 +851,9 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'stbrowser') out = _stBrowserHandle(arg.toString());
       else if (cmd == 'stdemo') out = _stDemo(arg.toString());
       else if (cmd == 'stdemos') out = _stDemoList();
+      else if (cmd == 'stgame') out = _stGame(arg.toString());
+      else if (cmd == 'stgamestop') out = _stGameStop(arg.toString());
+      else if (cmd == 'stgames') out = _stGameList();
       else if (cmd == 'sthaltarm') out = stHaltArm(arg);
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();

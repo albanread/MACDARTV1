@@ -1,0 +1,38 @@
+"80_gamepane_wiring.mst — MACDART: the GamePane primitives reach the Metal pane.
+
+ 43_gamepane.mst speaks MACVM's numbered game primitives (<primitive: 200..215>),
+ which this VM never had — every draw/sound call silently answered self and no
+ frame ever reached the engine. This overlay re-points those methods (same
+ selectors, same arity; the corpus stays verbatim) at dart:cocoa's stGp* helpers,
+ which append the exact gp* wire ops a Dart game ships (gpcls/gppset/gpline/
+ gpfill/gpdisc/gppal, gpsprite+gpspawn/gpspritepal/gpplace, gpsound+gpplay,
+ gptune+gpmusic — ABC compiled by dart:cocoa's twin of demos/abc.dart) into a
+ per-isolate command buffer. The language isolate's `stgame` driver drains that
+ buffer once per tick and pushes ['draw', cmds] to the UI, so an ST game rides
+ the same pane, pacing, keystate and teardown machinery as a Dart one
+ (GAMEPANE_PLAN.md §8: 'adds a driver, not a rewrite').
+
+ Headless (no driver) the buffer fills and is never shipped — the corpus's
+ documented 'silently a no-op' contract holds, and st/test/gamepane_wire.dart
+ asserts the exact ops without a GUI. run/stop only flip the driver's flag; the
+ frame loop itself is owned by the UI timer, exactly as 43's comments promise.
+ One deferral: blit: (215) buffers nothing yet (neither shipped game uses it;
+ it logs once). Loads after 43 (file 80); reopen replaces the primitive stubs."
+
+GamePane >> clearR: r g: g b: b [ <stprim: stGpClearRGB> ]
+GamePane >> paletteAt: index r: r g: g b: b [ <stprim: stGpPal> ]
+GamePane >> cls: index [ <stprim: stGpCls> ]
+GamePane >> point: x y: y color: c [ <stprim: stGpPset> ]
+GamePane >> line: x0 y: y0 to: x1 y: y1 color: c [ <stprim: stGpLine> ]
+GamePane >> fill: x y: y width: w height: h color: c [ <stprim: stGpFill> ]
+GamePane >> disc: cx y: cy radius: r color: c [ <stprim: stGpDisc> ]
+GamePane >> present [ <stprim: stGpPresent> ]
+GamePane >> blit: aByteArray [ <stprim: stGpBlit> ]
+GamePane >> run [ <stprim: stGpRun> ]
+GamePane >> stop [ <stprim: stGpStop> ]
+GamePane >> primDefineSprite: id rows: hexRows [ <stprim: stGpDefineSprite> ]
+GamePane >> primSpriteColor: id index: index r: r g: g b: b [ <stprim: stGpSpriteColor> ]
+GamePane >> primMoveSprite: id x: x y: y [ <stprim: stGpMoveSprite> ]
+
+Sound >> primPlay: n [ <stprim: stGpPlay> ]
+Tune >> primPlayTune: s [ <stprim: stGpPlayTune> ]

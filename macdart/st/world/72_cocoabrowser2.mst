@@ -656,6 +656,8 @@ Object subclass: CocoaBrowser2 [
          safe; the original deferred to escape a sync host callback we no
          longer have)."
         aView isNil ifTrue: [ ^self ].
+        aView isValid ifFalse: [ ^self ].   "MACDART: a torn-down browser's view
+         can still be reached by an in-flight refresh — released, not nil"
         aView == ClassTable ifTrue: [ self pushRows: Classes to: ClassDelegate ].
         aView == ProtoTable ifTrue: [ self pushRows: Protocols to: ProtoDelegate ].
         aView == MethTable ifTrue: [ self pushRows: Methods to: MethDelegate ].
@@ -667,6 +669,8 @@ Object subclass: CocoaBrowser2 [
          ObjC-side) — per-row hops starved the language isolate and froze
          the workspace window's own event handling."
         aDelegate isNil ifTrue: [ ^self ].
+        aDelegate isValid ifFalse: [ ^self ].   "MACDART: released by teardown
+         but still referenced by a stale refresh - skip, never send to a dead ref"
         aDelegate onMain setRowsJoined: (STCocoa joinRows: anArray).
     ]
 

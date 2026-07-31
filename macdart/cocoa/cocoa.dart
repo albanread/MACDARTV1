@@ -1249,13 +1249,17 @@ List _stObjcArgs(args) {
 
 /// Auto-shaped send on the isolate thread (headless-safe work).
 stObjcSend(h, String sel, args) {
-  if (h == null) throw 'Cocoa: send to a released or nil reference';
+  if (h == null) {
+    throw 'Cocoa: send to a released or nil reference (' + sel + ')';
+  }
   return (h as Cocoa).send(sel, _stObjcArgs(args));
 }
 
 /// The C3 hop: the same send with objc_msgSend on the MAIN thread (AppKit).
 stObjcSendMain(h, String sel, args) {
-  if (h == null) throw 'Cocoa: send to a released or nil reference';
+  if (h == null) {
+    throw 'Cocoa: send to a released or nil reference (' + sel + ')';
+  }
   return (h as Cocoa).sendMain(sel, _stObjcArgs(args));
 }
 
@@ -1552,6 +1556,394 @@ void _gpFullscreen(int on) native "Cocoa_gpFullscreen";
 /// The pane view takes (or leaves) the whole screen; logical resolution
 /// unchanged, upscaled crisp. No-op when the pane is closed.
 void gpFullscreen(bool on) => _gpFullscreen(on ? 1 : 0);
+
+// --- the ST game wire (GAMEPANE_PLAN.md §8: the language-isolate driver) -----
+// The world's GamePane/Sound/Tune speak MACVM's numbered game primitives
+// (200..215), which this VM never had. The overlay 80_gamepane_wiring.mst
+// reopens those methods onto the stGp* helpers below, which APPEND the exact
+// gp* wire ops a Dart game ships (workspace/demos/gamepane.dart) into a
+// per-isolate command buffer. A driver (language.dart's `stgame`) drains the
+// buffer once per tick with [stGpTake] and pushes `['draw', cmds]` to the UI —
+// so an ST game rides the same pane/pacing/teardown machinery as a Dart one.
+// Headless (no driver) the buffer just fills and is never shipped, preserving
+// the corpus's documented "silently a no-op" behaviour, and making the wiring
+// testable without a GUI (st/test/gamepane_wire.dart).
+List _stGpCmds = <List>[];
+bool _stGpRunning = false;
+var _stGpPane; // the GamePane instance `run` was sent to (the driver's handle)
+Map<int, bool> _stGpSounds = <int, bool>{}; // preset -> gpsound already shipped
+Map<String, int> _stGpTunes = <String, int>{}; // abc source -> tune slot
+int _stGpNextTune = 0;
+bool _stGpBlitWarned = false;
+
+// 43_gamepane.mst's Sound preset numbers, in declaration order, to the synth's
+// preset names (gp_synth.cc preset_* — verified 1:1).
+const List<String> _stGpPresetNames = const <String>[
+  'coin', 'jump', 'zap', 'shoot', 'explode',
+  'powerup', 'hurt', 'click', 'bang', 'blip'
+];
+
+// Instance <stprim:> passes the RECEIVER first; every helper answers it so the
+// reopened method keeps 43's `^self` convention.
+stGpClearRGB(p, r, g, b) {
+  // The wire clears to a PALETTE index; entry 1 is reserved as the clear
+  // colour (user entries start at 16 per the pane's contract).
+  _stGpCmds.add(<dynamic>['gppal', 1, r, g, b]);
+  _stGpCmds.add(<dynamic>['gpcls', 1]);
+  return p;
+}
+stGpPal(p, i, r, g, b) { _stGpCmds.add(<dynamic>['gppal', i, r, g, b]); return p; }
+stGpCls(p, i) { _stGpCmds.add(<dynamic>['gpcls', i]); return p; }
+stGpPset(p, x, y, c) { _stGpCmds.add(<dynamic>['gppset', x, y, c]); return p; }
+stGpLine(p, x0, y0, x1, y1, c) {
+  _stGpCmds.add(<dynamic>['gpline', x0, y0, x1, y1, c]);
+  return p;
+}
+stGpFill(p, x, y, w, h, c) {
+  _stGpCmds.add(<dynamic>['gpfill', x, y, w, h, c]);
+  return p;
+}
+stGpDisc(p, cx, cy, r, c) {
+  _stGpCmds.add(<dynamic>['gpdisc', cx, cy, r, c]);
+  return p;
+}
+stGpPresent(p) => p; // the driver's tick drain IS the frame boundary
+stGpBlit(p, bytes) {
+  if (!_stGpBlitWarned) {
+    _stGpBlitWarned = true;
+    print('st: GamePane>>blit: is not wired on this VM yet (draw ops and '
+        'sprites are) — the frame was skipped');
+  }
+  return p;
+}
+stGpDefineSprite(p, id, rows) {
+  // ST merges define+place ("defines the pixel art and places me"): one id
+  // serves as both the definition and the instance (separate namespaces
+  // engine-side); park it offscreen until the game's first moveTo:.
+  _stGpCmds.add(<dynamic>['gpsprite', id, rows.toString()]);
+  _stGpCmds.add(<dynamic>['gpspawn', id, id, -100, -100]);
+  return p;
+}
+stGpSpriteColor(p, id, i, r, g, b) {
+  _stGpCmds.add(<dynamic>['gpspritepal', id, i, r, g, b]);
+  return p;
+}
+stGpMoveSprite(p, id, x, y) {
+  _stGpCmds.add(<dynamic>['gpplace', id, x, y, 0, 1.0, 0.0, 1.0]);
+  return p;
+}
+stGpPlay(snd, preset) {
+  if (preset is! int || preset < 0 || preset >= _stGpPresetNames.length) {
+    return snd;
+  }
+  // The engine's sound slots are 0..63; park the ten ST presets at the top of
+  // that range (54..63), clear of a Dart game's low slots.
+  var slot = 54 + preset;
+  if (_stGpSounds[preset] != true) {
+    _stGpSounds[preset] = true;
+    _stGpCmds.add(<dynamic>['gpsound', slot, _stGpPresetNames[preset], 0, 0]);
+  }
+  _stGpCmds.add(<dynamic>['gpplay', slot]);
+  return snd;
+}
+stGpPlayTune(tn, abc) {
+  var src = abc.toString();
+  var slot = _stGpTunes[src];
+  if (slot == null) {
+    var t;
+    try { t = _stAbcParse(src); } catch (e) {
+      print('st: Tune fromAbc: did not compile - ' + e.toString());
+      return tn;
+    }
+    slot = _stGpNextTune++;
+    _stGpTunes[src] = slot;
+    _stGpCmds.add(<dynamic>['gptune', slot, t.bpm, t.events]);
+  }
+  _stGpCmds.add(<dynamic>['gpmusic', slot, 1]); // play once (43's contract)
+  return tn;
+}
+stGpRun(p) { _stGpRunning = true; _stGpPane = p; return p; }
+stGpStop(p) { _stGpRunning = false; return p; }
+
+/// Drain and return the command buffer (the driver ships it as one
+/// `['draw', cmds]`). Answers a fresh list; the buffer restarts empty.
+List stGpTake() {
+  var out = _stGpCmds;
+  _stGpCmds = <List>[];
+  return out;
+}
+
+/// Did an ST `GamePane>>run` arrive (and no `stop` since)?
+bool stGpIsRunning() => _stGpRunning;
+
+/// The pane instance `run` was sent to (for the driver's bookkeeping).
+dynamic stGpPane() => _stGpPane;
+
+/// Reset the whole wire between games: buffer, run flag, sound/tune caches.
+void stGpReset() {
+  _stGpCmds = <List>[];
+  _stGpRunning = false;
+  _stGpPane = null;
+  _stGpSounds = <int, bool>{};
+  _stGpTunes = <String, int>{};
+  _stGpNextTune = 0;
+}
+
+// --- ABC notation -> flat MIDI events (the ST game wire's music half) --------
+// A TWIN of workspace/demos/abc.dart (same frozen subset, same logic —
+// identifiers renamed with the _stAbc prefix): that copy deliberately lives
+// game-isolate-side for hot reload, while the ST driver runs in the language
+// isolate whose scratch source can only import dart: libraries — so the
+// compiler must live here in dart:cocoa. KEEP THE TWO IN SYNC.
+class _StAbcTune {
+  final List<int> events; // flat [timeMs, status, data1, data2, ...]
+  final int bpm;
+  final int endMs;
+  _StAbcTune(this.events, this.bpm, this.endMs);
+}
+
+Map<String, int> _stAbcKeySig(String k) {
+  k = k.trim();
+  var minor = false;
+  var m = k.toLowerCase();
+  if (m.endsWith('min')) { k = k.substring(0, k.length - 3); minor = true; }
+  else if (m.endsWith('m') && k.length > 1) { k = k.substring(0, k.length - 1); minor = true; }
+  else if (m.endsWith('maj')) { k = k.substring(0, k.length - 3); }
+  k = k.trim();
+  const order = 'FCGDAEB';
+  const majors = const <String, int>{
+    'C': 0, 'G': 1, 'D': 2, 'A': 3, 'E': 4, 'B': 5, 'F#': 6, 'C#': 7,
+    'F': -1, 'BB': -2, 'EB': -3, 'AB': -4, 'DB': -5, 'GB': -6, 'CB': -7,
+  };
+  const relMajorOfMinor = const <String, String>{
+    'A': 'C', 'E': 'G', 'B': 'D', 'F#': 'A', 'C#': 'E', 'G#': 'B',
+    'D': 'F', 'G': 'BB', 'C': 'EB', 'F': 'AB', 'BB': 'DB', 'EB': 'GB',
+  };
+  var name = k.toUpperCase().replaceAll('♭', 'B');
+  if (minor && relMajorOfMinor.containsKey(name)) name = relMajorOfMinor[name];
+  var n = majors.containsKey(name) ? majors[name] : 0;
+  var sig = <String, int>{};
+  if (n > 0) for (var i = 0; i < n; i++) sig[order[i]] = 1;
+  if (n < 0) for (var i = 0; i < -n; i++) sig[order[6 - i]] = -1;
+  return sig;
+}
+
+const Map<String, int> _stAbcLetterSemi = const {
+  'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11,
+};
+
+_StAbcTune _stAbcParse(String src) {
+  var bpm = 120;
+  var unitNum = 1, unitDen = 8;
+  var meterDecimal = 1.0;
+  var sawL = false;
+  var program = -1;
+  var sig = <String, int>{};
+  var body = new StringBuffer();
+
+  var lines = src.split('\n');
+  var inBody = false;
+  for (var line in lines) {
+    var t = line.trim();
+    if (t.isEmpty || t.startsWith('%')) {
+      if (t.startsWith('%%MIDI')) {
+        var parts = t.split(new RegExp(r'\s+'));
+        if (parts.length >= 3 && parts[1] == 'program') {
+          program = int.parse(parts[2], onError: (_) => -1);
+        }
+      }
+      continue;
+    }
+    if (!inBody && t.length > 1 && t[1] == ':' && 'XTMLQKVRZNOHW'.contains(t[0])) {
+      var field = t[0];
+      var val = t.substring(2).trim();
+      if (field == 'M') {
+        var mm = val.split('/');
+        if (mm.length == 2) {
+          var a = int.parse(mm[0], onError: (_) => 4);
+          var b = int.parse(mm[1], onError: (_) => 4);
+          if (b != 0) meterDecimal = a / b;
+        }
+      } else if (field == 'L') {
+        var ll = val.split('/');
+        if (ll.length == 2) {
+          unitNum = int.parse(ll[0], onError: (_) => 1);
+          unitDen = int.parse(ll[1], onError: (_) => 8);
+          sawL = true;
+        }
+      } else if (field == 'Q') {
+        var eq = val.indexOf('=');
+        var beat = eq >= 0 ? val.substring(eq + 1) : val;
+        bpm = int.parse(beat.trim(), onError: (_) => 120);
+        if (bpm <= 0) bpm = 120;
+      } else if (field == 'K') {
+        sig = _stAbcKeySig(val);
+        inBody = true;
+      }
+      continue;
+    }
+    if (inBody) body.write(t + ' ');
+    if (!inBody && !(t.length > 1 && t[1] == ':')) { body.write(t + ' '); inBody = true; }
+  }
+  if (!sawL) { unitNum = 1; unitDen = meterDecimal < 0.75 ? 16 : 8; }
+
+  var text = body.toString();
+  var open = text.indexOf('|:');
+  var close = text.indexOf(':|');
+  if (close >= 0) {
+    var start = open >= 0 && open < close ? open + 2 : 0;
+    var section = text.substring(start, close);
+    text = text.substring(0, start) + section + ' | ' + section +
+        text.substring(close + 2);
+  }
+
+  var events = <int>[];
+  var wholeMs = 4.0 * 60000.0 / bpm;
+  var unit = unitNum / unitDen;
+  var t = 0.0;
+  var barAcc = <String, int>{};
+  var tupletLeft = 0;
+  var tupletFactor = 1.0;
+  var pendingBroken = 0;
+
+  if (program >= 0 && program <= 127) {
+    events.add(0); events.add(0xC0); events.add(program); events.add(0);
+  }
+
+  void emit(int midi, double durWhole) {
+    var startMs = t.round();
+    var offMs = (t + durWhole * wholeMs * 0.92).round();
+    if (offMs <= startMs) offMs = startMs + 10;
+    events.add(startMs); events.add(0x90); events.add(midi); events.add(80);
+    events.add(offMs); events.add(0x80); events.add(midi); events.add(0);
+  }
+
+  var i = 0;
+  double readDur() {
+    var num = 0, den = 0, slashes = 0;
+    while (i < text.length && text[i].compareTo('0') >= 0 &&
+           text[i].compareTo('9') <= 0) {
+      num = num * 10 + (text.codeUnitAt(i) - 48); i++;
+    }
+    while (i < text.length && text[i] == '/') { slashes++; i++; }
+    if (slashes > 0) {
+      while (i < text.length && text[i].compareTo('0') >= 0 &&
+             text[i].compareTo('9') <= 0) {
+        den = den * 10 + (text.codeUnitAt(i) - 48); i++;
+      }
+    }
+    var mult = num == 0 ? 1.0 : num.toDouble();
+    if (slashes > 0) {
+      mult /= den != 0 ? den : (1 << slashes);
+    }
+    return mult;
+  }
+
+  double applyMods(double d) {
+    if (tupletLeft > 0) { d *= tupletFactor; tupletLeft--; }
+    if (pendingBroken != 0) {
+      d *= pendingBroken > 0 ? 0.5 : 1.5;
+      pendingBroken = 0;
+    }
+    if (i < text.length && (text[i] == '>' || text[i] == '<')) {
+      var c = text[i]; i++;
+      d *= c == '>' ? 1.5 : 0.5;
+      pendingBroken = c == '>' ? 1 : -1;
+    }
+    return d;
+  }
+
+  int readPitch(int accOverride, bool haveAcc) {
+    var c = text[i];
+    var upper = c.toUpperCase();
+    var octave = c == upper ? 4 : 5;
+    i++;
+    while (i < text.length && (text[i] == "'" || text[i] == ',')) {
+      if (text[i] == "'") octave++; else octave--;
+      i++;
+    }
+    var key = upper + octave.toString();
+    var acc;
+    if (haveAcc) { acc = accOverride; barAcc[key] = accOverride; }
+    else if (barAcc.containsKey(key)) { acc = barAcc[key]; }
+    else { acc = sig.containsKey(upper) ? sig[upper] : 0; }
+    return 12 * (octave + 1) + _stAbcLetterSemi[upper] + acc;
+  }
+
+  while (i < text.length) {
+    var c = text[i];
+    if (c == ' ' || c == '\t') { i++; continue; }
+    if (c == '|' || c == ':') {
+      barAcc.clear(); i++; continue;
+    }
+    if (c == '(') {
+      i++;
+      if (i < text.length && text[i] == '3') {
+        tupletLeft = 3; tupletFactor = 2.0 / 3.0; i++;
+      }
+      continue;
+    }
+    if (c == 'z' || c == 'x' || c == 'Z') {
+      i++;
+      var d = applyMods(unit * readDur());
+      t += d * wholeMs;
+      continue;
+    }
+    if (c == '[') {
+      i++;
+      var durs = <double>[];
+      while (i < text.length && text[i] != ']') {
+        var acc = 0; var haveAcc = false;
+        while (i < text.length && (text[i] == '^' || text[i] == '_' || text[i] == '=')) {
+          haveAcc = true;
+          if (text[i] == '^') acc++;
+          if (text[i] == '_') acc--;
+          i++;
+        }
+        if (i < text.length && _stAbcLetterSemi.containsKey(text[i].toUpperCase())) {
+          var midi = readPitch(acc, haveAcc);
+          var d = unit * readDur();
+          durs.add(d);
+          emit(midi, d);
+        } else { i++; }
+      }
+      if (i < text.length) i++;
+      var chordDur = 0.0;
+      for (var d in durs) if (d > chordDur) chordDur = d;
+      chordDur = applyMods(chordDur == 0.0 ? unit : chordDur);
+      t += chordDur * wholeMs;
+      continue;
+    }
+    var acc = 0; var haveAcc = false;
+    while (i < text.length && (text[i] == '^' || text[i] == '_' || text[i] == '=')) {
+      haveAcc = true;
+      if (text[i] == '^') acc++;
+      if (text[i] == '_') acc--;
+      i++;
+    }
+    if (i < text.length && _stAbcLetterSemi.containsKey(text[i].toUpperCase())) {
+      var midi = readPitch(acc, haveAcc);
+      var d = applyMods(unit * readDur());
+      emit(midi, d);
+      t += d * wholeMs;
+      continue;
+    }
+    i++;
+  }
+
+  var idx = new List<int>.generate(events.length ~/ 4, (k) => k);
+  idx.sort((a, b) => events[a * 4] - events[b * 4]);
+  var sorted = <int>[];
+  for (var k in idx) {
+    sorted.add(events[k * 4]); sorted.add(events[k * 4 + 1]);
+    sorted.add(events[k * 4 + 2]); sorted.add(events[k * 4 + 3]);
+  }
+  var end = 0;
+  for (var k = 0; k < sorted.length; k += 4) {
+    if (sorted[k] > end) end = sorted[k];
+  }
+  return new _StAbcTune(sorted, bpm, end + 200);
+}
 
 void _setSplitMinSize(int splitView, double minSize) native "Cocoa_setSplitMinSize";
 

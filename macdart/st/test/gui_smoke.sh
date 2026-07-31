@@ -61,8 +61,28 @@ fi
 
 # engine-level (world-independent) — these must hold on any instance
 chk "doit writestream"   "hi there"  "$(ctl doit "st> ((WriteStream on: String new) nextPutAll: 'hi there'; contents)")"
-chk "doit equality"      "true, false, false, true" \
+chk "doit equality"      "true false false true" \
      "$(ctl doit 'st> (Array with: ($a == $a) with: ($a = '"'"'a'"'"') with: (#foo = '"'"'foo'"'"') with: ((1/2) = (1/2)))')"
+
+# ST games on the Metal pane (GAMEPANE_PLAN.md §8): launch, let a few frames
+# tick, snapshot the pane's honest texture, stop. Needs the world in the image.
+if [ "$world" = 1 ]; then
+  chk "stgame breakout"   "ok"        "$(ctl stgame Breakout)"
+  sleep 2
+  st1="$(ctl gpstat)"; sleep 1; st2="$(ctl gpstat)"
+  if [ -n "$st1" ] && [ -n "$st2" ] && [ "$st1" != "$st2" ]; then
+    ok "stgame frames tick" "$st2"
+  else
+    bad "stgame frames tick" "gpstat frozen: $st1 / $st2"
+  fi
+  rm -f /tmp/stgame.png
+  chk "stgame gpsnap"     "ok"        "$(ctl gpsnap /tmp/stgame.png)"
+  if [ -s /tmp/stgame.png ]; then ok "stgame snapshot" "$(wc -c </tmp/stgame.png | tr -d ' ') bytes"
+  else bad "stgame snapshot" "missing/empty /tmp/stgame.png"; fi
+  chk "stgame stop"       "ok"        "$(ctl demostop)"
+else
+  skip "stgame breakout" "no world in this image"
+fi
 
 # scan the live log for anything that smells like a broken pane
 if [ -f "$LOG" ] && grep -qiE "NoSuchMethod|StSymbol|Cocoa: send to a released|Smalltalk browser: ERR|Unhandled exception" "$LOG"; then

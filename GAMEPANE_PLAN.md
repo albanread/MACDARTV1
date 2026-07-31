@@ -374,14 +374,23 @@ range-validate at the native boundary, throw not abort; `gpsnap` for honest
 headless verification.
 
 **Open (decide before or during implementation):**
-- whether games later also run in the **language isolate** (image classes,
-  hot-reload-while-playing, breakpoints in `onStep` — the full liveness
-  story) once the App-pane channel exists; the wire is deliberately
-  driver-agnostic so this adds a driver, not a rewrite;
+- ~~whether games later also run in the **language isolate**~~ **DONE — the
+  Smalltalk game driver.** The world's `GamePane`/`Sound`/`Tune` primitives
+  (200..215) re-point via `80_gamepane_wiring.mst` at dart:cocoa's `stGp*`
+  helpers, which buffer the exact gp* wire ops; the language isolate's
+  `stgame` command launches an image game (Breakout, Worms), registers a
+  dedicated tick port (`['port', ctl]`), pushes `['draw', [gpopen + setup]]`,
+  and answers each tick by mapping keycodes→`GamePane stepWithKeys:` bits and
+  pushing the drained buffer. The UI routes those lang pushes into `_onDemoMsg`
+  (`gStGameActive`) — exactly "a driver, not a rewrite". Music works: an ABC
+  twin (`_stAbcParse`) lives in dart:cocoa → `gptune`+`gpmusic`; SFX presets
+  park at slots 54..63. Games menu: Brickout/Invaders/Pong + the two ST games.
+  Headless-tested by `st/test/gamepane_wire.dart` (battery tier); GUI-tested in
+  `gui_smoke.sh` (launch → frames tick → gpsnap → stop).
 - whether the M4 shader layer accepts arbitrary MSL from game files (it is
   compiled at runtime; a bad shader must fail as a logged error, never an
   abort);
-- ABC tunes in M4 or deferred entirely.
+- ~~ABC tunes in M4 or deferred entirely~~ — tunes are in (see above).
 
 ## Standalone game windows (done)
 

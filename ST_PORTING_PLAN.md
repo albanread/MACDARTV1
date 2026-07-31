@@ -194,6 +194,18 @@ re-Accept any class in the image.
   cross-ref report; loud bare primitives (D3); `ab.sh`; `run_all.sh`;
   ledger generator; gui_smoke.sh. Exit: the sent-but-undefined list exists
   and the 6 failing probes are triaged into buckets.
+  **STATUS (2026-07-31): substantially DONE.** `st/st_audit` + `st/audit/`
+  (run_audit.sh, builtins.txt, AUDIT_SUMMARY.md) ship the static cross-ref —
+  headline finding: the language selector graph is CLOSED (≈0 genuine
+  sent-but-undefined pure-ST selectors; the whole surface is 144 bare
+  primitives = 84 num-bare + 60 ffi-bare[Posix 31/Accel 27/Time 2]). The
+  battery is unified behind `st/test/run_all.sh` (7 tiers, one exit code,
+  verified ALL GREEN) with `gui_smoke.sh` (the browser-regression catcher) and
+  `ab.sh` (MACVM oracle diff). The 6 failing probes are already fixed by the
+  parallel primitive-audit session (tier2 = failed 0). REMAINING: loud bare
+  primitives (D3 — the parallel session's active lane) and a per-class
+  PORTING_LEDGER.md generator (AUDIT_SUMMARY.md is the interim snapshot;
+  methods.tsv is its join source).
 - **M1 — Kernel truth.** The 6 probe failures; `copy`/at:put: hang (ENGINE —
   copy must answer a mutable buffer); instVar family; LargeInteger
   byteAt:put:; comparison/hashing coherence across the new

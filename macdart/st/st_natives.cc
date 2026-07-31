@@ -543,6 +543,57 @@ void ST_hasMethod(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, Dart_NewBoolean(found));
 }
 
+static const char** ExtHolderCandidates(const Object& recv);  // defined below
+
+// stRespondsTo(recv, selectorString) -> bool. `respondsTo:` for every receiver.
+// stHasMethod alone only walks the receiver's own Dart class chain — right for
+// an ST object, but a native (a Smi is a _Smi) keeps its methods in the "Integer
+// ext" holders, so this ALSO walks the extension chain (the same one dispatch
+// uses). The selector arrives already un-symboled to a String by the Dart side.
+void ST_respondsTo(Dart_NativeArguments args) {
+  Dart_Handle recv_h = Dart_GetNativeArgument(args, 0);
+  Dart_Handle sel_h = Dart_GetNativeArgument(args, 1);
+  const char* sel_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(sel_h, &sel_c)) || sel_c == NULL) {
+    Dart_SetReturnValue(args, Dart_NewBoolean(false));
+    return;
+  }
+  const std::string selector(sel_c);
+  Thread* thread = Thread::Current();
+  bool found = false;
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Object& recv = Object::Handle(zone, Api::UnwrapHandle(recv_h));
+    const String& sel = String::Handle(
+        zone, Symbols::New(thread, ::st::MangleSelector(selector).c_str()));
+    Function& fn = Function::Handle(zone);
+    // 1. the receiver's own class chain (an ST object; a native Dart method).
+    Class& c = Class::Handle(zone, recv.clazz());
+    while (!c.IsNull() && !found) {
+      if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+      fn ^= c.LookupDynamicFunction(sel);
+      if (!fn.IsNull()) found = true;
+      c ^= c.SuperClass();
+    }
+    // 2. the extension holders (where a native receiver's ST methods live).
+    if (!found) {
+      const char** candidates = ExtHolderCandidates(recv);
+      for (const char** name = candidates; *name != NULL && !found; name++) {
+        c = ::st::FindStClassByName(thread, *name);
+        while (!c.IsNull() && !found) {
+          if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+          fn ^= c.LookupDynamicFunction(sel);
+          if (!fn.IsNull()) found = true;
+          c ^= c.SuperClass();
+        }
+      }
+    }
+  }
+  Dart_SetReturnValue(args, Dart_NewBoolean(found));
+}
+
 // stClassSend(type, selector, args) -> result.  Sprint 11: the class-side
 // `self <sel>` dispatch — receiver is a CLASS VALUE (Type), target resolved at
 // runtime by walking its metaclass-shadow chain, so an inherited class-side
@@ -757,6 +808,39 @@ void ST_classSendTry(Dart_NativeArguments args) {
 // -> "Integer ext" -> "Number ext" -> ... wired by the loader from the world
 // files' own declared supers), finds the method, invokes it with the
 // receiver as arg 0. Null on a genuine miss.
+// The extension-holder candidate chain for a native/AOT receiver, in hierarchy
+// order — the same list ext-dispatch walks (SmallInteger ext -> ... -> Object
+// ext). Probed individually because a standalone file may load only one holder;
+// each found candidate's own super chain is walked too. Shared by ext-dispatch
+// and respondsTo: so they can never disagree on what a native understands.
+static const char** ExtHolderCandidates(const Object& recv) {
+  static const char* kIntC[] = {"SmallInteger ext", "LargeInteger ext",
+                                "Integer ext", "Number ext",
+                                "Magnitude ext", "Object ext", NULL};
+  static const char* kDblC[] = {"Double ext", "Float ext", "Number ext",
+                                "Magnitude ext", "Object ext", NULL};
+  static const char* kStrC[] = {"String ext", "Object ext", NULL};
+  static const char* kTrueC[] = {"True ext", "Boolean ext", "Object ext", NULL};
+  static const char* kFalseC[] = {"False ext", "Boolean ext", "Object ext",
+                                  NULL};
+  static const char* kNilC[] = {"UndefinedObject ext", "Object ext", NULL};
+  static const char* kArrC[] = {"Array ext", "Object ext", NULL};
+  static const char* kClosC[] = {"BlockClosure ext", "BlockContext ext",
+                                 "Object ext", NULL};
+  static const char* kTypeC[] = {"Behavior ext", "ClassDescription ext",
+                                 "Class ext", "Object ext", NULL};
+  static const char* kObjC[] = {"Object ext", NULL};
+  if (recv.IsSmi() || recv.IsMint() || recv.IsBigint()) return kIntC;
+  if (recv.IsDouble()) return kDblC;
+  if (recv.IsString()) return kStrC;
+  if (recv.IsBool()) return Bool::Cast(recv).value() ? kTrueC : kFalseC;
+  if (recv.IsNull()) return kNilC;
+  if (recv.IsArray() || recv.IsGrowableObjectArray()) return kArrC;
+  if (recv.IsClosure()) return kClosC;
+  if (recv.IsType()) return kTypeC;
+  return kObjC;
+}
+
 void ST_extSendTry(Dart_NativeArguments args) {
   Dart_Handle recv_h = Dart_GetNativeArgument(args, 0);
   Dart_Handle sel_h = Dart_GetNativeArgument(args, 1);
@@ -784,45 +868,7 @@ void ST_extSendTry(Dart_NativeArguments args) {
     HANDLESCOPE(thread);
     Zone* zone = thread->zone();
     const Object& recv = Object::Handle(zone, Api::UnwrapHandle(recv_h));
-    // Candidate holders in hierarchy order — probed individually, because a
-    // standalone file may load only ONE of them (fib.mst loads just
-    // "Integer ext"); each found candidate's own super chain is also walked
-    // (in a full world boot the chain covers the rest by itself).
-    static const char* kIntC[] = {"SmallInteger ext", "LargeInteger ext",
-                                  "Integer ext", "Number ext",
-                                  "Magnitude ext", "Object ext", NULL};
-    static const char* kDblC[] = {"Double ext", "Float ext", "Number ext",
-                                  "Magnitude ext", "Object ext", NULL};
-    static const char* kStrC[] = {"String ext", "Object ext", NULL};
-    static const char* kTrueC[] = {"True ext", "Boolean ext", "Object ext",
-                                   NULL};
-    static const char* kFalseC[] = {"False ext", "Boolean ext", "Object ext",
-                                    NULL};
-    static const char* kNilC[] = {"UndefinedObject ext", "Object ext", NULL};
-    static const char* kArrC[] = {"Array ext", "Object ext", NULL};
-    static const char* kClosC[] = {"BlockClosure ext", "BlockContext ext",
-                                   "Object ext", NULL};
-    static const char* kTypeC[] = {"Behavior ext", "ClassDescription ext",
-                                   "Class ext", "Object ext", NULL};
-    static const char* kObjC[] = {"Object ext", NULL};
-    const char** candidates = kObjC;
-    if (recv.IsSmi() || recv.IsMint() || recv.IsBigint()) {
-      candidates = kIntC;
-    } else if (recv.IsDouble()) {
-      candidates = kDblC;
-    } else if (recv.IsString()) {
-      candidates = kStrC;
-    } else if (recv.IsBool()) {
-      candidates = Bool::Cast(recv).value() ? kTrueC : kFalseC;
-    } else if (recv.IsNull()) {
-      candidates = kNilC;
-    } else if (recv.IsArray() || recv.IsGrowableObjectArray()) {
-      candidates = kArrC;
-    } else if (recv.IsClosure()) {
-      candidates = kClosC;
-    } else if (recv.IsType()) {
-      candidates = kTypeC;
-    }
+    const char** candidates = ExtHolderCandidates(recv);
     const String& sel = String::Handle(
         zone, Symbols::New(thread, ::st::MangleSelector(selector).c_str()));
     Function& fn = Function::Handle(zone);

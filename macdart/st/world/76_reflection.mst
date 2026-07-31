@@ -12,6 +12,12 @@
 Behavior >> name [ <stprim: stClassNameOf> ]
 Behavior >> superclass [ <stprim: stSuperclassOf> ]
 
+"respondsTo: is <primitive: 246> in 59_reflection.mst (a MACVM method-dictionary
+ walk that doesn't exist here, so it fell to primitiveFailed:). Re-point it at a
+ real lookup that walks BOTH the receiver's own class chain (ST objects) AND the
+ native extension holders (a Smi's methods live in `Integer ext`, not on _Smi)."
+Object >> respondsTo: aSymbol [ <stprim: stRespondsTo> ]
+
 ClassMirror class >> allClasses [ <stprim: stAllClasses> ]
 ClassMirror class >> selectorsOf: aBehavior [ <stprim: stSelectorsOf> ]
 ClassMirror class >> instanceVariablesOf: aBehavior [ <stprim: stInstVarNamesOf> ]

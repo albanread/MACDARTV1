@@ -336,10 +336,17 @@ control, exceptions, reflection.
    elements recursed through `printString` (strings quote, nested arrays
    parenthesize, `nil` prints `nil`) — while ST-object collections keep their own
    `printOn:`. Also pulled `null` out to print `nil`, fixing `nil printString`.
+8. **`respondsTo:` on any receiver.** It was an unwired `<primitive: 246>` that
+   fell to `primitiveFailed:`; `ST_hasMethod` alone only walks the receiver's own
+   Dart class chain (a Smi is a `_Smi`, whose ST methods live in `Integer ext`).
+   The `ST_extSendTry` candidate list is now a shared `ExtHolderCandidates()`
+   helper, and a new `ST_respondsTo` native walks BOTH the receiver's class chain
+   (ST objects, native ops like `#+`) and the ext holders (native receivers).
+   `76_reflection.mst` reopens `Object>>respondsTo:` at it. (`cocoa.dart` +
+   `st_natives.cc` + `76_reflection.mst`.)
 
 ### 9b. Gaps the suites found, still OPEN (documented, not yet fixed)
 
-- `respondsTo:` fails (`primitive failed`) on native receivers.
 - Class-side `superclass`/`name` on native classes (Integer superclass → nil).
 - `select:`/`reject:` on an Array return an OrderedCollection, not an Array
   (species); `printOn:` sent directly to a bare Dart Array with a fresh ST

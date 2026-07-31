@@ -102,6 +102,15 @@ _stSendTry(recv, String sel, List args) native "ST_sendTry";
 /// (No invoke, no prelude requirement — safe before any ST has loaded.)
 bool _stHasMethod(recv, String sel) native "ST_hasMethod";
 
+/// `respondsTo:` — does [recv] understand [sel] via its own class chain OR the
+/// native extension holders? The 76_reflection overlay routes Object>>respondsTo:
+/// here; [sel] arrives as a Symbol (or String), so name it before the probe.
+bool stRespondsTo(recv, sel) {
+  var s = _stStr(sel);
+  return s == null ? false : _stRespondsToImpl(recv, s);
+}
+bool _stRespondsToImpl(recv, String sel) native "ST_respondsTo";
+
 /// Public alias for the --with-st boot path (C++ enters via Dart_Invoke,
 /// which cannot reach the private installer).
 void stEnsureHooks() { _stEnsureHooks(); }

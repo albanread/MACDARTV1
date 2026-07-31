@@ -1,6 +1,5 @@
 "Feature test: reflection / class introspection. Expected values are the
- human-verified spec. KNOWN GAPS (documented, not asserted): native Character/Symbol reporting their
- Dart impl class name (StChar/StSymbol)."
+ human-verified spec. All native flyweights now report their ST class."
 STestCase subclass: TestReflection [
     tests [
         "--- instance -> class -> name ---"
@@ -10,6 +9,15 @@ STestCase subclass: TestReflection [
         self check: false class name is: 'False' label: 'False class name'.
         self check: nil class name is: 'UndefinedObject' label: 'nil class name'.
         self check: (3/4) class name is: 'Fraction' label: 'Fraction class name'.
+        self check: $a class name is: 'Character' label: 'Character (native flyweight) class name'.
+        self check: #foo class name is: 'Symbol' label: 'Symbol (native flyweight) class name'.
+
+        "--- native flyweights are-kind-of their ST class ---"
+        self assert: ($a isKindOf: Character) label: 'char isKindOf: Character'.
+        self assert: ($a isKindOf: Magnitude) label: 'char isKindOf: Magnitude (inherited)'.
+        self assert: (#foo isKindOf: Symbol) label: 'symbol isKindOf: Symbol'.
+        self assert: (#foo isKindOf: String) label: 'symbol isKindOf: String (Symbol is-a String)'.
+        self deny: ($a isKindOf: Integer) label: 'char is not an Integer'.
         self check: OrderedCollection new class name is: 'OrderedCollection' label: 'OC class name'.
 
         "--- class identity ---"

@@ -594,6 +594,29 @@ void ST_respondsTo(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, Dart_NewBoolean(found));
 }
 
+// stBlockNumArgs(block) -> the number of arguments an ST block takes
+// ([:a :b | ...] numArgs = 2). An ST block compiles to a closure whose function
+// carries 1 + N fixed parameters (the :closure context + the N block args, see
+// st_flow_graph_builder BuildClosure), so the arity is num_fixed_parameters - 1.
+void ST_blockNumArgs(Dart_NativeArguments args) {
+  Dart_Handle recv_h = Dart_GetNativeArgument(args, 0);
+  Thread* thread = Thread::Current();
+  intptr_t n = 0;
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Object& recv = Object::Handle(zone, Api::UnwrapHandle(recv_h));
+    if (recv.IsClosure()) {
+      const Function& fn =
+          Function::Handle(zone, Closure::Cast(recv).function());
+      n = fn.num_fixed_parameters();
+      if (n > 0) n -= 1;  // drop the implicit :closure context parameter
+    }
+  }
+  Dart_SetReturnValue(args, Dart_NewInteger(n));
+}
+
 // stClassSend(type, selector, args) -> result.  Sprint 11: the class-side
 // `self <sel>` dispatch — receiver is a CLASS VALUE (Type), target resolved at
 // runtime by walking its metaclass-shadow chain, so an inherited class-side
@@ -930,6 +953,8 @@ void ST_classOf(Dart_NativeArguments args) {
     static const char* kNilC[] = {"UndefinedObject ext", NULL};
     static const char* kArrC[] = {"Array ext", NULL};
     static const char* kClosC[] = {"BlockClosure ext", NULL};
+    static const char* kCharC[] = {"Character ext", NULL};
+    static const char* kSymC[] = {"Symbol ext", NULL};
     const char** candidates = NULL;
     if (recv.IsSmi() || recv.IsMint() || recv.IsBigint()) {
       candidates = kIntC;
@@ -951,6 +976,8 @@ void ST_classOf(Dart_NativeArguments args) {
       const Class& rc = Class::Handle(zone, recv.clazz());
       const std::string rcn(String::Handle(zone, rc.Name()).ToCString());
       if (rcn == "StMutableString") candidates = kStrC;
+      else if (rcn == "StChar") candidates = kCharC;    // -> Character ext
+      else if (rcn == "StSymbol") candidates = kSymC;   // -> Symbol ext
     }
     Class& cls = Class::Handle(zone);
     if (candidates != NULL) {
@@ -1343,8 +1370,16 @@ void ST_isKindOf(Dart_NativeArguments args) {
     const Object& t = Object::Handle(zone, Api::UnwrapHandle(type_h));
     if (t.IsType()) {
       const Class& target = Class::Handle(zone, Type::Cast(t).type_class());
-      Class& c = Class::Handle(
-          zone, isolate->class_table()->At(obj.GetClassId()));
+      // A native Character/Symbol carries a dart:cocoa Dart class outside the ST
+      // hierarchy; walk from the "X ext" holder it stands in for so `$a isKindOf:
+      // Character` (-> Magnitude) and `#s isKindOf: Symbol` (-> String) hold.
+      Class& c = Class::Handle(zone);
+      const std::string rcn(
+          String::Handle(zone, Class::Handle(zone, obj.clazz()).Name())
+              .ToCString());
+      if (rcn == "StChar") c = ::st::FindStClassByName(thread, "Character ext");
+      else if (rcn == "StSymbol") c = ::st::FindStClassByName(thread, "Symbol ext");
+      if (c.IsNull()) c = isolate->class_table()->At(obj.GetClassId());
       while (!c.IsNull()) {
         if (c.raw() == target.raw()) {
           result = true;

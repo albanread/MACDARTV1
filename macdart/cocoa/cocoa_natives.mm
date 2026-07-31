@@ -756,6 +756,7 @@ void ST_sendTry(Dart_NativeArguments args);
 void ST_getField(Dart_NativeArguments args);
 void ST_hasMethod(Dart_NativeArguments args);
 void ST_respondsTo(Dart_NativeArguments args);
+void ST_blockNumArgs(Dart_NativeArguments args);
 void ST_classNamed(Dart_NativeArguments args);
 void ST_asSymbol(Dart_NativeArguments args);
 void ST_ffiCall(Dart_NativeArguments args);
@@ -860,6 +861,7 @@ static void Cocoa_sendMain(Dart_NativeArguments args) {
   V(ST_getField, 2)                                                            \
   V(ST_hasMethod, 2)                                                           \
   V(ST_respondsTo, 2)                                                          \
+  V(ST_blockNumArgs, 1)                                                        \
   V(ST_classNamed, 1)                                                          \
   V(ST_asSymbol, 1)                                                            \
   V(ST_ffiCall, 2)                                                             \

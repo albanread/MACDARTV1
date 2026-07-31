@@ -29,5 +29,9 @@ STestCase subclass: TestStrings [
         self check: ('hello' indexOf: $z) is: 0 label: 'indexOf: absent -> 0'.
         self check: ('The quick' substrings: ' ') size is: 2 label: 'substrings:'.
         self check: (String with: $a with: $b) is: 'ab' label: 'with:with:'.
+        self check: (String new: 3 withAll: $x) is: 'xxx' label: 'new:withAll:'.
+        self check: ('hello world' select: [ :c | c isVowel ]) is: 'eoo' label: 'string select: -> String'.
+        self check: ('hello' reject: [ :c | c isVowel ]) is: 'hll' label: 'string reject: -> String'.
+        self check: ('hello' select: [ :c | c isVowel ]) class name is: 'String' label: 'string select: species is String'.
     ]
 ]

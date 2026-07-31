@@ -18,6 +18,11 @@ Behavior >> superclass [ <stprim: stSuperclassOf> ]
  native extension holders (a Smi's methods live in `Integer ext`, not on _Smi)."
 Object >> respondsTo: aSymbol [ <stprim: stRespondsTo> ]
 
+"numArgs is <primitive: 248> in 59_reflection.mst (a CompiledBlock arity read
+ that doesn't exist here). Re-point it at the closure's real fixed-parameter
+ count (minus the implicit context arg)."
+BlockClosure >> numArgs [ <stprim: stBlockNumArgs> ]
+
 ClassMirror class >> allClasses [ <stprim: stAllClasses> ]
 ClassMirror class >> selectorsOf: aBehavior [ <stprim: stSelectorsOf> ]
 ClassMirror class >> instanceVariablesOf: aBehavior [ <stprim: stInstVarNamesOf> ]

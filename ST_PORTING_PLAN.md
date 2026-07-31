@@ -365,10 +365,32 @@ control, exceptions, reflection.
     superclass` is nil), and `stPrintOf` prints a class Type as its stripped ST
     name. (`st_flow_graph_builder.cc` + `st_natives.cc` + `cocoa.dart`.)
 
-### 9b. Gaps the suites found, still OPEN (documented, not yet fixed)
+11. **Native `Character`/`Symbol` report their ST class.** `$a class` answered
+    `StChar` and `$a isKindOf: Character` was false — `ST_classOf` had no case for
+    the dart:cocoa flyweights, and `ST_isKindOf` walked their Dart class. The ST
+    classes are the ext holders `Character ext`/`Symbol ext` (like `SmallInteger
+    ext`), so `ST_classOf`/`ST_isKindOf` now map the flyweights to them; and the
+    StSymbol NSM hook answers `isKindOf:` on the SYMBOL rather than forwarding to
+    its spelling (a Symbol is-a Symbol AND a String). (`st_natives.cc` +
+    `cocoa.dart`.)
+12. **`String`/`Interval` `select:`/`reject:` species.** `78_seq_species.mst`
+    reopens `String>>select:`/`reject:` to build a `String` (char-by-char through a
+    WriteStream) and `Interval>>select:`/`reject:` to answer an `Array` (via
+    `asArray`) — completing what `77_array_species.mst` began. OrderedCollection/
+    Set keep the OrderedCollection base.
+13. **Block `numArgs` and `String new:withAll:`.** `numArgs` was an unwired
+    `<primitive: 248>`; a new `ST_blockNumArgs` native reads the closure's
+    `num_fixed_parameters - 1` (dropping the implicit context arg) and
+    `76_reflection.mst` reopens `BlockClosure>>numArgs` at it. `String new:withAll:`
+    is a new bridged constructor (`stStringNewWithAll`).
+14. **`WriteStream new` initializes its backing.** The real WriteStream
+    (18_writestream.mst) defined `on:` but no `new`, so a bare `WriteStream new`
+    left `collection`/`position` nil and the first write did `+` on nil.
+    `79_writestream_new.mst` adds `WriteStream class >> new [ ^self on: String new ]`
+    — so `anArray printOn: WriteStream new` works. (The array `printOn:` itself was
+    already correct; `WriteStream new` was the fault.)
 
-- `String`/`Interval` `select:`/`reject:` still answer an OrderedCollection, not
-  their own species; `printOn:` sent directly to a bare Dart Array with a fresh
-  ST WriteStream mis-dispatches (arrays nested in ST collections print fine).
-- Native `Character`/`Symbol` report their impl class (`StChar`/`StSymbol`),
-  and `String new:withAll:`, block `numArgs` are unimplemented.
+### 9b. Gaps the suites found — all cleared
+
+Every gap the self-validating suites surfaced (14 fixes above) is now green.
+The suites stand at **6 suites / 188 assertions**, part of the pre-push battery.

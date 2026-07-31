@@ -33,6 +33,8 @@ STestCase subclass: TestControl [
         self check: ([ :x :y | x + y ] value: 3 value: 4) is: 7 label: 'block value:value:'.
         self check: ([ 99 ] value) is: 99 label: 'niladic block value'.
         self check: ((self adder: 10) value: 5) is: 15 label: 'closure captures binding'.
+        self check: ([ 42 ] numArgs) is: 0 label: 'niladic block numArgs'.
+        self check: ([ :x :y | x + y ] numArgs) is: 2 label: 'dyadic block numArgs'.
         self check: (self makeCounter) is: 3 label: 'closure mutates captured var'.
 
         "--- non-local return through a block ---"

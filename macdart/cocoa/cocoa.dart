@@ -154,6 +154,10 @@ void _stEnsureHooks() {
       if (sel == 'asSymbol' || sel == 'yourself') return [r];
       if (sel == 'hash' || sel == 'identityHash') return [r.hashCode];
       if (sel == '=' || sel == '==') return [identical(r, args[0])];
+      // isKindOf:/class must see the SYMBOL, not its spelling — a Symbol is-a
+      // Symbol (and a String), which forwarding to r.name would answer as a bare
+      // String. (class already routes through the stClassOf helper, not here.)
+      if (sel == 'isKindOf_') return [stIsKindOf(r, args[0])];
       return _stStrForward(r.name, sel, args);    // full String protocol
     }
     if (r is StMutableString) {
@@ -1076,6 +1080,15 @@ stGcFull() native "ST_gcFull";
 // one); a Character value: answers the flyweight Character.
 stStringNew(n) => new StMutableString(new List<int>.filled(n, 32, growable: true));  // n spaces, mutable
 stStringNew0() => new StMutableString(<int>[]);
+/// `String new: n withAll: aChar` — a mutable String of n copies of the char.
+stStringNewWithAll(n, c) {
+  var code = (c is StChar)
+      ? c.code
+      : (c is String && c.length == 1 ? c.codeUnitAt(0) : 32);
+  return new StMutableString(new List<int>.filled(n, code, growable: true));
+}
+/// `[:a :b | ...] numArgs` — the block's declared argument count.
+int stBlockNumArgs(block) native "ST_blockNumArgs";
 stCharValue(c) => stChar(c);   // Character value: n -> the flyweight Character
 
 // Array with:* constructors.

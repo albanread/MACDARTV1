@@ -1482,7 +1482,59 @@ Fragment StGraphBuilder::TranslateClassSend(const Class& cls,
     instructions += InstanceCall(sel, Token::kILLEGAL, argc, 1);
     return instructions;
   }
-  return Unsupported(node, "class-side send (no matching class method)");
+  // A universal-helper selector (printString -> stPrintOf, size -> stSizeOf,
+  // ...) applies to a class VALUE too. The class-name routing reached here
+  // BEFORE the instance-send HelperRewrite ran, so re-apply it now — otherwise
+  // `Integer printString` misses stPrintOf and prints the holder name.
+  if (const HelperRewrite* hr =
+          FindHelperRewrite(node->selector, node->args.size())) {
+    Fragment instructions = Constant(
+        Type::ZoneHandle(zone_, Type::NewNonParameterizedType(inst_cls)));
+    instructions += PushArgument();  // receiver = the class value
+    for (size_t i = 0; i < node->args.size(); i++) {
+      instructions += TranslateExpression(node->args[i].get());
+      instructions += PushArgument();
+    }
+    instructions += StaticCall(
+        Function::ZoneHandle(zone_, LookupCocoaFunction(hr->helper)),
+        1 + static_cast<intptr_t>(node->args.size()));
+    return instructions;
+  }
+
+  // No class-side (static) method, and not new/signal: the selector may be a
+  // Behavior/Class INSTANCE method that a class object answers — `Integer name`,
+  // `Integer superclass`. Fall back to a runtime send to the class VALUE (its
+  // Type), which reaches those through the Type ext-holders (Behavior ext ->
+  // ClassDescription ext -> ...) exactly as a runtime reflective send does. A
+  // genuine miss now becomes an honest doesNotUnderstand instead of a silent nil.
+  {
+    const Function& send =
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stSendExtOrNil"));
+    const Function& new_list =
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stNewList"));
+    const Function& append =
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stListAppend"));
+    Fragment b;
+    // Push the fixed args first (arg 0 = receiver, arg 1 = selector), THEN build
+    // the list on top — GetArguments wants the call's args contiguous on the
+    // stack, and each append consumes only its own last two.
+    b += Constant(
+        Type::ZoneHandle(zone_, Type::NewNonParameterizedType(inst_cls)));
+    b += PushArgument();  // receiver = the class value    -> arg 0
+    b += Constant(String::ZoneHandle(
+        zone_, Symbols::New(thread_, node->selector.c_str())));
+    b += PushArgument();  // selector (stSendExt mangles)  -> arg 1
+    b += StaticCall(new_list, 0);  // the args list
+    for (size_t i = 0; i < node->args.size(); i++) {
+      b += PushArgument();  // list so far
+      b += TranslateExpression(node->args[i].get());
+      b += PushArgument();
+      b += StaticCall(append, 2);  // -> list (grown)
+    }
+    b += PushArgument();  // the args list                 -> arg 2
+    b += StaticCall(send, 3);
+    return b;
+  }
 }
 
 // `super sel: ..`: resolve the method starting in the OWNER's superclass and

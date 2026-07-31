@@ -1525,9 +1525,19 @@ void ST_superclassOf(Dart_NativeArguments args) {
     const Class& cls = Class::Handle(zone, StClassArg(thread, args, 0));
     if (!cls.IsNull()) {
       const Class& sup = Class::Handle(zone, cls.SuperClass());
-      if (!sup.IsNull())
-        result = Api::NewHandle(
-            thread, Type::NewNonParameterizedType(sup));
+      // The ST hierarchy roots at Object; its Dart super is the bridge root
+      // (named "?") or dart:core Object (ResolveSuper bridges `nil subclass:
+      // Object` there). Report either as nil — ST's `Object superclass` is nil,
+      // not a stray root class.
+      if (!sup.IsNull()) {
+        std::string nm(String::Handle(zone, sup.Name()).ToCString());
+        const size_t n = nm.size();
+        if (n >= 4 && nm.compare(n - 4, 4, " ext") == 0) nm.erase(n - 4);
+        const Class& core = Class::Handle(
+            zone, Type::Handle(zone, Type::ObjectType()).type_class());
+        if (nm != "?" && sup.raw() != core.raw())
+          result = Api::NewHandle(thread, Type::NewNonParameterizedType(sup));
+      }
     }
   }
   Dart_SetReturnValue(args, result);

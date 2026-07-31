@@ -449,6 +449,19 @@ stSendExt(receiver, String selector, List args) {
   return stSend(receiver, selector, args); // throws the proper doesNotUnderstand
 }
 
+/// Like stSendExt but GRACEFUL on a total miss: answers nil instead of throwing.
+/// The class-name send fallback uses it so a reflective send that resolves
+/// (`Integer superclass`) works, while a genuinely unknown class-side send
+/// (`Transcript basicPrint:`) answers nil exactly as the old compile-time
+/// bailout did — no surprise doesNotUnderstand where there used to be none.
+stSendExtOrNil(receiver, String selector, List args) {
+  var hit = _stExtSendTry(receiver, selector, args);
+  if (hit != null) return hit[0];
+  var box = _stSendTry(receiver, selector, args);
+  if (box != null) return box[0];
+  return null;
+}
+
 // --- Smalltalk non-local return (ST_PLAN.md closures Stage C) ---------------
 // A `^expr` inside a FIRST-CLASS closure returns from the closure's HOME
 // method activation. The ST IL builder desugars it to stNlrThrow(home, value)
@@ -1029,6 +1042,13 @@ stPrintOf(x) {
     return x.toString();
   }
   if (x is Function) return 'a Block';
+  // A class VALUE (a Type) prints as its ST name — `Number`, not `Number ext`
+  // and not the generic Object>>printOn: text. stClassNameOf answers non-null
+  // ONLY for a Type (it strips the bridged-holder suffix), so it doubles as the
+  // is-a-class test. (Behavior>>printOn: lives in an ext holder that stPrintOf's
+  // own-class-chain printOn: probe below can't reach for a Type receiver.)
+  var cn = stClassNameOf(x);
+  if (cn != null) return cn;
   var ws = new STWriteBuffer();
   var r = _stSendTry(x, 'printOn:', [ws]);
   if (r == null) return x.toString();   // no printOn: — the VM default text

@@ -1,7 +1,6 @@
 "Feature test: reflection / class introspection. Expected values are the
- human-verified spec. KNOWN GAPS (documented, not asserted): class-side superclass/name on native
- classes, and native Character/Symbol reporting their Dart impl class name
- (StChar/StSymbol)."
+ human-verified spec. KNOWN GAPS (documented, not asserted): native Character/Symbol reporting their
+ Dart impl class name (StChar/StSymbol)."
 STestCase subclass: TestReflection [
     tests [
         "--- instance -> class -> name ---"
@@ -34,6 +33,16 @@ STestCase subclass: TestReflection [
         self assert: (OrderedCollection new respondsTo: #add:) label: 'OC respondsTo: #add:'.
         self deny: (OrderedCollection new respondsTo: #nope) label: 'OC denies an unknown selector'.
         self assert: (nil respondsTo: #isNil) label: 'nil respondsTo: #isNil'.
+
+        "--- class-side name / superclass on class literals ---"
+        self check: Object name is: 'Object' label: 'Object class name'.
+        self check: Integer name is: 'Integer' label: 'Integer class name'.
+        self check: OrderedCollection name is: 'OrderedCollection' label: 'OC class name'.
+        self check: Integer superclass name is: 'Number' label: 'Integer superclass'.
+        self assert: (Integer superclass == Number) label: 'superclass identity'.
+        self check: SmallInteger superclass name is: 'Integer' label: 'SmallInteger superclass'.
+        self assert: Object superclass isNil label: 'Object superclass is nil (root)'.
+        self check: Number printString is: 'Number' label: 'class printString (not "Number ext")'.
 
         "--- ClassMirror sweep (M5) ---"
         self assert: (self allClassNames includes: 'OrderedCollection') label: 'allClasses includes OrderedCollection'.

@@ -354,9 +354,19 @@ control, exceptions, reflection.
    keep the OrderedCollection-returning base (no corpus `select:` runs on an
    Array, so nothing relies on the old return).
 
+10. **Class-side `name`/`superclass`/`printString` on class literals.** A send to
+    a class literal (`Integer name`) went through `TranslateClassSend`, which only
+    looked for a class-side STATIC method — missing the `Behavior` INSTANCE methods
+    a class object answers — and bailed to nil. It now falls back, in order, to
+    the instance HelperRewrite (so `printString` reaches `stPrintOf`) then a
+    graceful runtime send to the class VALUE (`stSendExtOrNil`, reaching
+    `Behavior ext`); a genuine miss still answers nil, not a surprise DNU.
+    `ST_superclassOf` reports the bridge root / dart:core Object as nil (`Object
+    superclass` is nil), and `stPrintOf` prints a class Type as its stripped ST
+    name. (`st_flow_graph_builder.cc` + `st_natives.cc` + `cocoa.dart`.)
+
 ### 9b. Gaps the suites found, still OPEN (documented, not yet fixed)
 
-- Class-side `superclass`/`name` on native classes (Integer superclass → nil).
 - `String`/`Interval` `select:`/`reject:` still answer an OrderedCollection, not
   their own species; `printOn:` sent directly to a bare Dart Array with a fresh
   ST WriteStream mis-dispatches (arrays nested in ST collections print fine).

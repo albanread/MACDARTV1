@@ -27,3 +27,9 @@ ClassMirror class >> allClasses [ <stprim: stAllClasses> ]
 ClassMirror class >> selectorsOf: aBehavior [ <stprim: stSelectorsOf> ]
 ClassMirror class >> instanceVariablesOf: aBehavior [ <stprim: stInstVarNamesOf> ]
 ClassMirror class >> classVariablesOf: aBehavior [ <stprim: stClassVarNamesOf> ]
+
+"instVarNames read MACVM's Rust KLASS layout (`self instVarAt: 6`), garbage on
+ a Dart Type; re-point it at the class's real declared fields (same source the
+ ClassMirror uses). instVarAt:put: is the reflective store the corpus lacked."
+Behavior >> instVarNames [ <stprim: stInstVarNamesOf> ]
+Object >> instVarAt: i put: v [ <stprim: stInstVarAtPut> ]

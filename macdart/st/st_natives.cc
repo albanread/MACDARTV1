@@ -1498,6 +1498,60 @@ void ST_instVarAt(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, result);
 }
 
+// stInstVarAtPut(obj, i, v): the store twin of ST_instVarAt (the world's
+// <primitive: 24>). Same super-first field walk; sets the i-th instance field
+// and answers v. Reflective mutation the corpus had no working path for.
+void ST_instVarAtPut(Dart_NativeArguments args) {
+  Dart_Handle obj_h = Dart_GetNativeArgument(args, 0);
+  Dart_Handle val_h = Dart_GetNativeArgument(args, 2);
+  int64_t idx = 0;
+  if (Dart_IsError(Dart_IntegerToInt64(Dart_GetNativeArgument(args, 1), &idx))) {
+    STThrow("instVarAt:put: index must be an Integer");
+    return;
+  }
+  Thread* thread = Thread::Current();
+  std::string err;
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Object& o = Object::Handle(zone, Api::UnwrapHandle(obj_h));
+    const Object& v = Object::Handle(zone, Api::UnwrapHandle(val_h));
+    if (!o.IsInstance()) {
+      err = "instVarAt:put: receiver has no instance variables";
+    } else {
+      const Instance& inst = Instance::Cast(o);
+      std::vector<Class*> chain;
+      Class& c = Class::Handle(zone, inst.clazz());
+      while (!c.IsNull()) {
+        chain.push_back(&Class::ZoneHandle(zone, c.raw()));
+        c ^= c.SuperClass();
+      }
+      Array& fields = Array::Handle(zone);
+      Field& f = Field::Handle(zone);
+      int64_t seen = 0;
+      bool found = false;
+      for (intptr_t k = static_cast<intptr_t>(chain.size()) - 1; k >= 0 && !found; k--) {
+        fields = chain[k]->fields();
+        if (fields.IsNull()) continue;
+        for (intptr_t i = 0; i < fields.Length(); i++) {
+          f ^= fields.At(i);
+          if (f.is_static()) continue;
+          if (++seen == idx) {
+            inst.SetField(f, v.IsNull() ? Object::null_instance() : Instance::Cast(v));
+            found = true;
+            break;
+          }
+        }
+      }
+      if (!found) err = "instVarAt:put: index out of range";
+    }
+  }
+  if (!err.empty()) { STThrow(err.c_str()); return; }
+  Dart_SetReturnValue(args, val_h);   // answers the stored value
+}
+
+
 // --- class reflection (ST_PORTING_PLAN M5: ClassMirror / browseSnapshot) -----
 // MACVM read a class's name/super/selectors/ivars from the class OBJECT's own
 // layout (instVarAt: KLASS_*_INDEX). MACDART classes are Dart Types, so these

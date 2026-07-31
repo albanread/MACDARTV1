@@ -1395,6 +1395,7 @@ stBecome(a, b) native "ST_become";
 /// bare <primitive: 25> with nothing behind it, so it used to answer the
 /// receiver.
 stInstVarAt(r, i) native "ST_instVarAt";
+stInstVarAtPut(r, i, v) native "ST_instVarAtPut";
 
 // --- Low-level natives ------------------------------------------------------
 int _nsStringFromCString(String s) native "Cocoa_nsStringFromCString";
@@ -1592,9 +1593,31 @@ _stClassNamedRaw(name) native "ST_classNamed";
 stClassNamed(name) => _stClassNamedRaw(name is String ? name : name.toString());
 
 /// ST `perform:` — dynamic dispatch by selector string.
-stPerform1(r, sel) => stSend(r, stDisplayOf(sel), []);
+// `perform:` is a normal send by another name — and must dispatch in the SAME
+// order a compiled send does, or it diverges both ways: the bare stSend misses
+// the extension holders (`42 perform: #printString` / `#between:and:` raised),
+// while an ext-FIRST dispatch mis-routes a native operator (`perform: #+` found
+// LargeInteger's byte-based `+` and ran it on the wrong receiver). So:
+//   1. the pure rewrite-table helpers (printString/class/...) that are real
+//      methods nowhere — a runtime send can't reach them;
+//   2. the native + ST class chain (operators, user methods) — stSendTry;
+//   3. the extension holders (Magnitude>>between:and: on a Smi, ...);
+//   4. stSend, which raises the honest doesNotUnderstand.
+stPerform(r, String sel, List args) {
+  if (args.isEmpty) {
+    if (sel == 'printString') return stPrintOf(r);
+    if (sel == 'displayString' || sel == 'asString') return stDisplayOf(r);
+    if (sel == 'class') return stClassOf(r);
+  }
+  var box = _stSendTry(r, sel, args);
+  if (box != null) return box[0];
+  var hit = _stExtSendTry(r, sel, args);
+  if (hit != null) return hit[0];
+  return stSend(r, sel, args);
+}
+stPerform1(r, sel) => stPerform(r, stDisplayOf(sel), const []);
 stPerform2(r, sel, args) =>
-    stSend(r, stDisplayOf(sel), args is List ? args : [args]);
+    stPerform(r, stDisplayOf(sel), args is List ? args : [args]);
 int stObjcPoolPush() native "Cocoa_poolPush";
 stObjcPoolPop(p) native "Cocoa_poolPop";
 

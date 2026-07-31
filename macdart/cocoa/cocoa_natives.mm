@@ -781,6 +781,7 @@ void ST_becomeForward(Dart_NativeArguments args);
 void ST_become(Dart_NativeArguments args);
 void ST_shallowCopy(Dart_NativeArguments args);
 void ST_instVarAt(Dart_NativeArguments args);
+void ST_instVarAtPut(Dart_NativeArguments args);
 
 // Reverse-callback natives (defined in cocoa_callbacks.mm) — target-action,
 // delegates, and the syntax-highlight span applier.
@@ -887,6 +888,7 @@ static void Cocoa_sendMain(Dart_NativeArguments args) {
   V(ST_become, 2)                                                              \
   V(ST_shallowCopy, 1)                                                         \
   V(ST_instVarAt, 2)                                                           \
+  V(ST_instVarAtPut, 3)                                                        \
   V(Cocoa_registerCallbackDispatch, 1)                                         \
   V(Cocoa_makeActionTarget, 1)                                                 \
   V(Cocoa_wireAction, 2)                                                       \

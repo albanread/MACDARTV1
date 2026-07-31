@@ -112,6 +112,18 @@ bool _stHooked = false;
 /// send to a CLASS VALUE held in a variable into ST class-side dispatch, and
 /// Object.noSuchMethod route misses on native receivers into the world
 /// image's extension holders (Integer>>fib, ...).
+/// Forward a String-protocol send from a native Symbol / mutable String to the
+/// Dart String [s] the way a plain String receiver is handled: the "String ext"
+/// holder chain FIRST (tokenize:, substrings:, asUppercase, replaceAll:, …),
+/// then stSend as a last resort. Answers the [result] box the hook contract
+/// wants. (stSend alone does not walk the extension holders, so symbols and
+/// mutable strings used to miss the whole String extension protocol.)
+List _stStrForward(String s, String sel, List args) {
+  var hit = _stExtSendTry(s, sel, args);      // already a [result] box, or null
+  if (hit != null) return hit;
+  return [stSend(s, sel, args)];
+}
+
 void _stEnsureHooks() {
   if (_stHooked) return;
   _stHooked = true;
@@ -133,12 +145,12 @@ void _stEnsureHooks() {
       if (sel == 'asSymbol' || sel == 'yourself') return [r];
       if (sel == 'hash' || sel == 'identityHash') return [r.hashCode];
       if (sel == '=' || sel == '==') return [identical(r, args[0])];
-      return [stSend(r.name, sel, args)];      // forward String protocol
+      return _stStrForward(r.name, sel, args);    // full String protocol
     }
     if (r is StMutableString) {
       var v = _stMutProtocol(r, sel, args);
       if (!identical(v, _noStMut)) return [v];
-      return [stSend(r.toString(), sel, args)];   // read protocol via the string
+      return _stStrForward(r.toString(), sel, args);  // full String protocol
     }
     if (r is StChar) {
       var v = _stCharProtocol(r, sel, args);
@@ -654,7 +666,19 @@ _stDivSlow(a, b) => a / b;
 // hook, whose ignored-pragma bodies would answer self).
 stAsDouble(r) => r is num ? r.toDouble() : _stAsDoubleSlow(r);
 _stAsDoubleSlow(r) => r.asDouble();
-stTruncated(r) => r is num ? r.truncate() : (r is StChar ? r.code : _stTruncSlow(r));  // asInteger of a Character = its code
+// `asInteger` (aliased here): a number truncates, a Character answers its code,
+// a String PARSES (leading optional-sign digits, nil if none) — Smalltalk's
+// String>>asInteger, which the helper alias would otherwise route to .truncated.
+stTruncated(r) {
+  if (r is num) return r.truncate();
+  if (r is StChar) return r.code;
+  var s = _stStr(r);                       // String / mutable String
+  if (s != null) {
+    var m = new RegExp(r'-?[0-9]+').firstMatch(s);
+    return m == null ? null : int.parse(m.group(0));
+  }
+  return _stTruncSlow(r);
+}
 _stTruncSlow(r) => r.truncated();
 stRounded(r) => r is num ? r.round() : _stRoundSlow(r);
 _stRoundSlow(r) => r.rounded();

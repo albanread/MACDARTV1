@@ -11,6 +11,8 @@
 // method (their bodies are not compiled until Sprint 3).
 
 #include <dlfcn.h>    // dlsym(RTLD_DEFAULT, …) — the FFI floor (ST_PORTING_PLAN §3a)
+#include <pthread.h>  // pthread_sigmask — shield blocking FFI syscalls from SIGPROF
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -1036,8 +1038,17 @@ void ST_ffiCall(Dart_NativeArguments args) {
     }
   }
 
+  // Block SIGPROF across the call: the VM profiler's sampling signal otherwise
+  // interrupts a blocking syscall (connect/recv/send) into EINTR, which the
+  // corpus's verbatim blocking sockets don't expect. Restored immediately after,
+  // so the profiler loses at most one sample of a call that was blocked anyway.
   double out_d0 = 0.0;
+  sigset_t ffi_block, ffi_old;
+  sigemptyset(&ffi_block);
+  sigaddset(&ffi_block, SIGPROF);
+  pthread_sigmask(SIG_BLOCK, &ffi_block, &ffi_old);
   const uint64_t rx = ffi_call_aapcs(fn, gpr, fpr, stk, si, &out_d0);
+  pthread_sigmask(SIG_SETMASK, &ffi_old, NULL);
 
   if (ret == 'v') {
     Dart_SetReturnValue(args, Dart_Null());

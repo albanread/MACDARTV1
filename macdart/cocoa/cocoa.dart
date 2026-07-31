@@ -346,6 +346,7 @@ stEquals(a, b) {
   return _stEqualsSlow(a, b);
 }
 _stEqualsSlow(a, b) {
+  if (a == null) return false;                  // nil = x (nil=nil took identical)
   if (a is StSymbol) return false;              // identity already failed
   if (a is StChar) return b is StChar && a.code == b.code;  // $a = 'a' -> false
   if (a is StMutableString) {                   // (String new:..) = 'abc'

@@ -799,6 +799,12 @@ stAsSymbol(s) {
 }
 _stAsSymSlow(s) => s.asSymbol();
 
+/// The FFI floor (ST_PORTING_PLAN §3a): call a C function by name. The builder
+/// lowers a `<primitive: FFI function: #name ret: #r args: #(c c)>` method to
+/// stFfiCall([params], "name|ret|codes"). Word args/return for now (Posix +
+/// Time); doubles (Accel) arrive with the FPR trampoline.
+stFfiCall(List args, String desc) native "ST_ffiCall";
+
 /// Sorted copy of a Dart list (prelude asSortedCollection plumbing).
 stSortedOf(l) { var c = new List.from(l); c.sort(); return c; }
 

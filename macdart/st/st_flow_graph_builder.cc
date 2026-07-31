@@ -2419,6 +2419,30 @@ Fragment StGraphBuilder::TranslateStatements(
   return instructions;
 }
 
+// Parse a `<primitive: FFI function: #name ret: #r args: #( c c )>` pragma's
+// captured text into name / ret-code / concatenated arg-codes (e.g. "gg").
+// Returns false (leaving the method to compile normally) on anything malformed.
+static bool ParseFfiPragma(const std::string& t, std::string* name,
+                           std::string* ret, std::string* codes) {
+  const size_t fp = t.find("function: #");
+  const size_t rp = t.find("ret: #");
+  if (fp == std::string::npos || rp == std::string::npos) return false;
+  const size_t fs = fp + 11;  // strlen("function: #")
+  const size_t fe = t.find(' ', fs);
+  *name = t.substr(fs, fe == std::string::npos ? std::string::npos : fe - fs);
+  *ret = t.substr(rp + 6, 1);  // strlen("ret: #") == 6
+  codes->clear();
+  const size_t ap = t.find("args: #(");
+  if (ap != std::string::npos) {
+    const size_t as = ap + 8;  // strlen("args: #(")
+    const size_t ae = t.find(')', as);
+    for (size_t i = as; i < ae && i < t.size(); i++) {
+      if (t[i] != ' ' && t[i] != '\t') codes->push_back(t[i]);
+    }
+  }
+  return !name->empty() && !ret->empty();
+}
+
 FlowGraph* StGraphBuilder::Build(MethodNode* method) {
   PrepareScope(method);
 
@@ -2469,6 +2493,42 @@ FlowGraph* StGraphBuilder::Build(MethodNode* method) {
     prim_body += StaticCall(fn, argc);
     prim_body += Return();
     normal_entry->LinkTo(prim_body.entry);
+    return new (zone_) FlowGraph(*pf_, graph_entry_, next_block_id_ - 1);
+  }
+
+  // A `<primitive: FFI function: #name ret: #r args: #( c c )>` — the FFI floor
+  // (ST_PORTING_PLAN §3a). The whole body IS the call (a bare primitive): build
+  // [params] as a Dart List and hand it to stFfiCall(args, "name|ret|codes"),
+  // which dlsym's the C function and marshals per the codes. Malformed pragma
+  // falls through to normal compilation (answers self, as today).
+  for (size_t i = 0; i < method->pragmas.size(); i++) {
+    const std::string& text = method->pragmas[i].text;
+    if (text.compare(0, 15, "primitive: FFI ") != 0) continue;
+    std::string fname, fret, fcodes;
+    if (!ParseFfiPragma(text, &fname, &fret, &fcodes)) break;
+    const std::string desc = fname + "|" + fret + "|" + fcodes;
+    const Function& call =
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stFfiCall"));
+    const Function& new_list =
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stNewList"));
+    const Function& append =
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stListAppend"));
+    Fragment b;
+    b += CheckStackOverflow();
+    b += StaticCall(new_list, 0);                    // the args list
+    for (size_t a = 0; a < method->args.size(); a++) {
+      b += PushArgument();                           // list so far
+      b += LoadLocal(locals_[method->args[a]]);
+      b += PushArgument();
+      b += StaticCall(append, 2);                    // -> list (grown)
+    }
+    b += PushArgument();                             // args list  -> arg 0
+    b += Constant(String::ZoneHandle(
+             zone_, String::New(desc.c_str(), Heap::kOld)));
+    b += PushArgument();                             // descriptor -> arg 1
+    b += StaticCall(call, 2);
+    b += Return();
+    normal_entry->LinkTo(b.entry);
     return new (zone_) FlowGraph(*pf_, graph_entry_, next_block_id_ - 1);
   }
 

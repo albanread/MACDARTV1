@@ -10,6 +10,7 @@
 // surface: it inspects registration metadata only and never invokes an ST
 // method (their bodies are not compiled until Sprint 3).
 
+#include <dlfcn.h>    // dlsym(RTLD_DEFAULT, …) — the FFI floor (ST_PORTING_PLAN §3a)
 #include <stdio.h>
 #include <string.h>
 
@@ -913,6 +914,69 @@ void ST_asSymbol(Dart_NativeArguments args) {
     result = Api::NewHandle(thread, sym.raw());
   }
   Dart_SetReturnValue(args, result);
+}
+
+// The FFI floor, stage A (ST_PORTING_PLAN.md §3a): call a C function BY NAME
+// with word arguments. `stFfiCall(List args, String desc)` where desc is
+// "name|ret|codes" (codes: one char per arg, 'g' = a machine word — a Dart
+// int, which is also how an Alien address travels). Word-only for now: Posix +
+// Time are entirely word-args; doubles (Accel) need the FPR trampoline
+// (stage C). Fails SAFE via STThrow (catchable) on an unresolved symbol or an
+// unsupported type — a bad binding must never segv the isolate. Runs in native
+// state; the Dart embedding API used here is valid there.
+void ST_ffiCall(Dart_NativeArguments args) {
+  Dart_Handle list_h = Dart_GetNativeArgument(args, 0);
+  Dart_Handle desc_h = Dart_GetNativeArgument(args, 1);
+  const char* desc_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(desc_h, &desc_c)) || desc_c == NULL) {
+    STThrow("FFI: bad descriptor");
+    return;
+  }
+  const std::string desc(desc_c);
+  const size_t p1 = desc.find('|');
+  const size_t p2 = (p1 == std::string::npos) ? p1 : desc.find('|', p1 + 1);
+  if (p1 == std::string::npos || p2 == std::string::npos) {
+    STThrow("FFI: malformed descriptor");
+    return;
+  }
+  const std::string name = desc.substr(0, p1);
+  const char ret = desc[p1 + 1];
+  const std::string codes = desc.substr(p2 + 1);
+
+  void* fn = dlsym(RTLD_DEFAULT, name.c_str());
+  if (fn == NULL) {
+    STThrow(("FFI: unresolved symbol '" + name + "'").c_str());
+    return;
+  }
+
+  // Marshal word args into x0..x7 (arm64 AAPCS64). Extra register slots stay 0;
+  // the callee reads only the args its own prototype declares.
+  intptr_t n = 0;
+  Dart_ListLength(list_h, &n);
+  long gpr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  int gi = 0;
+  for (intptr_t i = 0; i < n && i < static_cast<intptr_t>(codes.size()); i++) {
+    const char code = codes[i];
+    if (code != 'g') {
+      STThrow(("FFI: arg code '" + std::string(1, code) +
+               "' unsupported yet (word-only stage A)").c_str());
+      return;
+    }
+    int64_t v = 0;
+    Dart_Handle e = Dart_ListGetAt(list_h, i);
+    Dart_IntegerToInt64(e, &v);   // non-int -> left 0 (defensive)
+    if (gi < 8) gpr[gi++] = static_cast<long>(v);
+  }
+
+  typedef long (*fn8)(long, long, long, long, long, long, long, long);
+  const long r = reinterpret_cast<fn8>(fn)(gpr[0], gpr[1], gpr[2], gpr[3],
+                                           gpr[4], gpr[5], gpr[6], gpr[7]);
+
+  if (ret == 'v') {
+    Dart_SetReturnValue(args, Dart_Null());
+  } else {
+    Dart_SetReturnValue(args, Dart_NewInteger(r));   // 'g' word return
+  }
 }
 
 // Smalltalk gcScavenge — force a new-space collection.

@@ -246,6 +246,9 @@ final List<Map> _kStDemos = <Map>[
   {'name': 'Benchmarks', 'cls': 'BenchmarkDashboard',
    'sel': 'chartForWidth:height:', 'kind': 'json', 'inst': false,
    'blurb': 'live cold-vs-warm perf chart (42) — runs the suite, ~seconds'},
+  {'name': 'FFT', 'cls': 'FftChart', 'sel': 'commandsForWidth:height:',
+   'kind': 'json', 'inst': true,
+   'blurb': '3-tone signal + spectrum via Accelerate vDSP FFT (61e) — the FFI floor live'},
 ];
 
 // Invoke a demo's producer selector — class-side (stInvokeStatic) or on a

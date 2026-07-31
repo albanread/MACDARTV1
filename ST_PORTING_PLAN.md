@@ -251,8 +251,11 @@ re-Accept any class in the image.
   Object's whole tree (114 children); Fraction ivars → [numerator, denominator].
   Remaining M5 (optional): primitiveOf:/methodSends:, browser deep features
   (senders/implementors via D1's send index, in-image).
-- **M6 — Numerics tail.** LargeInteger completeness A/B'd (byteAt:put: et
-  al.); NativeFloatArray perf pass (bulk copy without per-element sends).
+- **M6 — Numerics tail.** LargeInteger byte protocol **DONE (2026-07-31,
+  827e7c9)**: size (magnitude byte count) + byteAt: (1-based little-endian byte)
+  read the real Dart int; hash (self) and byteAt:put: (immutable int) are
+  documented deviations, not gaps. Remaining M6 (optional): NativeFloatArray
+  perf pass (bulk copy without per-element sends).
 
 Sequencing note: M1–M3 are dependency-ordered (everything sits on kernel +
 collections + strings); M4/M5 parallelize after M2; M6 floats. M4's stages

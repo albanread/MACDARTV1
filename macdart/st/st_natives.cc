@@ -608,14 +608,19 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
           hit = true;
         }
       }
+      // Only when the alloc intercept above did NOT already produce a result —
+      // otherwise the `else if (!probe)` tail would clobber a good native
+      // allocation with a bogus "no class-side method" error. That is exactly
+      // why `self new: n` on a bridged holder (an INHERITED with:with: whose
+      // self is "String ext") failed while the probe path (WriteStream's
+      // `collection class new:`) worked.
+      if (!hit) {
       const String& sel =
           String::Handle(zone, Symbols::New(thread, msel.c_str()));
       // The metaclass-shadow chain holds class-side methods.
       Function& fn = Function::Handle(zone);
-      Class& c = Class::Handle(zone);
-      if (!hit) {
-        c = ::st::FindStClassByName(thread, (cls_name + " class").c_str());
-      }
+      Class& c = Class::Handle(
+          zone, ::st::FindStClassByName(thread, (cls_name + " class").c_str()));
       while (!c.IsNull()) {
         if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
         fn ^= c.LookupStaticFunction(sel);
@@ -670,6 +675,7 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
         err = "stClassSend: class '" + cls_name +
               "' has no class-side method '" + selector + "'";
       }
+      }  // if (!hit) — the intercept already answered otherwise
     }
   }
   if (!err.empty()) {

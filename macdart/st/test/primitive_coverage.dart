@@ -228,6 +228,18 @@ void runProbes() {
   // the fast path it answered self WITHOUT pausing — the no-op case only.
   probe('Object>>halt', 'halt answers self, pauses when armed', () => st('haltIsSelf'), true);
   probe('String>>basicByteAt:put:', 'basicByteAt: 1 put: 65', () => st('basicBytePut'), 65);
+  // ClassMirror's reflection primitives answer self/empty — broken, but the
+  // workspace browser does not use them (it reflects the image + dart:mirrors),
+  // so held open like LargeInteger rather than implemented.
+  openProbe('ClassMirror>>allClasses', 'ClassMirror allClasses size',
+        () { var v = st('cmAllClasses'); return v is int && v > 0; }, true,
+        'ClassMirror reflection unimplemented (vestigial)');
+  openProbe('ClassMirror>>selectorsOf:', 'selectorsOf: Object size',
+        () { var v = st('cmSelectors'); return v is int && v > 0; }, true,
+        'ClassMirror reflection unimplemented (vestigial)');
+  openProbe('ClassMirror>>instanceVariablesOf:', 'instanceVariablesOf: Association',
+        () => st('cmIvars'), 2, 'ClassMirror reflection unimplemented (vestigial)');
+
   // basicPrint: has a side effect; the invariant is only "does not answer self
   // and does not crash the run".
   covered.add('TranscriptStream>>basicPrint:');

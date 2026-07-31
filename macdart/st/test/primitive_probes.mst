@@ -105,6 +105,13 @@ Object subclass: PrimProbe [
 
     "basicPrint: writes to the transcript — must not answer self or crash"
     doBasicPrint [ ^Transcript basicPrint: 'x' ]
+
+    "ClassMirror reflection (needs the world). Broken: the primitives answer
+     self/empty. Vestigial in MACDART (the browser reflects the SQLite image
+     and dart:mirrors, not ClassMirror), so tracked open, not fixed."
+    cmAllClasses [ ^ClassMirror allClasses size ]
+    cmSelectors  [ ^(ClassMirror selectorsOf: Object) size ]
+    cmIvars      [ ^(ClassMirror instanceVariablesOf: Association) size ]
 ]
 
 Object subclass: PrimCell [

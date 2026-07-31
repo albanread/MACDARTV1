@@ -233,9 +233,13 @@ re-Accept any class in the image.
   vDSP (reductions/scale/FFT) runs on a+b (its doubles pass by pointer through
   the mmap'd NativeFloatArray), and **cblas_dgemm** (2 fp scalars + 4 spilled
   words) computes a correct 2x2 product via NativeMatrix. Also fixed a stEquals
-  nil bug (`nil = x`) it surfaced. **M4 CORE COMPLETE.** Remaining M4 (optional):
-  the kqueue/non-blocking sockets subset → DNS + ping from the workspace
-  (61c/61d/75); an FFT demo in the demos pane. WIRE/BRIDGE-DART keep the few
+  nil bug (`nil = x`) it surfaced. Then the **FFT demo landed in the demos pane**
+  (9413984) and the **sockets/DNS/ping tier went live** (f55e4d3): Dns
+  blockingResolve: → real IPs, Ping → ICMP 4/4, TCP connect+send+recv → live
+  HTTP/1.1 200 — needing a SIGPROF mask around the FFI call (the profiler was
+  EINTR-ing blocking syscalls), asInteger-parses-a-String, and native
+  Symbol/mutable-String getting the full String-ext protocol. **M4 CORE +
+  SHOWCASE COMPLETE.** WIRE/BRIDGE-DART keep the few
   spots where Dart's library is simply better (SystemDictionary stprims,
   DateTime conveniences, Random). Blocking IO / Worker (62/62a, prim 220)
   deferred.

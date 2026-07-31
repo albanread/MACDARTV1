@@ -1610,6 +1610,10 @@ void StGraphBuilder::CollectLocals(Node* node, LocalScope* scope) {
         scope->AddVariable(i);
         synth2_[m] = i;
       }
+      if (m->selector == "ifNil:" || m->selector == "ifNotNil:" ||
+          m->selector == "ifNil:ifNotNil:" || m->selector == "ifNotNil:ifNil:") {
+        AllocSynth(m, "rcv", scope);            // receiver, once -> synth_
+      }
     } else {
       CollectLocals(m->receiver.get(), scope);
       for (size_t i = 0; i < m->args.size(); i++) {
@@ -1824,6 +1828,16 @@ bool StGraphBuilder::IsInlinableControlFlow(MessageNode* node) {
     return node->args.size() == 2 && IsBlockNode(node->args[0].get()) &&
            IsBlockNode(node->args[1].get());
   }
+  // The nil-test family is inlined like ifTrue: — a `receiver === nil` branch —
+  // so a LITERAL nil receiver works (a message to Dart null otherwise throws a
+  // raw NoSuchMethod that bypasses the ST NSM hook). Block-literal args only.
+  if (s == "ifNil:" || s == "ifNotNil:") {
+    return node->args.size() == 1 && IsBlockNode(node->args[0].get());
+  }
+  if (s == "ifNil:ifNotNil:" || s == "ifNotNil:ifNil:") {
+    return node->args.size() == 2 && IsBlockNode(node->args[0].get()) &&
+           IsBlockNode(node->args[1].get());
+  }
   if (s == "whileTrue:" || s == "whileFalse:") {
     return IsBlockNode(node->receiver.get()) && node->args.size() == 1 &&
            IsBlockNode(node->args[0].get());
@@ -1928,6 +1942,89 @@ Fragment StGraphBuilder::TranslateControlFlow(MessageNode* node,
       result = Fragment(instructions.entry, then_fragment.current);
     } else if (otherwise_fragment.is_open()) {
       result = Fragment(instructions.entry, otherwise_fragment.current);
+    } else {
+      result = instructions.closed();
+    }
+    if (value_context && result.is_open()) result += LoadLocal(value_temp_);
+    return result;
+  }
+
+  // --- ifNil: family (a `receiver === nil` branch, inlined) -------------
+  // Real Smalltalks compile these; we must too, because a message sent to Dart
+  // `null` throws a raw NoSuchMethod that never reaches the ST NSM hook. The
+  // receiver is evaluated ONCE into a temp (side effects; reused as the value
+  // and as a 1-arg ifNotNil: block's argument). Value rules: nil receiver ->
+  // the nil-block's value (or nil); non-nil receiver -> the notNil-block's
+  // value with its param bound to the receiver (or the receiver itself).
+  if (s == "ifNil:" || s == "ifNotNil:" || s == "ifNil:ifNotNil:" ||
+      s == "ifNotNil:ifNil:") {
+    BlockNode* nil_block = NULL;
+    BlockNode* notnil_block = NULL;
+    if (s == "ifNil:") {
+      nil_block = dynamic_cast<BlockNode*>(node->args[0].get());
+    } else if (s == "ifNotNil:") {
+      notnil_block = dynamic_cast<BlockNode*>(node->args[0].get());
+    } else if (s == "ifNil:ifNotNil:") {
+      nil_block = dynamic_cast<BlockNode*>(node->args[0].get());
+      notnil_block = dynamic_cast<BlockNode*>(node->args[1].get());
+    } else {  // ifNotNil:ifNil:
+      notnil_block = dynamic_cast<BlockNode*>(node->args[0].get());
+      nil_block = dynamic_cast<BlockNode*>(node->args[1].get());
+    }
+    LocalVariable* recv = synth_.count(node) ? synth_[node] : NULL;
+    if (recv == NULL) return Unsupported(node, "ifNil: without a receiver temp");
+
+    Fragment instructions = TranslateExpression(node->receiver.get());
+    instructions += StoreLocal(recv);
+    instructions += Drop();
+    instructions += LoadLocal(recv);
+    instructions += NullConstant();
+    TargetEntryInstr* nil_entry;
+    TargetEntryInstr* notnil_entry;
+    instructions += BranchIfStrictEqual(&nil_entry, &notnil_entry);
+
+    // The non-nil arm binds a 1-arg block's parameter to the receiver.
+    Fragment bind;
+    if (notnil_block != NULL && notnil_block->args.size() >= 1) {
+      LocalVariable* p = LookupLocal(notnil_block->args[0]);
+      if (p != NULL) {
+        bind += LoadLocal(recv);
+        bind += StoreLocal(p);
+        bind += Drop();
+      }
+    }
+
+    Fragment nil_frag(nil_entry);
+    Fragment notnil_frag(notnil_entry);
+    if (value_context) {
+      nil_frag += ArmValue(nil_block);  // nil-block value, or nil
+      notnil_frag += bind;
+      if (notnil_block != NULL) {
+        Fragment v = InlineBlockValue(notnil_block);
+        if (v.is_open()) v += StoreToValueTemp();
+        notnil_frag += v;
+      } else {                          // ifNil: with no notNil arm -> receiver
+        notnil_frag += LoadLocal(recv);
+        notnil_frag += StoreToValueTemp();
+      }
+    } else {
+      if (nil_block != NULL) nil_frag += InlineBlockStmts(nil_block);
+      if (notnil_block != NULL) {
+        notnil_frag += bind;
+        notnil_frag += InlineBlockStmts(notnil_block);
+      }
+    }
+
+    Fragment result;
+    if (nil_frag.is_open() && notnil_frag.is_open()) {
+      JoinEntryInstr* join = BuildJoinEntry();
+      nil_frag += Goto(join);
+      notnil_frag += Goto(join);
+      result = Fragment(instructions.entry, join);
+    } else if (nil_frag.is_open()) {
+      result = Fragment(instructions.entry, nil_frag.current);
+    } else if (notnil_frag.is_open()) {
+      result = Fragment(instructions.entry, notnil_frag.current);
     } else {
       result = instructions.closed();
     }

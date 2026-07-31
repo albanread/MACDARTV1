@@ -311,13 +311,16 @@ control, exceptions, reflection.
 4. **Dart-List collection equality.** `#(1 4 9) = #(1 4 9)` threw (a literal
    array is a Dart `_List`, no ST `=`). `_stEqualsSlow` now compares two Lists
    element-wise, recursively (Array>>= semantics).
+5. **`nil ifNil:` / `ifNotNil:` on a literal nil.** A message to Dart `null`
+   throws a raw NoSuchMethod that bypasses the ST NSM hook, so the whole
+   `ifNil:`/`ifNotNil:`/`ifNil:ifNotNil:`/`ifNotNil:ifNil:` family is now
+   INLINED in the builder like `ifTrue:` — a `receiver === nil` branch,
+   receiver evaluated once, a 1-arg `ifNotNil:` block bound to the receiver.
+   Works for nil and non-nil alike; the corpus's heavy `ifNotNil:` use is
+   unchanged. (`IsInlinableControlFlow` + `CollectLocals` + `TranslateControlFlow`.)
 
 ### 9b. Gaps the suites found, still OPEN (documented, not yet fixed)
 
-- `nil ifNil:` / `nil ifNotNil:` — a literal nil bypasses the ST NSM hook
-  (Dart `null` throws NoSuchMethod directly). `ifNotNil:` works on non-nil
-  receivers (all over the corpus). Fix = inline the `ifNil:` family in the
-  builder like `ifTrue:`.
 - Exception `return:` and `retry` (ANSI resumption) are unimplemented and raise
   an uncatchable Dart NoSuchMethod; `ZeroDivide` resolves to nil; native Dart
   errors (`RangeError` from an out-of-range `at:`) are not catchable ST Errors.

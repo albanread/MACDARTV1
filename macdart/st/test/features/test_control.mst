@@ -1,7 +1,5 @@
 "Feature test: control flow, blocks, closures, non-local return. Expected values
- are the human-verified spec (standard Smalltalk block/control semantics).
- KNOWN GAPS (tested elsewhere / documented, not asserted here): ifNil:/ifNotNil:
- on a literal nil receiver (nil bypasses the ST NSM hook)."
+ are the human-verified spec (standard Smalltalk block/control semantics)."
 STestCase subclass: TestControl [
     tests [
         "--- conditionals ---"
@@ -12,6 +10,17 @@ STestCase subclass: TestControl [
         self assert: 42 notNil label: '42 notNil'.
         self check: ((5 > 3) and: [ 2 < 4 ]) is: true label: 'and: both'.
         self check: ((5 < 3) or: [ 2 < 4 ]) is: true label: 'or: short-circuit'.
+
+        "--- the nil-test family (inlined; works on a LITERAL nil too) ---"
+        self check: (nil ifNil: [ 'wasNil' ]) is: 'wasNil' label: 'nil ifNil:'.
+        self check: (5 ifNil: [ 'wasNil' ]) is: 5 label: 'non-nil ifNil: -> receiver'.
+        self check: (nil ifNotNil: [ 'x' ]) is: nil label: 'nil ifNotNil: -> nil'.
+        self check: (5 ifNotNil: [ 'notNil' ]) is: 'notNil' label: 'non-nil ifNotNil:'.
+        self check: (5 ifNotNil: [ :x | x + 1 ]) is: 6 label: 'ifNotNil: binds receiver'.
+        self check: (nil ifNil: [ 'A' ] ifNotNil: [ :x | 'B' ]) is: 'A' label: 'ifNil:ifNotNil: on nil'.
+        self check: (5 ifNil: [ 'A' ] ifNotNil: [ :x | x * 2 ]) is: 10 label: 'ifNil:ifNotNil: on value'.
+        self check: (5 ifNotNil: [ :x | x * 2 ] ifNil: [ 'A' ]) is: 10 label: 'ifNotNil:ifNil: on value'.
+        self check: (self evalOnce) is: 1 label: 'ifNil: evaluates receiver once'.
 
         "--- loops ---"
         self check: (self sumTo: 10) is: 55 label: 'whileTrue: sum'.
@@ -42,4 +51,7 @@ STestCase subclass: TestControl [
     makeCounter [ | n b | n := 0. b := [ n := n + 1 ]. b value. b value. b value. ^n ]
     firstEven: aColl [ aColl do: [ :x | x even ifTrue: [ ^x ] ]. ^-1 ]
     cascadeBuild [ | c | c := OrderedCollection new. c add: 1; add: 2; add: 3. ^c size ]
+    | sideCalls |
+    bumpNil [ sideCalls := sideCalls + 1. ^nil ]
+    evalOnce [ sideCalls := 0. self bumpNil ifNil: [ 'n' ] ifNotNil: [ :x | x ]. ^sideCalls ]
 ]

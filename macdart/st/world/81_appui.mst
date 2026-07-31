@@ -1,0 +1,100 @@
+"81_appui.mst — AppUI: the Apps-player widget surface, for Smalltalk apps.
+
+ A Smalltalk app is a class with `build: ui` (and an optional `stop`), exactly
+ mirroring the Dart contract (apps/*.dart: build(ui)). The player hands build:
+ an AppUI, whose widget methods are <stprim: stAppUi*> calls routed through
+ dart:cocoa's pluggable app-surface hook — the language isolate points that
+ hook at the live AppSurface while the app runs (the STHostService pattern,
+ applied to widgets). Blocks given to onText:/onClick:/... land in the
+ surface's handler map AS Smalltalk blocks and are invoked directly when the
+ pane fires an event; typed payloads arrive as the block's argument (a String
+ for text/click/select, true/false for toggles, a number for slides, x and y
+ for canvas clicks — a 2-argument block).
+
+ Frames are literal arrays { x. y. w. h } in TOP-LEFT coordinates (the pane
+ flips for AppKit); colours are { r. g. b } with 0.0..1.0 channels. The
+ column/row/grid layout helpers are pure Smalltalk (no primitive): they answer
+ an Array of frames. Outside the Apps player every primitive raises an Error
+ ('no app surface in this isolate') — catchable, never a silent no-op, so a
+ misplaced doit says what is wrong.
+
+ Install an app from the Apps menu (an .mst in apps/ whose first line is a
+ comment starting App: — the ST twin of the Dart // App: header); after that
+ it is an ordinary image class you edit in the Browser (Accept rebuilds the
+ running app in place, keeping its instance state)."
+
+Object subclass: AppUI [
+    "── the window ──"
+    title: aString [ <stprim: stAppUiTitle> ]
+    clear [ <stprim: stAppUiClear> ]
+    width [ <stprim: stAppUiWidth> ]
+    height [ <stprim: stAppUiHeight> ]
+
+    "── static content ──"
+    label: id text: t frame: f [ ^self label: id text: t frame: f align: 'left' ]
+    label: id text: t frame: f align: a [ <stprim: stAppUiLabel> ]
+    box: id title: t frame: f [ <stprim: stAppUiBox> ]
+    progress: id frame: f min: lo max: hi value: v [ <stprim: stAppUiProgress> ]
+
+    "── inputs (blocks fire on pane events) ──"
+    field: id text: t frame: f onText: aBlock [
+        ^self field: id text: t frame: f onText: aBlock onEnter: nil
+    ]
+    field: id text: t frame: f onText: aBlock onEnter: eBlock [ <stprim: stAppUiField> ]
+    button: id title: t frame: f onClick: aBlock [ <stprim: stAppUiButton> ]
+    checkbox: id label: t frame: f value: aBool onToggle: aBlock [ <stprim: stAppUiCheckbox> ]
+    slider: id frame: f min: lo max: hi value: v onSlide: aBlock [ <stprim: stAppUiSlider> ]
+    popup: id items: anArray frame: f selected: s onSelect: aBlock [ <stprim: stAppUiPopup> ]
+    secure: id text: t frame: f onText: aBlock onEnter: eBlock [ <stprim: stAppUiSecure> ]
+    list: id items: anArray frame: f onSelect: aBlock [ <stprim: stAppUiList> ]
+
+    "── containers ──"
+    tabs: id items: anArray frame: f [ <stprim: stAppUiTabs> ]
+    tab: id index: n [ <stprim: stAppUiTab> ]
+    scroll: id frame: f width: w height: h [ <stprim: stAppUiScroll> ]
+    into: id [ <stprim: stAppUiInto> ]
+    pane [ <stprim: stAppUiPane> ]
+
+    "── the canvas (draw ops: clear/rect/oval/line/text/blit) ──"
+    canvas: id frame: f bg: rgb onClick: aBlock [ <stprim: stAppUiCanvas> ]
+    draw: id ops: anArray [ <stprim: stAppUiDraw> ]
+
+    "── mutation of a live widget ──"
+    set: id text: t [ ^self basicSet: id key: 'text' value: t ]
+    set: id title: t [ ^self basicSet: id key: 'title' value: t ]
+    set: id value: v [ ^self basicSet: id key: 'value' value: v ]
+    set: id enabled: aBool [ ^self basicSet: id key: 'enabled' value: aBool ]
+    set: id checked: aBool [ ^self basicSet: id key: 'checked' value: aBool ]
+    set: id items: anArray [ ^self basicSet: id key: 'items' value: anArray ]
+    set: id selected: s [ ^self basicSet: id key: 'selected' value: s ]
+    basicSet: id key: k value: v [ <stprim: stAppUiSet> ]
+    remove: id [ <stprim: stAppUiRemove> ]
+    focus: id [ <stprim: stAppUiFocus> ]
+
+    "── layout math (pure Smalltalk — frames for a column/row/grid of cells) ──"
+    columnX: x y: y w: w h: h count: n gap: g [
+        | out |
+        out := Array new: n.
+        1 to: n do: [ :i |
+            out at: i put: { x. y + ((i - 1) * (h + g)). w. h } ].
+        ^out
+    ]
+    rowX: x y: y w: w h: h count: n gap: g [
+        | out |
+        out := Array new: n.
+        1 to: n do: [ :i |
+            out at: i put: { x + ((i - 1) * (w + g)). y. w. h } ].
+        ^out
+    ]
+    gridX: x y: y w: w h: h cols: nc rows: nr gapX: gx gapY: gy [
+        | out k |
+        out := Array new: nc * nr.
+        k := 1.
+        1 to: nr do: [ :r |
+            1 to: nc do: [ :c |
+                out at: k put: { x + ((c - 1) * (w + gx)).
+                                 y + ((r - 1) * (h + gy)). w. h }.
+                k := k + 1 ] ].
+        ^out
+    ]
+]

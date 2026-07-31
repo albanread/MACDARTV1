@@ -84,6 +84,21 @@ else
   skip "stgame breakout" "no world in this image"
 fi
 
+# ST apps in the Apps player: install the .mst from apps/, run it, read the
+# widget tree back (the exact-fraction result proves build: ran end to end).
+if [ "$world" = 1 ]; then
+  chk "appinstall fractions" "running FractionsApp" "$(ctl appinstall Fractions)"
+  chk "apps lists it"        "FractionsApp"         "$(ctl apps)"
+  at="$(ctl apptree)"
+  case "$at" in
+    *"1/3 + 1/6  =  1/2"*) ok "st app computes" "exact 1/2 shown" ;;
+    *) bad "st app computes" "$at" ;;
+  esac
+  chk "appstop"              "ok"                   "$(ctl appstop)"
+else
+  skip "st app" "no world in this image"
+fi
+
 # scan the live log for anything that smells like a broken pane
 if [ -f "$LOG" ] && grep -qiE "NoSuchMethod|StSymbol|Cocoa: send to a released|Smalltalk browser: ERR|Unhandled exception" "$LOG"; then
   bad "log clean" "$(grep -iE 'NoSuchMethod|StSymbol|browser: ERR' "$LOG" | tail -1)"

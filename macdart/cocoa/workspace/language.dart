@@ -889,8 +889,13 @@ String _stDoit(String code) {
   var n = ++_stDoitN;
   var cls = 'STDoIt' + n.toString();
   var body;
+  // A STATEMENT period is a dot not followed by a digit (else `0.5 sin` reads
+  // as two statements, runs verbatim without ^, and answers the class name —
+  // the STDoItN bug). String literals are blanked first so 'a.b' can't fake one.
+  var blanked = code.replaceAll(new RegExp(r"'[^']*'"), "''");
+  var hasStatements = blanked.contains(new RegExp(r'\.(?!\d)'));
   if (code.contains('^')) body = code;
-  else if (code.startsWith('|') || code.contains('.')) body = code;
+  else if (code.startsWith('|') || hasStatements) body = code;
   else body = '^ ( ' + code + ' )';
   var src = 'Object subclass: ' + cls + ' [ ' + cls +
       ' class >> doIt [ ' + body + ' ] ]';
@@ -1775,7 +1780,13 @@ List _appClasses() {
   // Anchored to a line, so a class whose COMMENT mentions build(ui) — this
   // project's own example does — is not mistaken for an app.
   var re = new RegExp(r'^\s*\w*\s*build\s*\(', multiLine: true);
-  _decls.forEach((name, src) { if (re.hasMatch(src)) out.add(name); });
+  // The Smalltalk arm: an st-class decl defining `build: aUi [` is an app too
+  // (the AppUI face, 81_appui.mst). Line-anchored for the same comment reason.
+  var reSt = new RegExp(r'^\s*build:\s*\w+\s*\[', multiLine: true);
+  _decls.forEach((name, src) {
+    if (re.hasMatch(src)) { out.add(name); return; }
+    if (_kindOf(src) == 'st-class' && reSt.hasMatch(src)) out.add(name);
+  });
   out.sort();
   return out;
 }
@@ -1784,14 +1795,30 @@ List _appClasses() {
 // is checked to be an identifier before it gets there.
 final RegExp _identRe = new RegExp(r'^[A-Za-z_]\w*$');
 
+// Is the running app a Smalltalk one? Decides how build/stop are dispatched
+// (stSend vs plain Dart call) and gates the AppUI hook's lifetime.
+bool _appIsSt = false;
+
 /// arg: [className, width, height]
 String _appRun(List arg) {
   var name = arg[0].toString();
   if (!_identRe.hasMatch(name)) return 'ERR: not a class name: ' + name;
   if (!_decls.containsKey(name)) return 'ERR: no class ' + name + ' in the image';
   _appStop();
-  var r = wsEval('_app = new ' + name + '()');
-  if (r.startsWith('ERR:')) return 'ERR: could not create ' + name + ' — ' + r;
+  if (_kindOf(_decls[name]) == 'st-class') {
+    // A Smalltalk app: instantiate through the ST engine, not wsEval. stNew is
+    // the allocator — most ST classes have no explicit class-side `new` (the
+    // in-language `Foo new` falls back to allocation the same way).
+    try {
+      _app = stNew(name);
+    } catch (e) {
+      return 'ERR: could not create ' + name + ' — ' + e.toString();
+    }
+    _appIsSt = true;
+  } else {
+    var r = wsEval('_app = new ' + name + '()');
+    if (r.startsWith('ERR:')) return 'ERR: could not create ' + name + ' — ' + r;
+  }
   _appClass = name;
   _appGen++;
   _surface = new AppSurface('pane', _appGen, _ui,
@@ -1811,7 +1838,15 @@ String _appBuild(List arg) {
   }
   _surface.clear();
   try {
-    _app.build(_surface);
+    if (_appIsSt) {
+      // Point the world's AppUI face at THIS surface for the app's lifetime,
+      // then run the ST contract: `build: ui`. Blocks the app registers land
+      // in _handlers as ST closures — _appEvent fires them like any Dart one.
+      stAppUiHook = _stAppUiDispatch;
+      stSend(_app, 'build:', [stNew('AppUI')]);
+    } else {
+      _app.build(_surface);
+    }
   } catch (e) {
     return 'ERR: ' + _appClass + '.build() threw — ' + e.toString();
   }
@@ -1823,13 +1858,96 @@ String _appStop() {
   // surface nobody can see. `stop()` is optional — most apps have no teardown —
   // so a missing one is not an error.
   if (_app != null) {
-    try { _app.stop(); } catch (e) { }
+    if (_appIsSt) {
+      try { stSendExtOrNil(_app, 'stop', []); } catch (e) { }
+    } else {
+      try { _app.stop(); } catch (e) { }
+    }
   }
   if (_surface != null) { _surface.clear(); _surface.flush(); }
+  stAppUiHook = null;                  // the AppUI face goes dark with the app
+  _appIsSt = false;
   _app = null;
   _surface = null;
   _appClass = null;
   return 'ok';
+}
+
+// The AppUI verb fan-out: 81_appui.mst's <stprim: stAppUi*> calls arrive here
+// (dart:cocoa routes them through stAppUiHook) and become AppSurface calls on
+// the LIVE surface. ST strings/arrays/blocks arrive as their Dart selves; the
+// only shaping needed is named-parameter fan-out. Kept as one switch so the
+// wire stays greppable next to the surface it drives.
+_stAppUiDispatch(String verb, List a) {
+  var s = _surface;
+  if (s == null) return 'ERR: no app surface (the app was stopped)';
+  String str(x) => x == null ? null : x.toString();
+  double dbl(x) => x == null ? 0.0 : (x as num).toDouble();
+  switch (verb) {
+    case 'title': s.title(str(a[0])); break;
+    case 'clear': s.clear(); break;
+    case 'width': return s.width;
+    case 'height': return s.height;
+    case 'label':
+      s.label(str(a[0]), text: str(a[1]), frame: a[2], align: str(a[3]));
+      break;
+    case 'field':
+      s.field(str(a[0]), text: str(a[1]), frame: a[2],
+          onText: a[3], onEnter: a[4]);
+      break;
+    case 'button':
+      s.button(str(a[0]), title: str(a[1]), frame: a[2], onClick: a[3]);
+      break;
+    case 'checkbox':
+      s.checkbox(str(a[0]), label: str(a[1]), frame: a[2],
+          value: a[3] == true, onToggle: a[4]);
+      break;
+    case 'slider':
+      s.slider(str(a[0]), frame: a[1], min: dbl(a[2]), max: dbl(a[3]),
+          value: dbl(a[4]), onSlide: a[5]);
+      break;
+    case 'popup':
+      s.popup(str(a[0]), items: a[1], frame: a[2], selected: str(a[3]),
+          onSelect: a[4]);
+      break;
+    case 'secure':
+      s.secure(str(a[0]), text: str(a[1]), frame: a[2],
+          onText: a[3], onEnter: a[4]);
+      break;
+    case 'progress':
+      s.progress(str(a[0]), frame: a[1], min: dbl(a[2]), max: dbl(a[3]),
+          value: dbl(a[4]));
+      break;
+    case 'box': s.box(str(a[0]), title: str(a[1]), frame: a[2]); break;
+    case 'list':
+      s.list(str(a[0]), items: a[1], frame: a[2], onSelect: a[3]);
+      break;
+    case 'tabs': s.tabs(str(a[0]), items: a[1], frame: a[2]); break;
+    case 'tab': s.tab(str(a[0]), (a[1] as num).toInt()); break;
+    case 'scroll':
+      s.scroll(str(a[0]), frame: a[1], width: dbl(a[2]), height: dbl(a[3]));
+      break;
+    case 'into': s.into(str(a[0])); break;
+    case 'pane': s.pane(); break;
+    case 'canvas':
+      s.canvas(str(a[0]), frame: a[1], bg: a[2], onClick: a[3]);
+      break;
+    case 'draw': s.draw(str(a[0]), a[1]); break;
+    case 'set':
+      var id = str(a[0]), key = str(a[1]), v = a[2];
+      if (key == 'text') s.set(id, text: str(v));
+      else if (key == 'title') s.set(id, title: str(v));
+      else if (key == 'value') s.set(id, value: v as num);
+      else if (key == 'enabled') s.set(id, enabled: v == true);
+      else if (key == 'checked') s.set(id, checked: v == true);
+      else if (key == 'items') s.set(id, items: v);
+      else if (key == 'selected') s.set(id, selected: str(v));
+      break;
+    case 'remove': s.remove(str(a[0])); break;
+    case 'focus': s.focus(str(a[0])); break;
+    default: return 'ERR: unknown app-ui verb ' + verb;
+  }
+  return null;
 }
 
 /// arg: [id, kind, value] — delivered as an ordinary request, so the watchdog

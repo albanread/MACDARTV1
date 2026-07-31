@@ -91,6 +91,10 @@ static const HelperRewrite kHelperRewrites[] = {
     {"ln", "stLn", 0},          {"exp", "stExp", 0},
     {"sin", "stSin", 0},        {"cos", "stCos", 0},
     {"tan", "stTan", 0},        {"atan", "stAtan", 0},
+    // Smalltalk spellings of the arc functions (the corpus never declared
+    // them, so `1.5 arcTan` was a raw DNU on a native double).
+    {"arcTan", "stAtan", 0},    {"arcSin", "stArcSin", 0},
+    {"arcCos", "stArcCos", 0},
     {"bitShift:", "stBitShift", 1},
     {"compare:", "stCompare", 1},
     // Round two of the same audit: each of these was a bare <primitive: N>

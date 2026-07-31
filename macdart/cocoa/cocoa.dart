@@ -8,7 +8,8 @@
 library dart.cocoa;
 
 import 'dart:_internal' as internal show VMLibraryHooks;
-import 'dart:math' as math show sqrt, log, exp, sin, cos, tan, atan;
+import 'dart:math' as math
+    show sqrt, log, exp, sin, cos, tan, atan, asin, acos, pow;
 import 'dart:mirrors' show MirrorSystem;
 import 'dart:developer' as developer show debugger;
 
@@ -170,6 +171,44 @@ void _stEnsureHooks() {
       if (!identical(v, _noStChar)) return [v];
       // not Character protocol — a Character IS NOT a String, so anything else
       // is a genuine doesNotUnderstand (fall through to the reify path).
+    }
+    // Dart's num operators COERCE an unknown right operand by delegating to a
+    // private on it — `2 + (1/3)` compiles to int.+ which calls
+    // `other._addFromInteger(2)`. An ST numeric (Fraction, ScaledDecimal) has
+    // no such private, so mixed int-op-Fraction arithmetic died as a dNU.
+    // Translate each coercion private to the receiver's own ST protocol (the
+    // int is the LEFT operand: _subFromInteger(n) means n - recv). Division
+    // builds the result from numerator/denominator directly — `reciprocal` is
+    // `1 / self`, which would loop straight back through this hook.
+    {
+      var at = sel.indexOf('@');                 // privates carry @libraryKey
+      var bare = at > 0 ? sel.substring(0, at) : sel;
+      if (bare == '_addFromInteger') return [stSend(r, '+', [args[0]])];
+      if (bare == '_mulFromInteger') return [stSend(r, '*', [args[0]])];
+      if (bare == '_subFromInteger') {
+        return [stSend(stSend(r, 'negated', []), '+', [args[0]])];
+      }
+      if (bare == '_greaterThanFromInteger') {
+        return [stSend(r, '<', [args[0]])];      // n > recv  ==  recv < n
+      }
+      if (bare == '_equalToInteger') return [stSend(r, '=', [args[0]])];
+      if (bare == 'toDouble') return [stSend(r, 'asDouble', [])];
+      if (bare == '_divFromInteger' || bare == '_truncDivFromInteger' ||
+          bare == '_moduloFromInteger') {
+        var num = _stSendTry(r, 'numerator', const []);
+        var den = _stSendTry(r, 'denominator', const []);
+        if (num != null && den != null) {
+          // n / (p/q) = n*q/p — exact, through the world's own constructor.
+          var q = stInvokeStatic('Fraction', 'numerator:denominator:',
+              [args[0] * den[0], num[0]]);
+          if (bare == '_divFromInteger') return [q];
+          var fl = stSend(q, 'floor', []);       // n // recv
+          if (bare == '_truncDivFromInteger') return [fl];
+          // n \\ recv = n - (n // recv) * recv
+          return [stSend(stSend(stSend(r, '*', [fl]), 'negated', []),
+              '+', [args[0]])];
+        }
+      }
     }
     var hit = _stExtSendTry(r, sel, args);
     if (hit != null) return hit;
@@ -785,7 +824,22 @@ stDivide(a, b) {
   if (a is num && b is num) return a / b;
   return _stDivSlow(a, b);
 }
-_stDivSlow(a, b) => a / b;
+_stDivSlow(a, b) {
+  // A native number over an ST numeric: Dart's `int./` is DOUBLE division and
+  // would call toDouble on the Fraction — but Smalltalk `2 / (1/3)` is EXACT
+  // (6). Build n / (p/q) = n*q/p through the world's own constructor; a
+  // double (or a fraction-less ST numeric) falls back to double division.
+  if (a is num && b is! num) {
+    var p = _stSendTry(b, 'numerator', const []);
+    var q = _stSendTry(b, 'denominator', const []);
+    if (a is int && p != null && q != null) {
+      return stInvokeStatic('Fraction', 'numerator:denominator:',
+          [a * q[0], p[0]]);
+    }
+    return (a as num) / (stSend(b, 'asDouble', []) as num);
+  }
+  return a / b;
+}
 
 // Numeric conversions/negation: Dart-num fast paths (the world kernel's
 // versions are <primitive:>-backed and must never be reached via the NSM
@@ -834,6 +888,41 @@ stTan(r) => r is num ? math.tan(r) : _stTanSlow(r);
 _stTanSlow(r) => r.tan();
 stAtan(r) => r is num ? math.atan(r) : _stAtanSlow(r);
 _stAtanSlow(r) => r.atan();
+// The Smalltalk spellings (arcTan/arcSin/arcCos) — the corpus only ever
+// declared `atan`, so `1.5 arcTan` was a raw DNU on a native double.
+stArcSin(r) => r is num ? math.asin(r) : math.asin(stSend(r, 'asDouble', []));
+stArcCos(r) => r is num ? math.acos(r) : math.acos(stSend(r, 'asDouble', []));
+
+/// `raisedTo:` for EVERY exponent (the corpus's 51_number_ext version errors on
+/// a non-integer). Integer exponents stay EXACT — an int base promotes through
+/// the bignum tower, an ST numeric (Fraction) accumulates via its own `*`, and
+/// a negative exponent answers the exact reciprocal (a Fraction for an int
+/// base, built directly — `reciprocal` is 1/self, which routes through the
+/// int-coercion path). A fractional exponent goes through doubles (math.pow).
+stRaisedTo(r, n) {
+  if (n is int) {
+    var m = n < 0 ? -n : n;
+    var acc;
+    if (r is num) {
+      acc = r is int ? 1 : 1.0;
+      for (var i = 0; i < m; i++) acc = acc * r;
+    } else {
+      acc = 1;
+      for (var i = 0; i < m; i++) {
+        acc = stSend(r, '*', [acc]);   // exact for Fraction/ScaledDecimal
+      }
+    }
+    if (n >= 0) return acc;
+    if (acc is int) {
+      return stInvokeStatic('Fraction', 'numerator:denominator:', [1, acc]);
+    }
+    if (acc is double) return 1.0 / acc;
+    return stSend(acc, 'reciprocal', []);
+  }
+  var base = r is num ? r : stSend(r, 'asDouble', []);
+  var e = n is num ? n : stSend(n, 'asDouble', []);
+  return math.pow((base as num).toDouble(), (e as num).toDouble());
+}
 
 /// Smalltalk `bitShift:` is signed: positive shifts left, negative right.
 stBitShift(r, n) {
@@ -1323,6 +1412,55 @@ stHostNewClass(svc, text) => _stHost('newClass', [text]);
 stHostAcceptClass(svc, text) => _stHost('acceptClass', [text]);
 stHostSetComment(svc, cls, text) => _stHost('setComment', [cls, text]);
 stHostRemoveClass(svc, cls) => _stHost('removeClass', [cls]);
+
+/// The Apps-player surface hook — the workspace language isolate installs a
+/// closure (verb, args) routing onto the LIVE AppSurface while an ST app runs
+/// (the STHostService pattern, applied to widgets). The world's AppUI class
+/// (81_appui.mst) is the ST face: each widget method is one stAppUi* prim
+/// below. ST blocks pass through UNTOUCHED into the surface's handler map —
+/// they are directly callable as Dart closures, so 'appevent' dispatch needs
+/// no ST-specific path at all. No hook (headless, or outside the player) is a
+/// programmer error and throws — catchable ST-side as an Error.
+var stAppUiHook;
+_stAppUi(String verb, List args) {
+  if (stAppUiHook == null) {
+    throw 'ERR no app surface in this isolate (run me from the Apps player)';
+  }
+  return stAppUiHook(verb, args);
+}
+
+stAppUiTitle(u, t) => _stAppUi('title', [t]);
+stAppUiClear(u) => _stAppUi('clear', const []);
+stAppUiLabel(u, id, t, f, align) => _stAppUi('label', [id, t, f, align]);
+stAppUiField(u, id, t, f, onText, onEnter) =>
+    _stAppUi('field', [id, t, f, onText, onEnter]);
+stAppUiButton(u, id, t, f, onClick) => _stAppUi('button', [id, t, f, onClick]);
+stAppUiCheckbox(u, id, label, f, value, onToggle) =>
+    _stAppUi('checkbox', [id, label, f, value, onToggle]);
+stAppUiSlider(u, id, f, min, max, value, onSlide) =>
+    _stAppUi('slider', [id, f, min, max, value, onSlide]);
+stAppUiPopup(u, id, items, f, selected, onSelect) =>
+    _stAppUi('popup', [id, items, f, selected, onSelect]);
+stAppUiSecure(u, id, t, f, onText, onEnter) =>
+    _stAppUi('secure', [id, t, f, onText, onEnter]);
+stAppUiProgress(u, id, f, min, max, value) =>
+    _stAppUi('progress', [id, f, min, max, value]);
+stAppUiBox(u, id, t, f) => _stAppUi('box', [id, t, f]);
+stAppUiList(u, id, items, f, onSelect) =>
+    _stAppUi('list', [id, items, f, onSelect]);
+stAppUiTabs(u, id, items, f) => _stAppUi('tabs', [id, items, f]);
+stAppUiTab(u, id, index) => _stAppUi('tab', [id, index]);
+stAppUiScroll(u, id, f, w, h) => _stAppUi('scroll', [id, f, w, h]);
+stAppUiInto(u, id) => _stAppUi('into', [id]);
+stAppUiPane(u) => _stAppUi('pane', const []);
+stAppUiCanvas(u, id, f, bg, onClick) =>
+    _stAppUi('canvas', [id, f, bg, onClick]);
+stAppUiDraw(u, id, ops) => _stAppUi('draw', [id, ops]);
+stAppUiSet(u, id, key, value) => _stAppUi('set', [id, key, value]);
+stAppUiRemove(u, id) => _stAppUi('remove', [id]);
+stAppUiFocus(u, id) => _stAppUi('focus', [id]);
+stAppUiWidth(u) => _stAppUi('width', const []);
+stAppUiHeight(u) => _stAppUi('height', const []);
 
 /// `Worker classNamed:` — the engine's class lookup (a class VALUE or nil).
 _stClassNamedRaw(name) native "ST_classNamed";

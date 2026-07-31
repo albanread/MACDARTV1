@@ -2199,6 +2199,18 @@ Future<String> handle(String line) async {
           ? gAppStatusLbl.stringValue().UTF8String()
           : "running " + gAppName;
     }
+    case 'appinstall': {                   // install a SCANNED app by title
+      var want = arg.trim().toLowerCase();
+      if (want.isEmpty) return "ERR: appinstall <title>";
+      for (var a in scanApps()) {
+        if (a[0].toLowerCase() == want) {
+          await installApp(a[0], a[1]);
+          return gAppName == null ? "ERR: install failed (see log)"
+                                  : "running " + gAppName;
+        }
+      }
+      return "ERR: no app titled " + arg.trim() + " in apps/";
+    }
     case 'appstop': await appStop(); return "ok";
     case 'appedit': {
       await appEdit();
@@ -5279,7 +5291,9 @@ List<List<String>> scanApps() {
   try {
     var files = <String>[];
     for (var f in new Directory(appsDir()).listSync()) {
-      if (f.path.endsWith('.dart')) files.add(f.path);
+      // .dart apps and .mst (Smalltalk) apps live side by side; both carry an
+      // App: header so a support library is never mistaken for an app.
+      if (f.path.endsWith('.dart') || f.path.endsWith('.mst')) files.add(f.path);
     }
     files.sort();
     for (var path in files) {
@@ -5287,6 +5301,12 @@ List<List<String>> scanApps() {
       try {
         for (var line in new File(path).readAsLinesSync().take(5)) {
           if (line.startsWith('// App:')) { title = line.substring(7).trim(); break; }
+          if (line.startsWith('"App:')) {   // the ST comment twin
+            var t = line.substring(5).trim();
+            var q = t.indexOf('"');
+            title = (q >= 0 ? t.substring(0, q) : t).trim();
+            break;
+          }
         }
       } catch (e) {}
       if (title == null) continue;    // a library the apps import, not an app
@@ -5314,8 +5334,14 @@ Future _installApp(String title, String path) async {
   var decls = editorDecls(src);
   if (decls.isEmpty) { log("✗ app — " + path + " has no declarations"); return; }
   var name;
+  var stClassRe = new RegExp(r'subclass:\s*(\w+)\s*\[');   // the ST class form
   for (var d in decls) {
-    var n = _classNameOf(d.toString());
+    var s = d.toString();
+    var n = _classNameOf(s);
+    if (n == null) {
+      var m = stClassRe.firstMatch(s);
+      if (m != null) n = m.group(1);
+    }
     if (n != null && name == null) name = n;
   }
   if (name == null) { log("✗ app — no class in " + path); return; }

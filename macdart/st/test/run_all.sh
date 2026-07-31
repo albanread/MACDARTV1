@@ -33,7 +33,7 @@ echo "Transcript showCr: 'boot'." > "$HERE/.boot.st"
 boot="$("$DART" --with-st "$HERE/run_mst.dart" "$HERE/.boot.st" 2>&1)"
 rm -f "$HERE/.boot.st"
 if echo "$boot" | grep -q "world loaded" && ! echo "$boot" | grep -qiE "error|exception|ERR:"; then
-  pass "tier0 world boot (90 files, clean)"
+  pass "tier0 world boot (92 files, clean)"
 else
   fail "tier0 world boot"; echo "$boot" | tail -3 | sed 's/^/        /'
 fi
@@ -76,6 +76,17 @@ if [ -f "$HERE/gamepane_wire.dart" ]; then
     fail "tier2b game wire"; echo "$gw" | grep -iE "FAIL" | head -4 | sed 's/^/        /'
   fi
 else skip "tier2b game wire (driver not present)"; fi
+
+# tier 2b-app — the ST Apps-player surface, asserted headless (AppUI face ->
+# AppSurface verbs; ST-block callbacks round-trip exactly as 'appevent' fires).
+if [ -f "$HERE/appui_wire.dart" ]; then
+  aw="$("$DART" --with-st "$HERE/appui_wire.dart" 2>&1)"
+  if echo "$aw" | grep -qE "APPUI GREEN"; then
+    pass "tier2b app wire ($(echo "$aw" | grep -cE '^  ok ') checks)"
+  else
+    fail "tier2b app wire"; echo "$aw" | grep -iE "FAIL" | head -4 | sed 's/^/        /'
+  fi
+else skip "tier2b app wire (driver not present)"; fi
 
 # tier 3 — per-class protocol probes (populated in M1+)
 if compgen -G "$HERE/probes/*.mst" >/dev/null 2>&1; then

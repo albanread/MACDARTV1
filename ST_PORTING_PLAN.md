@@ -11,10 +11,11 @@ that tail into an enumerable, classified, testable work queue.
 wherever it runs (the world is MACVM's; drift is a cost). Fix the ENGINE when
 the language is broken — never patch the corpus around an engine bug. Use the
 Dart library as the world's standard-library substrate (the proven pattern:
-Dictionary=Map, WriteStream→StMutableString, gc*/clock stprims). Drop to C++
-natives only for VM internals (reflection, become, instVarAt:) and platform
-frameworks (Accelerate/vDSP). Every fix lands with the probe that would have
-caught it.
+Dictionary=Map, WriteStream→StMutableString, gc*/clock stprims). Platform C
+(libc syscalls, Accelerate/vDSP) is reached through the corpus's own FFI floor
+(§3a) — C++ natives are reserved for VM internals (reflection, become,
+instVarAt:) and the FFI core itself. Every fix lands with the probe that
+would have caught it.
 
 **Ground truth today** (2026-07-31, primitive_coverage on build-st):
 
@@ -96,21 +97,53 @@ regression automatically.
 | **ENGINE** | builder/helper/native mislowers or misdispatches | the `=` leak (fixed); `,` on Arrays (fixed); `copy` → immutable buffer hang |
 | **WIRE** | capability already exists, primitive/selector just not connected | SystemDictionary gc*/clock → existing stGc*/stMillisecondClock stprims |
 | **PORT-ST** | pure Smalltalk can express it; write/keep .mst | most collection/stream/printing methods; Set `with:` |
-| **BRIDGE-DART** | ST facade keeps the MACVM API; `<stprim:>` body → dart:cocoa helper → Dart library | Time/Date → DateTime; Random → dart:math; Files/sockets → dart:io; Posix subset |
-| **NATIVE-C** | VM internals or platform frameworks | allClasses (prim 98) class-table walk; LargeInteger byteAt:put:; Accel → Accelerate/vDSP FFI |
+| **FFI-VERBATIM** | corpus C bindings run unmodified on the FFI floor (§3a) | Posix syscalls, sockets/DNS/ping (61c/61d/75), **Accelerate vDSP/BLAS (61a — wanted)**, mmap clock |
+| **BRIDGE-DART** | ST facade keeps the MACVM API; `<stprim:>` body → dart:cocoa helper → Dart library | Date/Time conveniences → DateTime; Random → dart:math; Files where dart:io is simply better |
+| **NATIVE-C** | VM internals only | allClasses (prim 98) class-table walk; LargeInteger byteAt:put:; the FFI core natives themselves |
 | **DEVIATE** | deliberate difference, documented + tested | resumable `resume:` (deferred by choice); ByteArray is a List |
 
 Decision tree, applied per selector: *does pure ST express it against
-already-working protocol?* → PORT-ST. *Is it platform/library state?* →
-BRIDGE-DART (Dart first — it is the larger, tested library). *VM guts or
-SIMD/frameworks?* → NATIVE-C. *Wrong answers from working machinery?* →
-ENGINE. Never fix the corpus to dodge an engine bug.
+already-working protocol?* → PORT-ST. *Is it a corpus C binding?* →
+FFI-VERBATIM (the pragma + Alien floor — never one-off natives). *Is it
+platform/library state where Dart's library is genuinely better?* →
+BRIDGE-DART. *VM guts?* → NATIVE-C. *Wrong answers from working machinery?*
+→ ENGINE. Never fix the corpus to dodge an engine bug.
+
+### 3a. The FFI floor — MACVM's Alien, ported not redesigned
+
+Decided 2026-07-31 (discussion): the world already contains a Strongtalk-style
+Alien FFI — `Alien forAddress:size:` + 1-based `byteAt:[put:]` accessors,
+`NativeBuffer` (one mmap'd page, GC-stable by construction), and the
+declarative pragma `<primitive: FFI function: #name ret: #g args: #(g g ...)>`
+with word-level type codes (`#g` GPR word, `#v` void, doubles for BLAS). All
+marshalling intelligence (sockaddr packing, endianness, errno-as-value) is
+Smalltalk library code in the corpus. We port THAT floor, not a new design:
+
+- **Builder**: `<primitive: FFI function:ret:args:>` compiles like the
+  `<stprim:>` hook — a parameterized call into the core.
+- **Core natives (~4)**: `dlsym` (RTLD_DEFAULT + dlopen fallback), one
+  generic word/double C-call reusing the existing AAPCS64 marshaller in
+  cocoa_natives.mm (on arm64 objc_msgSend IS a C call — this is its easy
+  subset), and bounds-checked peek/poke against the alien's
+  [address, address+size) span.
+- **Verbatim on top**: Alien / NativeBuffer / NativeFloatArray / Posix /
+  Accel classes as written.
+- **Explicitly NOT built**: callbacks/thunks (no corpus form; poll-model
+  kqueue), struct-by-value (corpus packs bytes itself), Smalltalk-heap
+  aliens (mmap pages only — the corpus's own GC-stability premise).
+- **Known dependency**: blocking IO (62_ioworker) wants `Worker` (prim 220,
+  unported) — scope to the kqueue/non-blocking subset first.
+- **Accelerate is a first-class target, not demand-gated**: link (or dlopen)
+  Accelerate.framework; vDSP FFT + BLAS dgemm probed and A/B'd; NativeFloatArray
+  needs the double-width peek/poke pair. Visible payoff: an FFT/spectrogram
+  demo in the demos pane and an Accel-vs-pure-ST bench row.
 
 **Priority score** = static send count (D1) × surface weight (browser/
 workspace/demos first — the user-visible image) × unblocking value (Magnitude
-before everything comparable; streams before printing). Posix/Accel score low
-until an app in the image needs them: 58 of the 66 platform gaps sit behind
-`Worker`/`Accel` classes nothing in the GUI image currently calls.
+before everything comparable; streams before printing; the FFI floor before
+the whole 61/62/75 tier). The sockets/DNS/ping/Accel tier is REAL library
+surface (workspace-callable), not dead weight — it lands as FFI-VERBATIM in
+M4, behind kernel truth.
 
 ## 4. Porting workflow — the per-class assembly line
 
@@ -171,17 +204,24 @@ re-Accept any class in the image.
 - **M3 — Strings & text.** Full String/Symbol/Character matrix (case, trim,
   tokenize, format, replaceAll), printString/displayString/storeString
   everywhere; text goes through the mutable-string machinery only.
-- **M4 — Platform bridge (BRIDGE-DART bulk).** SystemDictionary (WIRE to
-  existing stprims); Time/Date → DateTime; Delay → Timer; Random; Files;
-  the Posix subset something actually calls → dart:io/existing POSIX FFI.
+- **M4 — The C door: MACVM's FFI floor (§3a), then the platform tier
+  verbatim.** Stage a: builder pragma hook + the ~4 core natives + Alien/
+  NativeBuffer probes green. Stage b: clocks/mmap (30_date_time) and the
+  kqueue/non-blocking sockets subset → DNS + ping callable from the
+  workspace (61c/61d/75). Stage c: **Accelerate — framework linked/dlopen'd,
+  double peek/poke landed, vDSP FFT + BLAS dgemm probed, A/B'd against pure
+  ST, FFT demo in the demos pane.** WIRE/BRIDGE-DART keep the few spots
+  where Dart's library is simply better (SystemDictionary stprims, DateTime
+  conveniences, Random). Blocking IO / Worker (62/62a, prim 220) deferred.
 - **M5 — Reflection & tools.** allClasses (prim 98 native class-table walk),
   selectorsOf:/primitiveOf: verified, mirrors matrix, browser deep features
   (senders/implementors via D1's send index, in-image).
-- **M6 — Numerics tail (demand-gated).** LargeInteger completeness A/B'd;
-  Accel → Accelerate.framework C FFI only when an image app needs it.
+- **M6 — Numerics tail.** LargeInteger completeness A/B'd (byteAt:put: et
+  al.); NativeFloatArray perf pass (bulk copy without per-element sends).
 
 Sequencing note: M1–M3 are dependency-ordered (everything sits on kernel +
-collections + strings); M4/M5 parallelize after M2; M6 floats.
+collections + strings); M4/M5 parallelize after M2; M6 floats. M4's stages
+land independently — Accel (4c) does not wait on sockets (4b).
 
 ## 8. Seed backlog (known reds, day one of M0/M1)
 

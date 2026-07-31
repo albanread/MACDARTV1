@@ -93,6 +93,12 @@ static const HelperRewrite kHelperRewrites[] = {
     {"tan", "stTan", 0},        {"atan", "stAtan", 0},
     {"bitShift:", "stBitShift", 1},
     {"compare:", "stCompare", 1},
+    // Round two of the same audit: each of these was a bare <primitive: N>
+    // with no fast path, so it answered its receiver.
+    {"instVarAt:", "stInstVarAt", 1},
+    {"basicByteAt:", "stBasicByteAt", 1},
+    {"valueWithArguments:", "stValueWithArgs", 1},
+    {"printDigits", "stPrintDigits", 0},
     {"perform:", "stPerform1", 1},
     {"perform:withArguments:", "stPerform2", 2},
     {"<", "stLess", 1},   {"<=", "stLessEq", 1},

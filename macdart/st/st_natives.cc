@@ -1141,6 +1141,62 @@ void ST_becomeForward(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, b_h);
 }
 
+// stInstVarAt(obj, i): the world's Object>>instVarAt: — the i-th instance
+// variable, 1-BASED, in declaration order with the super chain walked outermost
+// first. There was no implementation at all: the world declares it as a bare
+// <primitive: 25>, which MACDART ignores, so `c instVarAt: 1` answered the
+// object itself. Found by st/test/primitive_coverage.
+void ST_instVarAt(Dart_NativeArguments args) {
+  Dart_Handle obj_h = Dart_GetNativeArgument(args, 0);
+  int64_t idx = 0;
+  if (Dart_IsError(Dart_IntegerToInt64(Dart_GetNativeArgument(args, 1), &idx))) {
+    STThrow("instVarAt: index must be an Integer");
+    return;
+  }
+  Thread* thread = Thread::Current();
+  Dart_Handle result = Dart_Null();
+  std::string err;
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Object& o = Object::Handle(zone, Api::UnwrapHandle(obj_h));
+    if (!o.IsInstance()) {
+      err = "instVarAt: receiver has no instance variables";
+    } else {
+      const Instance& inst = Instance::Cast(o);
+      // Collect super-first so index 1 is the outermost declared field, which
+      // is the order the world's own reflection assumes.
+      std::vector<Class*> chain;
+      Class& c = Class::Handle(zone, inst.clazz());
+      while (!c.IsNull()) {
+        chain.push_back(&Class::ZoneHandle(zone, c.raw()));
+        c ^= c.SuperClass();
+      }
+      Array& fields = Array::Handle(zone);
+      Field& f = Field::Handle(zone);
+      int64_t seen = 0;
+      bool found = false;
+      for (intptr_t k = static_cast<intptr_t>(chain.size()) - 1; k >= 0 && !found; k--) {
+        fields = chain[k]->fields();
+        if (fields.IsNull()) continue;
+        for (intptr_t i = 0; i < fields.Length(); i++) {
+          f ^= fields.At(i);
+          if (f.is_static()) continue;
+          if (++seen == idx) {
+            result = Api::NewHandle(thread, inst.GetField(f));
+            found = true;
+            break;
+          }
+        }
+      }
+      if (!found) err = "instVarAt: index out of range";
+    }
+  }
+  if (!err.empty()) { STThrow(err.c_str()); return; }
+  Dart_SetReturnValue(args, result);
+}
+
 // Shallow-copy an ST instance: a fresh Instance of the same (finalized)
 // class with every instance Field copied (the class chain walked). Public-API
 // equivalent of the protected Object::Clone, sufficient for ST objects.

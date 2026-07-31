@@ -157,6 +157,53 @@ void runProbes() {
   probe('Object>>==', "'x' == 'y'", () => st('objIdentity'), false);
   probe('Object>>identityHash', '42 identityHash is an int',
         () => st('objIdHash') is int, true);
+
+  // --- round 2: everything the first pass could only list -------------------
+  probe('ByteArray>>size', '#[1 2 3] size', () => st('baSize'), 3);
+  probe('ByteArray>>at:', '#[7 8 9] at: 1', () => st('baAt'), 7);
+  probe('ByteArray>>at:put:', 'ByteArray at:put:', () => st('baAtPut'), 42);
+  probe('ByteArray>>hash', '#[1 2 3] hash is an int',
+        () => st('baHash') is int, true);
+  probe('ByteArray>>compare:', '#[1 2 3] compare: is an int',
+        () => st('baCompare') is int, true);
+  probe('ByteArray>>replaceFrom:to:with:', 'replaceFrom:to:with:',
+        () => st('baReplace'), 8);
+
+  // LargeInteger's byte protocol presumes a byte-addressable representation
+  // that Dart's Mint/Bigint does not expose the same way — a design call, not
+  // a table entry.
+  openProbe('LargeInteger>>size', 'big size is not self',
+        () => st('liSizeNotSelf'), true, 'LargeInteger byte protocol unmapped');
+  openProbe('LargeInteger>>hash', 'big hash is not self',
+        () => st('liHashNotSelf'), true, 'LargeInteger byte protocol unmapped');
+  openProbe('LargeInteger>>byteAt:', 'big byteAt: 1 is a byte',
+        () { var v = st('liByteAt'); return v is int && v >= 0 && v < 256; }, true,
+        'LargeInteger byte protocol unmapped');
+
+  // asSymbol HAS a fast path (stAsSymbol), so this is not a missing primitive:
+  // the symbol it builds is not the canonical #abc. Belongs to the native
+  // Symbol work (9d32a89), not to this audit.
+  openProbe('String>>asSymbol', "'abc' asSymbol == #abc",
+        () => st('strAsSymbol'), true, 'asSymbol does not answer the canonical symbol');
+  probe('String>>basicByteAt:', "'abc' basicByteAt: 1", () => st('strByteAt'), 97);
+
+  probe('Object>>class', '42 class is not 42', () => st('objClass') != 42, true);
+  probe('Object>>basicNew', 'basicNew is an instance, not the class',
+        () => st('objBasicNewNe'), false);
+  probe('Object>>instVarAt:', 'instVarAt: 1 reads the ivar',
+        () => st('objInstVarAt'), 42);
+
+  probe('BlockClosure>>value:value:value:', '3-arg block',
+        () => st('blkValue3'), 42);
+  probe('BlockClosure>>valueWithArguments:', 'valueWithArguments: #(6 7)',
+        () => st('blkValueWith'), 42);
+  probe('BlockClosure>>ensure:', 'ensure: runs the guard',
+        () => st('blkEnsure'), 42);
+  probe('BlockClosure>>ifCurtailed:', 'ifCurtailed: leaves it alone',
+        () => st('blkCurtailed'), 42);
+
+  probe('Double>>printDigits', 'printDigits is not self',
+        () => st('dPrintDigitsNotSelf'), true);
 }
 
 st(String sel) => stSend(_probeObj, sel, []);
@@ -184,7 +231,7 @@ void probeNear(String key, String what, f(), double expected) {
 }
 
 
-int passed = 0, failed = 0, probed = 0;
+int passed = 0, failed = 0, probed = 0, open = 0;
 Set<String> covered = new Set<String>();
 
 /// Call an operation that reaches [key] and assert the answer. The point is
@@ -208,6 +255,30 @@ void probe(String key, String what, f(), expected) {
     failed++;
     print('  FAIL  ${what.padRight(28)} got $got (${got.runtimeType})'
           '  want $expected (${expected.runtimeType})');
+  }
+}
+
+/// A probe for something KNOWN to be open, and assigned elsewhere. It still
+/// runs and still prints; it just does not fail the suite. If it ever starts
+/// passing that IS a failure — the marker has to come off, or the next real
+/// regression hides behind it.
+void openProbe(String key, String what, f(), expected, String why) {
+  covered.add(key);
+  probed++;
+  var got;
+  var threw = false;
+  try {
+    got = f();
+  } catch (e) {
+    threw = true;
+    got = _first(e.toString());
+  }
+  if (!threw && got == expected) {
+    failed++;
+    print('  FIXED ${what.padRight(28)} now passes — drop the open marker');
+  } else {
+    open++;
+    print('  open  ${what.padRight(28)} $got   <- $why');
   }
 }
 

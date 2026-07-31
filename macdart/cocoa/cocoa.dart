@@ -666,7 +666,42 @@ stCompare(a, b) {
   if (a is String && b is String) return a.compareTo(b);
   return _stCompareSlow(a, b);
 }
-_stCompareSlow(a, b) => a.compare(b);
+_stCompareSlow(a, b) {
+  // A ByteArray is a Dart List, which has no compare — element-wise, same
+  // negative/zero/positive contract. Adding stCompare for Strings alone just
+  // moved the bug: `#[1 2 3] compare:` went from silently answering self to
+  // throwing "List has no method compare".
+  if (a is List && b is List) {
+    var n = a.length < b.length ? a.length : b.length;
+    for (var i = 0; i < n; i++) {
+      var d = (a[i] as Comparable).compareTo(b[i]);
+      if (d != 0) return d < 0 ? -1 : 1;
+    }
+    return a.length == b.length ? 0 : (a.length < b.length ? -1 : 1);
+  }
+  return a.compare(b);
+}
+
+/// `basicByteAt:` is the raw byte behind a String, 1-BASED.
+stBasicByteAt(r, i) {
+  if (r is StSymbol) r = r.name;
+  if (r is String && i is int) return r.codeUnitAt(i - 1);
+  if (r is List && i is int) return r[i - 1];
+  return _stBasicByteAtSlow(r, i);
+}
+_stBasicByteAtSlow(r, i) => r.basicByteAt(i);
+
+/// `valueWithArguments:` — a closure applied to a list of arguments.
+stValueWithArgs(r, a) {
+  if (r is Function && a is List) return Function.apply(r, a);
+  return _stValueWithArgsSlow(r, a);
+}
+_stValueWithArgsSlow(r, a) => r.valueWithArguments(a);
+
+/// Double>>printDigits answers the digits as a String — the world uses it as
+/// `s nextPutAll: self printDigits` (19_printing.mst).
+stPrintDigits(r) => r is num ? r.toString() : _stPrintDigitsSlow(r);
+_stPrintDigitsSlow(r) => r.printDigits();
 
 // Ordering (Sprint 14): Dart Strings have no operator< — a miss walked
 // into the world's Magnitude circularity (whose primitive stubs answer
@@ -879,6 +914,11 @@ stBecomeForward(a, b) native "ST_becomeForward";
 
 /// Two-way identity swap via shallow copies (identity hashes are the copies').
 stBecome(a, b) native "ST_become";
+
+/// The world's Object>>instVarAt: — 1-based, super-chain-first. Declared as a
+/// bare <primitive: 25> with nothing behind it, so it used to answer the
+/// receiver.
+stInstVarAt(r, i) native "ST_instVarAt";
 
 // --- Low-level natives ------------------------------------------------------
 int _nsStringFromCString(String s) native "Cocoa_nsStringFromCString";

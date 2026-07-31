@@ -10,6 +10,7 @@ library dart.cocoa;
 import 'dart:_internal' as internal show VMLibraryHooks;
 import 'dart:math' as math show sqrt, log, exp, sin, cos, tan, atan;
 import 'dart:mirrors' show MirrorSystem;
+import 'dart:developer' as developer show debugger;
 
 /// The process id — a POSIX FFI smoke test (getpid()).
 int processId() native "Cocoa_getpid";
@@ -545,6 +546,39 @@ stAtPut1(c, k, v) {
 }
 _stAtPutSlow(c, k, v) => c.at_put_(k, v);
 
+/// `basicByteAt: i put: v` — the raw 1-based byte store the world's
+/// String>>at:put: delegates to. at:put: has its own fast path (stAtPut1), so
+/// this only mattered on a DIRECT call — where it used to throw, because a
+/// mutable string forwards unknown selectors to its immutable copy. Same
+/// receiver handling as stAtPut1; the world returns the stored value (`^v`).
+stBasicBytePut(r, i, v) {
+  var code = _stCode(v);
+  if (r is StMutableString) { r.units[i - 1] = code; return code; }
+  if (r is List) { r[i - 1] = v; return v; }
+  return _stBasicBytePutSlow(r, i, v);
+}
+_stBasicBytePutSlow(r, i, v) => r.basicByteAt_put_(i, v);
+
+/// `self halt` — the programmer's breakpoint. The world's contract is precise:
+/// "open the debugger WHEN ONE IS ARMED, otherwise a no-op, answer self".
+///
+/// The arming is not optional bookkeeping — it is a safety requirement.
+/// dart:developer's debugger() pauses the isolate and BLOCKS until a service
+/// client resumes it; with no client (every headless run, every plain `dart`)
+/// it hangs forever. So halt pauses ONLY when the workspace has told this
+/// isolate a debugger is attached to catch it (stHaltArm below, set from
+/// dbgAttach). Unarmed, it is the no-op the world promises. Answers self both
+/// ways.
+bool stHaltArmed = false;
+stHalt(recv) {
+  if (stHaltArmed) developer.debugger(message: 'Smalltalk halt');
+  return recv;
+}
+
+/// The workspace arms halt while its Debugger tab is attached to this isolate,
+/// and disarms it otherwise — so a halt only pauses when something will resume.
+stHaltArm(on) { stHaltArmed = (on == true || on == 'on'); return stHaltArmed; }
+
 stSizeOf(c) {
   if (c is StMutableString) return c.units.length;
   if (c is StSymbol) return c.name.length;
@@ -685,6 +719,7 @@ _stCompareSlow(a, b) {
 /// `basicByteAt:` is the raw byte behind a String, 1-BASED.
 stBasicByteAt(r, i) {
   if (r is StSymbol) r = r.name;
+  if (r is StMutableString && i is int) return r.units[i - 1];  // String new:..
   if (r is String && i is int) return r.codeUnitAt(i - 1);
   if (r is List && i is int) return r[i - 1];
   return _stBasicByteAtSlow(r, i);

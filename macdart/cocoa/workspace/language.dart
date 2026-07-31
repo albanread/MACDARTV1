@@ -749,6 +749,7 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'stbrowser') out = _stBrowserHandle(arg.toString());
       else if (cmd == 'stdemo') out = _stDemo(arg.toString());
       else if (cmd == 'stdemos') out = _stDemoList();
+      else if (cmd == 'sthaltarm') out = stHaltArm(arg);
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();
     } catch (e) {

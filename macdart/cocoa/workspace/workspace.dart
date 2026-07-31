@@ -3405,6 +3405,10 @@ Future dbgAttach() async {
   dbgStatus("attached to " + _dbgIsoLabel(chosen[1].toString(), chosen[0].toString()) +
       (gDbgIsLang ? "  (language isolate)" : "  — raw-line breakpoints") +
       " — click a line, then Break Here");
+  // Arm `self halt` in the language isolate: only now, with a debugger attached
+  // to catch and resume it, is it safe to pause (debugger() BLOCKS forever with
+  // no client). Unarmed, halt is the no-op the world promises.
+  if (gDbgIsLang) ask('sthaltarm', 'on');
   log("debugger attached (" + gLangIsolateId + ")");
 }
 

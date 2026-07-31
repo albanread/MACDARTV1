@@ -99,6 +99,8 @@ static const HelperRewrite kHelperRewrites[] = {
     {"basicByteAt:", "stBasicByteAt", 1},
     {"valueWithArguments:", "stValueWithArgs", 1},
     {"printDigits", "stPrintDigits", 0},
+    {"basicByteAt:put:", "stBasicBytePut", 2},
+    {"halt", "stHalt", 0},
     {"perform:", "stPerform1", 1},
     {"perform:withArguments:", "stPerform2", 2},
     {"<", "stLess", 1},   {"<=", "stLessEq", 1},

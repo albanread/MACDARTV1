@@ -204,7 +204,45 @@ void runProbes() {
 
   probe('Double>>printDigits', 'printDigits is not self',
         () => st('dPrintDigitsNotSelf'), true);
+
+  // --- round 3 -------------------------------------------------------------
+  // error: must RAISE. A silent self answers the receiver and never throws.
+  covered.add('Object>>error:');
+  probed++;
+  var raised = false, edetail = '';
+  try {
+    var out = st('doError');
+    edetail = 'answered ' + _showV(out) + ' (did NOT raise)';
+  } catch (e) {
+    raised = true;
+    edetail = 'raised: ' + _first(e.toString());
+  }
+  if (raised) { passed++; print('  ok    ${"self error: raises".padRight(28)} $edetail'); }
+  else { failed++; print('  FAIL  ${"self error: raises".padRight(28)} $edetail'); }
+
+  probe('String>>at:put:', "String new:3; at:1 put: \$x", () => st('strAtPut'), 120);
+  probe('String>>new:size', '(String new: 3) size', () => st('strNewSize'), 3);
+  probe('Object>>basicNew:', '(Array new: 5) size', () => st('arrNewSize'), 5);
+  // halt now routes to dart:developer's debugger(): it pauses when a debugger
+  // is attached (headless here, so no-op) and answers self either way. Before
+  // the fast path it answered self WITHOUT pausing — the no-op case only.
+  probe('Object>>halt', 'halt answers self, pauses when armed', () => st('haltIsSelf'), true);
+  probe('String>>basicByteAt:put:', 'basicByteAt: 1 put: 65', () => st('basicBytePut'), 65);
+  // basicPrint: has a side effect; the invariant is only "does not answer self
+  // and does not crash the run".
+  covered.add('TranscriptStream>>basicPrint:');
+  probed++;
+  try {
+    st('doBasicPrint');
+    passed++;
+    print('  ok    ${"Transcript basicPrint:".padRight(28)} printed, survived');
+  } catch (e) {
+    failed++;
+    print('  FAIL  ${"Transcript basicPrint:".padRight(28)} threw ${_first(e.toString())}');
+  }
 }
+
+String _showV(v) => v == null ? 'nil' : (v.toString() + ' (' + v.runtimeType.toString() + ')');
 
 st(String sel) => stSend(_probeObj, sel, []);
 

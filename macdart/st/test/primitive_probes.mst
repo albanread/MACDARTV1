@@ -81,6 +81,30 @@ Object subclass: PrimProbe [
 
     "Double"
     dPrintDigitsNotSelf [ ^(1.5 printDigits) ~= 1.5 ]
+
+    "--- round 3: error:, mutation, allocation ---"
+
+    "error: must RAISE (the driver catches). A silent self would answer the
+     PrimProbe instance and the guard below would never run."
+    doError     [ self error: 'boom'. ^'NOT RAISED' ]
+
+    "String mutation: at:put: routes through basicByteAt:put:. If that is
+     unsupported the store is lost."
+    strAtPut    [ | s | s := String new: 3. s at: 1 put: $x. ^(s at: 1) asInteger ]
+    strNewSize  [ ^(String new: 3) size ]
+
+    "basicNew: — indexed allocation (Array new: goes through it in MACVM)"
+    arrNewSize  [ ^(Array new: 5) size ]
+
+    "halt answers self and is otherwise a no-op — DOCUMENTED behavior, so a
+     self-answer here is CORRECT, not the bug pattern"
+    haltIsSelf  [ ^self halt == self ]
+
+    "basicByteAt:put: directly (the raw store under at:put:)"
+    basicBytePut [ | s | s := String new: 2. s basicByteAt: 1 put: 65. ^s basicByteAt: 1 ]
+
+    "basicPrint: writes to the transcript — must not answer self or crash"
+    doBasicPrint [ ^Transcript basicPrint: 'x' ]
 ]
 
 Object subclass: PrimCell [

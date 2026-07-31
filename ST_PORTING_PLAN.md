@@ -1,0 +1,201 @@
+# ST_PORTING_PLAN.md — finishing the Smalltalk world on the bilingual VM
+
+The language core is done and fast (ST_PLAN.md sprints 0–16: closures, NLR,
+exceptions, become, metaclasses, inlining, debugging, the equality
+representation fix). What remains is the LONG TAIL: a partially-working world
+of 280 class declarations / ~3,755 methods / 200 `<primitive:>` sites, where
+"broken" hides as *silently wrong* rather than loudly failing. This plan turns
+that tail into an enumerable, classified, testable work queue.
+
+**Doctrine.** One image, two languages. Keep the Smalltalk SOURCE verbatim
+wherever it runs (the world is MACVM's; drift is a cost). Fix the ENGINE when
+the language is broken — never patch the corpus around an engine bug. Use the
+Dart library as the world's standard-library substrate (the proven pattern:
+Dictionary=Map, WriteStream→StMutableString, gc*/clock stprims). Drop to C++
+natives only for VM internals (reflection, become, instVarAt:) and platform
+frameworks (Accelerate/vDSP). Every fix lands with the probe that would have
+caught it.
+
+**Ground truth today** (2026-07-31, primitive_coverage on build-st):
+
+    probed 50   passed 40   FAILED 6   uncovered 68
+    uncovered = 2 core (ClassMirror allClasses, LargeInteger byteAt:put:)
+              + 66 platform (Accel×27, Posix×31, SystemDictionary×6, Time×2)
+
+---
+
+## 1. The four oracles
+
+Correctness claims must trace to one of these, in precedence order:
+
+1. **MACVM itself** — `~/claudeprojects/MACVM/target/release/macvm run f.mst`.
+   The same .mst on both VMs, outputs diffed. THE semantic oracle for anything
+   the original implements. (Its `tests/` are bytecode-golden — the *binary*
+   is the oracle, not the goldens.)
+2. **The world's own docstrings** — each class documents its contract
+   (09_character's flyweight promise found the `$a == $a` bug; trust these).
+3. **The battery** — conformance (38), primitive coverage, richards/deltablue
+   exact checksums, library_bench 11/11, 86/86 load. Green is the gate.
+4. **The GUI** — the browser/demos/workspace exercise paths headless never
+   reaches (the `classNamed: #Symbol` regression shipped through a fully green
+   battery and died on tab-open). GUI smoke is load-bearing, not optional.
+
+A deliberate difference from MACVM goes in **DEVIATIONS.md** with a test
+asserting the *deviation* (the `ok(dart)` pattern conformance already uses) —
+so an accidental drift back toward MACVM is also caught.
+
+## 2. Discovery — make every gap enumerable
+
+**D1. Static inventory (`st_dump --audit`).** Extend the standalone dumper
+(no VM deps) to emit machine-readable TSV/JSON per world file: classes,
+supers, ivars, methods (side, selector, argc), `<primitive: N>` sites (bare
+vs. guarded-with-fallback), and every selector SENT in method bodies. One
+cross-ref pass then yields the two lists that drive everything:
+
+- **sent-but-undefined**: selectors the corpus sends that no ST class,
+  extension holder, universal helper, or bridge defines → *will dNU at
+  runtime*, sorted by static send count = the missing-feature list, priced.
+- **defined-but-untested**: selectors no probe exercises = the coverage debt.
+
+**D2. Primitive census.** `primitive_coverage.dart` already inventories and
+probes bare primitives ("silence is the failure mode"). Grow it until every
+bare primitive on a core class is probed; platform primitives graduate to
+their porting bucket (§3) rather than probes-forever.
+
+**D3. Loud engine (the force multiplier).** Today an unwired bare
+`<primitive: N>` compiles to an empty body and *answers self* (`2 sin` → 2).
+Change the builder: a bare `<primitive: N>` with NO fallback statements
+compiles to a catchable `STThrow("unimplemented primitive N: Cls>>sel")`;
+a guarded one keeps running its fallback (ANSI semantics, unchanged).
+This converts the whole class of silent-wrong bugs into loud, greppable,
+enumerable errors — discovery by running the corpus, not by suspicion.
+(Boot-critical stubs that trip get wired or given real fallbacks, which is
+exactly the work surfacing itself.)
+
+**D4. A/B differential runner (`st/test/ab/`).** Self-checking probe files
+runnable on BOTH VMs (the bench harness already proves the dual-run pattern);
+`ab.sh` runs each on macvm + macdart and diffs. Divergence = engine bug,
+missing port, or a deviation to document — never ignorable.
+
+**D5. Protocol matrix probes (`st/test/probes/`).** One probe file per class
+family exercising every public selector on canonical receivers, printing
+`sel expected actual` self-checking lines. This is the per-class
+definition-of-done instrument (§5).
+
+**D6. GUI smoke script (`st/test/gui_smoke.sh`).** Scripted control-plane
+pass: launch, ping, `stbrowser` build, browse a class + method source, three
+doits (a Fraction, a WriteStream, an equality matrix), launch one ST demo,
+then grep the log for `ERR|NoSuchMethod|StSymbol`. Red on any hit. This
+script, run before the last two pushes, would have caught the browser
+regression automatically.
+
+## 3. Classification — every gap gets exactly one bucket
+
+| Bucket | Meaning | Examples (live ones) |
+|---|---|---|
+| **ENGINE** | builder/helper/native mislowers or misdispatches | the `=` leak (fixed); `,` on Arrays (fixed); `copy` → immutable buffer hang |
+| **WIRE** | capability already exists, primitive/selector just not connected | SystemDictionary gc*/clock → existing stGc*/stMillisecondClock stprims |
+| **PORT-ST** | pure Smalltalk can express it; write/keep .mst | most collection/stream/printing methods; Set `with:` |
+| **BRIDGE-DART** | ST facade keeps the MACVM API; `<stprim:>` body → dart:cocoa helper → Dart library | Time/Date → DateTime; Random → dart:math; Files/sockets → dart:io; Posix subset |
+| **NATIVE-C** | VM internals or platform frameworks | allClasses (prim 98) class-table walk; LargeInteger byteAt:put:; Accel → Accelerate/vDSP FFI |
+| **DEVIATE** | deliberate difference, documented + tested | resumable `resume:` (deferred by choice); ByteArray is a List |
+
+Decision tree, applied per selector: *does pure ST express it against
+already-working protocol?* → PORT-ST. *Is it platform/library state?* →
+BRIDGE-DART (Dart first — it is the larger, tested library). *VM guts or
+SIMD/frameworks?* → NATIVE-C. *Wrong answers from working machinery?* →
+ENGINE. Never fix the corpus to dodge an engine bug.
+
+**Priority score** = static send count (D1) × surface weight (browser/
+workspace/demos first — the user-visible image) × unblocking value (Magnitude
+before everything comparable; streams before printing). Posix/Accel score low
+until an app in the image needs them: 58 of the 66 platform gaps sit behind
+`Worker`/`Accel` classes nothing in the GUI image currently calls.
+
+## 4. Porting workflow — the per-class assembly line
+
+1. **Inventory** the class from D1 (selectors, primitives, senders).
+2. **Probe first**: write/extend its protocol-matrix file; run RED.
+3. **Classify** each gap into §3 buckets (recorded in the ledger, §6).
+4. **Implement** per bucket (engine fix / .mst port / cocoa.dart helper /
+   native). ST source stays MACVM-shaped; facades keep MACVM selectors.
+5. **A/B** the probe on MACVM where it runs there; else oracle = docstring;
+   divergence → fix or DEVIATIONS.md entry.
+6. **Battery + GUI smoke** green on debug AND release.
+7. **Ledger update**; commit with the probe in the same commit.
+
+**Definition of done (per class):** every public selector probed; A/B clean
+or deviation documented; survives `stimport` + reboot (SQLite image); visible
+and editable in the Browser tab; no bare-primitive throw reachable from it.
+
+## 5. Testing architecture — one battery, seven tiers, one exit code
+
+| Tier | What | Runs against |
+|---|---|---|
+| 0 | 86/86 parse+load, world boots, zero load errors | debug + release |
+| 1 | `type_conformance` (38) — language semantics, NO world | both |
+| 2 | `primitive_coverage` — bare-primitive census, world loaded | both |
+| 3 | protocol matrix probes — per-class, world loaded | both |
+| 4 | A/B differential vs MACVM | release |
+| 5 | apps exact: richards, deltablue 224874, library_bench 11/11 | release |
+| 6 | GUI smoke (control plane + log grep) | release dartui |
+
+`st/test/run_all.sh` runs 0–5 (6 where a display exists), exits nonzero on
+any red. That script IS the pre-push gate. Laws already learned, now binding:
+warm numbers are best-of; ApiError is not catchable (natives answer
+`[result]`-or-null); cocoa.dart changes need a snapshot rebuild; workspace.dart
+changes need a full GUI restart; vendored world edits need `--reimport`.
+
+## 6. The ledger — visible progress, no vibes
+
+`st/PORTING_LEDGER.md`: one row per class — bucket counts, probe file,
+A/B status, done-mark. Regenerated header numbers from D1 + tier results
+(classes done / selectors probed / bare primitives remaining / deviations).
+The plan is finished when the ledger says: every class done-marked, tier
+matrix green, bare-primitive count 0, and the browser can open, edit, and
+re-Accept any class in the image.
+
+## 7. Milestones
+
+- **M0 — Tooling (first, small, unblocks everything).** `st_dump --audit` +
+  cross-ref report; loud bare primitives (D3); `ab.sh`; `run_all.sh`;
+  ledger generator; gui_smoke.sh. Exit: the sent-but-undefined list exists
+  and the 6 failing probes are triaged into buckets.
+- **M1 — Kernel truth.** The 6 probe failures; `copy`/at:put: hang (ENGINE —
+  copy must answer a mutable buffer); instVar family; LargeInteger
+  byteAt:put:; comparison/hashing coherence across the new
+  Symbol/Character/MutableString trio everywhere (Dict/Set keys, sort).
+- **M2 — Collections & streams.** Protocol matrix green for Ordered/Sorted/
+  Dictionary/Set/Bag/Interval + Read/Write/ReadWrite streams; `Set with:`;
+  the copy family (copy/copyFrom:to:/copyWith:/reversed) on every collection.
+- **M3 — Strings & text.** Full String/Symbol/Character matrix (case, trim,
+  tokenize, format, replaceAll), printString/displayString/storeString
+  everywhere; text goes through the mutable-string machinery only.
+- **M4 — Platform bridge (BRIDGE-DART bulk).** SystemDictionary (WIRE to
+  existing stprims); Time/Date → DateTime; Delay → Timer; Random; Files;
+  the Posix subset something actually calls → dart:io/existing POSIX FFI.
+- **M5 — Reflection & tools.** allClasses (prim 98 native class-table walk),
+  selectorsOf:/primitiveOf: verified, mirrors matrix, browser deep features
+  (senders/implementors via D1's send index, in-image).
+- **M6 — Numerics tail (demand-gated).** LargeInteger completeness A/B'd;
+  Accel → Accelerate.framework C FFI only when an image app needs it.
+
+Sequencing note: M1–M3 are dependency-ordered (everything sits on kernel +
+collections + strings); M4/M5 parallelize after M2; M6 floats.
+
+## 8. Seed backlog (known reds, day one of M0/M1)
+
+1. The 6 failing primitive probes (triage first — each is a wrong answer
+   shipping today).
+2. `'x' copy at: 1 put:` hangs the isolate (task already spawned; ENGINE).
+3. `Set with:` answers nil (PORT-ST, 26_set class side).
+4. OrderedCollection `collect:` partial-dispatch miss (verify, then ENGINE
+   or WIRE).
+5. ClassMirror `allClasses` prim 98 unwired → UiBrowserService browseSnapshot
+   dies (NATIVE-C; unblocks M5).
+6. Multi-statement workspace do-its answer `STDoItN` instead of the value
+   (control-plane wrapper; user-facing daily).
+7. NSException from a Cocoa send is not `on:do:`-catchable (BRIDGE seam).
+8. Symbol-vs-String at native boundaries: audit remaining `String`-typed
+   natives a symbol can reach (`classNamed:` pattern; getClass/classExists/
+   selectorInfo).

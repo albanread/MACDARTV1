@@ -1,3 +1,4 @@
 # Build artifact produced by build.sh — not tracked.
 st_dump
 st_dump.dSYM/
+st_audit

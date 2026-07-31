@@ -180,11 +180,10 @@ void runProbes() {
         () { var v = st('liByteAt'); return v is int && v >= 0 && v < 256; }, true,
         'LargeInteger byte protocol unmapped');
 
-  // asSymbol HAS a fast path (stAsSymbol), so this is not a missing primitive:
-  // the symbol it builds is not the canonical #abc. Belongs to the native
-  // Symbol work (9d32a89), not to this audit.
-  openProbe('String>>asSymbol', "'abc' asSymbol == #abc",
-        () => st('strAsSymbol'), true, 'asSymbol does not answer the canonical symbol');
+  // asSymbol interns through stSymbol / _stSymbolTable — the SAME table the
+  // #abc literal uses — so a computed symbol is IDENTICAL to the literal.
+  probe('String>>asSymbol', "'abc' asSymbol == #abc",
+        () => st('strAsSymbol'), true);
   probe('String>>basicByteAt:', "'abc' basicByteAt: 1", () => st('strByteAt'), 97);
 
   probe('Object>>class', '42 class is not 42', () => st('objClass') != 42, true);

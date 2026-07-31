@@ -787,11 +787,14 @@ stMin(a, b) {
 }
 _stMinSlow(a, b) => a.min_(b);
 
-/// `'foo' asSymbol` — canonicalize through the VM symbol table, so runtime
-/// symbols are IDENTICAL to `#foo` literals (which are Symbols::New strings).
-_stInternNative(String s) native "ST_asSymbol";
+/// `'foo' asSymbol` — the CANONICAL interned Symbol, IDENTICAL to the `#foo`
+/// literal. Both must go through stSymbol / the _stSymbolTable: Phase 1 made
+/// Symbol its own class, so the old VM-Symbols-table native answered a
+/// different object and `'foo' asSymbol == #foo` was false.
 stAsSymbol(s) {
-  if (s is String) return _stInternNative(s);
+  if (s is StSymbol) return s;               // already canonical
+  var str = _stStr(s);                       // String / mutable String / Char
+  if (str != null) return stSymbol(str);
   return _stAsSymSlow(s);
 }
 _stAsSymSlow(s) => s.asSymbol();

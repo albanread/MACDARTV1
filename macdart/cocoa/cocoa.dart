@@ -493,17 +493,75 @@ stSignal(instance) {
   throw new _STException(instance);
 }
 
-stOnDo(protected, type, handler) {
+// A handler action (`e return:`/`retry`/`pass`/`return`). Thrown from inside a
+// running handler, it unwinds to the stOnDo that established THAT handler,
+// identified by `token`. An Expando maps each in-flight exception instance to
+// its handler's token so the instance's own method can find its stOnDo.
+class _STHandlerAction {
+  final token;
+  final String kind; // 'return' | 'retry' | 'pass'
+  final value;
+  _STHandlerAction(this.token, this.kind, this.value);
+}
+final Expando _stExcTokens = new Expando('stExcTokens');
+
+// A native Dart error caught by `on: Error do:` is reified as an ST exception so
+// the handler sees a real object (`e messageText`): ZeroDivide for a division by
+// zero, a plain Error otherwise. A narrower handler class simply won't match.
+_stWrapNativeError(e) {
+  var name = (e is IntegerDivisionByZeroException) ? 'ZeroDivide' : 'Error';
+  var err = stNew(name);
   try {
-    return protected();
-  } catch (e) {
-    if (e is _STNlr) rethrow; // non-local ^ is not an exception
-    if (e is _STException && stIsKindOf(e.instance, type)) {
-      return handler(e.instance);
+    stSend(err, 'messageText:', [e.toString()]);
+  } catch (_) {}
+  return err;
+}
+
+stOnDo(protected, type, handler) {
+  var token = new Object(); // identifies THIS handler activation (for retry etc.)
+  while (true) {
+    var exc;
+    try {
+      return protected();
+    } catch (e) {
+      if (e is _STNlr) rethrow; // non-local ^ is not an exception
+      if (e is _STHandlerAction) rethrow; // belongs to an ancestor handler
+      if (e is _STException) {
+        exc = e.instance;
+        if (!stIsKindOf(exc, type)) rethrow;
+      } else {
+        exc = _stWrapNativeError(e); // a native Dart error, if Error-catchable
+        if (!stIsKindOf(exc, type)) rethrow;
+      }
+      var saved = _stExcTokens[exc];
+      _stExcTokens[exc] = token;
+      var action;
+      try {
+        return handler(exc); // handler falls off its end -> its value wins
+      } on _STHandlerAction catch (a) {
+        if (a.token != token) rethrow; // an enclosing handler's action
+        action = a;
+      } finally {
+        _stExcTokens[exc] = saved;
+      }
+      if (action.kind == 'return') return action.value;
+      if (action.kind == 'pass') { // resignal to the next enclosing handler
+        if (e is _STException) rethrow;
+        throw e;
+      }
+      // 'retry' -> loop and re-run the protected block from the top.
     }
-    rethrow;
   }
 }
+
+// `e return: v` / `return` / `retry` / `pass`, sent to the exception INSIDE a
+// handler: throw the carrier keyed to the handler's stOnDo (found via the
+// Expando). Outside a handler the token is null and no stOnDo matches -> the
+// action surfaces as an ordinary unhandled error.
+stExcReturn(exc, v) { throw new _STHandlerAction(_stExcTokens[exc], 'return', v); }
+stExcReturnNil(exc) { throw new _STHandlerAction(_stExcTokens[exc], 'return', null); }
+stExcRetry(exc) { throw new _STHandlerAction(_stExcTokens[exc], 'retry', null); }
+stExcPass(exc) { throw new _STHandlerAction(_stExcTokens[exc], 'pass', null); }
 
 stEnsure(protected, cleanup) {
   try {

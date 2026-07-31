@@ -318,12 +318,20 @@ control, exceptions, reflection.
    receiver evaluated once, a 1-arg `ifNotNil:` block bound to the receiver.
    Works for nil and non-nil alike; the corpus's heavy `ifNotNil:` use is
    unchanged. (`IsInlinableControlFlow` + `CollectLocals` + `TranslateControlFlow`.)
+6. **The ANSI exception protocol.** `e return:`/`return`/`retry`/`pass` were
+   unimplemented (uncatchable Dart NoSuchMethod), `ZeroDivide` resolved to nil,
+   and native Dart errors escaped `on: Error do:`. Now: the handler actions are
+   `_STHandlerAction` carriers keyed to their `stOnDo` activation (an `Expando`
+   maps the in-flight exception to its handler token); `stOnDo` gained a retry
+   loop, a handler-action catch, and native-error reification — a caught Dart
+   error becomes an ST `Error` (a `ZeroDivide` for `IntegerDivisionByZero`) so
+   `on: Error do:` catches it, a narrower class simply not matching. The prelude
+   grows the standard hierarchy (`ArithmeticError`/`ZeroDivide`/`Warning`/
+   `MessageNotUnderstood`). `ensure:` still runs during a `return:`/`retry`
+   unwind, and an unhandled signal still surfaces. (`cocoa.dart` + `st_prelude.h`.)
 
 ### 9b. Gaps the suites found, still OPEN (documented, not yet fixed)
 
-- Exception `return:` and `retry` (ANSI resumption) are unimplemented and raise
-  an uncatchable Dart NoSuchMethod; `ZeroDivide` resolves to nil; native Dart
-  errors (`RangeError` from an out-of-range `at:`) are not catchable ST Errors.
 - `respondsTo:` fails (`primitive failed`) on native receivers.
 - Class-side `superclass`/`name` on native classes (Integer superclass → nil).
 - `collect:`/`select:` on a literal array return a raw Dart `List` (Dart-style

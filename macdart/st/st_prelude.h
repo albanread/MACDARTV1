@@ -23,6 +23,13 @@ Object subclass: Exception [
     description [ ^messageText ]
     signal [ <stprim: stSignal> ]
     signal: t [ messageText := t. ^ self signal ]
+    "Handler actions (ANSI), valid only while my handler runs: return: forces
+     the on:do: value, retry re-evaluates the protected block, pass resignals to
+     the next enclosing handler. Each unwinds to the stOnDo that caught me."
+    return: aValue [ <stprim: stExcReturn> ]
+    return [ <stprim: stExcReturnNil> ]
+    retry [ <stprim: stExcRetry> ]
+    pass [ <stprim: stExcPass> ]
 ]
 
 "Class-side `Error signal: 'msg'` needs no method here: the IL builder
@@ -30,6 +37,14 @@ Object subclass: Exception [
  (the ANSI Exception-class behaviour) — a static method of the same name
  would collide with the instance member under Dart's rules."
 Exception subclass: Error [ ]
+
+"The standard error hierarchy (so `on: ZeroDivide do:` names a real class, not
+ nil). A native Dart division by zero is reified as a ZeroDivide by stOnDo;
+ other native errors reify as a plain Error."
+Error subclass: ArithmeticError [ ]
+ArithmeticError subclass: ZeroDivide [ ]
+Error subclass: MessageNotUnderstood [ ]
+Exception subclass: Warning [ ]
 
 "── The system object (corpus surface: Smalltalk millisecondClock) ──"
 Object subclass: Smalltalk [

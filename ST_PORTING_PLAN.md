@@ -243,8 +243,13 @@ re-Accept any class in the image.
   spots where Dart's library is simply better (SystemDictionary stprims,
   DateTime conveniences, Random). Blocking IO / Worker (62/62a, prim 220)
   deferred.
-- **M5 — Reflection & tools.** allClasses (prim 98 native class-table walk),
-  selectorsOf:/primitiveOf: verified, mirrors matrix, browser deep features
+- **M5 — Reflection & tools.** **allClasses + the mirror family DONE
+  (2026-07-31, 586aed8)**: 6 reflection natives over the VM's real Class API
+  (allClasses walks the st: libraries → 190 class Types; name/superclass/
+  selectorsOf:/instanceVariablesOf:/classVariablesOf:), overlay
+  76_reflection.mst reopens Behavior/ClassMirror onto them. browseSnapshot walks
+  Object's whole tree (114 children); Fraction ivars → [numerator, denominator].
+  Remaining M5 (optional): primitiveOf:/methodSends:, browser deep features
   (senders/implementors via D1's send index, in-image).
 - **M6 — Numerics tail.** LargeInteger completeness A/B'd (byteAt:put: et
   al.); NativeFloatArray perf pass (bulk copy without per-element sends).

@@ -85,6 +85,14 @@ static const HelperRewrite kHelperRewrites[] = {
     {"rounded", "stRounded", 0},   {"floor", "stFloorU", 0},
     {"ceiling", "stCeilingU", 0},  {"negated", "stNegated", 0},
     {"sqrt", "stSqrt", 0},
+    // Without these the send falls through to the world's bare <primitive: N>
+    // body, which compiles to nothing and returns SELF — `2 sin` answered 2.
+    // st/test/primitive_coverage.dart pins all eight.
+    {"ln", "stLn", 0},          {"exp", "stExp", 0},
+    {"sin", "stSin", 0},        {"cos", "stCos", 0},
+    {"tan", "stTan", 0},        {"atan", "stAtan", 0},
+    {"bitShift:", "stBitShift", 1},
+    {"compare:", "stCompare", 1},
     {"perform:", "stPerform1", 1},
     {"perform:withArguments:", "stPerform2", 2},
     {"<", "stLess", 1},   {"<=", "stLessEq", 1},

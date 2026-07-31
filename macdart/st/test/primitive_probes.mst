@@ -1,0 +1,49 @@
+"primitive_probes.mst — the probes for primitive_coverage.dart.
+
+ Each method performs ONE send that lands on a world method whose whole body is
+ a bare <primitive: N>. Written in Smalltalk on purpose: that is the path real
+ code takes — an ordinary send to a native receiver, missing in Dart, arriving
+ at the extension holder through noSuchMethod. Calling stSend from Dart instead
+ tests a different (direct-lookup) path and proves nothing about user code.
+
+ Every expected answer is deliberately DIFFERENT from the receiver, because the
+ failure being hunted is a method that silently answers self."
+
+Object subclass: PrimProbe [
+
+    "SmallInteger — bit operations have no Dart operator mapping"
+    bitAnd      [ ^5 bitAnd: 3 ]        "1, not 5"
+    bitOr       [ ^5 bitOr: 2 ]         "7, not 5"
+    bitXor      [ ^5 bitXor: 3 ]        "6, not 5"
+    bitShift    [ ^1 bitShift: 4 ]      "16, not 1"
+    intAsDouble [ ^3 asDouble ]         "3.0 (a double), not the int 3"
+
+    "Double — the transcendentals"
+    dsqrt       [ ^4.0 sqrt ]           "2.0, not 4.0"
+    dfloor      [ ^2.7 floor ]          "2, not 2.7"
+    dln         [ ^1.0 ln ]             "0.0, not 1.0"
+    dexp        [ ^1.0 exp ]            "2.718…, not 1.0"
+    dcos        [ ^0.0 cos ]            "1.0, not 0.0"
+    dsin        [ ^1.5707963267948966 sin ]   "1.0"
+    dtan        [ ^0.7853981633974483 tan ]   "1.0"
+    datan       [ ^1.0 atan ]           "0.785…, not 1.0"
+
+    "String"
+    strSize     [ ^'abc' size ]         "3"
+    strHash     [ ^'abc' hash ]         "an integer"
+    strCompare  [ ^'abc' compare: 'abc' ]
+
+    "Array — at: is 1-based in Smalltalk"
+    arrSize     [ ^#(7 8 9) size ]      "3"
+    arrAt       [ ^#(7 8 9) at: 1 ]     "7"
+    arrAtPut    [ | a | a := Array new: 3. a at: 1 put: 42. ^a at: 1 ]   "42"
+
+    "BlockClosure"
+    blkValue    [ ^[ 42 ] value ]
+    blkValue1   [ ^[ :x | x + 1 ] value: 41 ]
+    blkValue2   [ ^[ :a :b | a * b ] value: 6 value: 7 ]
+
+    "Object"
+    objIdentity [ ^'x' == 'y' ]         "false"
+    objIdHash   [ ^42 identityHash ]    "an integer"
+]

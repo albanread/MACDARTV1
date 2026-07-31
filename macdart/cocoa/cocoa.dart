@@ -8,7 +8,7 @@
 library dart.cocoa;
 
 import 'dart:_internal' as internal show VMLibraryHooks;
-import 'dart:math' as math show sqrt;
+import 'dart:math' as math show sqrt, log, exp, sin, cos, tan, atan;
 import 'dart:mirrors' show MirrorSystem;
 
 /// The process id — a POSIX FFI smoke test (getpid()).
@@ -632,6 +632,42 @@ _stNegSlow(r) => r.negated();
 stSqrt(r) => r is num ? math.sqrt(r) : _stSqrtSlow(r);
 _stSqrtSlow(r) => r.sqrt();
 
+// The transcendentals and bitShift:, added because st/test/primitive_coverage
+// caught them ANSWERING THE RECEIVER. The world declares them on Double and
+// SmallInteger as bare <primitive: N> bodies; MACDART ignores numbered
+// primitives, so with no fast path the method compiled to an empty body — and
+// an empty Smalltalk body returns self. `2 sin` was 2, silently.
+stLn(r) => r is num ? math.log(r) : _stLnSlow(r);
+_stLnSlow(r) => r.ln();
+stExp(r) => r is num ? math.exp(r) : _stExpSlow(r);
+_stExpSlow(r) => r.exp();
+stSin(r) => r is num ? math.sin(r) : _stSinSlow(r);
+_stSinSlow(r) => r.sin();
+stCos(r) => r is num ? math.cos(r) : _stCosSlow(r);
+_stCosSlow(r) => r.cos();
+stTan(r) => r is num ? math.tan(r) : _stTanSlow(r);
+_stTanSlow(r) => r.tan();
+stAtan(r) => r is num ? math.atan(r) : _stAtanSlow(r);
+_stAtanSlow(r) => r.atan();
+
+/// Smalltalk `bitShift:` is signed: positive shifts left, negative right.
+stBitShift(r, n) {
+  if (r is int && n is int) return n >= 0 ? (r << n) : (r >> -n);
+  return _stBitShiftSlow(r, n);
+}
+_stBitShiftSlow(r, n) => r.bitShift(n);
+
+/// `compare:` answers an Integer the world tests against 0 (String>>= is
+/// `(self compare: other) = 0`, `<` is `< 0`), so compareTo's
+/// negative/zero/positive contract is exactly right.
+stCompare(a, b) {
+  if (a is StSymbol) a = a.name;
+  if (b is StSymbol) b = b.name;
+  if (a is String && b is String) return a.compareTo(b);
+  return _stCompareSlow(a, b);
+}
+_stCompareSlow(a, b) => a.compare(b);
+
 // Ordering (Sprint 14): Dart Strings have no operator< — a miss walked
 // into the world's Magnitude circularity (whose primitive stubs answer
 // self) and overflowed the stack. Nums stay fast, Strings compare
@@ -980,7 +1016,11 @@ stHostSetComment(svc, cls, text) => _stHost('setComment', [cls, text]);
 stHostRemoveClass(svc, cls) => _stHost('removeClass', [cls]);
 
 /// `Worker classNamed:` — the engine's class lookup (a class VALUE or nil).
-stClassNamed(name) native "ST_classNamed";
+_stClassNamedRaw(name) native "ST_classNamed";
+/// `Worker classNamed: name` — the browser passes a Symbol (`#CocoaTableFace`),
+/// and since Symbol became its own class the native's string lookup no longer
+/// sees a Dart String. Coerce any string-ish name to its spelling first.
+stClassNamed(name) => _stClassNamedRaw(name is String ? name : name.toString());
 
 /// ST `perform:` — dynamic dispatch by selector string.
 stPerform1(r, sel) => stSend(r, stDisplayOf(sel), []);

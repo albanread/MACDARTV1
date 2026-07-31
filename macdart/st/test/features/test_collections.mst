@@ -43,6 +43,14 @@ STestCase subclass: TestCollections [
 
         "--- sorting ---"
         self check: (#(3 1 4 1 5 9 2 6) asSortedCollection asArray) is: #(1 1 2 3 4 5 6 9) label: 'asSortedCollection'.
+
+        "--- Smalltalk-style printing (an Array is a Dart List) ---"
+        self check: #(1 2 3) printString is: '(1 2 3 )' label: 'array printString'.
+        self check: #('a' 'b') printString is: '(''a'' ''b'' )' label: 'array of strings quotes'.
+        self check: (Array with: 1 with: #(2 3)) printString is: '(1 (2 3 ) )' label: 'nested array printString'.
+        self check: (Array new: 2) printString is: '(nil nil )' label: 'array of nils prints nil'.
+        self check: (#(1 2 3) collect: [ :x | x * x ]) printString is: '(1 4 9 )' label: 'collect: result prints ST-style'.
+        self check: nil printString is: 'nil' label: 'nil printString'.
     ]
     oc: anArray [ | c | c := OrderedCollection new. anArray do: [ :e | c add: e ]. ^c ]
     setOf: anArray [ | s | s := Set new. anArray do: [ :e | s add: e ]. ^s ]

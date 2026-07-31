@@ -1001,7 +1001,22 @@ stPrintOf(x) {
   if (x is StChar) return r"$" + x.toString();     // Smalltalk prints a char as $a
   if (x is StSymbol) return "#" + x.name;        // Smalltalk prints symbols as #foo
   if (x is String) return "'" + x + "'";
-  if (x is num || x is bool || x == null || x is List || x is Map) {
+  if (x == null) return 'nil';                   // Smalltalk nil, not Dart null
+  if (x is List) {
+    // An ST Array IS a Dart List (a literal #(...), Array new:, a collect:
+    // result). Print it Smalltalk-style — `(e1 e2 e3 )` — instead of Dart's
+    // `[e1, e2, e3]`; elements recurse through printString (strings quote,
+    // nested arrays parenthesize). (GNU-Smalltalk Array form; Set/Bag add the
+    // class-name prefix in their own printOn:.)
+    var sb = new StringBuffer('(');
+    for (var e in x) {
+      sb.write(stPrintOf(e));
+      sb.write(' ');
+    }
+    sb.write(')');
+    return sb.toString();
+  }
+  if (x is num || x is bool || x is Map) {
     return x.toString();
   }
   if (x is Function) return 'a Block';

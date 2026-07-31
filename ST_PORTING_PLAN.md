@@ -329,12 +329,20 @@ control, exceptions, reflection.
    grows the standard hierarchy (`ArithmeticError`/`ZeroDivide`/`Warning`/
    `MessageNotUnderstood`). `ensure:` still runs during a `return:`/`retry`
    unwind, and an unhandled signal still surfaces. (`cocoa.dart` + `st_prelude.h`.)
+7. **Array prints Dart-style + `nil` prints `null`.** `collect:` in fact returns
+   a proper Array — the visible defect was that an ST Array (a Dart `List`) went
+   through Dart's `toString()` in `stPrintOf`, giving `[1, 2, 3]` not `(1 2 3 )`.
+   `stPrintOf` now formats a Dart `List` Smalltalk-style — `(e1 e2 e3 )` with
+   elements recursed through `printString` (strings quote, nested arrays
+   parenthesize, `nil` prints `nil`) — while ST-object collections keep their own
+   `printOn:`. Also pulled `null` out to print `nil`, fixing `nil printString`.
 
 ### 9b. Gaps the suites found, still OPEN (documented, not yet fixed)
 
 - `respondsTo:` fails (`primitive failed`) on native receivers.
 - Class-side `superclass`/`name` on native classes (Integer superclass → nil).
-- `collect:`/`select:` on a literal array return a raw Dart `List` (Dart-style
-  `printString`), not an ST Array.
+- `select:`/`reject:` on an Array return an OrderedCollection, not an Array
+  (species); `printOn:` sent directly to a bare Dart Array with a fresh ST
+  WriteStream mis-dispatches (arrays nested in ST collections print fine).
 - Native `Character`/`Symbol` report their impl class (`StChar`/`StSymbol`),
   and `String new:withAll:`, block `numArgs` are unimplemented.

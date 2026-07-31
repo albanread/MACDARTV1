@@ -1397,6 +1397,176 @@ void ST_instVarAt(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, result);
 }
 
+// --- class reflection (ST_PORTING_PLAN M5: ClassMirror / browseSnapshot) -----
+// MACVM read a class's name/super/selectors/ivars from the class OBJECT's own
+// layout (instVarAt: KLASS_*_INDEX). MACDART classes are Dart Types, so these
+// answer through the VM's real Class API instead. A MACDART overlay
+// (76_reflection.mst) reopens Behavior>>name/superclass and ClassMirror's
+// class-side primitives to <stprim:> onto these.
+
+// The dart::Class behind a class-VALUE argument at index i (a Type), or null.
+static RawClass* StClassArg(Thread* thread, Dart_NativeArguments args, int i) {
+  Zone* zone = thread->zone();
+  const Object& o =
+      Object::Handle(zone, Api::UnwrapHandle(Dart_GetNativeArgument(args, i)));
+  if (!o.IsType()) return Class::null();
+  return Type::Cast(o).type_class();
+}
+
+// Selector spelling from a mangled VM function name ('_' -> ':'): ST selectors
+// carry no literal underscores, so this inverts MangleSelector cleanly.
+static std::string UnmangleSelector(const std::string& m) {
+  std::string s = m;
+  for (size_t i = 0; i < s.size(); i++)
+    if (s[i] == '_') s[i] = ':';
+  return s;
+}
+
+static bool IsMetaclassName(const char* n) {
+  const size_t len = strlen(n);
+  return len >= 6 && strcmp(n + len - 6, " class") == 0;
+}
+
+// `aClass name` — the class's name as a String.
+void ST_classNameOf(Dart_NativeArguments args) {
+  Thread* thread = Thread::Current();
+  Dart_Handle result = Dart_Null();
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Class& cls = Class::Handle(zone, StClassArg(thread, args, 0));
+    if (!cls.IsNull()) {
+      // Strip the bridged-holder suffix so the browser shows "Object", not
+      // "Object ext" (the holder IS the class — no ambiguity).
+      std::string nm(String::Handle(zone, cls.Name()).ToCString());
+      const size_t n = nm.size();
+      if (n >= 4 && nm.compare(n - 4, 4, " ext") == 0) nm.erase(n - 4);
+      result = Api::NewHandle(thread, String::New(nm.c_str(), Heap::kNew));
+    }
+  }
+  Dart_SetReturnValue(args, result);
+}
+
+// `aClass superclass` — the superclass VALUE (a Type), or nil at the root.
+void ST_superclassOf(Dart_NativeArguments args) {
+  Thread* thread = Thread::Current();
+  Dart_Handle result = Dart_Null();
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Class& cls = Class::Handle(zone, StClassArg(thread, args, 0));
+    if (!cls.IsNull()) {
+      const Class& sup = Class::Handle(zone, cls.SuperClass());
+      if (!sup.IsNull())
+        result = Api::NewHandle(
+            thread, Type::NewNonParameterizedType(sup));
+    }
+  }
+  Dart_SetReturnValue(args, result);
+}
+
+// allClasses — every ST class (instance side; the "Foo class" metaclasses are
+// skipped) as a List of class Types, for ClassMirror's subclass sweep.
+void ST_allClasses(Dart_NativeArguments args) {
+  Thread* thread = Thread::Current();
+  Dart_Handle result = Dart_Null();
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    Isolate* isolate = thread->isolate();
+    const GrowableObjectArray& out =
+        GrowableObjectArray::Handle(zone, GrowableObjectArray::New(Heap::kOld));
+    const GrowableObjectArray& libs = GrowableObjectArray::Handle(
+        zone, isolate->object_store()->libraries());
+    Library& lib = Library::Handle(zone);
+    String& url = String::Handle(zone);
+    String& cname = String::Handle(zone);
+    Class& cls = Class::Handle(zone);
+    for (intptr_t i = 0; i < libs.Length(); i++) {
+      lib ^= libs.At(i);
+      url = lib.url();
+      if (url.IsNull() || strncmp(url.ToCString(), "st:", 3) != 0) continue;
+      DictionaryIterator it(lib);
+      while (it.HasNext()) {
+        const Object& entry = Object::Handle(zone, it.GetNext());
+        if (!entry.IsClass()) continue;
+        cls ^= entry.raw();
+        cname = cls.Name();
+        if (IsMetaclassName(cname.ToCString())) continue;
+        out.Add(Type::Handle(zone, Type::NewNonParameterizedType(cls)));
+      }
+    }
+    result = Api::NewHandle(thread, out.raw());
+  }
+  Dart_SetReturnValue(args, result);
+}
+
+// selectorsOf: aBehavior — the behavior's OWN instance selectors (un-mangled),
+// as a List of Strings (the browser asStrings them; ClassMirror sorts them).
+void ST_selectorsOf(Dart_NativeArguments args) {
+  Thread* thread = Thread::Current();
+  Dart_Handle result = Dart_Null();
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Class& cls = Class::Handle(zone, StClassArg(thread, args, 0));
+    const GrowableObjectArray& out =
+        GrowableObjectArray::Handle(zone, GrowableObjectArray::New(Heap::kOld));
+    if (!cls.IsNull()) {
+      const Array& fns = Array::Handle(zone, cls.functions());
+      Function& f = Function::Handle(zone);
+      String& nm = String::Handle(zone);
+      if (!fns.IsNull()) {
+        for (intptr_t i = 0; i < fns.Length(); i++) {
+          f ^= fns.At(i);
+          if (f.IsNull()) continue;
+          nm = f.name();
+          const std::string sel = UnmangleSelector(nm.ToCString());
+          out.Add(String::Handle(zone, String::New(sel.c_str(), Heap::kNew)));
+        }
+      }
+    }
+    result = Api::NewHandle(thread, out.raw());
+  }
+  Dart_SetReturnValue(args, result);
+}
+
+// The own variable names of a class as a List of Strings; `want_static` picks
+// class variables (static Fields) vs instance variables.
+static void FieldNames(Dart_NativeArguments args, bool want_static) {
+  Thread* thread = Thread::Current();
+  Dart_Handle result = Dart_Null();
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Class& cls = Class::Handle(zone, StClassArg(thread, args, 0));
+    const GrowableObjectArray& out =
+        GrowableObjectArray::Handle(zone, GrowableObjectArray::New(Heap::kOld));
+    if (!cls.IsNull()) {
+      const Array& flds = Array::Handle(zone, cls.fields());
+      Field& fld = Field::Handle(zone);
+      String& nm = String::Handle(zone);
+      if (!flds.IsNull()) {
+        for (intptr_t i = 0; i < flds.Length(); i++) {
+          fld ^= flds.At(i);
+          if (fld.IsNull() || fld.is_static() != want_static) continue;
+          nm = fld.name();
+          out.Add(String::Handle(zone, String::New(nm.ToCString(), Heap::kNew)));
+        }
+      }
+    }
+    result = Api::NewHandle(thread, out.raw());
+  }
+  Dart_SetReturnValue(args, result);
+}
+void ST_instVarNamesOf(Dart_NativeArguments args) { FieldNames(args, false); }
+void ST_classVarNamesOf(Dart_NativeArguments args) { FieldNames(args, true); }
+
 // Shallow-copy an ST instance: a fresh Instance of the same (finalized)
 // class with every instance Field copied (the class chain walked). Public-API
 // equivalent of the protected Object::Clone, sufficient for ST objects.

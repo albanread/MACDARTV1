@@ -763,6 +763,12 @@ void ST_peekF64(Dart_NativeArguments args);
 void ST_pokeF64(Dart_NativeArguments args);
 void ST_peekI64(Dart_NativeArguments args);
 void ST_pokeI64(Dart_NativeArguments args);
+void ST_classNameOf(Dart_NativeArguments args);
+void ST_superclassOf(Dart_NativeArguments args);
+void ST_allClasses(Dart_NativeArguments args);
+void ST_selectorsOf(Dart_NativeArguments args);
+void ST_instVarNamesOf(Dart_NativeArguments args);
+void ST_classVarNamesOf(Dart_NativeArguments args);
 void ST_gcScavenge(Dart_NativeArguments args);
 void ST_gcFull(Dart_NativeArguments args);
 void ST_gcStats(Dart_NativeArguments args);
@@ -859,6 +865,12 @@ static void Cocoa_sendMain(Dart_NativeArguments args) {
   V(ST_pokeF64, 2)                                                             \
   V(ST_peekI64, 1)                                                             \
   V(ST_pokeI64, 2)                                                             \
+  V(ST_classNameOf, 1)                                                         \
+  V(ST_superclassOf, 1)                                                        \
+  V(ST_allClasses, 0)                                                          \
+  V(ST_selectorsOf, 1)                                                         \
+  V(ST_instVarNamesOf, 1)                                                      \
+  V(ST_classVarNamesOf, 1)                                                     \
   V(ST_gcScavenge, 0)                                                          \
   V(ST_gcFull, 0)                                                              \
   V(ST_gcStats, 0)                                                             \

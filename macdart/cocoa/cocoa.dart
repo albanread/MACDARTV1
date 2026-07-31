@@ -839,6 +839,17 @@ stPokeF64(a, v) native "ST_pokeF64";
 stPeekI64(a) native "ST_peekI64";
 stPokeI64(a, v) native "ST_pokeI64";
 
+/// Class reflection (M5): a class VALUE's name/super and, class-side, the whole
+/// ST class list + a behavior's own selectors/ivars/classvars — answered from
+/// the VM's real Class API (MACVM read these off the class object's layout).
+/// The 76_reflection.mst overlay <stprim:>s ClassMirror/Behavior onto these.
+stClassNameOf(c) native "ST_classNameOf";
+stSuperclassOf(c) native "ST_superclassOf";
+stAllClasses() native "ST_allClasses";
+stSelectorsOf(c) native "ST_selectorsOf";
+stInstVarNamesOf(c) native "ST_instVarNamesOf";
+stClassVarNamesOf(c) native "ST_classVarNamesOf";
+
 /// Sorted copy of a Dart list (prelude asSortedCollection plumbing).
 stSortedOf(l) { var c = new List.from(l); c.sort(); return c; }
 

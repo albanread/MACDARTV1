@@ -1,0 +1,100 @@
+# builtins.txt — selectors the ENGINE provides, so a corpus send of them is NOT
+# a porting gap even when no corpus class defines them. Editable data, read by
+# run_audit.sh to filter the sent-but-undefined candidate list. One selector per
+# line; '#' comments and blank lines ignored. Refine as triage proceeds.
+#
+# (Selectors the corpus DOES define never reach this filter — they show
+# defined_by_corpus=1 in sends.tsv. This list is only about the defined=0 set.)
+
+# --- control flow: builder-inlined, never a real dispatch --------------------
+ifTrue:
+ifFalse:
+ifTrue:ifFalse:
+ifFalse:ifTrue:
+and:
+or:
+whileTrue:
+whileFalse:
+whileTrue
+whileFalse
+ifNil:
+ifNotNil:
+ifNil:ifNotNil:
+ifNotNil:ifNil:
+to:do:
+to:by:do:
+timesRepeat:
+repeat
+caseOf:
+caseOf:otherwise:
+
+# --- core object protocol (Object/UndefinedObject, via helpers/IL) -----------
+==
+~~
+=
+~=
+not
+isNil
+notNil
+class
+yourself
+hash
+identityHash
+->
+value
+value:
+value:value:
+value:value:value:
+valueWithArguments:
+perform:
+perform:with:
+perform:withArguments:
+isKindOf:
+isMemberOf:
+respondsTo:
+error:
+halt
+inspect
+->
+
+# --- arithmetic / magnitude the front-end maps to Dart IL or helpers ---------
++
+-
+*
+/
+//
+\\
+<
+>
+<=
+>=
+@
+bitAnd:
+bitOr:
+bitXor:
+bitShift:
+
+# --- Cocoa/ObjC bridge selectors that read as lowercase (interior-capital ----
+# ones are filtered heuristically). Sent to Cocoa refs, dispatched through
+# objc_msgSend — a bridge concern, not a Smalltalk porting gap.
+alloc
+init
+frame
+bounds
+retain
+release
+autorelease
+window
+superview
+image
+title
+action
+delegate
+target
+tag
+count
+length
+string
+stringValue
+intValue
+doubleValue

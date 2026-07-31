@@ -9,3 +9,10 @@ clang++ -std=c++17 -Wall -Wextra -O0 \
   -o st_dump
 
 echo "built ./st_dump"
+
+# The corpus static-inventory / cross-reference tool (M0 of ST_PORTING_PLAN.md).
+clang++ -std=c++17 -Wall -Wextra -O0 \
+  st_lexer.cc st_parser.cc st_audit.cc \
+  -o st_audit
+
+echo "built ./st_audit"

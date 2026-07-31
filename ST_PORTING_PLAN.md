@@ -222,7 +222,12 @@ re-Accept any class in the image.
   ST_ffiCall dlsym's + calls the arm64 word path (fail-safe STThrow on an
   unresolved symbol). Word args/return only. VERIFIED on libc (abs/getpid) and
   the corpus's own `Posix socketDomain:type:protocol:` → real fd, `close:` → 0.
-  Remaining stage a: Alien/NativeBuffer peek-poke natives (stage b prerequisite). Stage b: clocks/mmap (30_date_time) and the
+  Stage b **DONE (2026-07-31, 27f9d2b)**: the Alien class (MACVM built-in the
+  corpus assumes but never defines) provided in the prelude — 1-based byteAt:/
+  doubleAt:/signedLongAt: (+put:), ST bounds/base checks → catchable, backed by
+  6 peek/poke natives (byte/f64/i64, reject addr<=0). VERIFIED end-to-end on the
+  corpus's `Time>>millisecondClockValue` (clock_gettime → mmap timespec →
+  signedLongAt:) → real epoch ms. Remaining stage b: the
   kqueue/non-blocking sockets subset → DNS + ping callable from the
   workspace (61c/61d/75). Stage c: **Accelerate — framework linked/dlopen'd,
   double peek/poke landed, vDSP FFT + BLAS dgemm probed, A/B'd against pure

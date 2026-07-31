@@ -29,6 +29,25 @@ HashedCollection subclass: Dictionary [
         self keysDo: [:k | result add: (k -> (self at: k)) ].
         ^result asArray
     ]
+
+    "Remove aKey (16_dictionary omitted it — its open-addressed table has no
+     tombstones). Rebuild-without-the-key: snapshot the survivors, re-init, and
+     re-insert, so the probe chains stay intact. Answers the removed VALUE."
+    removeKey: aKey <Object> ^ <Object> [
+        ^self removeKey: aKey ifAbsent: [
+            self error: 'key not found: ', aKey printString ]
+    ]
+    removeKey: aKey <Object> ifAbsent: aBlock <[]> ^ <Object> [
+        | val survivors |
+        (self includesKey: aKey) ifFalse: [ ^aBlock value ].
+        val := self at: aKey.
+        survivors := OrderedCollection new.
+        self keysAndValuesDo: [:k :v |
+            (k = aKey) ifFalse: [ survivors add: (k -> v) ] ].
+        self init.
+        survivors do: [:as | self at: as key put: as value ].
+        ^val
+    ]
 ]
 
 Object subclass: Point [

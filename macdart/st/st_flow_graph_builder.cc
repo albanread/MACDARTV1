@@ -109,6 +109,9 @@ static const HelperRewrite kHelperRewrites[] = {
     {"arcCos", "stArcCos", 0},
     {"bitShift:", "stBitShift", 1},
     {"compare:", "stCompare", 1},
+    // `k -> v` builds the Association here so a Symbol key stays a Symbol (the
+    // Object>>-> method forwarded on a Symbol receiver, demoting #a to 'a').
+    {"->", "stArrow", 1},
     // Round two of the same audit: each of these was a bare <primitive: N>
     // with no fast path, so it answered its receiver.
     {"instVarAt:", "stInstVarAt", 1},
@@ -1349,11 +1352,18 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
           fast_f += StoreLocal(value_temp_);
           fast_f += Drop();
           Fragment slow_f(slow);
+          // thisCls is a SUBCLASS (an inherited factory): dispatch the actual
+          // `new`/`basicNew` so the subclass's override (with its init) runs —
+          // stBasicNew here skipped it and left growable collections nil.
           slow_f += LoadLocal(locals_["self"]);
           slow_f += PushArgument();
+          slow_f += Constant(String::ZoneHandle(
+              zone_, Symbols::New(thread_, node->selector.c_str())));
+          slow_f += PushArgument();
           slow_f += StaticCall(
-              Function::ZoneHandle(zone_, LookupCocoaFunction("stBasicNew")),
-              1);
+              Function::ZoneHandle(zone_,
+                                   LookupCocoaFunction("stClassNewDispatch")),
+              2);
           slow_f += StoreLocal(value_temp_);
           slow_f += Drop();
           JoinEntryInstr* join = BuildJoinEntry();
@@ -1365,8 +1375,13 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
         }
         Fragment instructions = LoadLocal(locals_["self"]);  // thisCls
         instructions += PushArgument();
+        instructions += Constant(String::ZoneHandle(
+            zone_, Symbols::New(thread_, node->selector.c_str())));
+        instructions += PushArgument();
         instructions += StaticCall(
-            Function::ZoneHandle(zone_, LookupCocoaFunction("stBasicNew")), 1);
+            Function::ZoneHandle(zone_,
+                                 LookupCocoaFunction("stClassNewDispatch")),
+            2);
         return instructions;
       }
       // Other unresolved (signal desugars, class-side closures whose owner

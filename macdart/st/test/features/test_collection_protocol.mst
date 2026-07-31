@@ -1,0 +1,144 @@
+"Feature test: the full collection protocol — Array / OrderedCollection / Set /
+ Dictionary / Bag / Interval / Association — one assertion per method with
+ human-verified expected values (the test IS the spec). Born from a live sweep
+ of every collection method; it pins the bugs that sweep found and fixed:
+   * `withAll:` on a growable collection (Set/OrderedCollection/Bag/Dictionary)
+     built the instance via bare basicNew, SKIPPING the subclass `init`, so its
+     storage was nil and it died on the first add (a `self new` from an
+     INHERITED class factory now dispatches the real subclass `new`);
+   * `#sym -> v` demoted the Symbol key to the String 'sym' (Object>>-> forwarded
+     on a Symbol receiver), and Association/Dictionary printOn: dropped the #/$
+     of a Symbol/Character key;
+   * Dictionary had no removeKey: at all."
+STestCase subclass: TestCollectionProtocol [
+    tests [
+        "── Array (fixed size) ──"
+        self check: #(1 2 3) size is: 3 label: 'Array size'.
+        self check: (#(10 20 30) at: 2) is: 20 label: 'Array at:'.
+        self check: #(1 2 3) first is: 1 label: 'first'.
+        self check: #(1 2 3) last is: 3 label: 'last'.
+        self check: (#(1 2 3 4 5) first: 3) is: #(1 2 3) label: 'first:'.
+        self check: (#(1 2 3 4 5) last: 2) is: #(4 5) label: 'last:'.
+        self check: #(1 2 3) second is: 2 label: 'second'.
+        self check: #(1 2 3) third is: 3 label: 'third'.
+        self check: #(1 2 3) allButFirst is: #(2 3) label: 'allButFirst'.
+        self check: #(1 2 3) allButLast is: #(1 2) label: 'allButLast'.
+        self check: (#(1 2 3) collect: [:e | e * e]) is: #(1 4 9) label: 'collect: -> Array'.
+        self check: (#(1 2 3 4) select: [:e | e even]) is: #(2 4) label: 'select: -> Array'.
+        self check: (#(1 2 3 4) reject: [:e | e even]) is: #(1 3) label: 'reject: -> Array'.
+        self check: (#(1 2 3 4) detect: [:e | e > 2]) is: 3 label: 'detect:'.
+        self check: (#(1 2 3) detect: [:e | e > 9] ifNone: [-1]) is: -1 label: 'detect:ifNone:'.
+        self check: (#(1 2 3 4) inject: 0 into: [:a :e | a + e]) is: 10 label: 'inject:into:'.
+        self assert: (#(1 2 3) includes: 2) label: 'includes:'.
+        self check: (#(10 20 30) indexOf: 20) is: 2 label: 'indexOf:'.
+        self check: (#(1 2 3 4 5) copyFrom: 2 to: 4) is: #(2 3 4) label: 'copyFrom:to:'.
+        self check: #(1 2 3) reverse is: #(3 2 1) label: 'reverse'.
+        self check: (#(1 2) , #(3 4)) is: #(1 2 3 4) label: 'comma concat'.
+        self check: #(1 2 3 4) sum is: 10 label: 'sum'.
+        self check: #(3 1 4 1 5) max is: 5 label: 'max'.
+        self check: #(3 1 4 1 5) min is: 1 label: 'min'.
+        self check: #(2 4 6) average is: 4 label: 'average'.
+        self check: (#(1 2 3 4 5) count: [:e | e odd]) is: 3 label: 'count:'.
+        self assert: (#(1 2 3) anySatisfy: [:e | e > 2]) label: 'anySatisfy:'.
+        self assert: (#(1 2 3) allSatisfy: [:e | e > 0]) label: 'allSatisfy:'.
+        self check: #(3 1 2) sorted is: #(1 2 3) label: 'sorted'.
+        self check: (#(1 2 3) sorted: [:a :b | a > b]) is: #(3 2 1) label: 'sorted:'.
+        self check: (#(1 2 3) with: #(10 20 30) collect: [:a :b | a + b]) is: #(11 22 33) label: 'with:collect:'.
+
+        "── OrderedCollection ──"
+        self check: (self ocOf: #(1 2 3)) size is: 3 label: 'OC withAll: size (was nil-storage crash)'.
+        self assert: (self ocAddFirstWorks) label: 'OC addFirst:/addLast:'.
+        self assert: (self ocRemoveWorks) label: 'OC removeFirst/removeLast/remove:'.
+        self check: (self ocRemoveAtIndex) is: #(1 3) label: 'OC removeAtIndex:'.
+        self check: (self ocRemoveSuchThat) is: #(1 3) label: 'OC removeAllSuchThat:'.
+        self check: (self ocOf: #(5 6)) asArray is: #(5 6) label: 'OC asArray round-trip'.
+
+        "── Set (dedup) ──"
+        self check: (Set withAll: #(1 2 2 3 3 3)) size is: 3 label: 'Set withAll: dedups (was crash)'.
+        self assert: ((Set withAll: #(1 2 3)) includes: 2) label: 'Set includes:'.
+        self check: (self setAddDup) is: 1 label: 'Set add: dedups'.
+        self check: (self setRemove) is: 2 label: 'Set remove:'.
+        self check: #(1 2 2 3) asSet size is: 3 label: 'asSet'.
+
+        "── Dictionary ──"
+        self check: (self dictAtPut) is: 1 label: 'Dictionary at:put:/at:'.
+        self assert: (self dictIncludesKey) label: 'includesKey:'.
+        self check: (self dictAtIfAbsent) is: 99 label: 'at:ifAbsent:'.
+        self check: (self dictAtIfAbsentPut) is: 7 label: 'at:ifAbsentPut:'.
+        self check: (self dictKeysAndValuesSum) is: 30 label: 'keysAndValuesDo:'.
+        self check: (self dictRemoveKey) is: 1 label: 'removeKey: (added — 16 had none)'.
+        self check: (self dictRemoveKeyValue) is: 42 label: 'removeKey: answers the value'.
+        self check: (self dictRemoveKeyAbsent) is: -1 label: 'removeKey:ifAbsent:'.
+
+        "── Bag ──"
+        self check: (self bagOccurrences) is: 2 label: 'Bag occurrencesOf:'.
+        self check: (self bagWithOccurrences) is: 5 label: 'Bag add:withOccurrences:'.
+        self check: (Bag withAll: #(1 1 2)) size is: 3 label: 'Bag withAll: (was crash)'.
+
+        "── Interval ──"
+        self check: (1 to: 10) size is: 10 label: 'Interval size'.
+        self check: (1 to: 5) asArray is: #(1 2 3 4 5) label: 'Interval asArray'.
+        self check: (1 to: 10 by: 2) asArray is: #(1 3 5 7 9) label: 'Interval by:'.
+        self check: (1 to: 100) sum is: 5050 label: 'Interval sum'.
+        self assert: ((1 to: 10) includes: 5) label: 'Interval includes:'.
+        self check: (1 to: 5) reverse is: #(5 4 3 2 1) label: 'Interval reverse'.
+        self check: ((1 to: 3) collect: [:e | e * e]) is: #(1 4 9) label: 'Interval collect: -> Array'.
+        self check: ((10 to: 20) at: 3) is: 12 label: 'Interval at:'.
+        self check: (self intDownBy) is: 15 label: 'to:by:-1 do:'.
+
+        "── Association (Symbol keys stay Symbols) ──"
+        self check: (#a -> 1) key is: #a label: 'Association key stays a Symbol'.
+        self check: (#a -> 1) value is: 1 label: 'Association value'.
+        self assert: ((#a -> 1) key == #a) label: 'Association key identity (was demoted to String)'.
+        self check: (#a -> 1) printString is: '#a->1' label: 'Association printString keeps #'.
+        self check: ('x' -> 1) printString is: '''x''->1' label: 'Association String key quotes'.
+        self assert: ((#a -> 1) = (#a -> 1)) label: 'Association ='.
+
+        "── advanced iteration ──"
+        self check: (#(3 1 4 1 5) detectMax: [:e | e]) is: 5 label: 'detectMax:'.
+        self check: (#(3 1 4 1 5) detectMin: [:e | e]) is: 1 label: 'detectMin:'.
+        self check: (#(1 2 3 4) fold: [:a :b | a + b]) is: 10 label: 'fold:'.
+        self check: (#(#(1 2) #(3 4)) flatCollect: [:e | e]) is: #(1 2 3 4) label: 'flatCollect:'.
+        self check: (#(10 20 30) withIndexCollect: [:e :i | e + i]) is: #(11 22 33) label: 'withIndexCollect:'.
+    ]
+
+    "── helpers (keep mutation off the shared expression line) ──"
+    ocOf: anArray [ ^OrderedCollection withAll: anArray ]
+    ocAddFirstWorks [
+        | c | c := OrderedCollection new. c add: 2. c addFirst: 1. c addLast: 3.
+        ^(c first = 1) and: [ c last = 3 ]
+    ]
+    ocRemoveWorks [
+        | c | c := OrderedCollection withAll: #(1 2 3).
+        c removeFirst. c removeLast.
+        ^(c size = 1) and: [ c first = 2 ]
+    ]
+    ocRemoveAtIndex [
+        | c | c := OrderedCollection withAll: #(1 2 3). c removeAtIndex: 2. ^c asArray
+    ]
+    ocRemoveSuchThat [
+        | c | c := OrderedCollection withAll: #(1 2 3 4). c removeAllSuchThat: [:e | e even]. ^c asArray
+    ]
+    setAddDup [ | s | s := Set new. s add: 1; add: 1. ^s size ]
+    setRemove [ | s | s := Set withAll: #(1 2 3). s remove: 2. ^s size ]
+    dictAtPut [ | d | d := Dictionary new. d at: #a put: 1. ^d at: #a ]
+    dictIncludesKey [ | d | d := Dictionary new. d at: #a put: 1. ^d includesKey: #a ]
+    dictAtIfAbsent [ | d | d := Dictionary new. ^d at: #x ifAbsent: [99] ]
+    dictAtIfAbsentPut [ | d | d := Dictionary new. d at: #x ifAbsentPut: [7]. ^d at: #x ]
+    dictKeysAndValuesSum [
+        | d s | d := Dictionary new. d at: 1 put: 10; at: 2 put: 20. s := 0.
+        d keysAndValuesDo: [:k :v | s := s + v]. ^s
+    ]
+    dictRemoveKey [
+        | d | d := Dictionary new. d at: #a put: 1; at: #b put: 2. d removeKey: #a. ^d size
+    ]
+    dictRemoveKeyValue [
+        | d | d := Dictionary new. d at: #a put: 42. ^d removeKey: #a
+    ]
+    dictRemoveKeyAbsent [
+        | d | d := Dictionary new. ^d removeKey: #missing ifAbsent: [-1]
+    ]
+    bagOccurrences [ | b | b := Bag new. b add: #x; add: #x; add: #y. ^b occurrencesOf: #x ]
+    bagWithOccurrences [ | b | b := Bag new. b add: #z withOccurrences: 5. ^b occurrencesOf: #z ]
+    intDownBy [ | s | s := 0. 5 to: 1 by: -1 do: [:i | s := s + i]. ^s ]
+]

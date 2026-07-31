@@ -678,6 +678,27 @@ bool stIsKindOf(obj, type) native "ST_isKindOf";
 /// for new/basicNew and to create-and-signal for signal/signal:.
 _stClassSend(type, String sel, List args) native "ST_classSend";
 stBasicNew(type) native "ST_basicNewFromType";
+
+/// `self new` / `self basicNew` reached from an INHERITED class factory, where
+/// the runtime class is a SUBCLASS of the method's owner (`OrderedCollection
+/// withAll:` runs `Collection class>>withAll:`, whose `self new` must build an
+/// OrderedCollection). The old slow path called stBasicNew — a bare allocation
+/// that SKIPPED the subclass's `new` (OrderedCollection/Set/Dictionary/Bag all
+/// do `basicNew init`), so `array` stayed nil and withAll:/asSet/... died on
+/// `size` of null. Dispatch the selector on the actual class so the override
+/// (with its init) runs; only a class with no such class-method falls back to
+/// the raw allocation.
+stClassNewDispatch(type, sel) {
+  var r = _stClassSendTry(type, sel is String ? sel : sel.toString(), const []);
+  if (r != null) return r[0];
+  return stBasicNew(type);
+}
+
+/// `k -> v` — an Association. A method (Object>>->), so on a Symbol receiver it
+/// forwarded to the spelling and the key came back as the String 'k' (breaking
+/// `(#a -> 1) key == #a`). Building it here keeps the key exactly as given.
+stArrow(k, v) => stInvokeStatic('Association', 'key:value:', [k, v]);
+
 stClassSend0(t, sel) => _stClassSend(t, sel, []);
 stClassSend1(t, sel, a) => _stClassSend(t, sel, [a]);
 stClassSend2(t, sel, a, b) => _stClassSend(t, sel, [a, b]);
@@ -1214,8 +1235,12 @@ stDisplayOf(x) => x is String ? x : (x is StMutableString ? x.toString() : (x is
 
 /// `x printOn: aStream` with a bridged x: write its text into the stream.
 stPrintOn(r, s) {
+  // The native value types print through stPrintOf too — else `key printOn: s`
+  // (Association/Dictionary) forwarded a Symbol/Character to its spelling and
+  // dropped the #/$ (`#a->1` printed as `a->1`).
   if (r is num || r is String || r is bool || r == null || r is List ||
-      r is Map || r is Function) {
+      r is Map || r is Function ||
+      r is StSymbol || r is StChar || r is StMutableString) {
     return _stNPASlow(s, stPrintOf(r));
   }
   var v = _stSendTry(r, 'printOn:', [s]);

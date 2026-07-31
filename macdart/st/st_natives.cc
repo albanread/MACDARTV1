@@ -916,6 +916,59 @@ void ST_asSymbol(Dart_NativeArguments args) {
   Dart_SetReturnValue(args, result);
 }
 
+// FFI stage C: a general arm64 AAPCS64 call trampoline. Loads x0..x7 from gpr[],
+// d0..d7 from fpr[], copies nstk overflow words to the outgoing stack (16-byte
+// aligned), calls fn, and hands back x0 (int return) plus d0 (via *out_d0, for
+// an fp return). The marshaller below sorts each arg into gpr/fpr/stack per the
+// procedure call standard, so this covers fp-register scalars (cblas_dgemm's
+// alpha/beta) and >8-arg spill — everything the corpus's FFI needs.
+extern "C" uint64_t ffi_call_aapcs(void* fn, const uint64_t* gpr,
+                                   const double* fpr, const uint64_t* stk,
+                                   int64_t nstk, double* out_d0);
+__asm__(
+    ".text\n"
+    ".p2align 2\n"
+    ".globl _ffi_call_aapcs\n"
+    "_ffi_call_aapcs:\n"
+    "  stp x29, x30, [sp, #-16]!\n"
+    "  stp x19, x20, [sp, #-16]!\n"
+    "  stp x21, x22, [sp, #-16]!\n"
+    "  mov x29, sp\n"                  // frame pointer, after all saves
+    "  mov x19, x0\n"                  // fn
+    "  mov x20, x2\n"                  // fpr
+    "  mov x21, x3\n"                  // stk
+    "  mov x22, x5\n"                  // out_d0
+    "  mov x9,  x1\n"                  // gpr (x1 is clobbered below)
+    "  mov x10, x4\n"                  // nstk
+    "  lsl x11, x10, #3\n"            // nstk*8
+    "  add x11, x11, #15\n"
+    "  bic x11, x11, #15\n"           // round up to 16
+    "  sub sp, sp, x11\n"             // reserve outgoing stack
+    "  mov x12, #0\n"
+    "  cbz x10, Lffi_regs\n"
+    "Lffi_copy:\n"
+    "  ldr x13, [x21, x12, lsl #3]\n"
+    "  str x13, [sp,  x12, lsl #3]\n"
+    "  add x12, x12, #1\n"
+    "  cmp x12, x10\n"
+    "  b.lt Lffi_copy\n"
+    "Lffi_regs:\n"
+    "  ldp d0, d1, [x20, #0]\n"
+    "  ldp d2, d3, [x20, #16]\n"
+    "  ldp d4, d5, [x20, #32]\n"
+    "  ldp d6, d7, [x20, #48]\n"
+    "  ldp x0, x1, [x9, #0]\n"
+    "  ldp x2, x3, [x9, #16]\n"
+    "  ldp x4, x5, [x9, #32]\n"
+    "  ldp x6, x7, [x9, #48]\n"
+    "  blr x19\n"
+    "  str d0, [x22]\n"               // fp return -> *out_d0
+    "  mov sp, x29\n"                 // drop the outgoing-arg area
+    "  ldp x21, x22, [sp], #16\n"
+    "  ldp x19, x20, [sp], #16\n"
+    "  ldp x29, x30, [sp], #16\n"
+    "  ret\n");
+
 // The FFI floor, stage A (ST_PORTING_PLAN.md §3a): call a C function BY NAME
 // with word arguments. `stFfiCall(List args, String desc)` where desc is
 // "name|ret|codes" (codes: one char per arg, 'g' = a machine word — a Dart
@@ -949,33 +1002,49 @@ void ST_ffiCall(Dart_NativeArguments args) {
     return;
   }
 
-  // Marshal word args into x0..x7 (arm64 AAPCS64). Extra register slots stay 0;
-  // the callee reads only the args its own prototype declares.
+  // Sort each arg into its AAPCS64 slot: 'g' word -> next GPR then stack;
+  // 'f'/'d' double -> next FPR then stack. Only the corpus's codes appear
+  // (g word, f double, v void); an unknown code fails safe.
   intptr_t n = 0;
   Dart_ListLength(list_h, &n);
-  long gpr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-  int gi = 0;
+  uint64_t gpr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  double fpr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  uint64_t stk[16] = {0};
+  int gi = 0, fi = 0, si = 0;
   for (intptr_t i = 0; i < n && i < static_cast<intptr_t>(codes.size()); i++) {
     const char code = codes[i];
-    if (code != 'g') {
-      STThrow(("FFI: arg code '" + std::string(1, code) +
-               "' unsupported yet (word-only stage A)").c_str());
+    Dart_Handle e = Dart_ListGetAt(list_h, i);
+    if (code == 'g') {
+      int64_t v = 0;
+      Dart_IntegerToInt64(e, &v);
+      if (gi < 8) gpr[gi++] = static_cast<uint64_t>(v);
+      else if (si < 16) stk[si++] = static_cast<uint64_t>(v);
+    } else if (code == 'f' || code == 'd') {
+      double v = 0.0;
+      if (Dart_IsInteger(e)) {
+        int64_t iv = 0;
+        Dart_IntegerToInt64(e, &iv);
+        v = static_cast<double>(iv);
+      } else {
+        Dart_DoubleValue(e, &v);
+      }
+      if (fi < 8) fpr[fi++] = v;
+      else if (si < 16) memcpy(&stk[si++], &v, sizeof(double));
+    } else {
+      STThrow(("FFI: unknown arg code '" + std::string(1, code) + "'").c_str());
       return;
     }
-    int64_t v = 0;
-    Dart_Handle e = Dart_ListGetAt(list_h, i);
-    Dart_IntegerToInt64(e, &v);   // non-int -> left 0 (defensive)
-    if (gi < 8) gpr[gi++] = static_cast<long>(v);
   }
 
-  typedef long (*fn8)(long, long, long, long, long, long, long, long);
-  const long r = reinterpret_cast<fn8>(fn)(gpr[0], gpr[1], gpr[2], gpr[3],
-                                           gpr[4], gpr[5], gpr[6], gpr[7]);
+  double out_d0 = 0.0;
+  const uint64_t rx = ffi_call_aapcs(fn, gpr, fpr, stk, si, &out_d0);
 
   if (ret == 'v') {
     Dart_SetReturnValue(args, Dart_Null());
+  } else if (ret == 'f' || ret == 'd') {
+    Dart_SetReturnValue(args, Dart_NewDouble(out_d0));
   } else {
-    Dart_SetReturnValue(args, Dart_NewInteger(r));   // 'g' word return
+    Dart_SetReturnValue(args, Dart_NewInteger(static_cast<int64_t>(rx)));  // 'g'
   }
 }
 

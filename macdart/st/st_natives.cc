@@ -979,6 +979,56 @@ void ST_ffiCall(Dart_NativeArguments args) {
   }
 }
 
+// FFI floor stage B (ST_PORTING_PLAN §3a): raw peek/poke behind the corpus's
+// Alien. `a` is an ABSOLUTE address — an int, the way mmap/an FFI call answers
+// one. Bounds are checked in Smalltalk (Alien knows its span) BEFORE reaching
+// here; a null address is rejected as the commonest segv, anything else past
+// the bounds check is the caller's footgun, by design. arm64 permits the
+// unaligned f64 access a byte-offset doubleAt: can produce.
+void ST_peekByte(Dart_NativeArguments args) {
+  int64_t a = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &a);
+  if (a <= 0) { STThrow("Alien byteAt: bad address"); return; }
+  Dart_SetReturnValue(args, Dart_NewInteger(*reinterpret_cast<uint8_t*>(a)));
+}
+void ST_pokeByte(Dart_NativeArguments args) {
+  int64_t a = 0, v = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &a);
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 1), &v);
+  if (a <= 0) { STThrow("Alien byteAt:put: bad address"); return; }
+  *reinterpret_cast<uint8_t*>(a) = static_cast<uint8_t>(v & 0xff);
+  Dart_SetReturnValue(args, Dart_GetNativeArgument(args, 1));
+}
+void ST_peekF64(Dart_NativeArguments args) {
+  int64_t a = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &a);
+  if (a <= 0) { STThrow("Alien doubleAt: bad address"); return; }
+  Dart_SetReturnValue(args, Dart_NewDouble(*reinterpret_cast<double*>(a)));
+}
+void ST_pokeF64(Dart_NativeArguments args) {
+  int64_t a = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &a);
+  if (a <= 0) { STThrow("Alien doubleAt:put: bad address"); return; }
+  double v = 0.0;
+  Dart_DoubleValue(Dart_GetNativeArgument(args, 1), &v);
+  *reinterpret_cast<double*>(a) = v;
+  Dart_SetReturnValue(args, Dart_GetNativeArgument(args, 1));
+}
+void ST_peekI64(Dart_NativeArguments args) {
+  int64_t a = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &a);
+  if (a <= 0) { STThrow("Alien signedLongAt: bad address"); return; }
+  Dart_SetReturnValue(args, Dart_NewInteger(*reinterpret_cast<int64_t*>(a)));
+}
+void ST_pokeI64(Dart_NativeArguments args) {
+  int64_t a = 0, v = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &a);
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 1), &v);
+  if (a <= 0) { STThrow("Alien signedLongAt:put: bad address"); return; }
+  *reinterpret_cast<int64_t*>(a) = v;
+  Dart_SetReturnValue(args, Dart_GetNativeArgument(args, 1));
+}
+
 // Smalltalk gcScavenge — force a new-space collection.
 void ST_gcScavenge(Dart_NativeArguments args) {
   Thread* thread = Thread::Current();

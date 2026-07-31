@@ -97,6 +97,46 @@ Object subclass: STSystem [
     STSystem class >> split: s by: charCode [ <stprim: stSplitByChar> ]
 ]
 
+"── Alien: raw memory access behind the FFI floor (ST_PORTING_PLAN §3a) ──
+ MACVM's built-in FFI wrapper. The corpus ASSUMES it (61_posix_io's
+ NativeBuffer, 30_date_time's clock, 61a_accelerate's NativeFloatArray) but
+ never defines it, so MACDART provides it here. addr+size name a span (an
+ mmap page or an FFI result address); accessors are 1-BASED byte offsets,
+ bounds-checked HERE so the raw peek/poke native never reads out of the span."
+Object subclass: Alien [
+    | addr size |
+    Alien class >> forAddress: a size: n [ ^self new setAddr: a size: n ]
+    setAddr: a size: n [
+        (a > 0 and: [ n >= 0 ]) ifFalse: [ ^self error: 'Alien: bad address or size' ].
+        addr := a. size := n ]
+    address [ ^addr ]
+    size [ ^size ]
+    byteAt: i [
+        (i < 1 or: [ i > size ]) ifTrue: [ ^self error: 'Alien byteAt: out of bounds' ].
+        ^Alien peekByte: addr + i - 1 ]
+    byteAt: i put: v [
+        (i < 1 or: [ i > size ]) ifTrue: [ ^self error: 'Alien byteAt:put: out of bounds' ].
+        ^Alien pokeByte: addr + i - 1 value: v ]
+    doubleAt: i [
+        (i < 1 or: [ i + 7 > size ]) ifTrue: [ ^self error: 'Alien doubleAt: out of bounds' ].
+        ^Alien peekDouble: addr + i - 1 ]
+    doubleAt: i put: v [
+        (i < 1 or: [ i + 7 > size ]) ifTrue: [ ^self error: 'Alien doubleAt:put: out of bounds' ].
+        ^Alien pokeDouble: addr + i - 1 value: v ]
+    signedLongAt: i [
+        (i < 1 or: [ i + 7 > size ]) ifTrue: [ ^self error: 'Alien signedLongAt: out of bounds' ].
+        ^Alien peekLong: addr + i - 1 ]
+    signedLongAt: i put: v [
+        (i < 1 or: [ i + 7 > size ]) ifTrue: [ ^self error: 'Alien signedLongAt:put: out of bounds' ].
+        ^Alien pokeLong: addr + i - 1 value: v ]
+    Alien class >> peekByte: a [ <stprim: stPeekByte> ]
+    Alien class >> pokeByte: a value: v [ <stprim: stPokeByte> ]
+    Alien class >> peekDouble: a [ <stprim: stPeekF64> ]
+    Alien class >> pokeDouble: a value: v [ <stprim: stPokeF64> ]
+    Alien class >> peekLong: a [ <stprim: stPeekI64> ]
+    Alien class >> pokeLong: a value: v [ <stprim: stPokeI64> ]
+]
+
 "── The collection bridge (Sprint 11: corpus breadth) ────────────────
  An Array IS a Dart fixed-length List (1-based at:/at:put: through the
  universal helpers); an OrderedCollection wraps a growable Dart List.

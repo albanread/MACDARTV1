@@ -805,6 +805,15 @@ _stAsSymSlow(s) => s.asSymbol();
 /// Time); doubles (Accel) arrive with the FPR trampoline.
 stFfiCall(List args, String desc) native "ST_ffiCall";
 
+/// Alien peek/poke (stage b): raw read/write at an ABSOLUTE address (an int).
+/// The prelude's Alien bounds-checks against its span before calling these.
+stPeekByte(a) native "ST_peekByte";
+stPokeByte(a, v) native "ST_pokeByte";
+stPeekF64(a) native "ST_peekF64";
+stPokeF64(a, v) native "ST_pokeF64";
+stPeekI64(a) native "ST_peekI64";
+stPokeI64(a, v) native "ST_pokeI64";
+
 /// Sorted copy of a Dart list (prelude asSortedCollection plumbing).
 stSortedOf(l) { var c = new List.from(l); c.sort(); return c; }
 

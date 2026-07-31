@@ -757,6 +757,12 @@ void ST_hasMethod(Dart_NativeArguments args);
 void ST_classNamed(Dart_NativeArguments args);
 void ST_asSymbol(Dart_NativeArguments args);
 void ST_ffiCall(Dart_NativeArguments args);
+void ST_peekByte(Dart_NativeArguments args);
+void ST_pokeByte(Dart_NativeArguments args);
+void ST_peekF64(Dart_NativeArguments args);
+void ST_pokeF64(Dart_NativeArguments args);
+void ST_peekI64(Dart_NativeArguments args);
+void ST_pokeI64(Dart_NativeArguments args);
 void ST_gcScavenge(Dart_NativeArguments args);
 void ST_gcFull(Dart_NativeArguments args);
 void ST_gcStats(Dart_NativeArguments args);
@@ -847,6 +853,12 @@ static void Cocoa_sendMain(Dart_NativeArguments args) {
   V(ST_classNamed, 1)                                                          \
   V(ST_asSymbol, 1)                                                            \
   V(ST_ffiCall, 2)                                                             \
+  V(ST_peekByte, 1)                                                            \
+  V(ST_pokeByte, 2)                                                            \
+  V(ST_peekF64, 1)                                                             \
+  V(ST_pokeF64, 2)                                                             \
+  V(ST_peekI64, 1)                                                             \
+  V(ST_pokeI64, 2)                                                             \
   V(ST_gcScavenge, 0)                                                          \
   V(ST_gcFull, 0)                                                              \
   V(ST_gcStats, 0)                                                             \

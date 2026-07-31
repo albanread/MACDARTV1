@@ -9,3 +9,10 @@
  18 (file 79); reopen adds the missing constructor."
 
 WriteStream class >> new [ ^self on: String new ]
+
+"next: n put: anObject — write n copies of anObject (ANSI/Squeak). The one
+ WriteStream method a sweep found missing next to nextPut:/nextPutAll:."
+WriteStream >> next: anInteger put: anObject [
+    anInteger timesRepeat: [ self nextPut: anObject ].
+    ^anObject
+]

@@ -1121,6 +1121,9 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
             {"String", "with:", "stStringWith", 1},
             {"String", "lf", "stStrLf", 0},
             {"Character", "lf", "stStrLf", 0},
+            {"Character", "nl", "stStrLf", 0},     // nl == lf (10); was missing,
+                                                   // so `Character nl` hit the
+                                                   // ST Table (a non-flyweight)
             {"Character", "tab", "stStrTab", 0},
             {"Character", "cr", "stStrCr", 0},
             {"Character", "space", "stStrSpace", 0},
@@ -1529,6 +1532,14 @@ Fragment StGraphBuilder::TranslateClassSend(const Class& cls,
   }
   if ((node->selector == "new" || node->selector == "basicNew") &&
       node->args.empty()) {
+    // Array is bridged to a Dart List: a bare AllocateObject makes an instance
+    // with no List backing (no size/at:put: — `WriteStream on: Array new` died
+    // on it). `Array new` is the empty Array, like `Array new: 0`.
+    const String& icn = String::Handle(zone_, inst_cls.Name());
+    if (icn.Equals("Array")) {
+      return StaticCall(
+          Function::ZoneHandle(zone_, LookupCocoaFunction("stNewArray0")), 0);
+    }
     return AllocateObject(inst_cls);
   }
   // Sprint 9: ANSI `Exception class >> signal[:]` — a class-side signal send

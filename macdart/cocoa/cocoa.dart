@@ -310,6 +310,13 @@ int _stCode(v) {
   if (v is int) return v;
   if (v is String && v.length >= 1) return v.codeUnitAt(0);
   if (v is StMutableString && v.units.isNotEmpty) return v.units[0];
+  // A non-flyweight ST Character (e.g. one the corpus Table minted via
+  // `basicNew setValue:`) still knows its code — read it rather than
+  // defaulting to a space, so any Character interops in string building.
+  if (v != null) {
+    var iv = _stSendTry(v, 'value', const []);
+    if (iv != null && iv[0] is int) return iv[0];
+  }
   return 32;
 }
 
@@ -1317,6 +1324,7 @@ stListIncludes(l, x) => l.contains(x);
 stListAppend(l, x) { l.add(x); return l; }  // literal-array build chain
 stSplitByChar(s, code) => s.toString().split(new String.fromCharCode(code));
 stStringWith(c) => c.toString();  // a Character IS a 1-char string here
+stNewArray0() => <dynamic>[];    // `Array new` — an empty growable Array (List)
 stStrLf() => '\n';
 stStrTab() => '\t';
 stStrCr() => '\r';

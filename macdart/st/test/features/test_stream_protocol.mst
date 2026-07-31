@@ -1,0 +1,71 @@
+"Feature test: the full stream protocol — WriteStream / ReadStream /
+ ReadWriteStream and the collection-stream constructors — one assertion per
+ method with human-verified expected values (the test IS the spec). Born from a
+ live sweep of every stream method; the stream protocol itself was already
+ sound, and the sweep's fixes were the neighbours it leans on:
+   * WriteStream>>next:put: (write n copies) was missing;
+   * `Array new` (no size) built a backing-less instance, so a WriteStream on
+     one had no size — now the empty Array;
+   * `Character nl` minted a NON-flyweight char (the ST value: Table), which
+     String-building mangled — nl now joins cr/tab/space as a bridged char."
+STestCase subclass: TestStreamProtocol [
+    "one-char newline, via the flyweight bridge (Character nl)"
+    nl [ ^String with: Character nl ]
+
+    tests [
+        "── WriteStream ──"
+        self check: ((WriteStream on: String new) nextPutAll: 'hi'; contents) is: 'hi' label: 'WS nextPutAll:/contents'.
+        self check: ((WriteStream new) nextPutAll: 'abc'; contents) is: 'abc' label: 'WriteStream new (bare)'.
+        self check: ((WriteStream on: String new) nextPut: $x; nextPut: $y; contents) is: 'xy' label: 'WS nextPut:'.
+        self check: ((WriteStream on: String new) print: 42; contents) is: '42' label: 'WS print: (int)'.
+        self check: ((WriteStream on: String new) print: 'hi'; contents) is: '''hi''' label: 'WS print: (quotes)'.
+        self check: ((WriteStream on: String new) << 'a' << 'b'; contents) is: 'ab' label: 'WS <<'.
+        self check: ((WriteStream on: String new) nextPutAll: 'a'; space; nextPutAll: 'b'; contents) is: 'a b' label: 'WS space'.
+        self check: ((WriteStream on: String new) nextPutAll: 'a'; tab; contents) size is: 2 label: 'WS tab'.
+        self check: ((WriteStream on: String new) next: 3 put: $z; contents) is: 'zzz' label: 'WS next:put: (was missing)'.
+        self check: ((WriteStream on: Array new) nextPut: 1; nextPut: 2; contents) is: #(1 2) label: 'WS on Array new (was backing-less)'.
+        self check: (String streamContents: [:s | s nextPutAll: 'x'. s print: 9]) is: 'x9' label: 'String streamContents:'.
+
+        "── ReadStream ──"
+        self check: (ReadStream on: #(10 20 30)) next is: 10 label: 'RS next'.
+        self check: (self rsThirdOf: #(1 2 3)) is: 3 label: 'RS next x3'.
+        self check: (self rsPeekThenNext) is: 1 label: 'RS peek does not advance'.
+        self deny: (ReadStream on: #(1)) atEnd label: 'RS atEnd false'.
+        self assert: (self rsAtEndAfterLast) label: 'RS atEnd true after last'.
+        self check: (self rsUpToEndFrom2) is: #(2 3 4) label: 'RS upToEnd'.
+        self check: (self rsSkip2Next) is: 3 label: 'RS skip:'.
+        self check: (self rsResetNext) is: 1 label: 'RS reset'.
+        self check: (self rsDoSum) is: 6 label: 'RS do:'.
+        self check: (ReadStream on: 'hello') next is: $h label: 'RS on String next'.
+        self check: (self rsStrUpToEnd) is: 'ello' label: 'RS on String upToEnd'.
+        self check: ((ReadStream on: 'hello') next: 3) is: 'hel' label: 'RS next:'.
+        self check: ((ReadStream on: 'a,b,c') upTo: $,) is: 'a' label: 'RS upTo:'.
+        self check: (self rsNextLine) is: 'one' label: 'RS nextLine (needs Character nl)'.
+        self assert: ((ReadStream on: 'abc') peekFor: $a) label: 'RS peekFor: hit'.
+        self check: (self rsSkipSeparators) is: 'hi' label: 'RS skipSeparators'.
+
+        "── ReadWriteStream ──"
+        self check: (self rwsWriteReset) is: 'hi' label: 'RWS write, reset, read'.
+        self check: (self rwsContents) is: 'abc' label: 'RWS contents'.
+
+        "── collection-stream constructors ──"
+        self check: (self arrReadStream2nd) is: 6 label: 'Array readStream'.
+        self check: ('' writeStream nextPutAll: 'xy'; contents) is: 'xy' label: 'String writeStream'.
+        self check: ('abc' readStream) next is: $a label: 'String readStream'.
+    ]
+
+    "── helpers (stream state must not straddle the assertion line) ──"
+    rsThirdOf: a [ | s | s := ReadStream on: a. s next. s next. ^s next ]
+    rsPeekThenNext [ | s | s := ReadStream on: #(1 2 3). s peek. ^s next ]
+    rsAtEndAfterLast [ | s | s := ReadStream on: #(1). s next. ^s atEnd ]
+    rsUpToEndFrom2 [ | s | s := ReadStream on: #(1 2 3 4). s next. ^s upToEnd ]
+    rsSkip2Next [ | s | s := ReadStream on: #(1 2 3 4). s skip: 2. ^s next ]
+    rsResetNext [ | s | s := ReadStream on: #(1 2 3). s next. s reset. ^s next ]
+    rsDoSum [ | s n | s := ReadStream on: #(1 2 3). n := 0. s do: [:e | n := n + e]. ^n ]
+    rsStrUpToEnd [ | s | s := ReadStream on: 'hello'. s next. ^s upToEnd ]
+    rsNextLine [ | s | s := ReadStream on: ('one', self nl, 'two'). ^s nextLine ]
+    rsSkipSeparators [ | s | s := ReadStream on: '   hi'. s skipSeparators. ^s upToEnd ]
+    rwsWriteReset [ | s | s := ReadWriteStream on: String new. s nextPutAll: 'hi'. s reset. ^s upToEnd ]
+    rwsContents [ | s | s := ReadWriteStream on: String new. s nextPutAll: 'abc'. ^s contents ]
+    arrReadStream2nd [ | s | s := #(5 6 7) readStream. s next. ^s next ]
+]

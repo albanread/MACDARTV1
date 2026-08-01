@@ -12,6 +12,8 @@ import 'dart:math' as math
     show sqrt, log, exp, sin, cos, tan, atan, asin, acos, pow;
 import 'dart:mirrors' show MirrorSystem;
 import 'dart:developer' as developer show debugger;
+import 'dart:typed_data' show Uint8List;
+import 'dart:convert' show BASE64;
 
 /// The process id — a POSIX FFI smoke test (getpid()).
 int processId() native "Cocoa_getpid";
@@ -1890,12 +1892,68 @@ stGpDisc(p, cx, cy, r, c) {
   _stGpCmds.add(<dynamic>['gpdisc', cx, cy, r, c]);
   return p;
 }
+
+// --- buffer slots (GAMEPANE_PLAN.md §5 / world/84_gamepane_buffers.mst) -----
+// The indexed pane's 8 buffer slots (0 front, 1 back, 2..7 asset/scratch —
+// gp_engine.h's kNumBuffers) and the GPU compute blitter between them, for
+// tile-atlas reuse and scrolling multi-layer scenes: pre-render a tile/layer
+// once into an asset slot, then cheaply blitMode:...: copies of it into the
+// front buffer instead of redrawing it every frame. These are plain wire ops
+// (like every stGp* above), applied by the SAME gpApply pass that draws —
+// unlike direct mode, there is no separate native buffer to reach into, so
+// load's bytes travel base64-encoded exactly as a Dart game's loadBuffer
+// would ship them. This SDK predates the Dart 2 lowercase rename — the
+// constant is `BASE64`, not `base64` (dart:convert's own base64.dart:
+// `const Base64Codec BASE64 = const Base64Codec();`); importing the
+// (nonexistent here) lowercase name compiled clean but threw a
+// NoSuchMethodError the first time an ST game actually called
+// loadBuffer:bytes:, which is what caught it.
+stGpScroll(p, x, y) { _stGpCmds.add(<dynamic>['gpscroll', x, y]); return p; }
+stGpActive(p, slot) { _stGpCmds.add(<dynamic>['gpactive', slot]); return p; }
+stGpSwap(p) { _stGpCmds.add(<dynamic>['gpswap']); return p; }
+stGpLoad(p, slot, bytes) {
+  _stGpCmds.add(<dynamic>['gpload', slot, BASE64.encode(bytes)]);
+  return p;
+}
+stGpBlitSlots(p, mode, src, dst, sx, sy, dx, dy, w, h, value) {
+  _stGpCmds.add(<dynamic>['gpblit', mode, src, dst, sx, sy, dx, dy, w, h, value]);
+  return p;
+}
+
 stGpPresent(p) => p; // the driver's tick drain IS the frame boundary
 stGpBlit(p, bytes) {
   if (!_stGpBlitWarned) {
     _stGpBlitWarned = true;
     print('st: GamePane>>blit: is not wired on this VM yet (draw ops and '
         'sprites are) — the frame was skipped');
+  }
+  return p;
+}
+
+// --- direct-mode bridge (GAMEPANE_PLAN.md §6b), for the world's whole-frame
+// CPU renderers (MandelZoom/MandelVM — see 83_gamepane_direct.mst) — the same
+// shape as demos/14_julia.dart at the Dart level: skip the indexed pane's
+// per-isolate command buffer for the pixel data entirely and write straight
+// into the shared GPU memory gpBackbuffer() exposes. Only meaningful when
+// _stGame opened the pane in direct mode (language.dart's _kStGames entry
+// has 'direct': true); otherwise gpBackbuffer() answers null and this is
+// silently a no-op, matching every other stGp* helper's headless contract.
+stGpDirectPal(p, i, r, g, b) { _stGpCmds.add(<dynamic>['gpdpal', i, r, g, b]); return p; }
+stGpDirectBlit(p, bytes) {
+  var fb = gpBackbuffer();
+  if (fb is! Uint8List) return p;             // not open/ready yet — no-op
+  var st = gpStat();
+  if (st is! List || st.length <= 6) return p;
+  int w = st[2], h = st[3], stride = st[6];
+  if (w <= 0 || h <= 0) return p;
+  var n = bytes.length < w * h ? bytes.length : w * h;
+  if (stride == w) {
+    for (var i = 0; i < n; i++) fb[i] = bytes[i];
+  } else {
+    for (var y = 0; y < h; y++) {
+      var srcRow = y * w, dstRow = y * stride;
+      for (var x = 0; x < w && srcRow + x < n; x++) fb[dstRow + x] = bytes[srcRow + x];
+    }
   }
   return p;
 }

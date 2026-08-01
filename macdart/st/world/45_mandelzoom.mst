@@ -6,25 +6,28 @@
  Mandelbrot uses — this demo reuses `Mandelbrot>>escapeAtRe:im:`
  (world/35_mandelbrot.mst) unchanged, the 'fast floats' the tour is about
  (world/08_double.mst). Each tick it computes a WHOLE 320x240 frame into a
- reused ByteArray of palette indices, then hands the buffer to the pane in one
- `blit:` command (primitive 215 → GameCommand::Blit → IndexedPane::blit, a single
- memcpy into the GPU-uploaded buffer). That is the bulk path for CPU-generated
- frames: one command per frame instead of one `point:y:color:` per pixel (a full
- frame would be 76,800 commands), so the whole image updates coherently and the
- view can dive one notch per frame toward the seahorse valley.
+ reused ByteArray of palette indices, then hands the buffer straight to the
+ Metal pane's shared GPU memory with `directBlit:` (world/83_gamepane_direct.mst
+ — the same direct-write demos/14_julia.dart uses at the Dart level, one bulk
+ copy instead of 76,800 `point:y:color:` commands). This class opts into that
+ by setting 'direct': true on its language.dart _kStGames entry, which makes
+ _stGame open the pane in direct mode before `start` even runs. (`blit:`,
+ primitive 215, is a documented no-op stub on this VM — see
+ 80_gamepane_wiring.mst — which is why this demo does NOT use it.)
 
- Palette (game-pane colours are 0..255; index 0 is transparent, user entries
- start at 16): entry 16 is the near-black interior; entries 17..255 are a
- colourful band cycled by escape count. In a headless VM every game primitive
- silently fails, so loading this class outside the GUI is harmless."
+ Palette (0..255, direct mode has no reserved low range): index 0 is the
+ near-black interior; entries 1..255 are a colourful band cycled by escape
+ count. In a headless VM every game primitive silently fails, so loading
+ this class outside the GUI is harmless."
 "I render a continuously zooming Mandelbrot set live in the native game
  pane, diving toward the seahorse valley one notch per frame and resetting
  once the dive bottoms out, so I loop forever. Launch me from the Demos
  menu, or a Workspace: MandelZoom launch. Each frame I compute a whole
  320x240 view of palette indices — reusing Mandelbrot escapeAtRe:im: for
  the Double escape-time math — into a reused buffer, then hand it to the
- pane in a single blit:, the bulk path for CPU-generated frames. Harmless
- to load in a headless VM (every game primitive silently fails there)."
+ pane's shared GPU memory in one directBlit:, the bulk path for CPU-generated
+ frames. Harmless to load in a headless VM (every game primitive silently
+ fails there)."
 Object subclass: MandelZoom [
     | pane mb maxIter buf centerR centerI scale zoomStep |
 
@@ -50,26 +53,29 @@ Object subclass: MandelZoom [
     ]
 
     buildPalette [
-        "Interior = a deep near-black blue (entry 16); 17..255 = a cyclic
+        "Interior = a deep near-black blue (entry 0); 1..255 = a cyclic
          colour band, the same decimal-channel bands the Canvas Mandelbrot uses
-         (world/35_mandelbrot.mst), baked into the palette once."
+         (world/35_mandelbrot.mst), baked into the palette once. Direct mode
+         has no reserved low range (that was an indexed-pane convention), so
+         this starts at 0, not 16."
         | k r g b |
-        pane paletteAt: 16 r: 8 g: 8 b: 24.
+        pane directPal: 0 r: 8 g: 8 b: 24.
         k := 0.
-        [ k < 239 ] whileTrue: [
+        [ k < 255 ] whileTrue: [
             r := (k * 8) \\ 256.
             g := (k * 5) \\ 256.
             b := 64 + ((k * 11) \\ 192).
-            pane paletteAt: 17 + k r: r g: g b: b.
+            pane directPal: 1 + k r: r g: g b: b.
             k := k + 1 ].
         ^self
     ]
 
     step [
         "One frame: compute the whole 320x240 view into `buf` (a palette index
-         per pixel, row-major from the top-left), blit it in one command, then
-         zoom in a notch (resetting to the whole set once we have dived a long
-         way, so it loops forever)."
+         per pixel, row-major from the top-left), copy it straight into the
+         Metal pane's shared GPU memory in one directBlit:, then zoom in a
+         notch (resetting to the whole set once we have dived a long way, so
+         it loops forever)."
         | stepc rmin imin ci cr i n idx |
         stepc := scale / 320.0.
         rmin := centerR - (scale / 2.0).
@@ -81,12 +87,12 @@ Object subclass: MandelZoom [
             0 to: 319 do: [ :px |
                 n := mb escapeAtRe: cr im: ci.
                 idx := n >= maxIter
-                    ifTrue: [ 16 ]
-                    ifFalse: [ 17 + (n \\ 239) ].
+                    ifTrue: [ 0 ]
+                    ifFalse: [ 1 + (n \\ 255) ].
                 buf at: i put: idx.
                 i := i + 1.
                 cr := cr + stepc ] ].
-        pane blit: buf.
+        pane directBlit: buf.
         pane present.        "show the frame — every frame in the loop presents"
         scale := scale * zoomStep.
         scale < 0.00005 ifTrue: [ self diveBottomed ].

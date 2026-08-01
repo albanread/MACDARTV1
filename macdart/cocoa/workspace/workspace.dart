@@ -1839,8 +1839,15 @@ Future spawnLanguage() async {
   });
   var errPort = new ReceivePort();
   var exitPort = new ReceivePort();
+  // The language isolate boots from a temp scratch file, so it cannot resolve
+  // the source tree itself — hand it the on-disk Dart library sources (the same
+  // the VM was built from) so the Browser can show the REAL source of the
+  // read-only libraries (dart:core, dart:cocoa, …), not just mirror signatures.
+  var sdkLib = Platform.script.resolve('../../sdk/lib').toFilePath();
+  var cocoaSrc = Platform.script.resolve('../cocoa.dart').toFilePath();
   gLangIsolate = await Isolate.spawnUri(
-      Uri.parse('file://' + gScratch), <String>[gScratch, gDbPath], gFromLang.sendPort,
+      Uri.parse('file://' + gScratch),
+      <String>[gScratch, gDbPath, sdkLib, cocoaSrc], gFromLang.sendPort,
       onError: errPort.sendPort, onExit: exitPort.sendPort, errorsAreFatal: false);
   gLang = await handshake.future;
   errPort.listen((e) {

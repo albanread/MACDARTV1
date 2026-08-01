@@ -512,6 +512,133 @@ const List<String> _kMirrorLibs = const [
   'dart:convert', 'dart:io', 'dart:isolate', 'dart:typed_data',
 ];
 
+// --- Reading the REAL source of the read-only Dart libraries from disk -------
+// The Browser's classSource/methodSource for a `dart:` library used to
+// SYNTHESIZE a signature stub from mirrors (`_worldClassSrc`). These paths, set
+// at spawn, point at the actual .dart the VM was built from, so we can show the
+// genuine library source — comments, bodies, `external` declarations and all —
+// read-only. Empty (or a miss) falls back to the mirror synthesis.
+String _sdkLibDir = '';       // <macdart>/sdk/lib   (dart:core -> core/*.dart)
+String _cocoaSrcPath = '';    // <macdart>/cocoa/cocoa.dart  (dart:cocoa)
+
+bool _isIdentCh(int c) =>
+    (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5A) ||
+    (c >= 0x61 && c <= 0x7A) || c == 0x5F || c == 0x24;
+
+// The .dart files that could hold a `dart:X` library's source.
+List<String> _libFiles(String libUri) {
+  if (libUri == 'dart:cocoa') {
+    return _cocoaSrcPath.isEmpty ? const <String>[] : <String>[_cocoaSrcPath];
+  }
+  if (!libUri.startsWith('dart:') || _sdkLibDir.isEmpty) return const <String>[];
+  var dir = _sdkLibDir + '/' + libUri.substring(5);   // dart:core -> .../core
+  var out = <String>[];
+  try {
+    for (var e in new Directory(dir).listSync(recursive: true)) {
+      if (e is File && e.path.endsWith('.dart')) out.add(e.path);
+    }
+  } catch (e) {}
+  out.sort();
+  return out;
+}
+
+// Index of `(abstract )?class Name` as a real declaration in `src`, or -1.
+int _findClassDecl(String src, String name) {
+  var needle = 'class ' + name;
+  var pos = 0;
+  while (true) {
+    var c = src.indexOf(needle, pos);
+    if (c < 0) return -1;
+    var after = c + needle.length;
+    var afterOk = after >= src.length || !_isIdentCh(src.codeUnitAt(after));
+    var beforeOk = c == 0 || !_isIdentCh(src.codeUnitAt(c - 1));  // not a suffix
+    if (afterOk && beforeOk) return c;
+    pos = c + 1;
+  }
+}
+
+// Back up from the `class` keyword to include `abstract ` and an immediately
+// preceding doc comment (/// lines or a /** */ block), so the view reads whole.
+int _declStart(String src, int classKw) {
+  var i = classKw;
+  // `abstract ` prefix
+  var pre = src.lastIndexOf('abstract', classKw);
+  if (pre >= 0 && src.substring(pre, classKw).trim() == 'abstract') i = pre;
+  // preceding doc-comment lines
+  var ls = src.lastIndexOf('\n', i - 1);        // start of the decl's line
+  while (ls > 0) {
+    var prevEnd = ls;                            // '\n' ending the line above
+    var prevStart = src.lastIndexOf('\n', prevEnd - 1) + 1;
+    var line = src.substring(prevStart, prevEnd).trim();
+    if (line.startsWith('///') || line.startsWith('*') ||
+        line.startsWith('/**') || line.startsWith('/*') || line.endsWith('*/')) {
+      ls = prevStart - 1;                        // absorb this line, keep going
+      i = prevStart;
+    } else {
+      break;
+    }
+  }
+  return i;
+}
+
+// Index of the `}` closing the first `{` at/after `from`, skipping strings and
+// comments (so a brace inside a string literal or comment never miscounts). -1
+// if unbalanced.
+int _matchBraceAfter(String s, int from) {
+  var n = s.length;
+  var i = s.indexOf('{', from);
+  if (i < 0) return -1;
+  var depth = 0;
+  while (i < n) {
+    var c = s.codeUnitAt(i);
+    if (c == 0x2F && i + 1 < n) {                       // // or /* comment
+      var d = s.codeUnitAt(i + 1);
+      if (d == 0x2F) { while (i < n && s.codeUnitAt(i) != 0x0A) i++; continue; }
+      if (d == 0x2A) {
+        i += 2;
+        while (i + 1 < n && !(s.codeUnitAt(i) == 0x2A && s.codeUnitAt(i + 1) == 0x2F)) i++;
+        i += 2; continue;
+      }
+    }
+    if (c == 0x27 || c == 0x22) {                       // ' or " string
+      var q = c; i++;
+      while (i < n && s.codeUnitAt(i) != q && s.codeUnitAt(i) != 0x0A) {
+        if (s.codeUnitAt(i) == 0x5C) i++;               // backslash escape
+        i++;
+      }
+      i++; continue;
+    }
+    if (c == 0x7B) depth++;
+    else if (c == 0x7D) { depth--; if (depth == 0) return i; }
+    i++;
+  }
+  return -1;
+}
+
+// The genuine on-disk source of `className` in a `dart:` library; '' if absent.
+String _diskLibSource(String libUri, String className) {
+  for (var path in _libFiles(libUri)) {
+    String src;
+    try { src = new File(path).readAsStringSync(); } catch (e) { continue; }
+    var kw = _findClassDecl(src, className);
+    if (kw < 0) continue;
+    var close = _matchBraceAfter(src, kw);
+    if (close < 0) continue;
+    return src.substring(_declStart(src, kw), close + 1);
+  }
+  return '';
+}
+
+// The member `sel` from the on-disk class source (read-only); '' if not found.
+String _diskLibMemberSource(String libUri, String className, String sel) {
+  var cls = _diskLibSource(libUri, className);
+  if (cls.isEmpty) return '';
+  for (var m in _splitMembers(cls)) {
+    if (_dartSel(m) == sel) return m.trim();
+  }
+  return '';
+}
+
 String _hostCall(String verb, List args) {
   if (verb == 'packageTree') {
     // The world grouped by source-file stem (MACVM: a class's category IS
@@ -606,13 +733,26 @@ String _hostCall(String verb, List args) {
   var cls = args.isNotEmpty ? args[0].toString() : '';
   var src = _decls.containsKey(cls) ? _decls[cls] : null;
   if (src == null) {
-    // A LIVE snapshot-core class (mirrors): read-only synthesized views.
+    // A LIVE snapshot-core class (mirrors): read-only. Prefer the REAL on-disk
+    // library source (the .dart the VM was built from) — genuine comments and
+    // bodies — and fall back to the mirror-synthesized signature stub only when
+    // the source isn't on disk.
     for (var uri in _kMirrorLibs) {
       if (_worldClasses(uri).contains(cls)) {
         if (verb == 'comment') return '"' + cls + ' - ' + uri + ' (read-only)"';
-        if (verb == 'classSource') return _worldClassSrc(uri + '|' + cls);
+        if (verb == 'classSource') {
+          var disk = _diskLibSource(uri, cls);
+          if (disk.isNotEmpty) {
+            return '// ' + uri + ' - real library source, read-only\n\n' + disk;
+          }
+          return _worldClassSrc(uri + '|' + cls);
+        }
         if (verb == 'methodSource') {
           var want = args[2].toString();
+          var disk = _diskLibMemberSource(uri, cls, want);
+          if (disk.isNotEmpty) {
+            return disk + '\n\n// ' + uri + ' - real library source, read-only';
+          }
           for (var m in _worldClassMembers(uri + '|' + cls)) {
             var sig = m[2].toString();
             if (sig == want || _dartMemberName(sig) == want) {
@@ -826,6 +966,10 @@ main(List args, SendPort uiPort) {
   stHostHook = (verb, argv) => _hostCall(verb.toString(), argv);
 
   _scratch = args[0];
+  // On-disk Dart library sources (passed by spawnLanguage), for the Browser's
+  // read-only real-source view of dart:core / dart:cocoa / …
+  if (args.length > 2 && args[2] != null) _sdkLibDir = args[2].toString();
+  if (args.length > 3 && args[3] != null) _cocoaSrcPath = args[3].toString();
   if (args.length > 1 && args[1] != null && (args[1] as String).length > 0) {
     _db = new Db.open(args[1]);
     if (_db.isOpen) {

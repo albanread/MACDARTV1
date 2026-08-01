@@ -102,13 +102,19 @@ runs, or Dart-2 features — not VM defects.
 
 The reference sources are **not** vendored in this repo — only the port (the
 scripts, the CMake build, and the patch). To build, you supply a Dart 1.24.3
-checkout as the source quarry:
+checkout as the source quarry. Dart V1 is end-of-life, so we do **not** depend
+on `dart-lang/sdk` staying online: the quarry comes from our own byte-verbatim
+mirror, [`albanread/dart-v1-sdk`](https://github.com/albanread/dart-v1-sdk)
+(a private snapshot of `dart-lang/sdk` @ `1.24.3`, commit `0b0b41ef2` — see its
+`PROVENANCE.md`). The build is fully offline once the quarry is present.
 
 ```bash
-# 1. Get the reference sources (the last V1 release), placed at ../sdk:
-git clone --depth 1 --branch 1.24.3 https://github.com/dart-lang/sdk.git sdk
+# 1. Get the reference sources (the last V1 release) at ../sdk, from our mirror:
+./macdart/port/get-sdk.sh            # clones albanread/dart-v1-sdk -> ./sdk
+#   (override the source with MACDART_SDK_MIRROR=<url-or-path> if you have a fork)
 
-# 2. Extract the needed subset into the owned tree and apply the port patch:
+# 2. Extract the needed subset into the owned tree and apply the port patch
+#    (auto-runs get-sdk.sh if ../sdk is still absent):
 ./macdart/port/extract.sh
 
 # 3. Build (CMake + Ninja, C++14):

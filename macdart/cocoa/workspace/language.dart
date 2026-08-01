@@ -583,8 +583,8 @@ String _hostCall(String verb, List args) {
       } else if (k == 'class' || k == 'enum') {
         var sels = <String>[];
         for (var m in _splitMembers(s)) {
-          var sig = _memberSig(m);
-          if (sig.length > 0) sels.add(sig);
+          var sel = _dartSel(m);          // the NAME — the wire list is
+          if (sel.isNotEmpty) sels.add(sel);   // space-delimited (see _dartSel)
         }
         out.write(n + _us + 'Object' + _us + _us + _us +
             sels.join(' ') + _us + '\n');
@@ -642,8 +642,10 @@ String _hostCall(String verb, List args) {
         if (_sigToSelector(m[2].toString()) == sel) return m[3].toString();
       }
     } else {
+      // Dart class: the browser sends the space-free NAME (browseRecords lists
+      // names now); accept a full signature too for any older caller.
       for (var m in _splitMembers(src)) {
-        if (_memberSig(m) == sel) return m;
+        if (_dartSel(m) == sel || _memberSig(m) == sel) return m;
       }
     }
     return 'ERR no source for ' + cls + '>>' + sel;
@@ -684,10 +686,15 @@ String _hostSaveMethod(String cls, String side, String text) {
     var sig = _memberSig(t2);
     if (sig.isEmpty) return 'ERR cannot read a Dart member signature from the text';
     var out = null;
+    // Exact-signature match first (safe for a get/set pair sharing a name);
+    // then fall back to the method NAME, so editing the parameter list replaces
+    // the method rather than appending a twin (Dart has no overloading).
     for (var m in _splitMembers(src)) {
-      if (_memberSig(m) == sig) {
-        out = src.replaceFirst(m.trim(), t2);
-        break;
+      if (_memberSig(m) == sig) { out = src.replaceFirst(m.trim(), t2); break; }
+    }
+    if (out == null) {
+      for (var m in _splitMembers(src)) {
+        if (_dartSel(m) == _dartSel(t2)) { out = src.replaceFirst(m.trim(), t2); break; }
       }
     }
     if (out == null) {
@@ -748,6 +755,20 @@ String _hostSaveMethod(String cls, String side, String text) {
 String _hostRemoveMethod(String cls, String side, String sel) {
   var src = _decls.containsKey(cls) ? _decls[cls] : null;
   if (src == null) return 'ERR no class ' + cls;
+  if (!_isStAny(src)) {
+    // Dart class: the ST member index (headers ending `[`) finds nothing here,
+    // so removal used to silently no-op. Match by the space-free NAME and
+    // splice the member out of the class body, through the checked accept.
+    for (var m in _splitMembers(src)) {
+      if (_dartSel(m) == sel) {
+        var out = src.replaceFirst(m.trim(), '')
+            .replaceAll(new RegExp(r'\n[ \t]*\n[ \t]*\n'), '\n\n');
+        var err = _acceptOne(out);
+        return err.isEmpty ? 'OK removed ' + sel : 'ERR ' + err;
+      }
+    }
+    return 'ERR no such method ' + cls + '>>' + sel;
+  }
   var lines = src.split('\n');
   var wantSide = (side == 'class') ? 'c' : 'i';
   var hit = null;
@@ -1361,6 +1382,12 @@ String _memberSig(String m) {
   }
   return m.substring(0, end).trim();
 }
+
+// The browser's space-free KEY for a Dart member — its bare name (`showAll`,
+// not `showAll(ui, v)`). The method-list wire is space-delimited, so a full
+// signature would shatter into `showAll(ui,` + `v)` in the list and never match
+// on lookup; every browser list/lookup for a Dart class keys on this.
+String _dartSel(String memberOrSig) => _dartMemberName(_memberSig(memberOrSig));
 
 List _classMembers2(String className) {
   var src = _decls[className];

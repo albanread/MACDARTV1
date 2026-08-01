@@ -1067,13 +1067,6 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'classes') out = _classNames(arg.toString());
       else if (cmd == 'members') out = _memberList(arg);
       else if (cmd == 'classsrc') out = _decls.containsKey(arg) ? _decls[arg] : '';
-      else if (cmd == 'classmembers') out = _classMembers2(arg);
-      else if (cmd == 'categories') out = _categories();
-      else if (cmd == 'classcomment') out = _classComment(arg);
-      else if (cmd == 'setcomment') out = _setComment(arg);
-      else if (cmd == 'worldclasses') out = _worldClasses(arg.length > 0 ? arg : 'dart:core');
-      else if (cmd == 'worldclassmembers') out = _worldClassMembers(arg);
-      else if (cmd == 'worldclasssrc') out = _worldClassSrc(arg);
       else if (cmd == 'find') out = _find(arg);
       else if (cmd == 'senders') out = _senders(arg);
       else if (cmd == 'alldecls') out = _allDecls();
@@ -1775,21 +1768,6 @@ String _paramSig(MethodMirror mm) {
     }
     return ps.join(', ');
   } catch (e) { return ''; }
-}
-
-// The class comment, stored in the image alongside its source.
-String _classComment(String name) {
-  if (_db == null || !_db.isOpen) return '';
-  var r = _db.query('SELECT comment FROM decls WHERE name=?', [name]);
-  if (r != null && r.length > 0 && r[0].length > 0 && r[0][0] != null) return r[0][0];
-  return '';
-}
-
-String _setComment(List a) {
-  if (_db != null && _db.isOpen) {
-    _db.exec('UPDATE decls SET comment=? WHERE name=?', [a[1].toString(), a[0].toString()]);
-  }
-  return 'ok';
 }
 
 // --- Find (over the image) --------------------------------------------------

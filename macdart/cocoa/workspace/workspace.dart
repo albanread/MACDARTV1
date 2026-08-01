@@ -26,20 +26,7 @@ int gLangGen = 0;                      // generation, to ignore stale exit event
 final Object _kTimeout = new Object();
 const Duration _kDoitTimeout = const Duration(seconds: 6);
 
-// Browser (Smalltalk-style, 4-pane) state.
-Cocoa gCatTable, gClassTable, gVarTable, gMethodTable, gBrowserSrc, gStatus;
-String gSelMemberSig;              // signature of the selected member (status line)
-List gBrCats = <dynamic>[];        // Categories: "User App" + world libraries
-List gBrClasses = <dynamic>[];     // classes in the selected category
-List gClassMembers = <dynamic>[];  // all member records of the selected class
-List gVarRecs = <dynamic>[];       // variables for the current side (i/c)
-List gMethodRecs = <dynamic>[];    // methods for the current side (i/c)
-String gBrSide = 'i';              // instance | class
-String gBrMode = 'source';         // comment | definition | source
-String gBrSelCat, gBrSelClass, gBrClassSrc, gBrClassComment, gSelMemberSrc;
-bool gBrUserApp = true;            // is the selected category editable (user app)?
 int gTab = 0;                      // the visible tab, for context-sensitive menu items
-String gSelPane;                   // 'v' or 'm': which member pane owns the selection
 List _dl(dynamic r) => r is List ? r : <dynamic>[];   // reply -> list
 
 // Find state.
@@ -286,12 +273,9 @@ void switchTab(int i) {
   // key-view loop, which for the Browser is the Categories table — Cut/Copy/
   // Paste would be greyed out until the user clicked the source pane. Put focus
   // on the tab's text view instead.
-  // The Browser tab (i==1) is now the EMBEDDED ST browser (Sprint 15a); the
-  // old Dart-browser focus target (gBrowserSrc) and refresh (openBrowser) are
-  // dead — gBrowserSrc/gCatTable were never built, so both were a
-  // NoSuchMethod on null. Focus and refresh belong to the embedded view now:
-  // re-embed if it is missing (world imported after boot, or a lost isolate),
-  // else ask it to refresh from the image.
+  // The Browser tab (i==1) is the EMBEDDED ST browser (CocoaBrowser2): focus and
+  // refresh belong to the embedded view — re-embed if it is missing (world
+  // imported after boot, or a lost isolate), else ask it to refresh from the image.
   var focus = (i == 0) ? gEditor
             : (i == 3) ? gFindField : (i == 4) ? gEdText
             : (i == 5) ? gDbgSrc : (i == 8) ? gProfSrc : null;
@@ -472,11 +456,9 @@ void buildChrome() {
   gTargets.add(onTextChange(gEditor, (s) => highlight()));
 
   // Browser tab (Sprint 15): MACVM's OWN CocoaBrowser2, embedded — it
-  // browses BOTH languages from the image (and edits them), so it replaces
-  // the Dart browser here. The view is BUILT by the language isolate (where
-  // the ST engine and the image live) and PARENTED by this one: the raw
-  // view handle crosses as an int. buildBrowserTab stays in the file,
-  // dormant, should anyone want the old face back.
+  // browses BOTH languages from the image (and edits them). The view is BUILT
+  // by the language isolate (where the ST engine and the image live) and
+  // PARENTED by this one: the raw view handle crosses as an int.
   buildStBrowserTab(addTab(gTabView, "browser", 868.0, 420.0));
 
   // Docs tab: the workspace guide, and searchable Dart V1 help beside it.
@@ -719,299 +701,6 @@ void stBrowserEmbed() {
   }();
 }
 
-void buildBrowserTab(Cocoa br) {
-  br.setAutoresizesSubviews(true);
-
-  // Two nested split views, so every separator is a draggable splitter: the four
-  // columns side by side over the source area.
-  var vsplit = splitView([8.0, 8.0, 852.0, 404.0], false);
-  var hsplit = splitView([0.0, 0.0, 852.0, 250.0], true);
-  var cw = 213.0, ph = 250.0;
-
-  // Categories — just a list.
-  var catPane = browserPane(hsplit, cw, ph);
-  gCatTable = tableIn(catPane, [0.0, 0.0, cw, ph]);
-
-  // Classes — list over its own New/Remove.
-  var classPane = browserPane(hsplit, cw, ph);
-  gClassTable = tableIn(classPane, [0.0, kPaneBtnH, cw, ph - kPaneBtnH]);
-  paneButtons(classPane, cw, "+ Class", 66.0, (s) => newClass(),
-                             "− Class", 66.0, (s) => browserRemove(),
-                             "New class", "Remove the selected class");
-
-  // Variables — the instance/class toggle governs this column and Methods, so it
-  // rides the top of this pane rather than floating in the tab.
-  var varPane = browserPane(hsplit, cw, ph);
-  gVarTable = tableIn(varPane, [0.0, kPaneBtnH, cw, ph - (2.0 * kPaneBtnH)]);
-  var bi = button(varPane, "instance", [4.0, ph - 24.0, 72.0, 22.0], (s) => setSide('i'));
-  var bc = button(varPane, "class", [78.0, ph - 24.0, 56.0, 22.0], (s) => setSide('c'));
-  bi.setAutoresizingMask(kMinYMargin);   // a fixed-size pair, kept together at
-  bc.setAutoresizingMask(kMinYMargin);   // the top-left of the column
-  _paneBtnFont(bi); _paneBtnFont(bc);
-  paneButtons(varPane, cw, "+ Variable", 82.0, (s) => newVariable(),
-                           "− Variable", 82.0, (s) => removeMember('v'),
-                           "New instance or class variable",
-                           "Remove the selected variable");
-
-  // Methods — list over its own New/Remove.
-  var methPane = browserPane(hsplit, cw, ph);
-  gMethodTable = tableIn(methPane, [0.0, kPaneBtnH, cw, ph - kPaneBtnH]);
-  paneButtons(methPane, cw, "+ Method", 74.0, (s) => newMethod(),
-                             "− Method", 74.0, (s) => removeMember('m'),
-                             "New method", "Remove the selected member");
-
-  // Lower half: the mode/action row pinned above the source view, both inside one
-  // container so the horizontal splitter moves them together.
-  var lower = Cocoa.cls("NSView").alloc().initWithFrame([0.0, 0.0, 852.0, 144.0]);
-  lower.setAutoresizesSubviews(true);
-  button(lower, "Comment", [0.0, 120.0, 84.0, 22.0], (s) => setMode('comment'));
-  button(lower, "Definition", [86.0, 120.0, 92.0, 22.0], (s) => setMode('definition'));
-  button(lower, "Source", [182.0, 120.0, 72.0, 22.0], (s) => setMode('source'));
-  gStatus = label(lower, [262.0, 122.0, 380.0, 18.0]);
-  alias("br:Accept", button(lower, "Accept", [650.0, 120.0, 68.0, 22.0], (s) => browserAccept()));
-  button(lower, "Cancel", [722.0, 120.0, 64.0, 22.0], (s) => browserCancel());
-  pinTop(<String>["Comment", "Definition", "Source"]);   // ride the top edge
-  pinTop(<String>["Accept", "Cancel"], kMinXMargin);     // ...and the right edge
-  gStatus.setAutoresizingMask(kMinYMargin + kWidthSizable);
-  gBrowserSrc = scrolledTextView(lower, [0.0, 0.0, 852.0, 116.0], true);
-  anchorScroll(gBrowserSrc, kWidthSizable + kHeightSizable);
-
-  vsplit.addSubview(hsplit);
-  vsplit.addSubview(lower);
-  vsplit.adjustSubviews();
-  hsplit.adjustSubviews();
-  vsplit.setPosition(ph, ofDividerAtIndex: 0);
-  hsplit.setPosition(cw, ofDividerAtIndex: 0);
-  hsplit.setPosition(cw * 2, ofDividerAtIndex: 1);
-  hsplit.setPosition(cw * 3, ofDividerAtIndex: 2);
-  br.addSubview(vsplit);
-  // A column narrower than this would let its own +/- buttons overlap, and the
-  // source pane needs room to be worth editing in.
-  setSplitMinSize(hsplit, 150.0);
-  setSplitMinSize(vsplit, 90.0);
-  var mf = _mono(13.0);
-  if (!mf.isNil) gBrowserSrc.setFont(mf);
-
-  gTargets.add(onTable(gCatTable, () => gBrCats.length, (r) => gBrCats[r].toString(), sel(selectCategory)));
-  gTargets.add(onTable(gClassTable, () => gBrClasses.length, (r) => gBrClasses[r].toString(), sel(selectClass)));
-  gTargets.add(onTable(gVarTable, () => gVarRecs.length, (r) => gVarRecs[r][2].toString(),
-      sel((r) { gSelPane = 'v'; selectMemberRec(gVarRecs, r); })));
-  gTargets.add(onTable(gMethodTable, () => gMethodRecs.length, (r) => gMethodRecs[r][2].toString(),
-      sel((r) { gSelPane = 'm'; selectMemberRec(gMethodRecs, r); })));
-  gTargets.add(onTextChange(gBrowserSrc, (s) => highlightView(gBrowserSrc)));
-}
-
-// Delete the selected member from its class, then re-accept the class — so the
-// removal is live and saved, exactly like any other edit. [pane] is 'v' or 'm':
-// each column removes only from ITS OWN list, so clicking − Method can never
-// delete the variable you had selected in the pane next door.
-void removeMember(String pane) {
-  if (!gBrUserApp) { log("world classes are read-only"); return; }
-  if (gBrSelClass == null || gBrClassSrc == null) { log("select a class first"); return; }
-  if (gSelPane != pane) {
-    log(pane == 'v' ? "select a variable first" : "select a method first");
-    return;
-  }
-  if (gSelMemberSrc == null || gSelMemberSrc.isEmpty) {
-    log("select a member to remove");
-    return;
-  }
-  var gone = gSelMemberSig;
-  var updated = _replaceOnce(gBrClassSrc, gSelMemberSrc, "");
-  ask('acceptMany', [updated]).then((r) {
-    if (r.toString().startsWith("ERR")) { log("Remove Method — " + r); return; }
-    log("Removed " + gBrSelClass + " >> " + (gone != null ? gone : "member"));
-    gBrClassSrc = updated;
-    gSelMemberSrc = null; gSelMemberSig = null;
-    gBrMode = 'definition';
-    _reloadBrowserClass();
-    updateSourcePane();
-  });
-}
-
-void openBrowser() {
-  ask('categories', '').then((r) {
-    gBrCats = _dl(r);
-    gCatTable.reloadData();
-    repaint();
-  });
-}
-
-void selectCategory(int row) {
-  if (row < 0 || row >= gBrCats.length) return;
-  gBrSelCat = gBrCats[row].toString();
-  // 'Smalltalk' browses the same editable image decls as 'User App', filtered
-  // to the ST layer — both use the decl path (classmembers/classsrc/Accept).
-  var isSt = (gBrSelCat == 'Smalltalk');
-  gBrUserApp = (gBrSelCat == 'User App') || isSt;
-  gBrSelClass = null;
-  gClassMembers = <dynamic>[]; gVarRecs = <dynamic>[]; gMethodRecs = <dynamic>[];
-  gBrowserSrc.setString("");
-  ask(gBrUserApp ? 'classes' : 'worldclasses',
-      gBrUserApp ? (isSt ? 'st' : '') : gBrSelCat).then((r) {
-    gBrClasses = _dl(r);
-    gClassTable.reloadData(); gVarTable.reloadData(); gMethodTable.reloadData();
-    repaint();
-  });
-}
-
-void selectClass(int row) {
-  if (row < 0 || row >= gBrClasses.length) return;
-  gBrSelClass = gBrClasses[row].toString();
-  gSelMemberSrc = null; gSelMemberSig = null;
-  var membersCmd = gBrUserApp ? 'classmembers' : 'worldclassmembers';
-  var membersArg = gBrUserApp ? gBrSelClass : (gBrSelCat + '|' + gBrSelClass);
-  ask(membersCmd, membersArg).then((r) { gClassMembers = _dl(r); filterMembers(); repaint(); });
-  if (gBrUserApp) {
-    ask('classsrc', gBrSelClass).then((r) { gBrClassSrc = r.toString(); if (gBrMode == 'source') gBrMode = 'definition'; updateSourcePane(); });
-    ask('classcomment', gBrSelClass).then((r) { gBrClassComment = r.toString(); });
-  } else {
-    // A world class has no source on disk; synthesize the WHOLE class from
-    // mirrors so Definition shows fields + typed signatures (read-only).
-    gBrClassSrc = "// " + gBrSelClass + "  —  loading definition…";
-    gBrClassComment = "";
-    gBrMode = 'definition';
-    updateSourcePane();
-    ask('worldclasssrc', gBrSelCat + '|' + gBrSelClass).then((r) {
-      var s = r.toString();
-      gBrClassSrc = s.length > 0 ? s : ("// " + gBrSelClass + "  —  world class (read-only)");
-      if (gBrMode == 'definition') updateSourcePane();
-    });
-  }
-}
-
-void filterMembers() {
-  gVarRecs = <dynamic>[]; gMethodRecs = <dynamic>[];
-  for (var rec in gClassMembers) {
-    if (rec[0] != gBrSide) continue;
-    if (rec[1] == 'var') gVarRecs.add(rec); else gMethodRecs.add(rec);
-  }
-  gVarTable.reloadData(); gMethodTable.reloadData();
-}
-
-void setSide(String side) { gBrSide = side; filterMembers(); repaint(); }
-
-void selectMemberRec(List recs, int row) {
-  if (row < 0 || row >= recs.length) return;
-  var src = recs[row][3].toString();
-  gSelMemberSig = recs[row][2].toString();
-  gSelMemberSrc = src.length > 0 ? src : gSelMemberSig;
-  gBrMode = 'source';
-  updateSourcePane();
-}
-
-void setMode(String mode) { gBrMode = mode; updateSourcePane(); }
-
-void updateSourcePane() {
-  var text;
-  if (gBrMode == 'comment') text = gBrClassComment != null ? gBrClassComment : "";
-  else if (gBrMode == 'definition') text = gBrClassSrc != null ? gBrClassSrc : "";
-  else text = (gSelMemberSrc != null && gSelMemberSrc.length > 0) ? gSelMemberSrc : (gBrClassSrc != null ? gBrClassSrc : "");
-  gBrowserSrc.setString(text);
-  clearUndo();
-  highlightView(gBrowserSrc);
-  updateStatus();
-  repaint();
-}
-
-// The "edit Class>>member" status line. Accept both hot-reloads live AND writes
-// the SQLite image, so it persists for the next run — hence "live + saved".
-void updateStatus() {
-  if (gStatus == null) return;
-  var t = "";
-  var tag = gBrUserApp ? "   ·   Accept: live + saved" : "   (read-only)";
-  if (gBrSelClass == null) {
-    t = (gBrMode == 'definition') ? "new class" + tag : "";
-  } else if (gBrMode == 'comment') {
-    t = "comment: " + gBrSelClass + tag;
-  } else if (gBrMode == 'definition') {
-    t = "definition: " + gBrSelClass + tag;
-  } else if (gSelMemberSig != null && gSelMemberSig.length > 0) {
-    t = gBrSelClass + " >> " + gSelMemberSig + tag;
-  } else {
-    t = "new method in " + gBrSelClass + tag;
-  }
-  gStatus.setStringValue(t);
-}
-
-// Cancel: discard edits in the source pane, restoring the committed version of
-// whatever is selected (member / class / comment).
-void browserCancel() {
-  updateSourcePane();
-  log("cancelled — reverted");
-}
-
-String _replaceOnce(String s, String find, String repl) {
-  var i = s.indexOf(find);
-  return i < 0 ? s : (s.substring(0, i) + repl + s.substring(i + find.length));
-}
-
-void browserAccept() {
-  if (!gBrUserApp) { log("world classes are read-only"); return; }
-  var text = gBrowserSrc.string().UTF8String();
-  if (gBrMode == 'comment') {
-    if (gBrSelClass == null) return;
-    var name = gBrSelClass;
-    ask('setcomment', [name, text]).then((r) { gBrClassComment = text; log("✓ comment saved — " + name); });
-    return;
-  }
-  // Source mode + a selected class: edit an existing member (replace) or add a
-  // new one (insert before the class's closing brace).
-  if (gBrMode == 'source' && gBrSelClass != null && gBrClassSrc != null) {
-    var newClass = (gSelMemberSrc != null && gSelMemberSrc.length > 0)
-        ? _replaceOnce(gBrClassSrc, gSelMemberSrc, text)
-        : _insertMember(gBrClassSrc, text);
-    guardedAccept(<String>[newClass], "Accept", () {
-      gSelMemberSrc = text;
-      ask('acceptMany', [newClass]).then((r) {
-        log("✓ Accept — " + r);
-        gBrClassSrc = newClass;
-        _reloadBrowserClass();
-      });
-    });
-    return;
-  }
-  // Definition mode / a brand-new class: accept the whole source. Select what we
-  // just accepted, so "+ Method" (and the member panes) work straight away —
-  // otherwise a freshly created class is left with nothing selected and the next
-  // click on + Method just says "select a user class first".
-  var decls = editorDecls(text);
-  if (decls.isEmpty) { log("(nothing to accept)"); return; }
-  var name = _classNameOf(decls[0]);
-  guardedAccept(decls, "Accept", () {
-  ask('acceptMany', decls).then((r) {
-    log("✓ Accept — " + r);
-    if (r.toString().startsWith("ERR")) return;   // reload cancelled: keep the edits
-    if (name != null) {
-      gBrSelCat = 'User App'; gBrUserApp = true;
-      gBrSelClass = name;
-      gBrClassSrc = text;
-      gSelMemberSrc = null; gSelMemberSig = null;
-    }
-    _reloadClassList();
-    updateStatus();
-  });
-  });
-}
-
-void _reloadBrowserClass() {
-  updateMetrics();
-  if (gBrSelClass == null || !gBrUserApp) return;
-  ask('classmembers', gBrSelClass).then((r) { gClassMembers = _dl(r); filterMembers(); repaint(); });
-  ask('classsrc', gBrSelClass).then((r) { gBrClassSrc = r.toString(); repaint(); });
-}
-
-void _reloadClassList() {
-  updateMetrics();
-  if (gBrSelCat == null) { gBrSelCat = 'User App'; gBrUserApp = true; }
-  ask(gBrUserApp ? 'classes' : 'worldclasses', gBrUserApp ? '' : gBrSelCat).then((r) {
-    gBrClasses = _dl(r);
-    gClassTable.reloadData();
-    _showClassSelection();
-    repaint();
-  });
-}
-
 /// The name a declaration defines, or null if it isn't a class/enum.
 String _classNameOf(String d) {
   var m = new RegExp(r'^\s*(?:abstract\s+)?(?:class|enum)\s+(\w+)')
@@ -1046,94 +735,6 @@ String afterLeadingComments(String s) {
     break;
   }
   return s.substring(i);
-}
-
-// Mirror gBrSelClass into the Classes pane, so the highlighted row always agrees
-// with what Accept / + Method act on. Reloading a table otherwise leaves the OLD
-// row index highlighted, which is how a click could look like it selected one
-// class while the browser was acting on another.
-void _showClassSelection() {
-  if (gBrSelClass == null) { gClassTable.deselectAll(null); return; }
-  for (var i = 0; i < gBrClasses.length; i++) {
-    if (gBrClasses[i].toString() != gBrSelClass) continue;
-    gClassTable.selectRowIndexes(
-        Cocoa.cls("NSIndexSet").indexSetWithIndex(i), byExtendingSelection: false);
-    gClassTable.scrollRowToVisible(i);
-    return;
-  }
-  gClassTable.deselectAll(null);   // it isn't in this list any more
-}
-
-// Insert a new member just before the class's closing brace.
-String _insertMember(String classSrc, String member) {
-  var i = classSrc.lastIndexOf('}');
-  if (i < 0) return classSrc + "\n" + member.trim();
-  return classSrc.substring(0, i) + "  " + member.trim() + "\n" + classSrc.substring(i);
-}
-
-// + New Class: drop a class template into the Definition pane; edit + Accept creates it.
-void newClass() {
-  gBrUserApp = true;
-  gBrSelCat = 'User App';   // a new class is always the user app's, whatever was browsed
-  gBrSelClass = null; gSelMemberSrc = null; gSelMemberSig = null;
-  gClassTable.deselectAll(null);
-  gClassMembers = <dynamic>[]; gVarRecs = <dynamic>[]; gMethodRecs = <dynamic>[];
-  gVarTable.reloadData(); gMethodTable.reloadData();
-  gBrMode = 'definition';
-  gBrClassSrc = "class NewClass {\n  \n}";
-  gBrowserSrc.setString(gBrClassSrc);
-  highlightView(gBrowserSrc);
-  updateStatus();
-  repaint();
-  log("+ New Class — rename it, add members, then Accept");
-}
-
-// + New Method: drop a method template into the Source pane; edit + Accept adds it.
-// Drop a variable template into the source pane; Accept inserts it into the
-// class. Which side it lands on follows the instance/class toggle.
-void newVariable() {
-  if (!gBrUserApp) {
-    log("'" + gBrSelCat + "' is a world library (read-only)");
-    return;
-  }
-  if (gBrSelClass == null) { log("select a class in the Classes pane first"); return; }
-  gSelMemberSrc = null; gSelMemberSig = null;
-  gBrMode = 'source';
-  gBrowserSrc.setString(gBrSide == 'c' ? "static int newVar = 0;" : "int newVar = 0;");
-  highlightView(gBrowserSrc);
-  updateStatus();
-  repaint();
-  log("+ New " + (gBrSide == 'c' ? "class" : "instance") + " variable in " +
-      gBrSelClass + " — edit and Accept");
-}
-
-void newMethod() {
-  if (!gBrUserApp) {
-    log("'" + gBrSelCat + "' is a world library (read-only) — pick User App to add methods");
-    return;
-  }
-  if (gBrSelClass == null) {
-    log("select a class in the Classes pane first (a new class needs Accept before you can add methods)");
-    return;
-  }
-  gSelMemberSrc = null; gSelMemberSig = null;   // new member — nothing to replace
-  gBrMode = 'source';
-  var tmpl = (gBrSide == 'c') ? "static newMethod() {\n  \n}" : "newMethod() {\n  \n}";
-  gBrowserSrc.setString(tmpl);
-  highlightView(gBrowserSrc);
-  updateStatus();
-  repaint();
-  log("+ New Method in " + gBrSelClass + " — edit and Accept");
-}
-
-void browserRemove() {
-  if (!gBrUserApp || gBrSelClass == null) { log("nothing to remove"); return; }
-  var name = gBrSelClass;
-  ask('remove', name).then((r) {
-    log("Browser — " + r);
-    gBrSelClass = null; gSelMemberSrc = null; gBrowserSrc.setString("");
-    selectCategory(0);
-  });
 }
 
 // --- Find (search / senders over the image) ---------------------------------
@@ -1477,7 +1078,8 @@ Cocoa stdItem(Cocoa menu, String title, String key, String selector, [int mask =
 // ⌘S means "commit what is in front of me", which differs per tab.
 void menuSave() {
   if (gTab == 4) { editorSaveImage(); return; }
-  if (gTab == 1) { browserAccept(); return; }
+  // Tab 1 is the embedded Smalltalk browser (CocoaBrowser2); it commits through
+  // its own Accept button, so ⌘S here falls through to the workspace editor.
   acceptEditor();
 }
 
@@ -2331,19 +1933,6 @@ Future<String> handle(String line) async {
       switchTab(int.parse(arg));
       return "ok";
     }
-    case 'brcat': selectCategory(int.parse(arg)); return "ok";
-    case 'brclass': selectClass(int.parse(arg)); return "ok";
-    // Mirror the real click path, which tags the owning pane (see gSelPane) —
-    // a verb that skipped that would make the harness lie about what a user does.
-    case 'brvar': gSelPane = 'v'; selectMemberRec(gVarRecs, int.parse(arg)); return "ok";
-    case 'brmethod': gSelPane = 'm'; selectMemberRec(gMethodRecs, int.parse(arg)); return "ok";
-    case 'brside': setSide(arg); return "ok";
-    case 'brmode': setMode(arg); return "ok";
-    case 'brnewclass': newClass(); return "ok";
-    case 'brnewmethod': newMethod(); return "ok";
-    case 'brsettext': gBrowserSrc.setString(arg.replaceAll('\\n', '\n')); highlightView(gBrowserSrc); return "ok";
-    case 'braccept': browserAccept(); return "ok";
-    case 'brcancel': browserCancel(); return "ok";
     case 'findset': gFindField.setStringValue(arg); return "ok";
     case 'findrun': runFind(arg.length > 0 ? arg : 'find'); return "ok";
     case 'findsel': findNavigate(int.parse(arg)); return "ok";
@@ -2543,7 +2132,6 @@ void editorSaveImage() {
       gEdClass = _classNameOf(decls[0]);
       edStatus((gEdClass != null ? gEdClass : "(saved)") + "  ·  live + saved in the image");
       editorRefreshClasses();
-      _reloadClassList();
     }
   });
   });
@@ -2641,7 +2229,6 @@ void editorFileIn() {
       log("✓ File In (" + decls.length.toString() + " declaration(s)) — " + r);
       edStatus(path + "  ·  filed in: " + decls.length.toString() + " declaration(s) live + saved");
       editorRefreshClasses();
-      _reloadClassList();
     });
     });
   });
@@ -5372,7 +4959,6 @@ Future appUninstall() async {
     log("✗ app remove — " + r);
   }
   appRefreshList();
-  _reloadClassList();
   editorRefreshClasses();
 }
 
@@ -5620,8 +5206,7 @@ void rebuildUi() {
   gTargets.clear();
   gMetricVals.clear();
   gMemBarFill = null;
-  gCatTable = null; gClassTable = null; gVarTable = null; gMethodTable = null;
-  gBrowserSrc = null; gStatus = null; gEdText = null; gEdPicker = null;
+  gEdText = null; gEdPicker = null;
   gEdStatus = null; gFindField = null; gFindTable = null; gEditor = null;
   gTranscript = null; gTabView = null;
   // The demo VIEW dies with the tree; the demo IMAGE and its isolate live on —

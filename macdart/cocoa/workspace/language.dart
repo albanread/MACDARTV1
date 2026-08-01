@@ -246,9 +246,11 @@ final List<Map> _kStDemos = <Map>[
   {'name': 'Benchmarks', 'cls': 'BenchmarkDashboard',
    'sel': 'chartForWidth:height:', 'kind': 'json', 'inst': false,
    'blurb': 'live cold-vs-warm perf chart (42) — runs the suite, ~seconds'},
-  {'name': 'FFT', 'cls': 'FftChart', 'sel': 'commandsForWidth:height:',
-   'kind': 'json', 'inst': true,
-   'blurb': '3-tone signal + spectrum via Accelerate vDSP FFT (61e) — the FFI floor live'},
+  // FftChart (61e), the static one-shot sibling of FftScope (61b), used to
+  // be "FFT" here — moved to _kStGames as the live scope instead, per
+  // request (FftChart's own header already called it the lesser sibling:
+  // "FftScope (61b) is the live Cocoa-window scope; this is its one-shot
+  // canvas sibling"). FftChart's class/file are untouched, just unlisted.
 ];
 
 // Invoke a demo's producer selector — class-side (stInvokeStatic) or on a
@@ -264,9 +266,31 @@ _stDemoInvoke(Map demo, int w, int h) {
 List _stDemoList() {
   var out = <List>[];
   for (var d in _kStDemos) {
-    out.add(<dynamic>[d['name'], d['blurb'], _decls.containsKey(d['cls'])]);
+    // cls travels alongside name (they differ — Waves is class WaveChart,
+    // FFT is class FftChart) so the UI side can open the right class in the
+    // Editor without having to guess or ask again per demo.
+    out.add(<dynamic>[d['name'], d['blurb'], _decls.containsKey(d['cls']), d['cls']]);
   }
   return out;
+}
+
+// `stnamecls <name>` -> the real class behind a _kStDemos/_kStGames display
+// name (they are NOT always the same string — Waves is class WaveChart,
+// and now FFT is class FftScope), or an ERR string. A small dedicated
+// lookup rather than reusing _stDemoList's/_stGameList's one-shot reply:
+// stAddDemoMenu's own fetch of that list runs once at menu-build time and
+// can lose the race against the language isolate spawning, silently — a
+// fresh on-demand query here (from demoEdit, well after startup) has no
+// such race, and covers both tables so callers never need to know which
+// one a name came from.
+_stNameToCls(String name) {
+  for (var d in _kStDemos) { if (d['name'] == name) return d['cls']; }
+  for (var d in _kStGames) { if (d['name'] == name) return d['cls']; }
+  // Not in either curated table — the same ad-hoc fallback _stGame() itself
+  // uses for a freshly-installed demos/*.mst file (runStFileDemo): if a
+  // class of exactly this name is in the image, name IS its own class.
+  if (_decls.containsKey(name)) return name;
+  return 'ERR unknown demo/game ' + name;
 }
 
 // `stdemo <name> <w> <h>` -> the payload for that demo at that size.
@@ -310,6 +334,36 @@ final List<Map> _kStGames = <Map>[
    'blurb': 'brick-breaking with sound (44_breakout.mst)'},
   {'name': 'Worms', 'cls': 'Worms', 'sel': 'launch',
    'blurb': 'three growing worms, you drive one (48a_worms.mst)'},
+  // 43_gamepane.mst's own doc calls MandelZoom (with Breakout) a "complete
+  // worked example", and MandelVM documents its own "Launch from the Demos
+  // menu" — both were written expecting a slot here and simply never got
+  // one. (ParallelMandel makes the same claim but is NOT registered here —
+  // verified it throws "cannot spawn a worker (no boot registered, or at the
+  // cap)" under a normal `start-gui.sh` launch: whatever worker-boot
+  // environment its own doc says "the GUI provides" is not wired up by
+  // default, so it would be a broken menu item.)
+  //
+  // 'direct': true — these render one whole CPU-generated frame per tick via
+  // blit: (215), which is a documented no-op stub on this VM (rendered as
+  // solid black — confirmed live, alongside Breakout rendering correctly via
+  // the same indexed pane, isolating the gap to blit: specifically, not the
+  // pane in general). Fixed by having them write the GPU backbuffer directly
+  // instead (world/83_gamepane_direct.mst), the same technique
+  // demos/14_julia.dart already proves — _stGame opens the pane in direct
+  // mode for any game flagged this way.
+  {'name': 'MandelZoom', 'cls': 'MandelZoom', 'sel': 'launch', 'direct': true,
+   'blurb': 'an unending seahorse-valley dive, single VM (45_mandelzoom.mst)'},
+  {'name': 'MandelVM', 'cls': 'MandelVM', 'sel': 'launch', 'direct': true,
+   'blurb': 'MandelZoom, but one dive then stops (46_mandelvm.mst)'},
+  // Same gap again: 61b_fftscope.mst's own doc says "Launch it from the
+  // Demos menu" and never got a slot either. It is the LIVE sibling of the
+  // static one-shot chart demo FftChart (61e) — 60 FFTs a second, a
+  // sweeping tone plus one you steer with Left/Right — indexed GamePane
+  // (cls:/paletteAt:/present, no blit:), so no 'direct' flag needed. Named
+  // 'FFT' (not the class name FftScope) since this replaces _kStDemos'
+  // former one-shot "FFT" entry — one identifier, used everywhere.
+  {'name': 'FFT', 'cls': 'FftScope', 'sel': 'launch',
+   'blurb': 'a live 60fps spectrum analyzer, steer a tone with ←/→ (61b_fftscope.mst)'},
 ];
 
 ReceivePort _stGameTick;               // the pull-tick port while a game runs
@@ -337,11 +391,19 @@ void _stGameCleanup() {
   stGpReset();
 }
 
-// `stgame <name>` -> 'ok' and the pane opens, or an ERR string.
+// `stgame <name>` -> 'ok' and the pane opens, or an ERR string. `name` is
+// usually one of _kStGames' curated titles, but a demo installed straight
+// from demos/ (runStFileDemo, not pre-registered here) is a raw class name
+// instead — fall back to that class directly, `launch` being the one
+// selector both shipped games already use, so any class following that
+// convention just plays without ever touching this table.
 _stGame(String arg) {
   var name = arg.trim().split(' ')[0];
   Map game = null;
   for (var g in _kStGames) { if (g['name'] == name) game = g; }
+  if (game == null && _decls.containsKey(name)) {
+    game = {'name': name, 'cls': name, 'sel': 'launch'};
+  }
   if (game == null) return 'ERR unknown game ' + name;
   if (!_decls.containsKey(game['cls'])) {
     return 'ERR ' + game['cls'] + ' not in the image (import the world)';
@@ -361,7 +423,16 @@ _stGame(String arg) {
   _stGameTick = new ReceivePort();
   _stGameTick.listen(_stGameOnTick);
   _ui.send(<dynamic>['port', _stGameTick.sendPort]);
-  var first = <List>[<dynamic>['gpopen', _kStGameW, _kStGameH]];
+  // 'direct': true opens the raw GPU-backed framebuffer (§6b) instead of the
+  // retained indexed pane, for games whose own setup calls directPal:/
+  // directBlit: (world/83_gamepane_direct.mst) rather than paletteAt:/blit:.
+  // 'world': [w, h] opens an indexed pane LARGER than the viewport (default
+  // world == viewport, i.e. no scrollable margin at all) — needed for
+  // scrollTo:y: (world/84_gamepane_buffers.mst) to have anywhere to pan into.
+  List world = (game['world'] is List) ? game['world'] : [_kStGameW, _kStGameH];
+  var first = (game['direct'] == true)
+      ? <List>[<dynamic>['gpopen', _kStGameW, _kStGameH, _kStGameW, _kStGameH, 1]]
+      : <List>[<dynamic>['gpopen', _kStGameW, _kStGameH, world[0], world[1]]];
   for (var c in setup) first.add(c);
   _ui.send(<dynamic>['draw', first]);  // gpopen is SETUP, not a frame
   return 'ok';
@@ -1016,6 +1087,7 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'stbrowser') out = _stBrowserHandle(arg.toString());
       else if (cmd == 'stdemo') out = _stDemo(arg.toString());
       else if (cmd == 'stdemos') out = _stDemoList();
+      else if (cmd == 'stnamecls') out = _stNameToCls(arg.toString());
       else if (cmd == 'stgame') out = _stGame(arg.toString());
       else if (cmd == 'stgamestop') out = _stGameStop(arg.toString());
       else if (cmd == 'stgames') out = _stGameList();

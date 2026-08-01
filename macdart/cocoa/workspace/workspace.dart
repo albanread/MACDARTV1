@@ -1524,9 +1524,12 @@ void buildMenu() {
       .setKeyEquivalentModifierMask(kCmd + kOpt);
   menuItem(code, "Analyze", "b", (s) { switchTab(4); editorAnalyze(); });
 
-  // Demos: standalone programs from demos/ beside the UI source, each spawned
-  // into its own isolate, drawing on the Demos tab's canvas through this
-  // isolate. The menu IS the folder — drop a file in, Rescan, run it.
+  // Demos: standalone programs from demos/ beside the UI source. A .dart demo
+  // spawns into its own isolate, drawing on the Demos tab's canvas through
+  // this isolate; a .mst demo installs into the running image instead and
+  // plays live through the ST-game pull-tick loop (runStFileDemo) — same
+  // dual-language colocation apps/ already has via scanApps. The menu IS the
+  // folder — drop a file in, Rescan, run it.
   // The PLAYABLE games are filed under their own Games menu (below); Demos
   // keeps the visual/benchmark pieces (Copper is an effect, so it stays).
   var demos = subMenu(mainMenu, "Demos");
@@ -1547,7 +1550,7 @@ void buildMenu() {
   }
   for (var d in shows) {
     var title = d[0], path = d[1];
-    menuItem(demos, title, "", (s) => runDemoAt(title, path));
+    menuItem(demos, title, "", (s) => runScannedDemo(title, path));
   }
   // Sprint 15b: the Smalltalk graphics tier, rendered into the SAME pane — its
   // HTML5-canvas / pixmap output is translated to the pane's draw-ops. The
@@ -1568,11 +1571,14 @@ void buildMenu() {
   var games = subMenu(mainMenu, "Games");
   for (var d in dartGames) {
     var title = d[0], path = d[1];
-    menuItem(games, title, "", (s) => runDemoAt(title, path));
+    menuItem(games, title, "", (s) => runScannedDemo(title, path));
   }
   if (dartGames.isNotEmpty) menuSep(games);
   menuItem(games, "Smalltalk Breakout", "", (s) => runStGame("Breakout"));
   menuItem(games, "Smalltalk Worms", "", (s) => runStGame("Worms"));
+  menuItem(games, "Smalltalk MandelZoom", "", (s) => runStGame("MandelZoom"));
+  menuItem(games, "Smalltalk MandelVM", "", (s) => runStGame("MandelVM"));
+  menuItem(games, "Smalltalk FFT", "", (s) => runStGame("FFT"));
   menuSep(games);
   menuItem(games, "Stop Game", "", (s) => stopDemo("stopped"));
 
@@ -2172,7 +2178,7 @@ Future<String> handle(String line) async {
       for (var d in scanDemos()) {
         if (d[0].toLowerCase().contains(want) ||
             d[1].split('/').last.toLowerCase().contains(want)) {
-          await runDemoAt(d[0], d[1]);
+          await runScannedDemo(d[0], d[1]);
           return gDemoTitle == null ? "ERR: demo failed to start" : "started " + d[0];
         }
       }
@@ -2295,6 +2301,11 @@ Future<String> handle(String line) async {
       return "ok";
     }
     case 'demostop': stopDemo("stopped"); return "ok";
+    case 'demoedit': {
+      await demoEdit();
+      return (gEdClass == null && gEdFile == null)
+          ? "ERR: nothing to edit" : "editing " + (gEdClass != null ? gEdClass : gEdFile);
+    }
     // received vs painted: if painted stalls while received climbs, the pacer
     // is dropping every frame — the screen is NOT showing what the demo sends.
     case 'demostatus': return gDemoTitle == null
@@ -3965,6 +3976,18 @@ Cocoa gDemoView, gDemoStatusLbl, gDemoImage;
 Isolate gDemoIso;
 ReceivePort gDemoPort, gDemoErrPort, gDemoExitPort;
 String gDemoTitle;                     // the running demo, null when idle
+// What Edit should open — mutually exclusive, mirroring gEdFile/gEdClass:
+// a Dart demo (runDemoAt) is a file on disk (gDemoEditPath). A Smalltalk
+// game (runStGame) or one-shot chart demo (runStDemo) sets gDemoEditStName
+// instead — its _kStGames/_kStDemos DISPLAY name, which is not always its
+// class (Waves is class WaveChart, FFT is class FftScope) — resolved to a
+// real class lazily, on demand, by demoEdit via 'stnamecls', rather than
+// trusting a cache populated once at menu-build time (stAddDemoMenu's own
+// fetch of the demo list can lose that race against the language isolate
+// spawning and never resolve, silently, for the rest of the session —
+// confirmed live). Both null when idle (cleared alongside gDemoTitle in
+// stopDemo).
+String gDemoEditPath, gDemoEditStName;
 int gDemoFrames = 0;
 bool gDemoFinished = false;            // saw 'done' (so exit is not news)
 const double kDemoW = 848.0, kDemoH = 352.0;
@@ -4035,8 +4058,13 @@ void buildDemosTab(Cocoa dm) {
   button(dm, "Full", [76.0, 392.0, 56.0, 24.0], (s) {
     if (gGpMode) gpFullscreen(true);
   });
-  pinTop(<String>["Stop", "Full"]);
-  gDemoStatusLbl = label(dm, [140.0, 396.0, 720.0, 16.0]);
+  // Same contract as the App pane's Edit: stop what's running, open its
+  // source on the Editor tab — a Dart demo's file, or a Smalltalk game's or
+  // chart demo's class (demoEdit resolves whichever of gDemoEditPath/
+  // gDemoEditStName is set).
+  button(dm, "Edit", [138.0, 392.0, 60.0, 24.0], (s) => demoEdit());
+  pinTop(<String>["Stop", "Full", "Edit"]);
+  gDemoStatusLbl = label(dm, [204.0, 396.0, 656.0, 16.0]);
   gDemoStatusLbl.setAutoresizingMask(kMinYMargin + kWidthSizable);
   // The image survives a chrome rebuild on purpose: a demo that is mid-flight
   // keeps drawing into it while the views around it are torn down and rebuilt.
@@ -4280,6 +4308,10 @@ void stAddDemoMenu(Cocoa demos) {
 void runStDemo(String name) {
   switchTab(6);                                  // the Demos tab
   gDemoTitle = "Smalltalk " + name;
+  // The real class (Waves -> WaveChart) is resolved lazily, on demand, by
+  // demoEdit — see gDemoEditStName's own comment for why not eagerly here.
+  gDemoEditStName = name;
+  gDemoEditPath = null;
   demoStatus('Smalltalk: ' + name + ' …');
   askQuiet('stdemo', name + ' ' + kDemoW.toInt().toString() + ' ' +
       kDemoH.toInt().toString(), const Duration(seconds: 90)).then((r) {
@@ -4322,13 +4354,17 @@ void renderDemo(List cmds) {
 String demosDir() => Platform.script.resolve('demos/').toFilePath();
 
 /// `[title, path]` per demo file, sorted by filename. The title is the file's
-/// `// Demo:` header, so the menu reads like a playbill, not a directory.
+/// `// Demo:` header (or the ST comment twin `"Demo:`), so the menu reads
+/// like a playbill, not a directory. `.dart` and `.mst` demos live side by
+/// side here exactly as they already do in apps/ (scanApps) — a `.mst` demo
+/// is installed into the running image and played live instead of spawned
+/// into its own isolate (see runStFileDemo), but it is found the same way.
 List<List<String>> scanDemos() {
   var out = <List<String>>[];
   try {
     var files = <String>[];
     for (var f in new Directory(demosDir()).listSync()) {
-      if (f.path.endsWith('.dart')) files.add(f.path);
+      if (f.path.endsWith('.dart') || f.path.endsWith('.mst')) files.add(f.path);
     }
     files.sort();
     for (var path in files) {
@@ -4338,6 +4374,12 @@ List<List<String>> scanDemos() {
           // The marker must OPEN the line: a file that merely mentions it in
           // prose (pixmap.dart's header does) is not declaring itself a demo.
           if (line.startsWith('// Demo:')) { title = line.substring(8).trim(); break; }
+          if (line.startsWith('"Demo:')) {   // the ST comment twin
+            var t = line.substring(6).trim();
+            var q = t.indexOf('"');
+            title = (q >= 0 ? t.substring(0, q) : t).trim();
+            break;
+          }
         }
       } catch (e) {}
       // No header, no listing: files like pixmap.dart are LIBRARIES the demos
@@ -4355,6 +4397,7 @@ Future runDemoAt(String title, String path) async {
   gDemoPaints = 0;
   gDemoFinished = false;
   gDemoTitle = title;
+  gDemoEditPath = path; gDemoEditStName = null;   // what the Edit button opens
   if (!gStandalone) switchTab(6);
   demoStatus("starting " + title + "…");
   gDemoPort = new ReceivePort();
@@ -4409,6 +4452,58 @@ void stopDemo(String why) {
     log("demo " + why + " — " + gDemoTitle);
   }
   gDemoTitle = null;
+  gDemoEditPath = null; gDemoEditStName = null;
+}
+
+/// Open whatever is running (or last shown) on the Demos tab in the Editor,
+/// stopping it first — the same "Edit ends it" contract the App pane's Edit
+/// button has. A Dart demo (runDemoAt) is a file on disk (gDemoEditPath); a
+/// Smalltalk game (runStGame) or one-shot chart demo (runStDemo) only has
+/// its display name (gDemoEditStName — Waves is class WaveChart, FFT is
+/// class FftScope), resolved to a real class here via 'stnamecls', on
+/// demand, rather than a cache populated once at menu-build time (which
+/// can lose the race against the language isolate spawning and never
+/// resolve for the rest of the session — confirmed live).
+Future demoEdit() async {
+  var path = gDemoEditPath, stName = gDemoEditStName, cls;
+  if (path == null && stName == null) {
+    demoStatus("nothing to edit — pick something from the Demos or Games menu");
+    return;
+  }
+  if (stName != null) {
+    var r = (await ask('stnamecls', stName)).toString();
+    if (r.startsWith('ERR')) {
+      demoStatus("could not resolve " + stName + "'s class");
+      return;
+    }
+    cls = r;
+  }
+  if (cls != null) {
+    var src = (await ask('classsrc', cls)).toString();
+    if (src.isEmpty || src.startsWith('ERR')) {
+      demoStatus("could not read " + cls + " from the image");
+      return;
+    }
+    stopDemo(null);
+    gEdClass = cls; gEdFile = null;
+    switchTab(4);
+    edSetText(src);
+    edStatus(cls + "  ·  stopped for editing  ·  Save to Image compiles + "
+             "saves; pick it again from the Games menu to try it");
+    log("editing " + cls + " (stopped)");
+    return;
+  }
+  var src;
+  try { src = new File(path).readAsStringSync(); }
+  catch (e) { demoStatus("could not read " + path); return; }
+  var title = gDemoTitle;
+  stopDemo(null);
+  gEdFile = path; gEdClass = null;
+  switchTab(4);
+  edSetText(src);
+  edStatus(path + "  ·  stopped for editing  ·  Save writes to disk; "
+           "Rescan Demos Folder then pick it again to try it");
+  log("editing " + (title != null ? title : path) + " (stopped)");
 }
 
 // --- Smalltalk games (GAMEPANE_PLAN.md §8: the language-isolate driver) ------
@@ -4421,6 +4516,10 @@ void runStGame(String name) {
   stopDemo(null);                       // replaces any demo OR prior ST game
   gStGameActive = true;
   gDemoTitle = "Smalltalk " + name;     // keyCapture keys off this on tab 6
+  // name is a _kStGames display name, not always its class (FFT -> FftScope)
+  // — resolved lazily by demoEdit via 'stnamecls', same as one-shot demos.
+  gDemoEditStName = name;
+  gDemoEditPath = null;
   switchTab(6);
   keyCapture(true);
   demoStatus('Smalltalk ' + name + ' …');
@@ -4435,6 +4534,50 @@ void runStGame(String name) {
     demoStatus('ST game: ' + err);
     log("x st game " + name + " - " + err);
   });
+}
+
+/// Run a [title, path] pair as scanDemos() returns it, regardless of which
+/// call site found it (the Demos menu, the Games menu's dartGames slice, the
+/// `demorun` console command, or a standalone `--game` launch): a `.dart`
+/// demo spawns into its own isolate (runDemoAt); a `.mst` demo installs into
+/// the running image and plays live instead (runStFileDemo). Routing every
+/// site through here means `.mst` support is not something each one has to
+/// remember to add.
+Future runScannedDemo(String title, String path) {
+  return path.endsWith('.mst') ? runStFileDemo(title, path) : runDemoAt(title, path);
+}
+
+/// A standalone `.mst` file found by scanDemos (Demos menu), the same file
+/// shape apps/ already colocates with .dart via scanApps. There is no isolate
+/// to spawn — the class installs into the SAME running image (the
+/// editorDecls/acceptMany path _installApp uses) and then plays live through
+/// the ST-game pull-tick loop (runStGame), so a demo dropped in demos/ needs
+/// no matching entry in language.dart's _kStGames table: _stGame() falls back
+/// there to an ad-hoc {cls: name, sel: 'launch'} for any class it finds
+/// already installed but not in its hardcoded list.
+Future runStFileDemo(String title, String path) async {
+  var src;
+  try { src = new File(path).readAsStringSync(); }
+  catch (e) { log("✗ demo — cannot read " + path); return; }
+  var decls = editorDecls(src);
+  if (decls.isEmpty) { log("✗ demo — " + path + " has no declarations"); return; }
+  var name;
+  var stClassRe = new RegExp(r'subclass:\s*(\w+)\s*\[');
+  for (var d in decls) {
+    var s = d.toString();
+    var n = _classNameOf(s);
+    if (n == null) {
+      var m = stClassRe.firstMatch(s);
+      if (m != null) n = m.group(1);
+    }
+    if (n != null && name == null) name = n;
+  }
+  if (name == null) { log("✗ demo — no class in " + path); return; }
+  var r = await checkDecls(decls);
+  if (!r.ok) { log("✗ demo refused — " + r.message); return; }
+  var reply = await ask('acceptMany', decls);
+  log("✓ installed " + title + " — " + reply.toString());
+  runStGame(name);
 }
 
 void onDemoMsg(msg) {
@@ -4720,9 +4863,9 @@ void buildAppTab(Cocoa ap) {
     appRun(gAppPicker.titleOfSelectedItem().UTF8String());
   });
   button(ap, "Stop App", [298.0, 390.0, 84.0, 26.0], (s) => appStop());
-  // The point of the pane: change the app that is running in it. Editing goes
-  // through the Editor tab like any other class, and Save to Image commits it —
-  // which hot-reloads and re-runs build(), so the app keeps its state.
+  // The point of the pane: change the app that is running in it. Edit stops
+  // the running instance and opens its source on the Editor tab, like any
+  // other class — Save to Image commits it back; Run starts it fresh.
   button(ap, "Edit", [386.0, 390.0, 60.0, 26.0], (s) => appEdit());
   // The inverse of installing: delete the picked class from the image.
   button(ap, "Remove", [450.0, 390.0, 76.0, 26.0], (s) => appUninstall());
@@ -5204,9 +5347,9 @@ Future appRun(String name) async {
   log("app: " + name);
 }
 
-/// Open the app's own source in the Editor. The running app if there is one,
-/// otherwise whatever is selected in the picker — so it also works as "show me
-/// what I am about to run".
+/// Open the app's own source in the Editor, stopping it first if it is the
+/// one running — otherwise whatever is selected in the picker, so it also
+/// works as "show me what I am about to run" for an app that isn't up yet.
 /// The inverse of installing an app: delete the picker's class from the image
 /// (the language isolate's 'remove' drops it from the decls AND the SQLite DB,
 /// then hot-reloads — so it is gone live, not just on disk). A running app is
@@ -5247,15 +5390,21 @@ Future appEdit() async {
     appStatus("could not read " + name + " from the image");
     return;
   }
+  // Edit ends the running instance rather than hot-reloading it in place —
+  // simpler to reason about (no live state to keep consistent with a source
+  // that's mid-edit), and it frees the App pane immediately instead of
+  // leaving a stale build behind it. Only stop if THIS is the running app
+  // (name may instead be the picker's selection when nothing is running).
+  if (gAppName == name) await appStop();
   // Set the class BEFORE switching: the Editor repopulates its picker on the
   // way in and restores the selection from gEdClass.
   gEdClass = name;
   gEdFile = null;
   switchTab(4);
   edSetText(src);
-  edStatus(name + "  ·  the running app  ·  Save to Image = live + saved, and "
-           "the app rebuilds keeping its state");
-  log("editing " + name);
+  edStatus(name + "  ·  stopped for editing  ·  Save to Image compiles + "
+           "saves; press Run on the App pane to try it again");
+  log("editing " + name + " (stopped)");
 }
 
 Future appStop() async {
@@ -6158,8 +6307,8 @@ MENUS
          switches to the Demos tab. Stop Demo is Cmd-. and kills the isolate.
          Drop a new .dart in the folder and Rescan.
   Apps   install an example from apps/ into the image and run it. In the App
-         pane, Edit opens the running app's own source in the Editor; Save to
-         Image commits it, and the app rebuilds while keeping its state.
+         pane, Edit stops the running app and opens its own source in the
+         Editor; Save to Image commits it, then Run starts it again.
          Remove is install's inverse: it deletes the picked class from the
          image (DB + live, via hot reload), stopping it first if running —
          examples reinstall from this menu, and an open Editor buffer can
@@ -6302,7 +6451,7 @@ main(List<String> args) async {
     }
   } else if (standaloneGame != null) {
     var d = _resolveDemo(standaloneGame);
-    if (d != null) await runDemoAt(d[0], d[1]);   // opens the game pane on its first frame
+    if (d != null) await runScannedDemo(d[0], d[1]);  // opens the game pane on its first frame
     else gWindow.setTitle(standaloneGame + " — no such game/demo");
   }
 }

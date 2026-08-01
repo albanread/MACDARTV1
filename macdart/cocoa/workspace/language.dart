@@ -1723,14 +1723,29 @@ String _setComment(List a) {
 // --- Find (over the image) --------------------------------------------------
 // Name search: classes and members whose name contains `term`. Records
 // [class, memberSig] ('' = the class itself).
+// A find result is [class, browserSelector, side] — the selector is the KEY the
+// Browser lists a member under (a Dart method's NAME, an ST keyword selector),
+// so findNavigate can reveal it directly; side is 'instance'/'class'.
 List _find(String term) {
   var t = term.toLowerCase();
   var out = <List>[];
   _decls.forEach((name, src) {
-    if (name.toLowerCase().contains(t)) out.add([name, '']);
-    for (var m in _splitMembers(src)) {
-      var sig = _memberSig(m);
-      if (sig.toLowerCase().contains(t)) out.add([name, sig]);
+    if (name.toLowerCase().contains(t)) out.add([name, '', 'instance']);
+    if (_isStAny(src)) {
+      for (var m in _stMembers(src)) {                 // [side, kind, sig, source]
+        var sig = m[2].toString();
+        if (sig.toLowerCase().contains(t)) {
+          out.add([name, _sigToSelector(sig), m[0] == 'c' ? 'class' : 'instance']);
+        }
+      }
+    } else {
+      for (var m in _classMembers2(name)) {            // [side, kind, sig, source]
+        if (m[1] != 'method') continue;
+        var sig = m[2].toString();
+        if (sig.toLowerCase().contains(t)) {
+          out.add([name, _dartMemberName(sig), m[0] == 'c' ? 'class' : 'instance']);
+        }
+      }
     }
   });
   return out;

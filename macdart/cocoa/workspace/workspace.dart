@@ -1158,8 +1158,12 @@ String _findRowLabel(int r) {
   var rec = gFindResults[r];
   var cls = rec[0].toString();
   var member = (rec is List && rec.length > 1) ? rec[1].toString() : "";
-  return member.length > 0 ? (cls + "  >>  " + member) : cls;
+  var side = (rec is List && rec.length > 2) ? rec[2].toString() : "";
+  var sep = (side == 'class') ? "  class >>  " : "  >>  ";
+  return member.length > 0 ? (cls + sep + member) : cls;
 }
+
+String _sqEsc(String s) => s.replaceAll("'", "''");   // ST single-quote escape
 
 void runFind(String cmd) {
   var term = gFindField.stringValue().UTF8String().trim();   // NSTextField -> stringValue
@@ -1172,19 +1176,23 @@ void runFind(String cmd) {
   });
 }
 
-// Click a result → open the Browser on that class.
+// Click a result → open the Browser and REVEAL that class + method. The live
+// Browser tab is MACVM's CocoaBrowser2 (Sprint 15a); the old gClassTable browser
+// is dead code, which is why the previous version — driving gClassTable — landed
+// "in a random place". Drive the real browser: it finds the class's package,
+// selects the package/class/side/method, and highlights the rows.
 void findNavigate(int row) {
   if (row < 0 || row >= gFindResults.length) return;
-  var cls = gFindResults[row][0].toString();
-  gTabView.selectTabViewItemAtIndex(1);   // Browser (no reset)
-  gBrSelCat = 'User App'; gBrUserApp = true;
-  ask('classes', '').then((r) {
-    gBrClasses = _dl(r); gClassTable.reloadData();
-    for (var i = 0; i < gBrClasses.length; i++) {
-      if (gBrClasses[i].toString() == cls) { selectClass(i); break; }
-    }
-    updateMetrics(); repaint();
-  });
+  var rec = gFindResults[row];
+  var cls = rec[0].toString();
+  var sel = (rec is List && rec.length > 1) ? rec[1].toString() : "";
+  var side = (rec is List && rec.length > 2) ? rec[2].toString() : "instance";
+  gTabView.selectTabViewItemAtIndex(1);   // the Browser (CocoaBrowser2)
+  // `ask`s serialize into the language isolate, so this reveal runs after the
+  // tab-switch's own doRefresh and wins the selection.
+  ask('doit', "st> CocoaBrowser2 revealClass: '" + _sqEsc(cls) +
+      "' selector: '" + _sqEsc(sel) + "' side: '" + side + "'. nil")
+      .then((r) { log("Find → " + cls + (sel.isEmpty ? "" : " >> " + sel)); });
 }
 
 // --- Syntax highlighting ----------------------------------------------------

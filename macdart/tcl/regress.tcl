@@ -82,6 +82,20 @@ check "stored multi-line"     [expr {[llength [split [ui classsrc ScriptOk] \n]]
 ui remove ScriptOk
 after 1500
 
+section "image versioning + rollback"
+# Every persisted edit records the decl's prior state (WORLD_DB-style time-travel,
+# Dart-side, no C++), so a change that compiled but was wrong can be undone.
+check "v1 accepted"        [expr {[string match accepted* [ui accept {class VerT { int v() => 1; }}]]}] 1
+check "v1 runs"            [ui doit {new VerT().v()}] 1
+check "v2 accepted"        [expr {[string match accepted* [ui accept {class VerT { int v() => 2; }}]]}] 1
+check "v2 runs"            [ui doit {new VerT().v()}] 2
+check "edit is in history" [expr {[string match {*VerT*} [ui versions 5]]}] 1
+check "rollback restores"  [expr {[string match {*rolled back VerT*} [ui rollback]]}] 1
+after 300
+check "back to v1"         [ui doit {new VerT().v()}] 1
+ui remove VerT
+after 800
+
 section "the ui rebuilds itself"
 check "rebuild layout"    [ui uirebuild] ok
 after 800

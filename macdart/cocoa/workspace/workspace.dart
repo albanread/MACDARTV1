@@ -1083,6 +1083,17 @@ void menuSave() {
   acceptEditor();
 }
 
+// Undo the most recent persisted image edit, via the append-only version history
+// in the SQLite image (Debug ▸ Roll Back Last Change). askDeferrable so a reload
+// that stops at a breakpoint can't deadlock; then refresh the browser view.
+Future rollbackLast() async {
+  var r = await askDeferrable('rollback', '');
+  log("Roll Back — " + r.toString());
+  if (!r.toString().startsWith("ERR")) {
+    ask('doit', 'st> CocoaBrowser2 doRefresh. nil').then((_) {});
+  }
+}
+
 void buildMenu() {
   // With no .app bundle there is no CFBundleName, so macOS titles the
   // application menu from the process name — "dartui" without this.
@@ -1232,6 +1243,7 @@ void buildMenu() {
   menuItem(dbg, "Rebuild UI Layout", "l", (s) => rebuildUi())
       .setKeyEquivalentModifierMask(kCmd + kCtrl);
   menuItem(dbg, "Revert UI to Last Good", "", (s) => revertUi());
+  menuItem(dbg, "Roll Back Last Change", "", (s) => rollbackLast());
   menuSep(dbg);
   menuItem(dbg, "Restart Language Isolate", "", (s) => respawnLanguage("restart from the Debug menu"));
   menuSep(dbg);
@@ -2000,6 +2012,12 @@ Future<String> handle(String line) async {
     }
     case 'classsrc': return await askDeferrable('classsrc', arg);
     case 'remove': return await askDeferrable('remove', arg);
+    case 'versions': {   // "versions [N]" — the image's append-only edit history
+      var r = await ask('versions', arg.trim().isEmpty ? '20' : arg.trim());
+      var l = _dl(r);
+      return l.isEmpty ? "(no versions)" : l.join('\n');
+    }
+    case 'rollback': return await askDeferrable('rollback', arg);   // "rollback [<id>]"
     case 'lang': {
       // Generic language-isolate passthrough for scripted tests:
       // `lang <cmd> [arg]` → ask(cmd, arg). Read-only browsing verbs mostly

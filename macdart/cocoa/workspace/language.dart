@@ -1047,6 +1047,13 @@ main(List args, SendPort uiPort) {
       _db.exec('CREATE TABLE IF NOT EXISTS decls'
           '(name TEXT PRIMARY KEY, kind TEXT, category TEXT, source TEXT, comment TEXT)');
       _db.exec('ALTER TABLE decls ADD COLUMN comment TEXT');  // no-op if it exists
+      // Append-only edit history (WORLD_DB-style time-travel): every persisted
+      // edit records the decl's PRIOR state here first, so any change — even one
+      // that compiles but is logically wrong — can be rolled back. existed=0
+      // means the decl was new (rolling back that version removes it).
+      _db.exec('CREATE TABLE IF NOT EXISTS versions'
+          '(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, label TEXT,'
+          ' name TEXT, existed INTEGER, kind TEXT, category TEXT, source TEXT)');
       _loadFromImage();
     }
   }
@@ -1064,6 +1071,8 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'acceptLive') out = _acceptLive(arg);
       else if (cmd == 'reset') out = _reset(arg);
       else if (cmd == 'remove') out = _remove(arg);
+      else if (cmd == 'versions') out = _versions(int.parse(arg.toString(), onError: (_) => 20));
+      else if (cmd == 'rollback') out = _rollback(arg.toString());
       else if (cmd == 'classes') out = _classNames(arg.toString());
       else if (cmd == 'members') out = _memberList(arg);
       else if (cmd == 'classsrc') out = _decls.containsKey(arg) ? _decls[arg] : '';
@@ -1277,6 +1286,92 @@ void _imageUpsert(String name, String source, [String category]) {
   }
 }
 
+// --- Append-only version history (Dart-side rollback) ------------------------
+// Record a decl's CURRENT persisted state before it is overwritten or removed,
+// so it can be restored. Called on the PERSISTED edit paths (accept / remove) —
+// never on _acceptLive (not saved) or _reset (watchdog replay), so the history
+// is user edits, not machinery.
+void _recordVersion(String name, String label) {
+  if (_db == null || !_db.isOpen) return;
+  var ts = new DateTime.now().toString();
+  var r = _db.query('SELECT kind, category, source FROM decls WHERE name=?', [name]);
+  if (r != null && r.length > 0) {
+    _db.exec('INSERT INTO versions(ts,label,name,existed,kind,category,source)'
+        ' VALUES(?,?,?,1,?,?,?)', [ts, label, name, r[0][0], r[0][1], r[0][2]]);
+  } else {
+    _db.exec('INSERT INTO versions(ts,label,name,existed,kind,category,source)'
+        ' VALUES(?,?,?,0,?,?,?)', [ts, label, name, '', '', '']);
+  }
+}
+
+// Most-recent-first history: "<id>  <name>  <label>  (edit|new)  <ts>".
+List _versions([int n = 20]) {
+  if (_db == null || !_db.isOpen) return <dynamic>[];
+  // LIMIT takes an inlined int (n is parsed, not user text) — the wrapper binds
+  // params as text, which SQLite rejects in a LIMIT clause.
+  var lim = (n > 0 && n <= 1000) ? n : 20;
+  var r = _db.query(
+      'SELECT id, ts, label, name, existed FROM versions ORDER BY id DESC LIMIT ' + lim.toString());
+  var out = <String>[];
+  if (r != null) {
+    for (var row in r) {
+      var existed = (row[4] is int) ? row[4]
+                  : int.parse(row[4].toString(), onError: (_) => 1);
+      out.add(row[0].toString() + '  ' + row[3].toString() + '  ' +
+              row[2].toString() + '  ' + (existed == 1 ? '(edit)' : '(new)') +
+              '  ' + row[1].toString());
+    }
+  }
+  return out;
+}
+
+// Roll the decl named in version <id> back to its recorded prior state (or, if
+// it was new then, remove it). No arg = the most recent change. The rollback is
+// itself recorded, so it can be undone in turn. A reload failure reverts, so the
+// image never ends up holding source the VM would refuse on the next boot.
+String _rollback(String arg) {
+  if (_db == null || !_db.isOpen) return 'ERR: no image';
+  var a = arg.trim();
+  var id;
+  if (a.isEmpty) {
+    var m = _db.query('SELECT MAX(id) FROM versions');
+    if (m == null || m.length == 0 || m[0][0] == null) return 'ERR: no versions to roll back';
+    id = m[0][0];
+  } else {
+    id = int.parse(a, onError: (_) => -1);
+    if (id < 0) return 'ERR: rollback [<id>]';
+  }
+  var r = _db.query(
+      'SELECT name, existed, kind, category, source FROM versions WHERE id=?', [id]);
+  if (r == null || r.length == 0) return 'ERR: no version ' + id.toString();
+  var name = r[0][0].toString();
+  var existed = (r[0][1] is int) ? r[0][1]
+              : int.parse(r[0][1].toString(), onError: (_) => 1);
+  var curHad = _decls.containsKey(name);
+  var cur = curHad ? _decls[name] : null;
+  _recordVersion(name, 'rollback #' + id.toString());   // so the rollback is undoable
+  if (existed == 1) {
+    var src = r[0][4].toString();
+    _decls[name] = src;
+    _declCat[name] = r[0][3] != null ? r[0][3].toString() : 'user';
+    _db.exec('INSERT OR REPLACE INTO decls(name,kind,category,source) VALUES(?,?,?,?)',
+        [name, r[0][2], _declCat[name], src]);
+  } else {
+    _decls.remove(name);
+    _db.exec('DELETE FROM decls WHERE name=?', [name]);
+  }
+  var err = _rebuildAndReload();
+  if (err.isNotEmpty) {
+    if (curHad) { _decls[name] = cur; _imageUpsert(name, cur); }
+    else { _decls.remove(name); _db.exec('DELETE FROM decls WHERE name=?', [name]); }
+    _rebuildAndReload();
+    return 'ERR: rollback would not reload — ' + err;
+  }
+  return existed == 1
+      ? ('rolled back ' + name + ' to version ' + id.toString())
+      : ('rolled back ' + name + ' (removed — it was new in version ' + id.toString() + ')');
+}
+
 String _accept(String decl) => _acceptMany(<String>[decl]);
 
 // GUI Accept: the editor's top-level declarations, redefining by name; UPSERT
@@ -1312,7 +1407,7 @@ String _acceptMany(List decls) {
     _rebuildAndReload();
     return err;
   }
-  for (var name in names) _imageUpsert(name, _decls[name]);
+  for (var name in names) { _recordVersion(name, 'accept'); _imageUpsert(name, _decls[name]); }
   return 'accepted ' + names.join(', ');
 }
 
@@ -1355,6 +1450,7 @@ String _reset(List decls) {
 }
 
 String _remove(String name) {
+  _recordVersion(name, 'remove');
   _decls.remove(name);
   if (_db != null && _db.isOpen) _db.exec('DELETE FROM decls WHERE name=?', [name]);
   var err = _rebuildAndReload();

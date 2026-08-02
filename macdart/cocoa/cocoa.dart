@@ -252,18 +252,21 @@ final Map<String, StSymbol> _stSymbolTable = <String, StSymbol>{};
 
 /// The canonical Symbol for [name] — interned, so `#foo == #foo` by identity.
 ///
-/// Thunk-free on purpose: putIfAbsent's `() => ...` argument allocated a
-/// Context + Closure on EVERY call — a `#sym` literal in a hot method paid
-/// two heap objects per evaluation (deltablue's satisfy_ carried three such
-/// pairs for #forward/#backward, seen directly in the optimized flow graph).
-/// The hit path is now one map read, zero allocations.
+/// The AUTHORITY is the native intern table (ST_symbolFor / st::InternStSymbol),
+/// which the flow-graph builder also uses to bake a `#foo` literal as a
+/// compile-time Constant — so a compiled literal and a runtime `'foo' asSymbol`
+/// are the SAME object. This Dart map is a per-isolate FAST CACHE over that
+/// authority (one map read on the hit path, no allocation); on a miss it asks
+/// the native for the canonical (old-space, rooted) StSymbol and records it.
 StSymbol stSymbol(String name) {
   var s = _stSymbolTable[name];
   if (s != null) return s;
-  s = new StSymbol._(name);
+  s = _stSymbolFor(name);      // native: the one canonical StSymbol
   _stSymbolTable[name] = s;
   return s;
 }
+
+StSymbol _stSymbolFor(String name) native "ST_symbolFor";
 
 bool stIsSymbol(x) => x is StSymbol;
 

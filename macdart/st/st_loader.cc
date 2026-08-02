@@ -23,7 +23,13 @@
 #include <set>
 #include <vector>
 
+#include <functional>
+#include <mutex>
+#include <unordered_map>
+
 #include "vm/class_finalizer.h"
+#include "vm/dart_api_impl.h"
+#include "vm/dart_api_state.h"
 #include "vm/isolate.h"
 #include "vm/object.h"
 #include "vm/object_store.h"
@@ -453,6 +459,85 @@ std::string MangleSelector(const std::string& selector) {
 // dispatch cache to flush) get a no-op; dart_cocoa's strong definition in
 // st_natives.cc overrides it — the same pattern as macdart_browser_stubs.
 __attribute__((weak)) void ClearSendCache() {}
+
+// ── Symbol interning: one canonical StSymbol per (isolate, spelling) ─────────
+// A symbol is a unique interned object; identity IS its meaning (`#foo == #foo`,
+// `#foo == 'foo' asSymbol`). This is the ONE authority: the flow-graph builder
+// resolves a `#foo` literal here AT COMPILE TIME and bakes the result as a
+// Constant, and the runtime stSymbol/asSymbol (cocoa.dart, via ST_symbolFor)
+// route here too, so the compiled literal and a runtime-computed symbol are the
+// SAME object. The StSymbol is allocated OLD-space (so it may be a stable
+// Constant — 1.24 old space never moves) and rooted by a persistent handle (so
+// the raw cache pointer, and any baked constant, stay valid no matter which
+// code references it). NOT flushed on reload: a symbol is a symbol across method
+// changes, and flushing would mint a NEW object, breaking identity with
+// constants baked into un-reloaded code. Keyed on Isolate* (each its own heap).
+//
+// This lives in st_loader.cc, NOT st_natives.cc, ON PURPOSE: st_natives is
+// inside `namespace dart::bin`, so a definition there would be
+// `dart::bin::st::InternStSymbol` and NOT match the `::st::InternStSymbol` the
+// header declares (the builder and ST_symbolFor call the latter). st_loader's
+// `namespace st` is top-level, so this is the one strong `::st::` definition,
+// and st_loader is always-linked so every binary (incl. gen_snapshot) gets it —
+// no weak stub needed. If dart:cocoa's StSymbol isn't loaded, it returns null
+// and the builder falls back to the runtime lowering (which routes back here).
+namespace {
+struct SymKey {
+  dart::Isolate* iso;
+  std::string name;
+  bool operator==(const SymKey& o) const {
+    return iso == o.iso && name == o.name;
+  }
+};
+struct SymKeyHash {
+  size_t operator()(const SymKey& k) const {
+    return std::hash<std::string>()(k.name) ^
+           (reinterpret_cast<size_t>(k.iso) >> 4);
+  }
+};
+std::unordered_map<SymKey, dart::RawInstance*, SymKeyHash> g_symbol_intern;
+std::mutex g_symbol_mutex;
+}  // namespace
+
+dart::RawInstance* InternStSymbol(dart::Thread* thread, const char* name) {
+  using namespace dart;
+  Isolate* iso = thread->isolate();
+  const SymKey key = {iso, std::string(name)};
+  {
+    std::lock_guard<std::mutex> lock(g_symbol_mutex);
+    std::unordered_map<SymKey, RawInstance*, SymKeyHash>::iterator it =
+        g_symbol_intern.find(key);
+    if (it != g_symbol_intern.end()) return it->second;
+  }
+  Zone* zone = thread->zone();
+  const Library& cocoa = Library::Handle(
+      zone, Library::LookupLibrary(
+                thread, String::Handle(zone, String::New("dart:cocoa"))));
+  if (cocoa.IsNull()) return Instance::null();
+  const Class& cls = Class::Handle(
+      zone, cocoa.LookupClassAllowPrivate(
+                String::Handle(zone, String::New("StSymbol"))));
+  if (cls.IsNull()) return Instance::null();
+  // FULL member finalization (parses the source class) — dart:cocoa is compiled
+  // lazily, so a bare LookupClass hands back a class whose fields() is still
+  // empty; EnsureIsFinalized materializes them. (StSymbol is a normal Dart
+  // class with a TokenStream, so unlike an ST class this parses cleanly.)
+  if (cls.EnsureIsFinalized(thread) != Error::null()) return Instance::null();
+  const Field& f = Field::Handle(
+      zone, cls.LookupInstanceFieldAllowPrivate(
+                String::Handle(zone, Symbols::New(thread, "name"))));
+  if (f.IsNull()) return Instance::null();
+  const Instance& sym = Instance::Handle(zone, Instance::New(cls, Heap::kOld));
+  sym.SetField(f, String::Handle(zone, String::New(name, Heap::kOld)));
+  // Root it forever (symbols are immortal, bounded by distinct spellings).
+  PersistentHandle* root =
+      iso->api_state()->persistent_handles().AllocateHandle();
+  root->set_raw(sym);
+  std::lock_guard<std::mutex> lock(g_symbol_mutex);
+  // Race: another thread may have interned meanwhile — first insert wins; the
+  // loser's symbol is harmlessly orphaned (still persistent-rooted).
+  return g_symbol_intern.insert(std::make_pair(key, sym.raw())).first->second;
+}
 
 // The shared cross-load resolver (st_loader.h): newest st: library first.
 dart::RawClass* FindStClassByName(dart::Thread* thread, const char* name) {

@@ -23,6 +23,7 @@
 
 namespace dart {
 class RawClass;
+class RawInstance;
 class Thread;
 }  // namespace dart
 
@@ -85,6 +86,13 @@ std::string MangleSelector(const std::string& selector);
 // (ST_eq). Called by every st load and every hot reload — both can replace a
 // class's methods, and the cache holds raw old-space Function pointers.
 void ClearSendCache();
+
+// The canonical interned StSymbol for `name` in the current isolate (old-space,
+// persistent-rooted). The flow-graph builder calls this to resolve a `#foo`
+// literal AT COMPILE TIME and bake it as a Constant; the runtime stSymbol
+// routes here too, so both yield the SAME object. Caller holds a VM transition
+// + HANDLESCOPE. Returns Instance::null() only if StSymbol isn't loaded yet.
+dart::RawInstance* InternStSymbol(dart::Thread* thread, const char* name);
 
 }  // namespace st
 

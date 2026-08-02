@@ -953,11 +953,19 @@ Fragment StGraphBuilder::TranslateLiteral(LiteralNode* node) {
       return Constant(Double::ZoneHandle(
           zone_, Double::New(strtod(node->text.c_str(), NULL), Heap::kOld)));
     case LiteralNode::Kind::kSymbol: {
-      // A Symbol is a DISTINCT interned class (StSymbol) — `String subclass:
-      // Symbol` in the world, but Dart's String can't be subclassed, so it is
-      // its own class that forwards String protocol and whose `=` is identity.
-      // stSymbol(name) interns, so `#foo == #foo` holds by identity, and the
-      // distinct class is what lets `=` tell a Symbol from a String.
+      // A Symbol is a unique interned object; identity IS its meaning
+      // (`#foo == #foo`, `#foo == 'foo' asSymbol`). Resolve it to its one
+      // canonical StSymbol AT COMPILE TIME and bake it as a Constant — a
+      // symbol literal is then a bare constant load, not a per-evaluation
+      // intern-table lookup. st::InternStSymbol is the same authority the
+      // runtime stSymbol routes through, so the baked object and a runtime
+      // `asSymbol` are identical. (The interned StSymbol is old-space +
+      // persistent-rooted, so it is a stable Constant.)
+      const Instance& sym = Instance::ZoneHandle(
+          zone_, ::st::InternStSymbol(thread_, node->text.c_str()));
+      if (!sym.IsNull()) return Constant(sym);
+      // StSymbol not loaded yet (pre-world-boot): fall back to the runtime
+      // lowering, which routes through the same intern table — still identical.
       Fragment f = Constant(String::ZoneHandle(
           zone_, String::New(node->text.c_str(), Heap::kOld)));
       f += PushArgument();

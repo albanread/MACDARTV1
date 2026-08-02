@@ -532,6 +532,29 @@ void ClearSendCache() {
 }
 }  // namespace st
 
+// stSymbolFor(name) -> the canonical StSymbol. The Dart-side stSymbol delegates
+// here so runtime symbols share the builder's compile-time intern table. The
+// intern table + st::InternStSymbol live in st_loader.cc (always-linked, so the
+// one strong `::st::` definition is used everywhere — see the note there).
+void ST_symbolFor(Dart_NativeArguments args) {
+  Dart_Handle name_h = Dart_GetNativeArgument(args, 0);
+  const char* name_c = NULL;
+  if (Dart_IsError(Dart_StringToCString(name_h, &name_c)) || name_c == NULL) {
+    Dart_SetReturnValue(args, Dart_Null());
+    return;
+  }
+  const std::string name(name_c);
+  Thread* thread = Thread::Current();
+  Dart_Handle result = Dart_Null();
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    RawInstance* sym = ::st::InternStSymbol(thread, name.c_str());
+    result = Api::NewHandle(thread, sym);
+  }
+  Dart_SetReturnValue(args, result);
+}
+
 void ST_eq(Dart_NativeArguments args) {
   Dart_Handle a_h = Dart_GetNativeArgument(args, 0);
   Dart_Handle b_h = Dart_GetNativeArgument(args, 1);

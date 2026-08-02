@@ -519,6 +519,32 @@ static std::unordered_map<ExtCacheKey, dart::RawFunction*, ExtCacheHash>
 // receiver's cid, so the two must not share a map. Same mutex + same flush.
 static std::unordered_map<ExtCacheKey, dart::RawFunction*, ExtCacheHash>
     g_cls_cache;
+// The class-side DECISION cache, keyed on the INCOMING selector's identity (a
+// compiled call site passes a canonical String constant, so its RawString* is a
+// stable key). `g_cls_cache` above only skipped the by-name shadow
+// re-resolution — the key it is probed with still had to be BUILT on every
+// call: Dart_StringToCString + MangleSelector + Symbols::New, and Symbols::New
+// HASHES the string. Profiling deltablue put exactly that chain at the top of
+// the whole VM (CodePointIterator::Next 139, STClassSendCommon 113,
+// ToCString 89, Symbols::FromUTF8 64), because its hot class-side send is
+// `basicNew` on an inherited factory — which MISSES the method lookup, so the
+// negative cache saved the scan but every one of its ~5000 calls per run still
+// paid the key-building.
+//
+// This caches the resolved ACTION, so a hit does no string work at all:
+//   kClsFn  — invoke this class-side Function
+//   kClsNew — no class-side method; `new`/`basicNew` with 0 args -> Instance::New
+// ONLY those two outcomes are cached, and only for classes that are NOT the
+// Array/ByteArray/String extension holders (whose `new:`/`new` is intercepted
+// into a native allocation ahead of all this), so a cached entry can never
+// shadow that intercept. Signal desugars, errors and probe misses take the full
+// path unchanged. Flushed with the others by ClearSendCache.
+enum ClsAction : uint8_t { kClsFn = 0, kClsNew = 1 };
+struct ClsDecision {
+  dart::RawFunction* fn;  // valid iff action == kClsFn
+  ClsAction action;
+};
+static std::unordered_map<ExtCacheKey, ClsDecision, ExtCacheHash> g_cls_decide;
 static std::mutex g_ext_mutex;
 
 }  // namespace bin
@@ -541,6 +567,7 @@ void ClearSendCache() {
     std::lock_guard<std::mutex> lock(dart::bin::g_ext_mutex);
     dart::bin::g_ext_cache.clear();
     dart::bin::g_cls_cache.clear();
+    dart::bin::g_cls_decide.clear();
   }
 }
 }  // namespace st
@@ -802,8 +829,7 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
   Dart_Handle type_h = Dart_GetNativeArgument(args, 0);
   Dart_Handle sel_h = Dart_GetNativeArgument(args, 1);
   Dart_Handle list_h = Dart_GetNativeArgument(args, 2);
-  const char* sel_c = NULL;
-  if (Dart_IsError(Dart_StringToCString(sel_h, &sel_c)) || sel_c == NULL) {
+  if (!Dart_IsString(sel_h)) {
     STThrow("stClassSend: bad selector argument");
     return;
   }
@@ -821,7 +847,6 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
       return;
     }
   }
-  const std::string selector(sel_c);
   Thread* thread = Thread::Current();
   Dart_Handle result_handle = Dart_Null();
   bool hit = false;
@@ -836,8 +861,51 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
     } else {
       const Type& type = Type::Cast(type_obj);
       const Class& cls = Class::Handle(zone, type.type_class());
+      const String& insel =
+          String::Cast(Object::Handle(zone, Api::UnwrapHandle(sel_h)));
+      // FAST PATH: an already-decided (class, selector-identity) pair needs no
+      // string work whatsoever — no ToCString, no MangleSelector, no
+      // Symbols::New. This is the whole point of the decision cache.
+      static const bool kClsDecideOn =
+          std::getenv("MACDART_CLS_DECIDE") == NULL ||
+          std::string(std::getenv("MACDART_CLS_DECIDE")) != "0";
+      const bool id_ok = kClsDecideOn && insel.IsCanonical();
+      const ExtCacheKey dkey = {thread->isolate(), cls.id(), insel.raw()};
+      bool decided = false;
+      ClsDecision dec = {NULL, kClsFn};
+      if (id_ok) {
+        std::lock_guard<std::mutex> lock(g_ext_mutex);
+        std::unordered_map<ExtCacheKey, ClsDecision, ExtCacheHash>::iterator dit =
+            g_cls_decide.find(dkey);
+        if (dit != g_cls_decide.end()) {
+          dec = dit->second;
+          decided = true;
+        }
+      }
+      if (decided && dec.action == kClsNew && n == 0) {
+        if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
+        const Instance& inst = Instance::Handle(zone, Instance::New(cls));
+        result_handle = Api::NewHandle(thread, inst.raw());
+        hit = true;
+      } else if (decided && dec.action == kClsFn) {
+        Function& dfn = Function::Handle(zone);
+        dfn ^= dec.fn;
+        const Array& arr = Array::Handle(zone, Array::New(n + 1));
+        arr.SetAt(0, type);  // thisCls propagates unchanged
+        for (intptr_t i = 0; i < n; i++) {
+          arr.SetAt(i + 1, Object::Handle(zone, Api::UnwrapHandle(elems[i])));
+        }
+        const Object& result =
+            Object::Handle(zone, DartEntry::InvokeFunction(dfn, arr));
+        result_handle = Api::NewHandle(thread, result.raw());
+        hit = true;
+      } else {
+      const std::string selector(insel.ToCString());
       const String& cname = String::Handle(zone, cls.Name());
       const std::string cls_name(cname.ToCString());
+      const bool cacheable_cls = id_ok && cls_name != "Array ext" &&
+                                 cls_name != "ByteArray ext" &&
+                                 cls_name != "String ext";
       // The selector may arrive RAW (builder stClassSendN sites) or already
       // MANGLED (the NSM hooks pass the missed method name) — normalize once
       // and compare canonical forms below.
@@ -923,6 +991,11 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
         g_cls_cache[ckey] = fn.raw();  // the hit, OR null = a known miss
       }
       if (!fn.IsNull()) {
+        if (cacheable_cls) {
+          ClsDecision d = {fn.raw(), kClsFn};
+          std::lock_guard<std::mutex> lock(g_ext_mutex);
+          g_cls_decide[dkey] = d;
+        }
         const Array& arr =
             Array::Handle(zone, Array::New(n + 1));
         arr.SetAt(0, type);  // thisCls propagates unchanged
@@ -934,6 +1007,11 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
         result_handle = Api::NewHandle(thread, result.raw());
         hit = true;
       } else if ((msel == "new" || msel == "basicNew") && n == 0) {
+        if (cacheable_cls) {
+          ClsDecision d = {NULL, kClsNew};
+          std::lock_guard<std::mutex> lock(g_ext_mutex);
+          g_cls_decide[dkey] = d;
+        }
         if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
         const Instance& inst = Instance::Handle(zone, Instance::New(cls));
         result_handle = Api::NewHandle(thread, inst.raw());
@@ -971,6 +1049,7 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
               "' has no class-side method '" + selector + "'";
       }
       }  // if (!hit) — the intercept already answered otherwise
+      }  // else — the decision cache did not already answer
     }
   }
   if (!err.empty()) {

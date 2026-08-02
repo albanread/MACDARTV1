@@ -81,6 +81,11 @@ const char* BootWorldForMain(const char* explicit_dir,
 // every lookup site (builder + natives) must agree on this one mangle.
 std::string MangleSelector(const std::string& selector);
 
+// Flush the (isolate, cid) -> Function dispatch cache in st_natives.cc
+// (ST_eq). Called by every st load and every hot reload — both can replace a
+// class's methods, and the cache holds raw old-space Function pointers.
+void ClearSendCache();
+
 }  // namespace st
 
 #endif  // MACDART_ST_ST_LOADER_H_

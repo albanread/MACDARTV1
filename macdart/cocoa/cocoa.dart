@@ -462,8 +462,13 @@ _stEqualsSlow(a, b) {
     }                                           // recursively so nested arrays
     return true;                                // and ST elements compare too.
   }
-  return stSend(a, '=', [b]);                   // Fraction / user classes
-}
+  return _stEqNative(a, b);                     // Fraction / user classes —
+}                                               // cached dispatch, no args List
+
+/// The `=` dispatch native: (isolate, cid)-cached lookup + direct invoke —
+/// stSend(a, '=', [b]) here cost ~158ns per ST-object comparison (fresh args
+/// List + uncached C++ super-walk + old-space args Array).
+_stEqNative(a, b) native "ST_eq";
 
 /// `,` concatenation. String+String is the hot path (plain Dart `+`). Any pair
 /// of string-ish operands (mutable String / Symbol / Character mixed with a

@@ -59,7 +59,13 @@ SequenceableCollection subclass: OrderedCollection [
         ^v
     ]
     add: v <Object> ^ <Object> [
-        ^self addLast: v
+        "addLast:'s body inlined by hand: the forwarding send cost more than
+         the append itself (51ns vs 15ns) once add: reached here as a plain
+         per-site InstanceCall."
+        lastIndex = array size ifTrue: [ self makeRoomAtEnd ].
+        lastIndex := lastIndex + 1.
+        array at: lastIndex put: v.
+        ^v
     ]
     addFirst: v <Object> ^ <Object> [
         firstIndex = 1 ifTrue: [ self makeRoomAtFront ].

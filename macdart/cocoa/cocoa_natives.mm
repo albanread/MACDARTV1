@@ -744,6 +744,7 @@ void ST_load(Dart_NativeArguments args);
 void ST_invokeStatic(Dart_NativeArguments args);
 void ST_new(Dart_NativeArguments args);
 void ST_send(Dart_NativeArguments args);
+void ST_eq(Dart_NativeArguments args);
 void ST_classSend(Dart_NativeArguments args);
 void ST_basicNewFromType(Dart_NativeArguments args);
 void ST_run(Dart_NativeArguments args);
@@ -851,6 +852,7 @@ static void Cocoa_sendMain(Dart_NativeArguments args) {
   V(ST_invokeStatic, 3)                                                        \
   V(ST_new, 1)                                                                 \
   V(ST_send, 3)                                                                \
+  V(ST_eq, 2)                                                                  \
   V(ST_classSend, 3)                                                           \
   V(ST_basicNewFromType, 1)                                                    \
   V(ST_run, 1)                                                                 \

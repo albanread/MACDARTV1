@@ -17,6 +17,7 @@
 #include <string.h>
 
 #include <memory>
+#include <mutex>   // the ST_eq (isolate, cid) -> `=` Function dispatch cache
 #include <string>
 #include <vector>
 
@@ -459,6 +460,97 @@ void ST_send(Dart_NativeArguments args) { STSendCommon(args, false); }
 // ApiError for a missing method (an ApiError is not catchable by Dart
 // try/catch, which crashed the Release GUI inside stPrintOf's fallback).
 void ST_sendTry(Dart_NativeArguments args) { STSendCommon(args, true); }
+
+// ── ST_eq(a, b): the `=` slow path, direct and cached ──────────────────────
+// _stEqualsSlow's terminal used to be stSend(a, '=', [b]) — a fresh args List
+// per comparison, then STSendCommon's per-call MangleSelector + Symbols::New +
+// an UNCACHED super-chain walk + an OLD-space args Array. On ST receivers
+// (Fraction, user classes) that priced every value-equality at ~158ns, 11x
+// MACVM's dispatch (the front-end review's probe). This entry takes (a, b)
+// directly and caches (isolate, cid) -> the resolved `=` Function.
+//
+// Why raw pointers are safe: Functions/Classes live in OLD space and this VM's
+// old space never moves (1.24 mark-sweep, no compactor). Why the cache must be
+// FLUSHED: an st load or a hot reload can replace a class's methods — both
+// call st::ClearSendCache() (Loader::Load, wsReload).
+struct EqCacheEntry {
+  dart::Isolate* iso;
+  intptr_t cid;
+  dart::RawFunction* fn;
+};
+static std::vector<EqCacheEntry> g_eq_cache;
+static std::mutex g_eq_mutex;
+
+namespace st {
+void ClearSendCache() {
+  std::lock_guard<std::mutex> lock(g_eq_mutex);
+  g_eq_cache.clear();
+}
+}  // namespace st
+
+void ST_eq(Dart_NativeArguments args) {
+  Dart_Handle a_h = Dart_GetNativeArgument(args, 0);
+  Dart_Handle b_h = Dart_GetNativeArgument(args, 1);
+  Thread* thread = Thread::Current();
+  Dart_Handle result_handle = Dart_Null();
+  std::string err;
+  {
+    TransitionNativeToVM transition(thread);
+    HANDLESCOPE(thread);
+    Zone* zone = thread->zone();
+    const Object& recv = Object::Handle(zone, Api::UnwrapHandle(a_h));
+    const intptr_t cid = recv.GetClassId();
+    Isolate* iso = thread->isolate();
+    Function& fn = Function::Handle(zone);
+    {
+      std::lock_guard<std::mutex> lock(g_eq_mutex);
+      for (size_t i = 0; i < g_eq_cache.size(); i++) {
+        if (g_eq_cache[i].iso == iso && g_eq_cache[i].cid == cid) {
+          fn ^= g_eq_cache[i].fn;
+          break;
+        }
+      }
+    }
+    if (fn.IsNull()) {
+      const String& sel = String::Handle(zone, Symbols::New(thread, "="));
+      Class& c = Class::Handle(zone, recv.clazz());
+      while (!c.IsNull()) {
+        if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+        fn ^= c.LookupDynamicFunction(sel);
+        if (!fn.IsNull()) break;
+        c ^= c.SuperClass();
+      }
+      if (!fn.IsNull()) {
+        std::lock_guard<std::mutex> lock(g_eq_mutex);
+        if (g_eq_cache.size() < 64) {  // a handful of classes define `=`
+          EqCacheEntry e;
+          e.iso = iso;
+          e.cid = cid;
+          e.fn = fn.raw();
+          g_eq_cache.push_back(e);
+        }
+      }
+    }
+    if (fn.IsNull()) {
+      const Class& cls = Class::Handle(zone, recv.clazz());
+      err = "stSend: " + std::string(cls.ToCString()) + " has no method '='";
+    } else {
+      // kNew, deliberately: the args Array dies at the next scavenge, where
+      // STSendCommon's kOld allocation churned old space per comparison.
+      const Array& arr = Array::Handle(zone, Array::New(2));
+      arr.SetAt(0, recv);
+      arr.SetAt(1, Object::Handle(zone, Api::UnwrapHandle(b_h)));
+      const Object& result =
+          Object::Handle(zone, DartEntry::InvokeFunction(fn, arr));
+      result_handle = Api::NewHandle(thread, result.raw());
+    }
+  }
+  if (!err.empty()) {
+    STThrow(err.c_str());
+    return;
+  }
+  Dart_SetReturnValue(args, result_handle);
+}
 
 // stGetField(recv, name) -> the value of the dart:core GETTER `name` on recv.
 // The universal send (stSendExt) uses this as the LAST resort for a unary ST

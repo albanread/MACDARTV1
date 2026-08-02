@@ -11,6 +11,9 @@
 #include "include/dart_api.h"
 #include "include/dart_tools_api.h"
 
+// st::ClearSendCache — flush the ST dispatch cache across a hot reload.
+namespace st { void ClearSendCache(); }
+
 // Implemented by the GUI host (macdart/cocoa/cocoa_host.mm), which is linked
 // only into `dartui`. Every other binary (dart, gen_snapshot, dart_bootstrap)
 // still pulls this object via the dart:cocoa native resolver table, so it needs
@@ -68,6 +71,7 @@ void Workspace_eval(Dart_NativeArguments args) {
 // change), at which point the workspace restarts the isolate. This is the piece
 // MACVM lacks (no `become`): a structural class change stays live here.
 void Workspace_reload(Dart_NativeArguments args) {
+  st::ClearSendCache();  // a reload can replace methods the ST_eq cache holds
   Dart_Handle r = Dart_WorkspaceReloadSources(true /* force_reload */);
   if (Dart_IsError(r)) {
     char buf[1024];

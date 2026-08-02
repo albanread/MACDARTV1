@@ -449,6 +449,11 @@ std::string MangleSelector(const std::string& selector) {
   return out;
 }
 
+// Weak default: binaries that link the loader without st_natives (no ST_eq
+// dispatch cache to flush) get a no-op; dart_cocoa's strong definition in
+// st_natives.cc overrides it — the same pattern as macdart_browser_stubs.
+__attribute__((weak)) void ClearSendCache() {}
+
 // The shared cross-load resolver (st_loader.h): newest st: library first.
 dart::RawClass* FindStClassByName(dart::Thread* thread, const char* name) {
   using namespace dart;
@@ -479,6 +484,10 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
                   bool* has_toplevel,
                   bool allow_reopen) {
   using namespace dart;
+
+  // Any load can add or replace methods — stale (cid -> Function) dispatch
+  // cache entries would then dispatch to the OLD method body.
+  ClearSendCache();
 
   // Retain the AST for the isolate's lifetime BEFORE stamping any marker into
   // it (a failed load still leaves valid marker targets rather than danglers).

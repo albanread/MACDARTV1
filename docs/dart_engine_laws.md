@@ -106,7 +106,8 @@ Two landed instances:
   `"<Type> ext"` holder classes, and every native-receiver send re-resolved the
   holder **by name** (`FindStClassByName` = a library scan + `ToCString` per
   candidate). `between:and:` on a Smi, from `OrderedCollection>>at:`'s bounds
-  check, fired **~30 000×/run**, each a full scan. Cached on
+  check, fired **~330× per iteration** (~30 000× over a benchmark process run),
+  each a full scan. Cached on
   `(isolate, cid, sel)`: **deltablue 1132 → 729 µs, Cog gap 4.1× → 2.6×** — the
   single biggest move of the arc (commit `7d3a92e`).
 

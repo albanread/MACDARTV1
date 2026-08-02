@@ -21,9 +21,10 @@ Every law here was bought with a measurement and locked behind two gates that
    quiet-machine gated).
 
 The numbers cited are from the 2026-08-02 performance arc (commits `f9008c5` …
-`7d3a92e`). Net result, review-start → arc-end (µs/iter, warm, best-of):
-sieve 410→193, dict 599→455, richards 799→636, **deltablue 1271→729**,
-alloc 458→405 — **6 of 7 benches ahead of Cog**, the production Squeak/Pharo JIT.
+`9438e4a`). Net result, review-start → arc-end (µs/iter, warm, best-of):
+sieve 410→186, dict 599→454, richards 799→628, **deltablue 1271→537**,
+alloc 458→390 — **6 of 7 benches ahead of Cog**, the production Squeak/Pharo JIT
+(the seventh, deltablue, closed from a 4.6× loss to 1.9×).
 
 ---
 
@@ -120,6 +121,22 @@ Two landed instances:
   no-op definition of `ClearSendCache` keeps loader-only binaries linking (§5.3).
 - **Cache only what the key faithfully discriminates** — see the boolean guard,
   §4.2.
+
+**Cache the misses too, when the miss is deterministic and its fallback is hot.**
+A *hit-only* class-side cache on `STClassSendCommon` was **completely inert** —
+because the hot residual was `basicNew` on inherited constraint factories
+(`BinaryConstraint>>var:var:strength:` sent to an `EqualityConstraint`, so the
+guarded-alloc slow path lands in the native with `thisCls` a subclass).
+`basicNew` has *no* class-side method, so it always **misses** the lookup and
+falls to `Instance::New` — and a hit-only cache never stored the miss, so it
+re-scanned `FindStClassByName` ~5000×/class/run forever. Caching the **negative
+result** (a null `Function`, meaning "no static method, take the fallback")
+skipped the scan: **deltablue 729 → 537 µs** (commit `9438e4a`). The
+resolution `(cls, sel) → Function-or-nothing` is deterministic within a load, so
+the negative entry is as safe as a positive one and is flushed by the same
+`ClearSendCache`. Watch for this whenever a hot dispatch *fails* its lookup and
+falls to a default — the failing scan is pure waste and only a negative cache
+removes it.
 
 ### 1.4 Comparisons cannot naively become `InstanceCall`s.
 
@@ -327,13 +344,15 @@ build-st-rel/dart --with-st --inlining_size_threshold=250 --inlining_callee_size
 | 5 | `b33286a` | thunk-free `stSymbol` | 3.1 | deltablue −8% (first real move) |
 | 6 | `44d8909` | per-site value-family `ClosureCall` | 1.2 | bench-neutral, poison removed (honest) |
 | 7 | `7d3a92e` | ext-holder dispatch cache | 1.3, 4.2, 5.1 | **deltablue 1132→729, Cog 4.1×→2.6×** |
+| 8 | `9438e4a` | class-side dispatch cache (negative) | 1.3 | **deltablue 729→537, Cog 2.6×→1.9×** |
 
 Two levers proven **dead ends** by measurement, saving the work of building them:
 poly-fan devirtualization (§0 forced-inline experiment: ~3 %), and raising
-inliner budgets (deltablue unchanged). The remaining live lever is the same as
-§1.3 one native over — `STClassSendCommon` (class-side `Planner current` /
-`Strength required` re-resolving `"Foo"`/`"Foo class"` by name), the entire
-`LookupEntry` residual after commit 7.
+inliner budgets (deltablue unchanged). After commit 8, DeltaBlue's profile is
+allocation-bound (`Object::Allocate` on top, the name-scan gone) — the honest
+floor for a boxing runtime, and the same shape as MACVM's own DeltaBlue.
+Remaining sketched-not-built levers: the load-time literal pool (§3.2) and OSR
+for hosted loops (§2.4), both cold-path payoffs.
 
 ---
 

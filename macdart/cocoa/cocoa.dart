@@ -525,6 +525,11 @@ stSendExt(receiver, String selector, List args) {
   return stSend(receiver, selector, args); // throws the proper doesNotUnderstand
 }
 
+// The unary form with NO argument list allocated — the getter-collision path
+// (`7 sign`, `#(1 2) first`) used to build a fresh empty List per send.
+final List _stNoArgs = const [];
+stSendExt0(receiver, String selector) => stSendExt(receiver, selector, _stNoArgs);
+
 /// Like stSendExt but GRACEFUL on a total miss: answers nil instead of throwing.
 /// The class-name send fallback uses it so a reflective send that resolves
 /// (`Integer superclass`) works, while a genuinely unknown class-side send
@@ -720,6 +725,9 @@ stClassSend5(t, sel, a, b, c, d, e) => _stClassSend(t, sel, [a, b, c, d, e]);
 // receiver falls back to real ST dispatch via stSend, so an ST class defining
 // its own at:/size keeps working through the same selectors.
 stNot(b) => b == true ? false : true;
+// `~=` in ONE call (the builder used to emit stEquals + stNot — two static
+// calls per send); same truth table as stNot(stEquals(a, b)).
+stNotEquals(a, b) => stEquals(a, b) == true ? false : true;
 
 /// value-family sends: a real closure invokes directly (the optimizer inlines
 /// these helpers, restoring per-site monomorphic ICs); anything else — e.g. a
@@ -752,19 +760,27 @@ stBoolOr(a, b) {
 _stPipeSlow(a, b) => a | b;
 
 stAt1(c, k) {
+  // Tiny on purpose (one test + rare tail) so every hot site inlines the
+  // List fast path; Smalltalk indexes from 1.
+  if (c is List) return c[k - 1];
+  return _stAt1Rare(c, k);
+}
+_stAt1Rare(c, k) {
+  if (c is Map) return c[k];
   if (c is StMutableString) return stChar(c.units[k - 1]);
   if (c is StSymbol) return stChar(c.name.codeUnitAt(k - 1));
-  if (c is List) return c[k - 1]; // Smalltalk indexes from 1
-  if (c is Map) return c[k];
   if (c is String) return stChar(c.codeUnitAt(k - 1));  // a Character, not a 1-char string
   return _stAtSlow(c, k);
 }
 _stAtSlow(c, k) => c.at_(k);
 
 stAtPut1(c, k, v) {
-  if (c is StMutableString) { c.units[k - 1] = _stCode(v); return v; }
-  if (c is List) { c[k - 1] = v; return v; }
+  if (c is List) { c[k - 1] = v; return v; }   // tiny: inlines at every hot site
+  return _stAtPut1Rare(c, k, v);
+}
+_stAtPut1Rare(c, k, v) {
   if (c is Map) { c[k] = v; return v; }
+  if (c is StMutableString) { c.units[k - 1] = _stCode(v); return v; }
   return _stAtPutSlow(c, k, v);
 }
 _stAtPutSlow(c, k, v) => c.at_put_(k, v);
@@ -826,11 +842,11 @@ stAddU(c, x) {
 _stAddSlow(c, x) => c.add_(x);
 
 stDo(c, f) {
+  if (c is List) { for (var e in c) f(e); return c; }   // the hot case, first
+  if (c is Map) { for (var v in c.values) f(v); return c; }
   if (c is StMutableString) { for (var i = 0; i < c.units.length; i++) f(stChar(c.units[i])); return c; }
   if (c is StSymbol) { for (var i = 0; i < c.name.length; i++) f(stChar(c.name.codeUnitAt(i))); return c; }
   if (c is String) { for (var i = 0; i < c.length; i++) f(stChar(c.codeUnitAt(i))); return c; }
-  if (c is List) { for (var e in c) f(e); return c; }
-  if (c is Map) { for (var v in c.values) f(v); return c; }
   return _stDoSlow(c, f);
 }
 _stDoSlow(c, f) => c.do_(f);
@@ -1081,9 +1097,16 @@ _stPrintDigitsSlow(r) => r.printDigits();
 // self) and overflowed the stack. Nums stay fast, Strings compare
 // lexically, everything else is real ST dispatch.
 stLess(a, b) {
+  // Tiny on purpose: one test + a rare-tail call, so the optimizer ALWAYS
+  // inlines this at hot sites (a bigger body fell out of the inline budget
+  // and cost fib 2.7x in out-of-line compare calls).
+  if (a is num && b is num) return a < b;
+  return _stLessRare(a, b);
+}
+_stLessRare(a, b) {
   if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
   if (a is StChar) a = a.code; if (b is StChar) b = b.code;
-  if (a is num && b is num) return a < b;
+  if (a is num && b is num) return a < b;   // $a < $b
   if (a is String && b is String) return a.compareTo(b) < 0;
   return _stLtSlow(a, b);
 }
@@ -1099,9 +1122,16 @@ _stLtSlow(a, b) {
   return a < b;
 }
 stLessEq(a, b) {
+  // Tiny on purpose: one test + a rare-tail call, so the optimizer ALWAYS
+  // inlines this at hot sites (a bigger body fell out of the inline budget
+  // and cost fib 2.7x in out-of-line compare calls).
+  if (a is num && b is num) return a <= b;
+  return _stLessEqRare(a, b);
+}
+_stLessEqRare(a, b) {
   if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
   if (a is StChar) a = a.code; if (b is StChar) b = b.code;
-  if (a is num && b is num) return a <= b;
+  if (a is num && b is num) return a <= b;   // $a <= $b
   if (a is String && b is String) return a.compareTo(b) <= 0;
   return _stLeSlow(a, b);
 }
@@ -1110,9 +1140,16 @@ _stLeSlow(a, b) {
   return a <= b;
 }
 stGreater(a, b) {
+  // Tiny on purpose: one test + a rare-tail call, so the optimizer ALWAYS
+  // inlines this at hot sites (a bigger body fell out of the inline budget
+  // and cost fib 2.7x in out-of-line compare calls).
+  if (a is num && b is num) return a > b;
+  return _stGreaterRare(a, b);
+}
+_stGreaterRare(a, b) {
   if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
   if (a is StChar) a = a.code; if (b is StChar) b = b.code;
-  if (a is num && b is num) return a > b;
+  if (a is num && b is num) return a > b;   // $a > $b
   if (a is String && b is String) return a.compareTo(b) > 0;
   return _stGtSlow(a, b);
 }
@@ -1121,9 +1158,16 @@ _stGtSlow(a, b) {
   return a > b;
 }
 stGreaterEq(a, b) {
+  // Tiny on purpose: one test + a rare-tail call, so the optimizer ALWAYS
+  // inlines this at hot sites (a bigger body fell out of the inline budget
+  // and cost fib 2.7x in out-of-line compare calls).
+  if (a is num && b is num) return a >= b;
+  return _stGreaterEqRare(a, b);
+}
+_stGreaterEqRare(a, b) {
   if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
   if (a is StChar) a = a.code; if (b is StChar) b = b.code;
-  if (a is num && b is num) return a >= b;
+  if (a is num && b is num) return a >= b;   // $a >= $b
   if (a is String && b is String) return a.compareTo(b) >= 0;
   return _stGeSlow(a, b);
 }

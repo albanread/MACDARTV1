@@ -1234,16 +1234,14 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
     return instructions;
   }
   if (node->selector == "~=" && node->args.size() == 1) {
-    // a ~= b  ==  (a = b) not  — value inequality (was identity; now stEquals)
+    // a ~= b  ==  (a = b) not — ONE helper (stNotEquals); this used to emit
+    // stEquals + stNot, two static calls per send.
     Fragment instructions = TranslateExpression(node->receiver.get());
     instructions += PushArgument();
     instructions += TranslateExpression(node->args[0].get());
     instructions += PushArgument();
     instructions += StaticCall(
-        Function::ZoneHandle(zone_, LookupCocoaFunction("stEquals")), 2);
-    instructions += PushArgument();
-    instructions += StaticCall(
-        Function::ZoneHandle(zone_, LookupCocoaFunction("stNot")), 1);
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stNotEquals")), 2);
     return instructions;
   }
   // `,` concatenation — routed through stConcat so a native mutable String
@@ -1426,16 +1424,15 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
   // getter and getter-CALL its result. Route it through stSend(recv, sel, [])
   // so ST dispatch runs (Number>>sign) for native AND ST receivers alike.
   if (node->args.empty() && IsCoreGetterCollision(node->selector)) {
+    // stSendExt0 shares one const empty args list — the 3-arg form built a
+    // fresh List per send of first/last/sign/reversed.
     Fragment instructions = TranslateExpression(node->receiver.get());
     instructions += PushArgument();
     instructions += Constant(String::ZoneHandle(
         zone_, Symbols::New(thread_, node->selector.c_str())));
     instructions += PushArgument();
     instructions += StaticCall(
-        Function::ZoneHandle(zone_, LookupCocoaFunction("stNewList")), 0);
-    instructions += PushArgument();
-    instructions += StaticCall(
-        Function::ZoneHandle(zone_, LookupCocoaFunction("stSendExt")), 3);
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stSendExt0")), 2);
     return instructions;
   }
 

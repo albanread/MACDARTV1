@@ -509,12 +509,26 @@ struct ExtCacheHash {
 };
 static std::unordered_map<ExtCacheKey, dart::RawFunction*, ExtCacheHash>
     g_ext_cache;
+// The class-side send cache: (isolate, class-value cid, selector) -> the
+// resolved class-side static Function. STClassSendCommon otherwise re-resolves
+// the "Foo class" metaclass shadow BY NAME (FindStClassByName) on every
+// class-side send — the residual name-lookup cost after the ext-send cache
+// (`Planner current`, `Strength required` in the deltablue cascade). Same key
+// STRUCTURE as the ext cache but a DISTINCT map: this keys on the class value's
+// OWN cid (type.type_class().id()), a different id-space meaning than a native
+// receiver's cid, so the two must not share a map. Same mutex + same flush.
+static std::unordered_map<ExtCacheKey, dart::RawFunction*, ExtCacheHash>
+    g_cls_cache;
 static std::mutex g_ext_mutex;
 
 namespace st {
 void ClearSendCache() {
   { std::lock_guard<std::mutex> lock(g_eq_mutex); g_eq_cache.clear(); }
-  { std::lock_guard<std::mutex> lock(g_ext_mutex); g_ext_cache.clear(); }
+  {
+    std::lock_guard<std::mutex> lock(g_ext_mutex);
+    g_ext_cache.clear();
+    g_cls_cache.clear();
+  }
 }
 }  // namespace st
 
@@ -833,15 +847,41 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
       if (!hit) {
       const String& sel =
           String::Handle(zone, Symbols::New(thread, msel.c_str()));
-      // The metaclass-shadow chain holds class-side methods.
+      // Cache (isolate, class-value cid, selector) -> the class-side Function,
+      // skipping the by-name "Foo class" shadow re-resolution. NEGATIVE entries
+      // (a null Function) are cached too, and are the point: the hot residual
+      // was `basicNew` on an INHERITED constraint factory — BinaryConstraint's
+      // var:var:strength: sent to an EqualityConstraint/ScaleConstraint, so the
+      // guarded-alloc slow path lands here with thisCls a subclass. basicNew has
+      // no class-side method, so it MISSES the lookup and falls to Instance::New
+      // below; a hit-only cache re-scanned FindStClassByName every call (~5000x
+      // per constraint class per run). A negative entry skips straight to the
+      // fallback. `cls` is type.type_class(); its cid identifies the class
+      // value. Reached only when the alloc-intercept did NOT fire.
+      const ExtCacheKey ckey = {thread->isolate(), cls.id(), sel.raw()};
       Function& fn = Function::Handle(zone);
-      Class& c = Class::Handle(
-          zone, ::st::FindStClassByName(thread, (cls_name + " class").c_str()));
-      while (!c.IsNull()) {
-        if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
-        fn ^= c.LookupStaticFunction(sel);
-        if (!fn.IsNull()) break;
-        c ^= c.SuperClass();
+      bool cached = false;
+      {
+        std::lock_guard<std::mutex> lock(g_ext_mutex);
+        std::unordered_map<ExtCacheKey, dart::RawFunction*,
+                           ExtCacheHash>::iterator it = g_cls_cache.find(ckey);
+        if (it != g_cls_cache.end()) {
+          fn ^= it->second;
+          cached = true;
+        }
+      }
+      if (!cached) {
+        // The metaclass-shadow chain holds class-side methods.
+        Class& c = Class::Handle(
+            zone, ::st::FindStClassByName(thread, (cls_name + " class").c_str()));
+        while (!c.IsNull()) {
+          if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+          fn ^= c.LookupStaticFunction(sel);
+          if (!fn.IsNull()) break;
+          c ^= c.SuperClass();
+        }
+        std::lock_guard<std::mutex> lock(g_ext_mutex);
+        g_cls_cache[ckey] = fn.raw();  // the hit, OR null = a known miss
       }
       if (!fn.IsNull()) {
         const Array& arr =

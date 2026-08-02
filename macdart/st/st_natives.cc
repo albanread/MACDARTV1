@@ -303,7 +303,7 @@ void ST_invokeStatic(Dart_NativeArguments args) {
         if (!cls.is_finalized()) ClassFinalizer::FinalizeClass(cls);
         const Type& type = Type::Handle(
             zone, Type::NewNonParameterizedType(cls));
-        const Array& arr = Array::Handle(zone, Array::New(n + 1, Heap::kOld));
+        const Array& arr = Array::Handle(zone, Array::New(n + 1));
         arr.SetAt(0, type);
         for (intptr_t i = 0; i < n; i++) {
           arr.SetAt(i + 1, Object::Handle(zone, Api::UnwrapHandle(elems[i])));
@@ -423,7 +423,7 @@ static void STSendCommon(Dart_NativeArguments args, bool probe) {
               " has no method '" + selector + "'";
       }
     } else {
-      const Array& arr = Array::Handle(zone, Array::New(n + 1, Heap::kOld));
+      const Array& arr = Array::Handle(zone, Array::New(n + 1));
       arr.SetAt(0, recv);  // receiver = argument 0
       for (intptr_t i = 0; i < n; i++) {
         arr.SetAt(i + 1, Object::Handle(zone, Api::UnwrapHandle(elems[i])));
@@ -924,7 +924,7 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
       }
       if (!fn.IsNull()) {
         const Array& arr =
-            Array::Handle(zone, Array::New(n + 1, Heap::kOld));
+            Array::Handle(zone, Array::New(n + 1));
         arr.SetAt(0, type);  // thisCls propagates unchanged
         for (intptr_t i = 0; i < n; i++) {
           arr.SetAt(i + 1, Object::Handle(zone, Api::UnwrapHandle(elems[i])));
@@ -955,7 +955,7 @@ static void STClassSendCommon(Dart_NativeArguments args, bool probe) {
           err = "stClassSend: '" + cls_name + "' cannot signal";
         } else {
           const Array& arr =
-              Array::Handle(zone, Array::New(n + 1, Heap::kOld));
+              Array::Handle(zone, Array::New(n + 1));
           arr.SetAt(0, inst);
           for (intptr_t i = 0; i < n; i++) {
             arr.SetAt(i + 1,
@@ -1069,8 +1069,7 @@ void ST_extSendTry(Dart_NativeArguments args) {
   Dart_Handle recv_h = Dart_GetNativeArgument(args, 0);
   Dart_Handle sel_h = Dart_GetNativeArgument(args, 1);
   Dart_Handle list_h = Dart_GetNativeArgument(args, 2);
-  const char* sel_c = NULL;
-  if (Dart_IsError(Dart_StringToCString(sel_h, &sel_c)) || sel_c == NULL) {
+  if (!Dart_IsString(sel_h)) {
     Dart_SetReturnValue(args, Dart_Null());
     return;
   }
@@ -1083,7 +1082,6 @@ void ST_extSendTry(Dart_NativeArguments args) {
   for (intptr_t i = 0; i < n; i++) {
     elems[i] = Dart_ListGetAt(list_h, i);
   }
-  const std::string selector(sel_c);
   Thread* thread = Thread::Current();
   Dart_Handle result_handle = Dart_Null();
   bool hit = false;
@@ -1092,41 +1090,76 @@ void ST_extSendTry(Dart_NativeArguments args) {
     HANDLESCOPE(thread);
     Zone* zone = thread->zone();
     const Object& recv = Object::Handle(zone, Api::UnwrapHandle(recv_h));
-    const String& sel = String::Handle(
-        zone, Symbols::New(thread, ::st::MangleSelector(selector).c_str()));
+    const String& insel =
+        String::Cast(Object::Handle(zone, Api::UnwrapHandle(sel_h)));
     // Bool is the one type whose holder is NOT a function of cid alone: true
     // and false share kBoolCid but resolve to True ext vs False ext
     // (ExtHolderCandidates splits on the value). Never cache a bool receiver;
     // it always takes the full scan. No hot path sends to bools this way.
     const bool cacheable = !recv.IsBool();
-    const ExtCacheKey key = {thread->isolate(), recv.GetClassId(), sel.raw()};
     Function& fn = Function::Handle(zone);
-    if (cacheable) {
+    // FAST probe: key on the INCOMING selector's identity. A compiled call
+    // site's selector is a canonical String constant — a stable pointer — so
+    // a hit here skips the whole per-send key-building tax (ToCString +
+    // std::string mangle + a Symbols::New symbol-table hash), which the
+    // profiler put at ~200 samples across the remaining native sends. A
+    // computed selector (perform: with a fresh string) is non-canonical,
+    // misses, and takes the full path below — same cost as before, and it is
+    // never INSERTED under its unstable pointer (the cache would only grow).
+    const bool identity_key_ok = cacheable && insel.IsCanonical();
+    if (identity_key_ok) {
+      const ExtCacheKey ikey = {thread->isolate(), recv.GetClassId(),
+                                insel.raw()};
       std::lock_guard<std::mutex> lock(g_ext_mutex);
       std::unordered_map<ExtCacheKey, dart::RawFunction*,
-                         ExtCacheHash>::iterator it = g_ext_cache.find(key);
+                         ExtCacheHash>::iterator it = g_ext_cache.find(ikey);
       if (it != g_ext_cache.end()) fn ^= it->second;
     }
     if (fn.IsNull()) {
-      const char** candidates = ExtHolderCandidates(recv);
-      Class& c = Class::Handle(zone);
-      for (const char** name = candidates; *name != NULL && fn.IsNull();
-           name++) {
-        c = ::st::FindStClassByName(thread, *name);
-        while (!c.IsNull()) {
-          if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
-          fn ^= c.LookupDynamicFunction(sel);
-          if (!fn.IsNull()) break;
-          c ^= c.SuperClass();
+      // Full path: mangle to the canonical method-name symbol and resolve.
+      const std::string selector(insel.ToCString());
+      const String& sel = String::Handle(
+          zone, Symbols::New(thread, ::st::MangleSelector(selector).c_str()));
+      const ExtCacheKey key = {thread->isolate(), recv.GetClassId(),
+                               sel.raw()};
+      if (cacheable) {
+        std::lock_guard<std::mutex> lock(g_ext_mutex);
+        std::unordered_map<ExtCacheKey, dart::RawFunction*,
+                           ExtCacheHash>::iterator it = g_ext_cache.find(key);
+        if (it != g_ext_cache.end()) fn ^= it->second;
+      }
+      if (fn.IsNull()) {
+        const char** candidates = ExtHolderCandidates(recv);
+        Class& c = Class::Handle(zone);
+        for (const char** name = candidates; *name != NULL && fn.IsNull();
+             name++) {
+          c = ::st::FindStClassByName(thread, *name);
+          while (!c.IsNull()) {
+            if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+            fn ^= c.LookupDynamicFunction(sel);
+            if (!fn.IsNull()) break;
+            c ^= c.SuperClass();
+          }
+        }
+        if (!fn.IsNull() && cacheable) {
+          std::lock_guard<std::mutex> lock(g_ext_mutex);
+          g_ext_cache[key] = fn.raw();
         }
       }
-      if (!fn.IsNull() && cacheable) {
+      // Alias the resolution under the identity key too (the raw selector and
+      // the mangled symbol are different strings, so the entries never
+      // collide) — the NEXT send from this call site takes the fast probe.
+      if (!fn.IsNull() && identity_key_ok) {
+        const ExtCacheKey ikey = {thread->isolate(), recv.GetClassId(),
+                                  insel.raw()};
         std::lock_guard<std::mutex> lock(g_ext_mutex);
-        g_ext_cache[key] = fn.raw();
+        g_ext_cache[ikey] = fn.raw();
       }
     }
     if (!fn.IsNull()) {
-      const Array& arr = Array::Handle(zone, Array::New(n + 1, Heap::kOld));
+      // kNew: the args Array dies at the next scavenge — kOld churned old
+      // space per send (and old-space allocation is the slower, locked path).
+      const Array& arr = Array::Handle(zone, Array::New(n + 1));
       arr.SetAt(0, recv);
       for (intptr_t i = 0; i < n; i++) {
         arr.SetAt(i + 1, Object::Handle(zone, Api::UnwrapHandle(elems[i])));

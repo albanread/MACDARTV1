@@ -81,6 +81,10 @@ static const HelperRewrite kHelperRewrites[] = {
     {"value:value:value:", "stValue3", 3},
     {"value:value:value:value:", "stValue4", 4},
     {"max:", "stMax", 1},       {"min:", "stMin", 1},
+    // The hottest ext-send in the deltablue profile (OC bounds checks on Smis
+    // rode NSM -> ST_extSendTry per call); num fast path inlines to 2 compares,
+    // the rare tail re-emits the old dynamic send (dispatch order unchanged).
+    {"between:and:", "stBetween", 2},
     {"asSymbol", "stAsSymbol", 0},
     {"printString", "stPrintOf", 0},
     {"displayString", "stDisplayOf", 0},

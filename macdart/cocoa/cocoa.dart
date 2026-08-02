@@ -744,6 +744,17 @@ stClassSend5(t, sel, a, b, c, d, e) => _stClassSend(t, sel, [a, b, c, d, e]);
 // receiver falls back to real ST dispatch via stSend, so an ST class defining
 // its own at:/size keeps working through the same selectors.
 stNot(b) => b == true ? false : true;
+// `between:and:` — the #1 remaining ext-send by the profiler (OrderedCollection
+// at:/at:put: bounds checks send it to a Smi ~330x per deltablue iteration, and
+// each ride was a full native round-trip: NSM -> stSendExt -> ST_extSendTry).
+// Tiny fast/rare split so the num case inlines to two compares; the rare tail
+// is EXACTLY the dynamic send the builder used to emit, so ST receivers
+// (Character, Fraction, Date) keep today's dispatch order unchanged.
+stBetween(a, lo, hi) {
+  if (a is num && lo is num && hi is num) return lo <= a && a <= hi;
+  return _stBetweenRare(a, lo, hi);
+}
+_stBetweenRare(a, lo, hi) => a.between_and_(lo, hi);
 // `~=` in ONE call (the builder used to emit stEquals + stNot — two static
 // calls per send); same truth table as stNot(stEquals(a, b)).
 stNotEquals(a, b) => stEquals(a, b) == true ? false : true;

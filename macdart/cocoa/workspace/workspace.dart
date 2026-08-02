@@ -422,10 +422,12 @@ void buildChrome() {
 
   // Toolbar band: a textured strip carrying icon view-switchers on the left and
   // a live metrics readout on the right (MACVM's CocoaUI toolbar, same assets).
-  var bar = Cocoa.cls("NSView").alloc().initWithFrame([0.0, 596.0, 900.0, 44.0]);
+  var bar = Cocoa.cls("NSView").alloc().initWithFrame([0.0, 596.0, 900.0, kToolbarH]);
   bar.setAutoresizingMask(kWidthSizable + kMinYMargin);   // pinned to the top edge
+  bar.setAutoresizesSubviews(true);
+  gToolbar = bar;                    // [layoutChrome] re-seats it on a rebuild
   gContent.addSubview(bar);
-  texturedBox(bar, [0.0, 0.0, 900.0, 44.0], kWidthSizable + kHeightSizable);
+  texturedBox(bar, [0.0, 0.0, 900.0, kToolbarH], kWidthSizable + kHeightSizable);
   iconButton(bar, "Workspace", "texteditor", [8.0, 6.0, 36.0, 32.0], (s) => switchTab(0));
   iconButton(bar, "Browser", "hierarchy", [48.0, 6.0, 36.0, 32.0], (s) => switchTab(1));
   iconButton(bar, "Editor", "blankSheet", [88.0, 6.0, 36.0, 32.0], (s) => switchTab(4));
@@ -483,16 +485,120 @@ void buildChrome() {
   buildProfileTab(addTab(gTabView, "profile", 868.0, 420.0));
 
   // Transcript dock (shared across tabs): docked to the bottom at a fixed
-  // height, widening with the window.
-  gTranscript = scrolledTextView(gContent, [16.0, 12.0, 868.0, 140.0], false);
+  // height, widening with the window — and collapsible, see [layoutChrome].
+  gTranscript = scrolledTextView(gContent, [16.0, kDockMargin, 868.0, kDockH], false);
   anchorScroll(gTranscript, kWidthSizable);
-  // Clear sits with the transcript it clears, reachable from every tab.
-  button(gContent, "Clear", [824.0, 154.0, 60.0, 18.0], (s) {
-    gLog.clear(); gTranscript.setString(""); repaint();
+
+  // The dock's strip: the collapse toggle on the left, the newest line beside
+  // it (shown only when the pane is shut), and Clear on the right with the
+  // transcript it clears — all reachable from every tab.
+  gDockBar = Cocoa.cls("NSView").alloc().initWithFrame(
+      [16.0, _dockBarY(), 868.0, kDockBarH]);
+  gDockBar.setAutoresizingMask(kWidthSizable);
+  gDockBar.setAutoresizesSubviews(true);
+  gContent.addSubview(gDockBar);
+  var dockFont = Cocoa.cls("NSFont").systemFontOfSize(10.0);
+  // Registered under the plain title so `click Transcript` keeps working: the
+  // displayed title carries the ▾/▸ state and is rewritten on every toggle.
+  gDockToggle = button(gDockBar, "Transcript", [0.0, 0.0, 104.0, kDockBarH],
+                       (s) => setDock(!gDockCollapsed));
+  if (!dockFont.isNil) gDockToggle.setFont(dockFont);
+  gDockLastLbl = label(gDockBar, [112.0, 1.0, 868.0 - 112.0 - 68.0, 14.0]);
+  if (!dockFont.isNil) gDockLastLbl.setFont(dockFont);
+  gDockLastLbl.setAutoresizingMask(kWidthSizable);
+  gDockLastLbl.setHidden(true);
+  button(gDockBar, "Clear", [808.0, 0.0, 60.0, kDockBarH], (s) {
+    gLog.clear(); gTranscript.setString(""); dockShowLast(); repaint();
   }).setAutoresizingMask(kMinXMargin);
 
   gTabView.selectTabViewItemAtIndex(0);
+  layoutChrome();   // the dock's height is the tab host's — settle both together
   updateMetrics();
+}
+
+// --- the transcript dock ----------------------------------------------------
+// Everything below the toolbar is either the dock or the tab host, so what one
+// gives up the other takes: collapsing the transcript to its strip hands those
+// 142pt to whichever tab is in front.
+//
+// The collapsed flag is a global on purpose. rebuildUi() throws the whole view
+// tree away and runs buildChrome() again, and a rebuild that popped the dock
+// back open would undo the user's choice every time the layout reloads.
+bool gDockCollapsed = false;
+Cocoa gToolbar;          // the textured band (laid out here, not just at build)
+Cocoa gDockBar;          // the strip carrying the toggle, the last line, Clear
+Cocoa gDockToggle;       // "▾ Transcript" / "▸ Transcript"
+Cocoa gDockLastLbl;      // the newest line, shown only while collapsed
+Cocoa gDockMenuItem;     // View ▸ Hide/Show Transcript
+
+const double kToolbarH = 44.0;    // the textured band across the top
+const double kDockH = 140.0;      // the transcript pane, when open
+const double kDockBarH = 18.0;    // the strip above it
+const double kDockMargin = 12.0;  // gap to the window's bottom edge
+
+/// The strip's y: at the window's bottom edge when collapsed, above the
+/// transcript pane when open.
+double _dockBarY() =>
+    gDockCollapsed ? kDockMargin : kDockMargin + kDockH + 2.0;
+
+/// Lay the window's fixed furniture out for the current state and window size:
+/// the toolbar band, the dock, and the tab host between them. Run on build and
+/// on every toggle; in between, autoresizing masks hold the arrangement — the
+/// margins set here are exactly what AppKit then preserves.
+///
+/// buildChrome() builds at the 900x640 frames it was written for, so this is
+/// also what makes a REBUILD land correctly on a window that has since been
+/// resized (Debug ▸ Rebuild UI Layout, and every UI reload) — before this, a
+/// rebuild at another size left the toolbar and the tab host at their build-time
+/// geometry, stranded across the middle of the window.
+void layoutChrome() {
+  if (gTabView == null || gDockBar == null || gTranscript == null) return;
+  var b = gContent.bounds();
+  var w = b[2], h = b[3];
+  if (gToolbar != null) gToolbar.setFrame([0.0, h - kToolbarH, w, kToolbarH]);
+  var scroll = gTranscript.enclosingScrollView();
+  scroll.setHidden(gDockCollapsed);
+  scroll.setFrame([16.0, kDockMargin, w - 32.0, kDockH]);
+  var barY = _dockBarY();
+  gDockBar.setFrame([16.0, barY, w - 32.0, kDockBarH]);
+  var tabY = barY + kDockBarH + 4.0;
+  gTabView.setFrame([16.0, tabY, w - 32.0, h - kToolbarH - tabY]);
+  gDockToggle.setTitle(gDockCollapsed ? "▸ Transcript" : "▾ Transcript");
+  gDockLastLbl.setHidden(!gDockCollapsed);   // open, the pane itself shows it
+  dockShowLast();
+  if (gDockMenuItem != null) {
+    gDockMenuItem.setTitle(gDockCollapsed ? "Show Transcript" : "Hide Transcript");
+  }
+}
+
+/// Collapse the transcript to its strip, or open it again.
+void setDock(bool collapsed) {
+  if (gDockBar == null) return;      // a standalone app window has no transcript
+  gDockCollapsed = collapsed;
+  // A hidden view must not keep the keyboard: hand focus back to the tab in
+  // front if the transcript had it.
+  if (collapsed) gWindow.makeFirstResponder(gTabView);
+  layoutChrome();
+  repaint();
+}
+
+/// The newest transcript line, in the collapsed strip. Collapsing must not make
+/// output invisible — and an error is the line you most need to see when the
+/// pane it would have landed in is shut, so those come through in red. The
+/// FIRST line of the entry: a failed do-it logs its stack under the message,
+/// and the message is the part worth a single line.
+void dockShowLast() {
+  if (gDockLastLbl == null || !gDockCollapsed) return;
+  var line = gLog.isEmpty ? "" : gLog.last;
+  var nl = line.indexOf('\n');
+  if (nl >= 0) line = line.substring(0, nl);
+  gDockLastLbl.setStringValue(line.trim());
+  // The two shapes an error takes here: "✗ …" from the UI itself, and a do-it
+  // whose result came back "⟹   ERR: …" from the language isolate.
+  var bad = line.trimLeft().startsWith("✗") || line.contains("ERR:");
+  var c = bad ? Cocoa.cls("NSColor").systemRedColor()
+              : Cocoa.cls("NSColor").secondaryLabelColor();
+  if (!c.isNil) gDockLastLbl.setTextColor(c);
 }
 
 // --- VM metrics cluster (MACVM's toolbar readout) ---------------------------
@@ -586,6 +692,7 @@ void log(String line) {
   if (gTranscript != null) {                 // no transcript in a standalone app window
     gTranscript.setString(gLog.join("\n"));
     gTranscript.scrollToEndOfDocument(null);
+    dockShowLast();                          // collapsed: the strip is the view
   }
   repaint();   // async/callback updates run outside AppKit's event flush
 }
@@ -1224,8 +1331,12 @@ void buildMenu() {
   menuItem(view, "Demos", "7", (s) => switchTab(6));
   menuItem(view, "App", "8", (s) => switchTab(7));
   menuSep(view);
+  // Title and state are set by [layoutChrome], which runs after this — the menu is
+  // built before the dock exists.
+  gDockMenuItem = menuItem(view, "Hide Transcript", "t",
+                           (s) => setDock(!gDockCollapsed));
   menuItem(view, "Clear Transcript", "k", (s) {
-    gLog.clear(); gTranscript.setString(""); repaint();
+    gLog.clear(); gTranscript.setString(""); dockShowLast(); repaint();
   });
 
   // The workspace's own sources, editable from inside itself.
@@ -1765,10 +1876,22 @@ Future<String> handle(String line) async {
       var b = gContent.bounds();
       return "content " + b[2].toString() + "x" + b[3].toString();
     }
+    case 'dock': {   // "dock" reports; "dock hide|show|toggle" moves it
+      var a = arg.trim().toLowerCase();
+      if (a == 'hide' || a == 'collapse') setDock(true);
+      else if (a == 'show' || a == 'open') setDock(false);
+      else if (a == 'toggle') setDock(!gDockCollapsed);
+      else if (a.isNotEmpty) return "ERR: dock [show|hide|toggle]";
+      return gDockCollapsed ? "collapsed" : "open";
+    }
     case 'frames': {
       var o = <String>[];
       o.add("content   " + gContent.bounds().toString());
+      o.add("toolbar   " + (gToolbar == null ? "(absent)" : gToolbar.frame().toString()));
       o.add("tabview   " + gTabView.frame().toString());
+      o.add("dock      " + (gDockCollapsed ? "collapsed" : "open") +
+            "  bar " + gDockBar.frame().toString() +
+            "  pane " + gTranscript.enclosingScrollView().frame().toString());
       for (var t in <String>["+ Class", "− Class", "+ Method", "− Method",
                              "instance", "class", "Comment", "Accept", "Clear"]) {
         var b = gButtons[t];
@@ -5227,6 +5350,10 @@ void rebuildUi() {
   gEdText = null; gEdPicker = null;
   gEdStatus = null; gFindField = null; gFindTable = null; gEditor = null;
   gTranscript = null; gTabView = null;
+  // The dock's collapsed state is NOT cleared: it is the user's choice and
+  // buildChrome rebuilds into it (see [layoutChrome]).
+  gToolbar = null;
+  gDockBar = null; gDockToggle = null; gDockLastLbl = null; gDockMenuItem = null;
   // The demo VIEW dies with the tree; the demo IMAGE and its isolate live on —
   // buildDemosTab reattaches them, so a running demo just keeps drawing.
   gDemoView = null; gDemoStatusLbl = null;
@@ -5916,7 +6043,7 @@ MENUS
          image (DB + live, via hot reload), stopping it first if running —
          examples reinstall from this menu, and an open Editor buffer can
          Save to Image to bring a class back.
-  View   the tabs, and Clear Transcript (Cmd-K).
+  View   the tabs, Hide/Show Transcript (Cmd-T) and Clear Transcript (Cmd-K).
 
 EDITOR
   Analyze compiles the buffer for real (dart --compile_all in a separate
@@ -5929,6 +6056,13 @@ TOOLBAR
   Live VM counters for the language isolate: MEM used/capacity with a usage bar,
   JIT functions compiled/optimised, CODE generated bytes, GC scavenges/marksweeps.
   A cell shows - when the VM cannot answer it.
+
+TRANSCRIPT
+  The pane docked below every tab. COLLAPSE it with the "Transcript" button on
+  its strip (or Cmd-T) and the tab in front takes the freed height; collapsed,
+  the strip still shows the newest line, errors in red, so nothing goes
+  unreported. Clear empties it (Cmd-K). The choice survives a UI rebuild.
+  Control verb: `dock [show|hide|toggle]` -> "open" | "collapsed".
 
 DEBUGGER — CONTROL VERBS (the formats below are a CONTRACT; agents parse them)
   dbgisolates             one per line: "<name>  <isolates/ID>[  [lang]]".

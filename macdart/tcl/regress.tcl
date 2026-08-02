@@ -96,6 +96,31 @@ check "back to v1"         [ui doit {new VerT().v()}] 1
 ui remove VerT
 after 800
 
+section "the transcript dock collapses"
+# The dock and the tab host share the height below the toolbar: what one gives
+# up the other must take, or collapsing would just leave a hole.
+proc tabHeight {} {
+    foreach l [split [ui frames] \n] {
+        if {[regexp {^tabview\s+\[[^,]+,\s*[^,]+,\s*[^,]+,\s*([0-9.]+)\]} $l -> h]} { return $h }
+    }
+    return 0
+}
+ui dock show
+set openH [tabHeight]
+check "collapse"          [ui dock hide] collapsed
+after 300
+check "the tab took the space" [expr {[tabHeight] - $openH}] 142.0
+check "clear still reachable"  [ui click Clear] "clicked Clear"
+# The choice is the user's: a rebuild must not pop it back open.
+ui uirebuild
+after 900
+check "survives a rebuild"     [ui dock] collapsed
+check "and stays that tall"    [expr {[tabHeight] - $openH}] 142.0
+check "reopen"                 [ui dock show] open
+after 300
+check "the tab gave it back"   [tabHeight] $openH
+check "bad argument refused"   [ui dock wobble] "ERR: dock \[show|hide|toggle\]"
+
 section "the ui rebuilds itself"
 check "rebuild layout"    [ui uirebuild] ok
 after 800

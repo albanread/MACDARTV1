@@ -49,6 +49,7 @@ Exception subclass: Warning [ ]
 "── The system object (corpus surface: Smalltalk millisecondClock) ──"
 Object subclass: Smalltalk [
     Smalltalk class >> millisecondClock [ <stprim: stMillisecondClock> ]
+    Smalltalk class >> microsecondClock [ <stprim: stMicrosecondClock> ]
     Smalltalk class >> gcScavenge [ <stprim: stGcScavenge> ]
     Smalltalk class >> gcFull [ <stprim: stGcFull> ]
     Smalltalk class >> gcStats [ <stprim: stGcStats> ]

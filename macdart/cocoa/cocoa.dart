@@ -852,6 +852,12 @@ stError(recv, msg) {
 
 /// `Smalltalk millisecondClock` — the corpus benchmark clock.
 stMillisecondClock() => new DateTime.now().millisecondsSinceEpoch;
+// Monotonic microsecond clock for benchmarking: one process-lifetime Stopwatch
+// (mach_absolute_time underneath), so t1-t0 is immune to wall-clock / NTP jumps.
+// Mirrors MACVM's `Smalltalk microsecondClock` (prim 252) and Cog's
+// `Time microsecondClockValue` so one harness times identically on all three.
+final Stopwatch _stMicroClock = new Stopwatch()..start();
+stMicrosecondClock() => _stMicroClock.elapsedMicroseconds;
 
 /// ST `/` is EXACT: int/int divides evenly to an int, else answers a world
 /// Fraction (when 23_fraction is loaded; a plain double otherwise). The

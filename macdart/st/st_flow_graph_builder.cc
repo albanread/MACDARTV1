@@ -69,7 +69,13 @@ static const HelperRewrite kHelperRewrites[] = {
     {"size", "stSizeOf", 0},    {"isEmpty", "stIsEmptyU", 0},
     {"not", "stNot", 0},        {"error:", "stError", 1},
     {"&", "stBoolAnd", 1},      {"|", "stBoolOr", 1},
-    {"add:", "stAddU", 1},      {"do:", "stDo", 1},
+    // `add:` deliberately NOT here: an ST collection's add: through the shared
+    // stAddU funnel measured 57ns vs 15ns as a plain per-site InstanceCall
+    // (the funnel's slow-site ICData aggregates every receiver in the image,
+    // so the inliner can never specialize it). A native growable List receiver
+    // falls back through NSM -> the ext-holder chain, which stAddU still
+    // serves (kept for that path and for stSendExt dispatch).
+    {"do:", "stDo", 1},
     {"value", "stValue0", 0},   {"value:", "stValue1", 1},
     {"value:value:", "stValue2", 2},
     {"value:value:value:", "stValue3", 3},

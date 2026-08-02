@@ -521,16 +521,32 @@ static std::unordered_map<ExtCacheKey, dart::RawFunction*, ExtCacheHash>
     g_cls_cache;
 static std::mutex g_ext_mutex;
 
+}  // namespace bin
+}  // namespace dart
+
+// ::st::ClearSendCache — the REAL dispatch-cache flush. It MUST be top-level
+// `::st` (not dart::bin::st) to match the st_loader.h declaration and override
+// the weak st_loader stub: defined inside `namespace dart::bin` (where the rest
+// of this file lives) it would mangle as dart::bin::st::ClearSendCache and the
+// weak `::st` no-op would silently win — the caches would then never flush on a
+// load/reload (stale dispatch after a live method edit). The caches are
+// file-static in dart::bin, reachable here by qualified name within this one TU.
 namespace st {
 void ClearSendCache() {
-  { std::lock_guard<std::mutex> lock(g_eq_mutex); g_eq_cache.clear(); }
   {
-    std::lock_guard<std::mutex> lock(g_ext_mutex);
-    g_ext_cache.clear();
-    g_cls_cache.clear();
+    std::lock_guard<std::mutex> lock(dart::bin::g_eq_mutex);
+    dart::bin::g_eq_cache.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(dart::bin::g_ext_mutex);
+    dart::bin::g_ext_cache.clear();
+    dart::bin::g_cls_cache.clear();
   }
 }
 }  // namespace st
+
+namespace dart {
+namespace bin {
 
 // stSymbolFor(name) -> the canonical StSymbol. The Dart-side stSymbol delegates
 // here so runtime symbols share the builder's compile-time intern table. The

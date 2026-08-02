@@ -21,10 +21,12 @@ Every law here was bought with a measurement and locked behind two gates that
    quiet-machine gated).
 
 The numbers cited are from the 2026-08-02 performance arc (commits `f9008c5` …
-`43d520b`). Net result, review-start → arc-end (µs/iter, warm, best-of):
-sieve 410→186, dict 599→454, richards 799→628, **deltablue 1271→399**,
-alloc 458→390 — **6 of 7 benches ahead of Cog**, the production Squeak/Pharo JIT
-(the seventh, deltablue, closed from a 4.6× loss to 1.4×).
+`d00ed48`). Net result, review-start → arc-end (µs/iter, warm, best-of):
+sieve 410→195, dict 599→461, richards 799→631, **deltablue 1271→288**,
+alloc 458→399 — **6 of 7 benches ahead of Cog** (the production Squeak/Pharo
+JIT) **and the seventh a statistical tie**: deltablue closed from a 4.6× loss
+to 288 vs Cog's 278 (within the harness's 4% noise). Cog is never faster than
+MACDART's Smalltalk beyond noise on any of the seven.
 
 ---
 
@@ -374,15 +376,20 @@ build-st-rel/dart --with-st --inlining_size_threshold=250 --inlining_callee_size
 | 8 | `9438e4a` | class-side dispatch cache (negative) | 1.3 | **deltablue 729→537, Cog 2.6×→1.9×** |
 | 9 | `43d520b` | compile-time symbol interning | 3.2, 5.1–5.3 | **deltablue 537→399, Cog 1.9×→1.4×** |
 | — | `68a7add` | fix `ClearSendCache` namespace (§5.3 trap) | 5.3 | correctness: caches now flush on reload |
+| 10 | `d00ed48` | native-send tax: `between:and:` helper + selector-identity cache keys + kNew args | 1.1, 1.3, 0 | **deltablue 399→288 — statistical tie with Cog (278)** |
 
-Two levers proven **dead ends** by measurement, saving the work of building them:
-poly-fan devirtualization (§0 forced-inline experiment: ~3 %), and raising
-inliner budgets (deltablue unchanged). DeltaBlue's profile is now allocation-
-bound (`Object::Allocate` on top, the name-scans and per-eval symbol lookups
-gone) — the honest floor for a boxing runtime, the same shape as MACVM's own
-DeltaBlue. The only remaining lever is attacking the boxing itself (escape/reuse
-of the constraint & context objects); sketched-not-built cold-path items: OSR for
-hosted loops (§2.4) and baking `$c` / `#(…)` literals like symbols (§3.2).
+Three levers proven **dead ends** by measurement, saving the work of building
+them: poly-fan devirtualization (§0 forced-inline experiment: ~3 %), raising
+inliner budgets (deltablue unchanged), and — at the 399 µs baseline — forcing
+MORE inlining, which by then **hurt** (+8%): past a point, splicing everything
+costs more in icache/register pressure than the calls it removes. After commit
+10 the profile is genuinely flat: the top named C++ frames are single-digit
+samples and the time is in generated code — the real boxing floor, reached only
+after THREE successive "allocation-bound" diagnoses each turned out to be one
+more layer of removable dispatch/marshalling tax. Remaining sketched-not-built
+cold-path items: the class-side selector-identity key (STClassSendCommon still
+builds its key per call), CHA-guarded inline allocation for inherited factories,
+OSR for hosted loops (§2.4), and baking `$c` / `#(…)` literals like symbols.
 
 ---
 

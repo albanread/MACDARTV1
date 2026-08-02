@@ -112,13 +112,13 @@ allocation-bound ones). µs per iteration, warm — lower is better:
 
 | bench     | MACDART | Cog (Pharo 13) | MACVM |
 |-----------|--------:|------:|------:|
-| arith     | 698 | 5221 | 1383 |
-| fib       | 6872 | 18692 | 8955 |
-| sieve     | 195 | 363 | 176 |
-| dict      | 451 | 1017 | 252 |
-| alloc     | 398 | 713 | 591 |
-| richards  | 632 | 2266 | 1084 |
-| deltablue | 299 | 279 | 150 |
+| arith     | 715 | 5224 | 1411 |
+| fib       | 6935 | 18726 | 9034 |
+| sieve     | 196 | 362 | 180 |
+| dict      | 457 | 1024 | 255 |
+| alloc     | 384 | 701 | 587 |
+| richards  | 628 | 2223 | 1087 |
+| deltablue | 300 | 280 | 150 |
 
 Cog is never meaningfully ahead: the closest row, `deltablue`, is 299 vs 279 —
 inside the harness's noise, so a statistical tie rather than a win for either.

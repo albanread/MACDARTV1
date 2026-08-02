@@ -74,27 +74,31 @@ on every VM — µs per iteration, warm (lower is better):
 
 | bench     | MACDART | Cog (Pharo 13) | MACVM | noise |
 |-----------|--------:|------:|------:|------:|
-| arith     | **697** |  5203 |  1396 | 2% |
-| fib       | **6807** | 18634 | 10790 | 1% |
-| sieve     |     197 |   361 | **178** | 2% |
-| dict      |     483 |  1021 | **269** | 5% |
-| alloc     | **405** |   704 |   578 | 3% |
-| richards  | **633** |  2211 |  1438 | 1% |
-| deltablue |     297 |   280 | **176** | 4% |
+| arith     | **715** |  5224 |  1411 | 1% |
+| fib       | **6935** | 18726 |  9034 | 1% |
+| sieve     |     196 |   362 | **180** | 2% |
+| dict      |     457 |  1024 | **255** | 4% |
+| alloc     | **384** |   701 |   587 | 3% |
+| richards  | **628** |  2223 |  1087 | 1% |
+| deltablue |     300 |   280 | **150** | 3% |
 
 ## What this says
 
 **MACDART's Smalltalk beats Cog — the production Squeak/Pharo JIT — on six of the
 seven** (arith by 7.5×, richards by 3.5×, fib 2.7×, dict 2.1×, sieve 1.8×, alloc
-1.7×) **and ties the seventh**: deltablue at 297 vs 280 is a 6% difference against
-4% measurement noise — a statistical tie, not a win for either. Cog is not
+1.7×) **and ties the seventh**: deltablue at 300 vs 280 is a 7% difference against
+3% measurement noise — a statistical tie, not a win for either. Cog is not
 meaningfully ahead of MACDART anywhere in the suite.
 
 Against **MACVM** (the sibling Rust VM running the *same* Smalltalk) it remains a
 genuine 4–3 split: MACDART wins the compute/dispatch-bound benches (arith, fib,
 alloc, richards), MACVM the allocation-bound ones (sieve, dict, deltablue).
+MACVM's columns moved between the previous stamp and this one — its own
+register-allocator arc took richards 1440 → 1087 and fib 10790 → 9034 — so
+MACDART's compute lead narrowed from 2.3× to 1.7× on richards without anything
+changing on this side. These are two moving targets, measured together.
 
-**The deltablue arc, 1271 → 297 µs (−77%).** This was MACDART's one real weakness —
+**The deltablue arc, 1271 → 300 µs (−76%).** This was MACDART's one real weakness —
 4.6× behind Cog, 7× behind MACVM. A twelve-commit **front-end** arc closed it with
 **no VM source changed**: the cost was never the compiler or the garbage collector
 (measured: zero scavenges per run, and forcing full inlining moved nothing, then

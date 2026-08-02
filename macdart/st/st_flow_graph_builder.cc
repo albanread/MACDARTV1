@@ -132,6 +132,21 @@ static const HelperRewrite kHelperRewrites[] = {
     {">", "stGreater", 1}, {">=", "stGreaterEq", 1},
     {"copyFrom:to:", "stCopyFromTo", 2},
 };
+// The block-invocation family. Handled per site (LoadClassId == kClosureCid
+// -> a direct ClosureCall, else the old helper) instead of through the shared
+// stValueN funnel: the funnel's `r is Function` InstanceOf is an ESCAPING use
+// for allocation sinking, and its shared slow-site ICData drags every
+// value-receiver in the image into every inlined copy — deltablue's satisfy_
+// kept its (fully spliced!) block allocated because of exactly that.
+static bool IsValueFamily(const std::string& sel, size_t argc) {
+  if (sel == "value") return argc == 0;
+  if (sel == "value:") return argc == 1;
+  if (sel == "value:value:") return argc == 2;
+  if (sel == "value:value:value:") return argc == 3;
+  if (sel == "value:value:value:value:") return argc == 4;
+  return false;
+}
+
 static const HelperRewrite* FindHelperRewrite(const std::string& sel,
                                               size_t argc) {
   for (size_t i = 0; i < sizeof(kHelperRewrites) / sizeof(kHelperRewrites[0]);
@@ -340,6 +355,23 @@ class StGraphBuilder {
     *then_entry = *branch->true_successor_address() = BuildTargetEntry();
     *otherwise_entry = *branch->false_successor_address() = BuildTargetEntry();
     return Fragment(branch).closed();
+  }
+
+  Fragment LoadClassIdF() {
+    LoadClassIdInstr* load = new (zone_) LoadClassIdInstr(Pop());
+    Push(load);
+    return Fragment(load);
+  }
+  // The kernel builder's ClosureCall shape verbatim (kernel_to_il.cc:2547):
+  // the closure is argument 0 AND, pushed last, the bare input-0 value.
+  Fragment ClosureCallF(intptr_t argument_count) {
+    Value* function = Pop();
+    ArgumentArray arguments = GetArguments(argument_count);
+    ClosureCallInstr* call = new (zone_) ClosureCallInstr(
+        function, arguments, /*type_args_len=*/0, Array::null_array(),
+        TokenPosition::kNoSource);
+    Push(call);
+    return Fragment(call);
   }
 
   // --- primitives (guide §2, §5.D) ---
@@ -695,6 +727,7 @@ class StGraphBuilder {
   LocalVariable* value_temp_;                     // reusable control-flow value temp
   std::map<Node*, LocalVariable*> synth_;         // per-node synth temps (to:do: limit, cascade rcvr)
   std::map<Node*, LocalVariable*> synth2_;        // second per-node temp (timesRepeat: counter)
+  std::map<Node*, std::vector<LocalVariable*> > vsynth_;  // value-family send temps (recv + args)
   intptr_t synth_counter_;                        // makes synth-temp names unique
   LocalVariable* closure_var_;                    // the :closure param (closure builds)
   std::vector<LocalVariable*> param_vars_;        // params in frame order (capture copy)
@@ -1277,6 +1310,71 @@ Fragment StGraphBuilder::TranslateMessage(MessageNode* node) {
         Function::ZoneHandle(zone_, LookupCocoaFunction("stConcat")), 2);
     return instructions;
   }
+  // Per-site value-family lowering (see IsValueFamily): evaluate receiver and
+  // args once into temps, then split on LoadClassId == kClosureCid — a closure
+  // receiver takes a DIRECT ClosureCall (per-site: when the closure's creation
+  // is visible the class test constant-folds, the dead branch dies, the
+  // closure-call inliner splices the body, and the allocation SINKS — true
+  // context elision for non-escaping blocks); any other receiver (Association
+  // value, Variable value:, …) takes the old stValueN helper unchanged.
+  if (IsValueFamily(node->selector, node->args.size()) &&
+      vsynth_.count(node)) {
+    const std::vector<LocalVariable*>& t = vsynth_[node];
+    const size_t argc = node->args.size();
+    Fragment f = TranslateExpression(node->receiver.get());
+    f += StoreLocal(t[0]);
+    f += Drop();
+    bool closed = f.is_closed();
+    for (size_t i = 0; !closed && i < argc; i++) {
+      f += TranslateExpression(node->args[i].get());
+      f += StoreLocal(t[1 + i]);
+      f += Drop();
+      closed = f.is_closed();
+    }
+    if (closed) return f;  // a ^-path closed mid-evaluation; rest is dead
+    f += LoadLocal(t[0]);
+    f += LoadClassIdF();
+    f += IntConstant(kClosureCid);
+    TargetEntryInstr* is_closure = NULL;
+    TargetEntryInstr* not_closure = NULL;
+    f += BranchIfStrictEqual(&is_closure, &not_closure);
+    Fragment fast(is_closure);
+    fast += LoadLocal(t[0]);           // the closure is argument 0
+    fast += PushArgument();
+    for (size_t i = 0; i < argc; i++) {
+      fast += LoadLocal(t[1 + i]);
+      fast += PushArgument();
+    }
+    fast += LoadLocal(t[0]);           // …and, pushed last, input 0 —
+    fast += LoadField(Closure::function_offset());  // the closure's FUNCTION
+    // (the parser's BuildClosureCall does exactly this load; passing the
+    // closure itself made codegen read Function::code_offset() off a _Closure
+    // and blr into garbage — a SIGBUS the battery caught immediately).
+    fast += ClosureCallF(1 + static_cast<intptr_t>(argc));
+    fast += StoreLocal(value_temp_);
+    fast += Drop();
+    Fragment slow(not_closure);
+    slow += LoadLocal(t[0]);
+    slow += PushArgument();
+    for (size_t i = 0; i < argc; i++) {
+      slow += LoadLocal(t[1 + i]);
+      slow += PushArgument();
+    }
+    char helper[16];
+    snprintf(helper, sizeof(helper), "stValue%d", static_cast<int>(argc));
+    slow += StaticCall(
+        Function::ZoneHandle(zone_, LookupCocoaFunction(helper)),
+        1 + static_cast<intptr_t>(argc));
+    slow += StoreLocal(value_temp_);
+    slow += Drop();
+    JoinEntryInstr* join = BuildJoinEntry();
+    fast += Goto(join);
+    slow += Goto(join);
+    Fragment result(f.entry, join);
+    result += LoadLocal(value_temp_);
+    return result;
+  }
+
   {
     const HelperRewrite* hr =
         FindHelperRewrite(node->selector, node->args.size());
@@ -1768,6 +1866,19 @@ void StGraphBuilder::CollectLocals(Node* node, LocalScope* scope) {
       CollectLocals(m->receiver.get(), scope);
       for (size_t i = 0; i < m->args.size(); i++) {
         CollectLocals(m->args[i].get(), scope);
+      }
+      if (IsValueFamily(m->selector, m->args.size())) {
+        // Per-site value-family lowering needs the receiver + each argument
+        // in a temp (both branches of the class-id split read them).
+        std::vector<LocalVariable*>& v = vsynth_[m];
+        for (size_t i = 0; i < 1 + m->args.size(); i++) {
+          char buf[32];
+          snprintf(buf, sizeof(buf), ":vt%ld",
+                   static_cast<long>(synth_counter_++));
+          LocalVariable* tv = MakeLocal(buf);
+          scope->AddVariable(tv);
+          v.push_back(tv);
+        }
       }
     }
   } else if (BlockNode* b = dynamic_cast<BlockNode*>(node)) {

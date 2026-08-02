@@ -55,6 +55,18 @@ if [ "$world" = 1 ]; then
   esac
   chk "browser classSource" "String"  "$(ctl lang classsrc String | head -1)"
   chk "doit fraction"       "1/2"      "$(ctl doit 'st> (1/3) + (1/6)')"
+
+  # The browser slices source into methods with its own scanner (language.dart,
+  # _stMemberIndex) — a SECOND reader of the grammar st_parser.cc owns. When the
+  # two drift the pane quietly shows half a method, or none. These three are the
+  # shapes that broke; browser_index.py is the exhaustive form of this check
+  # (whole world vs st_dump, 2453 methods).
+  chk "method body, annotated" "a <= b" \
+      "$(ctl lang methodsrc 'Magnitude class defaultSort' | tr '\n' ' ')"
+  chk "one-liner methods listed" "classSourceFor:" \
+      "$(ctl lang selectors STHostService | tr '\n' ' ')"
+  chk "binary selectors listed" "i <=" \
+      "$(ctl lang selectors Magnitude | tr '\n' ' ')"
 else
   skip "world in image" "absent — run with --launch; browser/Fraction checks skipped"
 fi

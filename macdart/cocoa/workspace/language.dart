@@ -947,8 +947,11 @@ String _hostSaveMethod(String cls, String side, String text) {
   }
   var out;
   if (hit != null) {
-    out = lines.sublist(0, hit['start']).join('\n') + '\n' + body + '\n' +
-        lines.sublist(hit['end'] + 1).join('\n');
+    // Replace the member's OWN span, not its lines — see [_stSpliceSpan].
+    var span = _stSpliceSpan(src, hit);
+    out = src.substring(0, span[0]) +
+        (span[2] == 1 ? body : t.trim()) +
+        src.substring(span[1] + 1);
   } else {
     // insert before the decl's final closing bracket line
     var close = -1;
@@ -987,8 +990,8 @@ String _hostRemoveMethod(String cls, String side, String sel) {
     if (m['side'] == wantSide && m['sel'] == sel) hit = m;
   }
   if (hit == null) return 'ERR no such method ' + cls + '>>' + sel;
-  var out = lines.sublist(0, hit['start']).join('\n') + '\n' +
-      lines.sublist(hit['end'] + 1).join('\n');
+  var span = _stSpliceSpan(src, hit);
+  var out = src.substring(0, span[0]) + src.substring(span[1] + 1);
   var err = _acceptOne(out);
   return err.isEmpty ? 'OK removed ' + sel : 'ERR ' + err;
 }
@@ -1076,6 +1079,56 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'classes') out = _classNames(arg.toString());
       else if (cmd == 'members') out = _memberList(arg);
       else if (cmd == 'classsrc') out = _decls.containsKey(arg) ? _decls[arg] : '';
+      // "Cls <instance|class> selector" — the Browser's OWN source path, made
+      // addressable from a script: what the source pane shows for a selection
+      // is exactly this, so a test can hold the browser to it
+      // (st/test/browser_index.py). Space-separated on purpose — a Smalltalk
+      // binary selector can be `|`, `,` or `\`, so no punctuation is safe as a
+      // delimiter, and a selector can never contain a space.
+      // "Cls" -> "<i|c> <selector>" per line: the Browser's selector pane, in
+      // a form a script can read. `members` answers a Dart list whose toString
+      // is ambiguous the moment a selector is `,` — this one never is.
+      else if (cmd == 'selectors') {
+        var src = _decls.containsKey(arg) ? _decls[arg] : null;
+        if (src == null) out = 'ERR no such class ' + arg.toString();
+        else {
+          var b = new StringBuffer();
+          for (var m in _stMembers(src)) {
+            b.write(m[0]);
+            b.write(' ');
+            b.write(_sigToSelector(m[2].toString()));
+            b.write('\n');
+          }
+          out = b.toString();
+        }
+      }
+      else if (cmd == 'methodsrc') {
+        var p = arg.toString().trim().split(new RegExp(r'\s+'));
+        if (p.length < 2) {
+          // Bare class name: EVERY method, one round trip. 2453 separate calls
+          // is enough traffic to trip the control plane's own 30s deadline, and
+          // a client that times out mid-stream desynchronises — which reads as
+          // "the browser returned nothing" for everything after it.
+          var src = _decls.containsKey(p[0]) ? _decls[p[0]] : null;
+          if (src == null) out = 'ERR no such class ' + p[0];
+          else {
+            var b = new StringBuffer();
+            for (var m in _stMembers(src)) {
+              b.write('\u001d');       // GS: a delimiter no source carries
+              b.write(m[0]);
+              b.write(' ');
+              b.write(_sigToSelector(m[2].toString()));
+              b.write('\n');
+              b.write(m[3]);
+              b.write('\n');
+            }
+            out = b.toString();
+          }
+        } else {
+          out = _hostCall('methodSource', <String>[
+              p[0], p[1], p.length > 2 ? p.sublist(2).join(' ') : '']);
+        }
+      }
       else if (cmd == 'find') out = _find(arg);
       else if (cmd == 'senders') out = _senders(arg);
       else if (cmd == 'alldecls') out = _allDecls();
@@ -1518,82 +1571,285 @@ List _memberList(String className) {
 }
 
 // Sprint 12/14: split a (possibly merged) ST class decl into members —
-// [side 'c'|'i', 'method', signature, source] per method. A member's source
-// runs from its header line to the line where ITS OWN bracket closes
-// (depth-tracked through 'strings', "comments", and $c literals) — slicing
-// to the next header leaked trailing comments, the class's closing bracket,
-// even the next merged chunk into the pane ("follow-on text").
-int _stMemberEndLine(List<String> lines, int start) {
-  var depth = 0;
-  var inStr = false, inCmt = false;
-  for (var li = start; li < lines.length; li++) {
-    var s = lines[li];
-    for (var i = 0; i < s.length; i++) {
-      var ch = s[i];
-      if (inStr) {
-        if (ch == "'") {
-          if (i + 1 < s.length && s[i + 1] == "'") { i++; } else { inStr = false; }
-        }
-        continue;
-      }
-      if (inCmt) {
-        if (ch == '"') inCmt = false;
-        continue;
-      }
-      if (ch == "'") { inStr = true; continue; }
-      if (ch == '"') { inCmt = true; continue; }
-      if (ch == r'$') { i++; continue; }        // $[ char literal
-      if (ch == '[') depth++;
-      if (ch == ']') {
-        depth--;
-        if (depth == 0) return li;
-      }
-    }
+// [side 'c'|'i', 'method', signature, source] per method. This is the Browser's
+// whole view of a Smalltalk class: the selector list is these signatures, the
+// source pane is these slices, and Accept/Remove splice by these line numbers.
+//
+// It is also a SECOND reader of the .mst grammar — st_parser.cc is the first
+// and the authority — and the two drifted badly. macdart/st/test/browser_index.py
+// holds this one to that one: it parses the whole world with st_dump, asks the
+// running browser for the same classes, and fails on any method the browser
+// loses, invents, or shows incompletely. Two rules the old line-scanner lacked,
+// each of them a bug a user saw:
+//
+//   * A TYPE ANNOTATION IS A SPAN, NOT CODE. `defaultSort ^ <[Object,^Boolean]>`
+//     carries brackets that open no block, so counting them closed the method on
+//     its own header line: the pane showed a header and nothing under it. Most of
+//     this dialect's methods are annotated, so most of them displayed truncated.
+//   * A BODY NEED NOT START ON THE HEADER'S LINE. `clear [ <stprim: stAppUiClear> ]`
+//     is a whole method. Requiring the line to END with `[` made every one-liner
+//     invisible, and a class written entirely in one-liners (STHostService, AppUI,
+//     Accel) listed no methods at all.
+//
+// The scan follows st_parser.cc's own shape: at class-body level skip trivia,
+// instance-variable lists and class pragmas; read a method pattern (arguments
+// and the `^ <Type>` return may carry annotations) up to the `[` that opens the
+// body; then match that bracket through 'strings', "comments" and $c literals.
+
+/// Past whitespace and "comments" from [i].
+int _stSkipTrivia(String s, int i) {
+  while (i < s.length) {
+    var c = s[i];
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { i++; continue; }
+    if (c == '"') { i = _stSkipComment(s, i); continue; }
+    break;
   }
-  return lines.length - 1;
+  return i;
 }
+
+/// Past the "comment" opening at [i] (a doubled "" is an escaped quote).
+int _stSkipComment(String s, int i) {
+  i++;                                     // the opening quote
+  while (i < s.length) {
+    if (s[i] == '"') {
+      if (i + 1 < s.length && s[i + 1] == '"') { i += 2; continue; }
+      return i + 1;
+    }
+    i++;
+  }
+  return s.length;
+}
+
+/// Past the 'string' opening at [i] (a doubled '' is an escaped quote).
+int _stSkipString(String s, int i) {
+  i++;
+  while (i < s.length) {
+    if (s[i] == "'") {
+      if (i + 1 < s.length && s[i + 1] == "'") { i += 2; continue; }
+      return i + 1;
+    }
+    i++;
+  }
+  return s.length;
+}
+
+/// Past the `<...>` type annotation opening at [i], or -1 if it never closes.
+/// A type is a name, a union (`<A|B>`) or a block type (`<[Object,^Boolean]>`);
+/// none of them nests an angle bracket (st_parser.cc, SkipTypeAnnotationOpt),
+/// so the first `>` ends it. Its BRACKETS ARE NOT BLOCKS — that is the whole
+/// point of skipping it as a span.
+int _stSkipAnnotation(String s, int i) {
+  for (var j = i + 1; j < s.length; j++) {
+    if (s[j] == '>') return j + 1;
+    if (s[j] == '\n' && j + 1 < s.length && s[j + 1] == '\n') return -1;
+  }
+  return -1;
+}
+
+/// The offset of the `[` opening the body of a member starting at [start], or
+/// -1 if what starts there is not a method header. A method pattern holds only
+/// selector parts, argument names and annotations — a `.` or a closing bracket
+/// means we were not looking at a method at all (a stray statement in a merged
+/// chunk), and must not swallow the next real method's body.
+///
+/// The `<` at the very start is the SELECTOR of `< aMagnitude <Magnitude> [`,
+/// not an annotation. Reading it as one consumed the pattern and left the
+/// argument name looking like a unary method: Magnitude, Date, Fraction and
+/// friends lost `<` and `<=` from the pane and gained a phantom `aMagnitude`.
+int _stBodyOpen(String s, int start) {
+  var i = _stBinaryRunEnd(s, start);      // a binary selector, `<<` included
+  while (i < s.length) {
+    var c = s[i];
+    if (c == '"') { i = _stSkipComment(s, i); continue; }
+    if (c == "'") { i = _stSkipString(s, i); continue; }
+    if (c == r'$') { i += 2; continue; }
+    if (c == '<') {
+      var j = _stSkipAnnotation(s, i);
+      if (j < 0) return -1;
+      i = j;
+      continue;
+    }
+    if (c == '[') return i;
+    if (c == '.' || c == ']') return -1;
+    i++;
+  }
+  return -1;
+}
+
+/// A method header reduced to its signature: annotations removed, the `^` of a
+/// return type with them, whitespace collapsed. SCANNED, not regexed — a regex
+/// cannot tell the leading `<` of the binary selector `<` from the opening of
+/// an annotation, so `<[^>]*>` swallowed `< aMagnitude <Magnitude>` whole and
+/// `<`, `<=` and `<<` disappeared from the pane on twelve classes.
+String _stSigOf(String head) {
+  var b = new StringBuffer();
+  // A leading run of binary characters is the SELECTOR, whole: `<<` is one
+  // token, so the second `<` is not an annotation opening either (reading it
+  // as one turned WriteStream>><< into `<`).
+  var i = _stBinaryRunEnd(head, 0);
+  if (i > 0) b.write(head.substring(0, i));
+  while (i < head.length) {
+    var c = head[i];
+    if (c == '<') {
+      var j = _stSkipAnnotation(head, i);
+      if (j > 0) { i = j; continue; }
+    }
+    b.write(c);
+    i++;
+  }
+  return b.toString()
+      .replaceAll(new RegExp(r'\^\s*$'), '')   // the caret of a stripped `^ <T>`
+      .replaceAll(new RegExp(r'\s+'), ' ')
+      .trim();
+}
+
+/// The end of the run of binary-selector characters starting at [i] (== [i]
+/// when there is none). The set is st_lexer.cc's IsBinaryChar, and a RUN is one
+/// token there — `<<`, `>=`, `~=` are single selectors, not two.
+int _stBinaryRunEnd(String s, int i) {
+  const String kBinary = r'+-*/~<>=&|@%,?!\';
+  while (i < s.length && kBinary.indexOf(s[i]) >= 0) i++;
+  return i;
+}
+
+/// Is the `<` at [i] a pragma (`<primitive: 10>`, `<stprim: foo>`) rather than
+/// the binary selector `<`? st_parser.cc's own test: a pragma's `<` is followed
+/// by a KEYWORD — an identifier ending in `:`.
+bool _stIsPragma(String s, int i) {
+  var j = _stSkipTrivia(s, i + 1);
+  var k = j;
+  while (k < s.length && _stIsWordChar(s[k])) k++;
+  return k > j && k < s.length && s[k] == ':';
+}
+
+/// The offset of the `]` matching the body bracket at [open] (or the last
+/// offset, for a decl whose brackets do not balance — half a method beats
+/// none, and the Accept gate refuses to store it anyway).
+int _stBodyClose(String s, int open) {
+  var depth = 0;
+  var i = open;
+  while (i < s.length) {
+    var c = s[i];
+    if (c == '"') { i = _stSkipComment(s, i); continue; }
+    if (c == "'") { i = _stSkipString(s, i); continue; }
+    if (c == r'$') { i += 2; continue; }     // $[ and $] are literals
+    if (c == '[') depth++;
+    if (c == ']') {
+      depth--;
+      if (depth == 0) return i;
+    }
+    i++;
+  }
+  return s.length - 1;
+}
+
+/// Is the `|` at [i] the binary method `|` rather than an ivar list? The
+/// parser's own test: an argument name followed by the body or a return type
+/// (st_parser.cc, ParseClassBody).
+bool _stIsBarMethod(String s, int i) {
+  var j = _stSkipTrivia(s, i + 1);
+  var k = j;
+  while (k < s.length && (_stIsWordChar(s[k]))) k++;
+  if (k == j) return false;                  // no argument name
+  var m = _stSkipTrivia(s, k);
+  return m < s.length && (s[m] == '[' || s[m] == '^');
+}
+
+bool _stIsWordChar(String c) =>
+    (c.compareTo('a') >= 0 && c.compareTo('z') <= 0) ||
+    (c.compareTo('A') >= 0 && c.compareTo('Z') <= 0) ||
+    (c.compareTo('0') >= 0 && c.compareTo('9') <= 0) || c == '_';
+
+/// Past an instance-variable list `| a b <Type> |` opening at [i]. Annotations
+/// are skipped as spans: a union type `<A|B>` carries a bar that does NOT close
+/// the list.
+int _stSkipIvarList(String s, int i) {
+  i++;
+  while (i < s.length) {
+    var c = s[i];
+    if (c == '<') {
+      var j = _stSkipAnnotation(s, i);
+      if (j < 0) return i + 1;
+      i = j;
+      continue;
+    }
+    if (c == '|') return i + 1;
+    if (c == '[' || c == ']') return i;      // unterminated: do not eat a body
+    i++;
+  }
+  return s.length;
+}
+
+/// A class shell rather than a method: `Object subclass: Foo [` / `Foo extend [`
+/// / `Foo class extend [`. Its body holds members, so we step INTO it.
+bool _stIsShellHead(String head) =>
+    head.contains('subclass:') ||
+    new RegExp(r'^\w+(\s+class)?\s+extend$').hasMatch(head.trim());
 
 /// Every method in the decl: {side 'c'|'i', sel, sig, start, end} (line idx,
 /// inclusive). The shared index under _stMembers, methodSource, and the
 /// browser's Accept splices.
 List<Map> _stMemberIndex(List<String> lines) {
+  var src = lines.join('\n');
   var out = <Map>[];
+  var n = src.length;
   var i = 0;
-  while (i < lines.length) {
-    var t = lines[i].trimRight();
-    var lt = t.trimLeft();
-    var indent = t.length - lt.length;
-    var isHeader = t.endsWith('[') &&
-        indent <= 4 &&
-        !lt.startsWith('"') &&
-        !lt.contains('subclass:') &&
-        !new RegExp(r'^\w+(\s+class)?\s+extend\s*\[$').hasMatch(lt);
-    if (!isHeader) { i++; continue; }
-    var end = _stMemberEndLine(lines, i);
-    var head = lines[i].trim();
-    var sig = head.substring(0, head.length - 1).trim();
-    sig = sig.replaceAll(new RegExp(r'\^\s*<[^>]*>\s*$'), '');
-    sig = sig.replaceAll(new RegExp(r'<[^>]*>'), '');
-    sig = sig.replaceAll(new RegExp(r'\s+'), ' ').trim();
-    var side = sig.contains('class >>') ? 'c' : 'i';
-    var bare = sig.replaceAll(new RegExp(r'^\w+\s+class\s*>>\s*'), '');
+  while (i < n) {
+    i = _stSkipTrivia(src, i);
+    if (i >= n) break;
+    var c = src[i];
+    if (c == ']' || c == '.' || c == '!') { i++; continue; }   // shell close, chunk end
+    if (c == '<' && _stIsPragma(src, i)) {           // a class-level pragma
+      var j = _stSkipAnnotation(src, i);
+      i = (j < 0) ? i + 1 : j;
+      continue;
+    }
+    if (c == '|' && !_stIsBarMethod(src, i)) {        // instance variables
+      i = _stSkipIvarList(src, i);
+      continue;
+    }
+    var open = _stBodyOpen(src, i);
+    if (open < 0) { i++; continue; }                  // not a header — step over
+    var head = src.substring(i, open).trim();
+    if (_stIsShellHead(head)) { i = open + 1; continue; }      // enter the class
+    var close = _stBodyClose(src, open);
+    var sig = _stSigOf(head);
+    // `Foo class >> sel` is the class side; `Foo >> sel` is an instance-side
+    // reopen. Both carry a receiver that is not part of the signature.
+    var side = new RegExp(r'^\w+\s+class\s*>>').hasMatch(sig) ? 'c' : 'i';
+    var bare = sig.replaceAll(new RegExp(r'^\w+(\s+class)?\s*>>\s*'), '').trim();
     if (bare.isNotEmpty) {
       out.add({'side': side, 'sel': _sigToSelector(bare), 'sig': bare,
-               'start': i, 'end': end});
+               'from': i, 'to': close});
     }
-    i = end + 1;
+    i = close + 1;
   }
   return out;
 }
 
 List<List> _stMembers(String src) {
-  var lines = src.split('\n');
   var out = <List>[];
-  for (var m in _stMemberIndex(lines)) {
+  for (var m in _stMemberIndex(src.split('\n'))) {
     out.add([m['side'], 'method', m['sig'],
-             lines.sublist(m['start'], m['end'] + 1).join('\n')]);
+             src.substring(m['from'], m['to'] + 1)]);
   }
   return out;
+}
+
+/// Where a member's replacement text goes: [from, to] widened to the start of
+/// its line when only whitespace precedes it, so an edited method keeps its
+/// indentation. When it does NOT start its line (`a [ ^a ] b [ ^b ]` — four
+/// methods on one line in InetAddress), the span stays exact: splicing by line
+/// there would silently delete the method's neighbours.
+List<int> _stSpliceSpan(String src, Map m) {
+  var from = m['from'], to = m['to'];
+  var ls = from;
+  while (ls > 0 && src[ls - 1] != '\n') ls--;
+  var onlySpace = true;
+  for (var i = ls; i < from; i++) {
+    if (src[i] != ' ' && src[i] != '\t') { onlySpace = false; break; }
+  }
+  return <int>[onlySpace ? ls : from, to, onlySpace ? 1 : 0];
 }
 
 

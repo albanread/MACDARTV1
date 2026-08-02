@@ -96,6 +96,26 @@ check "back to v1"         [ui doit {new VerT().v()}] 1
 ui remove VerT
 after 800
 
+section "the browser slices whole methods"
+# The source pane is a hand-scanned slice of the class's own text — a SECOND
+# reader of the grammar st_parser.cc owns. These are the shapes that used to
+# come back truncated, missing, or with a neighbour attached.
+# macdart/st/test/browser_index.py is the exhaustive form: the whole world
+# against st_dump, every method, every side.
+check "annotated header keeps its body" \
+    [expr {[string match {*a <= b*} [ui lang methodsrc {Magnitude class defaultSort}]]}] 1
+check "a class of one-liners lists them" \
+    [expr {[string match {*classSourceFor:*} [ui lang selectors STHostService]]}] 1
+check "binary selectors are listed" \
+    [expr {[string match {*i <=*} [ui lang selectors Magnitude]]}] 1
+# InetAddress puts four methods on ONE line. Editing one of them must leave the
+# other three alone: the splice used to replace whole LINES, which would have
+# deleted three methods to save one.
+ui doit {st> STHostService new saveMethodFor: 'InetAddress' side: 'instance' source: 'b [ ^b ]'}
+ui settle
+check "editing one of four on a line keeps the rest" \
+    [ui lang methodsrc {InetAddress instance d}] "d \[ ^d \]"
+
 section "the transcript dock collapses"
 # The dock and the tab host share the height below the toolbar: what one gives
 # up the other must take, or collapsing would just leave a hole.

@@ -502,6 +502,20 @@ class StGraphBuilder {
     return Fragment(
         new (zone_) CheckStackOverflowInstr(cur_pos_, 0));
   }
+
+  // The FUNCTION-ENTRY stack check. The parser's rule verbatim
+  // (runtime/vm/flow_graph_builder.cc:3901): the instruction is CONSTRUCTED
+  // unconditionally — its base ctor consumes a deopt id, and deopt ids must
+  // match between the inlined and non-inlined builds of the same method — but
+  // it is ATTACHED only when this is a standalone compile. Before this,
+  // every ST body the inliner spliced kept its entry check: an optimized
+  // deltablue satisfy_ carried NINE CheckStackOverflows.
+  Fragment EntryStackCheck() {
+    CheckStackOverflowInstr* check =
+        new (zone_) CheckStackOverflowInstr(cur_pos_, 0);
+    if (exit_collector_ != NULL) return Fragment();  // inlining: id only
+    return Fragment(check);
+  }
   Fragment Return() {
     Value* value = Pop();
     ASSERT(stack_ == NULL);
@@ -2718,7 +2732,7 @@ FlowGraph* StGraphBuilder::BuildClosure(BlockNode* block) {
   graph_entry_ = new (zone_) GraphEntryInstr(*pf_, normal_entry, osr_id_);
 
   Fragment body;
-  body += CheckStackOverflow();
+  body += EntryStackCheck();
 
   // Stage B prologue: restore the captured context. The closure object is
   // argument 0; its saved context (stored at creation) becomes this frame's
@@ -2870,7 +2884,7 @@ FlowGraph* StGraphBuilder::Build(MethodNode* method) {
     const Function& fn =
         Function::ZoneHandle(zone_, LookupCocoaFunction(prim.c_str()));
     Fragment prim_body;
-    prim_body += CheckStackOverflow();
+    prim_body += EntryStackCheck();
     intptr_t argc = 0;
     if (this_var_ != NULL) {
       prim_body += LoadLocal(this_var_);
@@ -2906,7 +2920,7 @@ FlowGraph* StGraphBuilder::Build(MethodNode* method) {
     const Function& append =
         Function::ZoneHandle(zone_, LookupCocoaFunction("stListAppend"));
     Fragment b;
-    b += CheckStackOverflow();
+    b += EntryStackCheck();
     b += StaticCall(new_list, 0);                    // the args list
     for (size_t a = 0; a < method->args.size(); a++) {
       b += PushArgument();                           // list so far
@@ -2929,7 +2943,7 @@ FlowGraph* StGraphBuilder::Build(MethodNode* method) {
   // before the first statement runs.
   if (method->pos.offset > 0) cur_pos_ = TokenPosition(method->pos.offset);
   Fragment body;
-  body += CheckStackOverflow();
+  body += EntryStackCheck();
 
   // Stage B: if any locals were captured, allocate the heap Context and chain
   // it into current_context_var, then copy captured PARAMETERS from their

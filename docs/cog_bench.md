@@ -66,37 +66,50 @@ ninja -C build-release dart      # if not already built
 COG_DIR=/path/to/cog ROUNDS=3 ./scripts/cog-bench.sh
 ```
 
-## Scoreboard (first run, M-series, best of 3 rounds)
+## Scoreboard (2026-08-02, M-series, best of 7 rounds — current)
 
 The three-way suite (MACDART, MACVM, and Cog), best-of-7 interleaved rounds,
 30 warmup iterations + 41 single-workload microsecond samples per bench, JIT hot
 on every VM — µs per iteration, warm (lower is better):
 
-| bench     | MACDART | Cog (Pharo 13) | MACVM |
-|-----------|--------:|------:|------:|
-| arith     | **719** |  5223 |  1369 |
-| fib       | **7187** | 18361 | 10741 |
-| sieve     |     410 |   361 | **174** |
-| dict      |     599 |  1021 | **274** |
-| alloc     | **458** |   705 |   588 |
-| richards  | **799** |  2197 |  1446 |
-| deltablue |    1271 |   278 | **176** |
+| bench     | MACDART | Cog (Pharo 13) | MACVM | noise |
+|-----------|--------:|------:|------:|------:|
+| arith     | **697** |  5203 |  1396 | 2% |
+| fib       | **6807** | 18634 | 10790 | 1% |
+| sieve     |     197 |   361 | **178** | 2% |
+| dict      |     483 |  1021 | **269** | 5% |
+| alloc     | **405** |   704 |   578 | 3% |
+| richards  | **633** |  2211 |  1438 | 1% |
+| deltablue |     297 |   280 | **176** | 4% |
 
 ## What this says
 
-**MACDART's Smalltalk beats Cog — the production Squeak/Pharo JIT — on five of the
-seven** (arith by 7.3×, richards by 2.8×, plus fib, dict, alloc), and loses only
-`sieve` (narrowly) and `deltablue` (by 4.6×). Cog is never the fastest of the three.
+**MACDART's Smalltalk beats Cog — the production Squeak/Pharo JIT — on six of the
+seven** (arith by 7.5×, richards by 3.5×, fib 2.7×, dict 2.1×, sieve 1.8×, alloc
+1.7×) **and ties the seventh**: deltablue at 297 vs 280 is a 6% difference against
+4% measurement noise — a statistical tie, not a win for either. Cog is not
+meaningfully ahead of MACDART anywhere in the suite.
 
-Against **MACVM** (the sibling Rust VM running the *same* Smalltalk) it is a genuine
-split: MACDART wins the compute/dispatch-bound benches (arith, fib, alloc, richards),
-MACVM wins the allocation-bound ones (sieve, dict, deltablue). Neither dominates;
-both beat Cog.
+Against **MACVM** (the sibling Rust VM running the *same* Smalltalk) it remains a
+genuine 4–3 split: MACDART wins the compute/dispatch-bound benches (arith, fib,
+alloc, richards), MACVM the allocation-bound ones (sieve, dict, deltablue).
 
-**DeltaBlue is MACDART's one real weakness** — behind Cog (4.6×) and MACVM (7×). It
-is the allocation-and-collection-heavy constraint solver, and the gap is in the
-object-allocation path for boxed Smalltalk instances, not the compiler. Two
-independent axes (vs Cog, vs MACVM) agree it is the hardest benchmark for this VM.
+**The deltablue arc, 1271 → 297 µs (−77%).** This was MACDART's one real weakness —
+4.6× behind Cog, 7× behind MACVM. A twelve-commit **front-end** arc closed it with
+**no VM source changed**: the cost was never the compiler or the garbage collector
+(measured: zero scavenges per run, and forcing full inlining moved nothing, then
+later *hurt*). It was the Smalltalk dispatch layer — `"<Type> ext"` holder classes
+re-resolved **by name string on every send** to a native receiver, plus per-send
+cache-key construction, plus symbol literals re-interned per evaluation. Fixes:
+`(isolate, cid, selector)` dispatch caches (positive *and* negative), selector
+identity keys, compile-time symbol interning, helper fast-paths, per-site block
+lowering. The generalized laws are in
+[`dart_engine_laws.md`](dart_engine_laws.md).
+
+What remains is structural, not tuning: MACVM's generational scavenger beats a
+boxing runtime on allocation churn, which is why it still holds sieve, dict, and
+deltablue. Closing *that* would mean changing how Smalltalk objects are
+represented, not how they are dispatched.
 
 > **A correction, on the record.** An earlier version of this doc claimed MACDART
 > "wins all seven against Cog" and, via a transitive argument, that Dart beat MACVM

@@ -105,25 +105,34 @@ Smalltalk benchmarks run three ways under one microsecond-clocked protocol
 ([MACVM's `xvm-bench.sh`](https://github.com/albanread/MACVM/blob/main/scripts/xvm-bench.sh):
 a cold run, 30 warmup iterations, then 41 single-workload samples, best-of-7,
 JIT hot on every VM). **MACDART's Smalltalk-on-the-Dart-VM beats Cog — the
-production Squeak/Pharo JIT — on five of seven**, and splits with the sibling
-[MACVM](https://github.com/albanread/MACVM) Rust Smalltalk VM (MACDART wins the
-compute-bound benches, MACVM wins the allocation-bound ones). µs per iteration,
-warm — lower is better:
+production Squeak/Pharo JIT — on six of seven, and ties the seventh**, and
+splits with the sibling [MACVM](https://github.com/albanread/MACVM) Rust
+Smalltalk VM (MACDART wins the compute/dispatch-bound benches, MACVM the
+allocation-bound ones). µs per iteration, warm — lower is better:
 
 | bench     | MACDART | Cog (Pharo 13) | MACVM |
 |-----------|--------:|------:|------:|
-| arith     | **719** |  5223 |  1369 |
-| fib       | **7187** | 18361 | 10741 |
-| sieve     |     410 |   361 | **174** |
-| dict      |     599 |  1021 | **274** |
-| alloc     | **458** |   705 |   588 |
-| richards  | **799** |  2197 |  1446 |
-| deltablue |    1271 |   278 | **176** |
+| arith     | **697** |  5203 |  1396 |
+| fib       | **6807** | 18634 | 10790 |
+| sieve     |     197 |   361 | **178** |
+| dict      |     483 |  1021 | **269** |
+| alloc     | **405** |   704 |   578 |
+| richards  | **633** |  2211 |  1438 |
+| deltablue |     297 |   280 | **176** |
 
-Cog is never the fastest of the three. MACDART loses only `sieve` (narrowly) and
-`deltablue` — the allocation/collection-bound constraint solver, its one real
-weak spot, where the cost is the boxed-instance allocation path, not the
-compiler. The full three-way record is in [`docs/cog_bench.md`](docs/cog_bench.md).
+Cog is never meaningfully ahead: the closest row, `deltablue`, is 297 vs 280 —
+inside the harness's 4% noise, so a statistical tie rather than a win for either.
+That row was a **4.6× loss** before a twelve-commit front-end arc (1271 → 297 µs)
+that removed dispatch overhead from the Smalltalk layer — helper fast-paths,
+`(isolate, cid, selector)` caches over the extension-holder resolution,
+compile-time symbol interning, per-site block-call lowering. **No VM source was
+touched**; the laws that arc established are written up in
+[`docs/dart_engine_laws.md`](docs/dart_engine_laws.md), and the full three-way
+record is in [`docs/cog_bench.md`](docs/cog_bench.md).
+
+MACVM still wins the allocation-bound three (sieve, dict, deltablue) — a
+generational scavenger beats a boxing runtime on allocation churn, which is the
+honest structural limit here, not a tuning gap.
 
 ## Building
 

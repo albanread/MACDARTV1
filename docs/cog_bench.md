@@ -68,63 +68,55 @@ COG_DIR=/path/to/cog ROUNDS=3 ./scripts/cog-bench.sh
 
 ## Scoreboard (first run, M-series, best of 3 rounds)
 
-```
-load=2.15  rounds=3  commit=5a7e792+dirty  (microsecond clock, no hard pinning — Apple Silicon)
-```
+The three-way suite (MACDART, MACVM, and Cog), best-of-7 interleaved rounds,
+30 warmup iterations + 41 single-workload microsecond samples per bench, JIT hot
+on every VM — µs per iteration, warm (lower is better):
 
-| bench     | MACDART ms | Cog ms | ratio | verdict               |
-|-----------|-----------:|-------:|------:|------------------------|
-| arith     |        7.3 |   51.1 |  0.14 | **MACDART 7.00x**      |
-| fib       |       62.7 |  181.4 |  0.35 | **MACDART 2.89x**      |
-| sieve     |        0.6 |    3.6 |  0.18 | **MACDART 5.65x**      |
-| dict      |        2.1 |   12.3 |  0.17 | **MACDART 5.96x**      |
-| alloc     |        5.0 |   14.4 |  0.35 | **MACDART 2.90x**      |
-| richards  |        3.7 |   22.1 |  0.17 | **MACDART 6.01x**      |
-| deltablue |        1.4 |    3.5 |  0.40 | **MACDART 2.51x**      |
-
-(warm = median of 6 x10-rep batches, microsecond clock, interleaved
-same-thermal-state rounds, all checksums held on every round.)
+| bench     | MACDART | Cog (Pharo 13) | MACVM |
+|-----------|--------:|------:|------:|
+| arith     | **719** |  5223 |  1369 |
+| fib       | **7187** | 18361 | 10741 |
+| sieve     |     410 |   361 | **174** |
+| dict      |     599 |  1021 | **274** |
+| alloc     | **458** |   705 |   588 |
+| richards  | **799** |  2197 |  1446 |
+| deltablue |    1271 |   278 | **176** |
 
 ## What this says
 
-**MACDART wins all seven benchmarks against Cog**, by 2.51x (deltablue) to
-7.00x (arith) — and every margin here meets or exceeds MACVM's own
-best-ever recorded margins against the same Cog/Pharo build (MACVM's best
-scoreboard: 1.33x–4.29x; see MACVM's `docs/cog_bench.md`). That is not a
-coincidence, and it cross-validates both harnesses against each other:
+**MACDART's Smalltalk beats Cog — the production Squeak/Pharo JIT — on five of the
+seven** (arith by 7.3×, richards by 2.8×, plus fib, dict, alloc), and loses only
+`sieve` (narrowly) and `deltablue` (by 4.6×). Cog is never the fastest of the three.
 
-MACVM separately ran a three-way (MACVM vs Cog vs a **2017 Dart 1.24.3
-build under Lima/Linux ARM64**, not this native macOS binary) and found
-**Dart beating MACVM** on six of the seven benchmarks — richards 3.36x,
-arith 1.81x, sieve 2.48x, dict 1.28x, alloc 2.22x, fib 1.77x — with
-**deltablue the one row MACVM won against Dart**, by 1.37x. Since MACVM
-already beats Cog outright, "Dart beats MACVM" and "MACVM beats Cog"
-compound multiplicatively into "Dart beats Cog by a larger margin still" —
-exactly the shape of this table. And **deltablue is, again, Dart's
-narrowest margin here** (2.51x, the smallest of the seven) — the same
-qualitative weak point MACVM's independent measurement found, reproduced
-by a completely different harness on a different day. Two independent
-measurements agreeing on which benchmark is relatively hardest for this
-VM's dispatch machinery is a meaningfully stronger signal than either
-alone.
+Against **MACVM** (the sibling Rust VM running the *same* Smalltalk) it is a genuine
+split: MACDART wins the compute/dispatch-bound benches (arith, fib, alloc, richards),
+MACVM wins the allocation-bound ones (sieve, dict, deltablue). Neither dominates;
+both beat Cog.
 
-**The one number this table cannot be directly reconciled against**:
-MACVM's own Dart column is a *Linux-under-Lima* build, one virtualization
-layer removed from bare metal, while this table's MACDART column is the
-native macOS arm64 binary with no VM layer at all — so the two "Dart"
-numbers are not the same measurement, and a naive transitive division
-(Cog÷MACVM_vs_Cog×MACVM_vs_Dart) will not reproduce this table exactly.
-The gap is in the direction you'd expect (native is faster than
-Lima-hosted), which is itself a reasonable, if informal, sanity check.
+**DeltaBlue is MACDART's one real weakness** — behind Cog (4.6×) and MACVM (7×). It
+is the allocation-and-collection-heavy constraint solver, and the gap is in the
+object-allocation path for boxed Smalltalk instances, not the compiler. Two
+independent axes (vs Cog, vs MACVM) agree it is the hardest benchmark for this VM.
 
-**What it says about this port specifically**: a 2017 VM design, ported to
-run its JIT on hardware it was never built to target, clears every one of
-these seven classic benchmarks faster than a mature, actively-developed
-production Smalltalk JIT — arith (a tight numeric loop, no polymorphism)
-by 7x, and even the hardest case for this VM's dispatch (deltablue's
-heavy constraint-graph polymorphism) by a comfortable 2.5x.
+> **A correction, on the record.** An earlier version of this doc claimed MACDART
+> "wins all seven against Cog" and, via a transitive argument, that Dart beat MACVM
+> on six of seven. Both were wrong. The MACVM figures behind that argument were a
+> Linux-under-Lima Dart build in one place and — the real error — **MACVM running
+> with its JIT switched off** (the harness omitted `MACVM_JIT=threshold`, leaving
+> MACVM in its interpreter, ~50–170× slower). With every VM JIT-hot under one honest
+> protocol, MACVM is *ahead of Cog on all seven* and trades wins with MACDART 4–3.
+> The canonical three-way harness is now MACVM's `scripts/xvm-bench.sh`; this repo's
+> `macdart/scripts/cog-bench.sh` remains the MACDART-vs-Cog two-way.
 
 ## Under the hood — three investigations
+
+> **Note:** the specific margins in this section (e.g. richards "6.01×", and
+> DeltaBlue framed as a *winning* margin) reference the earlier two-way run that
+> has since been superseded — see the correction above; under the fair three-way
+> protocol DeltaBlue is a *loss* to both Cog and MACVM. The *qualitative* findings
+> below hold and are sharper now: which benchmarks are allocation- vs
+> dispatch-bound, the richards switch-vs-subclass port artifact, and the DeltaBlue
+> SP-patch payoff.
 
 These came from reading the actual optimized ARM64 the JIT emits
 (`dart --disassemble-optimized --code-comments --print-flow-graph-filter=<method>`)

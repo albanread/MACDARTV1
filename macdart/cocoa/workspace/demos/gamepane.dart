@@ -97,10 +97,13 @@ class GamePane {
             int w, int h, [int value = 0]) =>
       _cmds.add(<dynamic>['gpblit', mode, src, dst, sx, sy, dx, dy, w, h, value]);
 
-  // --- HUD text (seven-segment digits; letters draw as boxes) ---------------
+  // --- HUD text (a 5x7 pixel font, the whole printable ASCII range) ---------
   void textClear() => _cmds.add(<dynamic>['gptextclear']);
-  void text(int x, int y, String s, int r, int g, int b) =>
-      _cmds.add(<dynamic>['gptext', x, y, s, r, g, b]);
+  /// [x],[y] is the top-left of the first glyph. Six pixels of advance per
+  /// character, eight per line; `\n` starts a new line at the same left edge.
+  /// [scale] blocks each font pixel — 1 for a HUD, 3+ for a title screen.
+  void text(int x, int y, String s, int r, int g, int b, [int scale = 1]) =>
+      _cmds.add(<dynamic>['gptext', x, y, s, r, g, b, scale]);
 
   // --- the shader background (layer 0) --------------------------------------
   /// [fmainBody] is an MSL fragment function:

@@ -230,8 +230,8 @@ main(List args, SendPort ui) {
 
     if (lives <= 0) {                        // game over: space restarts
       g.textClear();
-      g.text(150, 100, score.toString(), 255, 80, 80);
-      g.text(150, 120, '-------', 255, 255, 255);
+      g.text(150, 100, score.toString(), 255, 80, 80, 2);
+      g.text(150, 120, '-------', 255, 255, 255, 2);
       if (g.key(Keys.space)) {
         score = 0; lives = 3; wave = 0; shipHit = 0; ship.alpha = 1.0;
         spawnWave(g);
@@ -337,7 +337,7 @@ main(List args, SendPort ui) {
     }
 
     g.textClear();
-    g.text(8, 6, score.toString(), 255, 255, 255);
-    g.text(380, 6, lives.toString(), 255, 120, 120);
+    g.text(8, 6, score.toString(), 255, 255, 255, 2);
+    g.text(392, 6, lives.toString(), 255, 120, 120, 2);
   });
 }

@@ -110,6 +110,9 @@ main(List args, SendPort ui) {
       }
     }
 
+    // Clear first: the overlay is retained between frames, so an un-cleared
+    // counter prints over its own previous value until the digits are blocks.
+    cmds.add(<dynamic>['gptextclear']);
     cmds.add(<dynamic>['gptext', 8, 6,
         'dive ' + dive.toString() + '  iter ' + maxIter.toString(), 230, 230, 255]);
     ui.send(['draw', cmds]);          // apply palette/HUD, then present the buffer

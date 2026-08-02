@@ -50,6 +50,6 @@ main(List args, SendPort ui) {
     ball.rot = g.frame * 2.0;
     ball.update();
     g.textClear();
-    g.text(8, 8, g.frame.toString(), 255, 255, 255);
+    g.text(8, 8, g.frame.toString(), 255, 255, 255, 2);
   });
 }

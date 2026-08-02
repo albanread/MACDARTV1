@@ -21,7 +21,7 @@ architecture already contains the machinery MACVM had to invent.
 **Converted (the engine, Rust → ObjC++/C++):** the layered Metal pane —
 shader background, 8-bit indexed framebuffer with per-scanline palettes,
 overscan + scroll, 8 buffer slots with a GPU compute blitter, 16-colour
-sprites with per-sprite palettes, seven-segment text overlay — plus the SFX
+sprites with per-sprite palettes, a 5x7-atlas text overlay — plus the SFX
 synthesizer and its AVAudioEngine playback. Ported into `macdart/cocoa/` as
 part of the `dart_cocoa` static library; no Rust in the build.
 
@@ -91,7 +91,7 @@ per frame (mutate the retained scene):
   ['gpblit', src, dst, mode, ...]  slot-to-slot GPU blit (copy/key/and/or/xor/clear)
   ['gpswap']                       front/back buffer swap
   ['gpplay', id]                   trigger a sound
-  ['gptext', x, y, s, r, g, b]     HUD overlay
+  ['gptext', x, y, s, r, g, b, ?scale]  HUD overlay (scale defaults to 1)
 ```
 
 The UI isolate applies the whole list, renders the four layers in order
@@ -184,9 +184,16 @@ Per subsystem, with the facts that will bite a careless port:
   rects panic there; here they must clip), and the CPU-mirror writeback sets
   `dirty[dst]=false` unconditionally, silently discarding pre-blit CPU draws
   — the port reconciles by uploading a dirty destination before blitting.
-- **TextOverlay (284 lines).** Viewport-sized RGBA8 CPU buffer, seven-segment
-  digits (`[0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F]`), letters as
-  placeholder boxes, one full-screen sampled pass, alpha-blended, Load.
+- **TextOverlay (284 lines).** Viewport-sized RGBA8 CPU buffer, one full-screen
+  sampled pass, alpha-blended, Load. The Rust's seven-segment digits (letters
+  drawn as placeholder boxes) are gone: this port bakes a **5x7 pixel atlas**
+  for the whole printable range (`kFont5x7`, 665 bytes, nothing loaded at
+  runtime), 6px advance / 8px line, `\n` honoured, and an integer `scale` that
+  blocks each font pixel — one font from HUD to title screen. Hand-set pixels,
+  not a rasterised system font: the overlay lives on the LOGICAL pane, which
+  the layer blows up with a nearest filter, so anti-aliased outlines would
+  arrive as a blur. `demos/18_fontsheet.dart` is the sheet that proves it —
+  an unmapped byte still draws as a hollow box, and that box IS the report.
 - **ShaderPane (160 lines).** Runtime `newLibraryWithSource:` of a fixed
   header (`Uniforms{time, aspect, p[8]}` + big-triangle vertex fn) + the
   game's `fmain` body. Compile errors must surface as a logged Dart error,
@@ -265,8 +272,7 @@ Worth quarrying later, recorded so it isn't re-discovered: the
 `AVAudioSourceNode` render-callback glue (`AudioManager.mm:1483-1560`, ~75
 lines — the pattern for *realtime* voices if `VoiceBank` ever goes live;
 preallocate the callback buffer, theirs mallocs on the audio thread), the
-copper-bar/gradient `PaletteAutomation` structs, the prebuilt Unscii font
-atlases (a real font for the text overlay someday), and `CAMetalLayer`
+copper-bar/gradient `PaletteAutomation` structs, and `CAMetalLayer`
 config details (`framebufferOnly`, `maximumDrawableCount=3`,
 backing-scale handling in `viewDidChangeBackingProperties`).
 

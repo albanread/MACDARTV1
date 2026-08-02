@@ -147,15 +147,18 @@ class GpBlitter {
 };
 
 // --- layer 3: the text overlay ----------------------------------------------
-// A viewport-sized RGBA8 CPU buffer with seven-segment digits (letters draw
-// as placeholder boxes), uploaded when dirty, sampled over everything.
+// A viewport-sized RGBA8 CPU buffer carrying the full printable ASCII range
+// (0x20..0x7E) from a baked 5x7 pixel atlas, uploaded when dirty, sampled over
+// everything. Six pixels of advance per glyph, eight per line; `\n` starts a
+// new line at the string's own left edge, and `scale` blocks each atlas pixel
+// for HUD-to-title-screen sizes off one font.
 class GpTextOverlay {
  public:
   GpTextOverlay(id<MTLDevice> device, int w, int h, std::string* err);
   ~GpTextOverlay();
   void clear();
   void draw_text(int64_t x, int64_t y, const char* text,
-                 uint8_t r, uint8_t g, uint8_t b);
+                 uint8_t r, uint8_t g, uint8_t b, int scale = 1);
   void upload();
   void render(id<MTLCommandBuffer> cb, id<MTLTexture> target);
 
@@ -163,6 +166,8 @@ class GpTextOverlay {
   void set_px(int64_t x, int64_t y, uint8_t r, uint8_t g, uint8_t b);
   void fill_px(int64_t x, int64_t y, int64_t w, int64_t h,
                uint8_t r, uint8_t g, uint8_t b);
+  void draw_glyph(int64_t x, int64_t y, unsigned char c,
+                  uint8_t r, uint8_t g, uint8_t b, int s);
   int w_, h_;
   std::vector<uint8_t> rgba_;
   bool dirty_;

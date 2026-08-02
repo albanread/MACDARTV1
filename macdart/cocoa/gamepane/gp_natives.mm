@@ -173,7 +173,8 @@ void Cocoa_gpApply(Dart_NativeArguments args) {
         } else if (strcmp(op, "gptext") == 0 && cn >= 7) {
           const char* s = ElStr(c, 3);
           if (s != NULL) eng->text()->draw_text(ElInt(c, 1), ElInt(c, 2), s,
-              ClampByte(ElInt(c, 4)), ClampByte(ElInt(c, 5)), ClampByte(ElInt(c, 6)));
+              ClampByte(ElInt(c, 4)), ClampByte(ElInt(c, 5)), ClampByte(ElInt(c, 6)),
+              cn > 7 ? (int)ElInt(c, 7) : 1);      // optional pixel scale
         } else if (strcmp(op, "gpfull") == 0 && cn >= 2) {
           eng->set_fullscreen(ElInt(c, 1) != 0);
         } else if (strcmp(op, "gpsound") != 0 && strcmp(op, "gpplay") != 0 &&
@@ -304,7 +305,8 @@ void Cocoa_gpApply(Dart_NativeArguments args) {
           eng->text()->draw_text(ElInt(c, 1), ElInt(c, 2), s,
                                  ClampByte(ElInt(c, 4)),
                                  ClampByte(ElInt(c, 5)),
-                                 ClampByte(ElInt(c, 6)));
+                                 ClampByte(ElInt(c, 6)),
+                                 cn > 7 ? (int)ElInt(c, 7) : 1);   // pixel scale
         }
       } else if (strcmp(op, "gpshader") == 0 && cn >= 2) {
         const char* body = ElStr(c, 1);

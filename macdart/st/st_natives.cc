@@ -19,6 +19,7 @@
 #include <memory>
 #include <mutex>   // the ST_eq (isolate, cid) -> `=` Function dispatch cache
 #include <string>
+#include <unordered_map>  // the ext-send (isolate, cid, sel) dispatch cache
 #include <vector>
 
 #include "include/dart_api.h"
@@ -481,10 +482,39 @@ struct EqCacheEntry {
 static std::vector<EqCacheEntry> g_eq_cache;
 static std::mutex g_eq_mutex;
 
+// The ext-send dispatch cache: (isolate, cid, mangled-selector symbol) -> the
+// resolved "<Type> ext" holder Function. ST_extSendTry otherwise re-resolves
+// the holder by NAME on EVERY send to a native receiver — FindStClassByName is
+// a library scan + a String::ToCString per candidate, and the profiler put
+// that whole chain at ~a third of DeltaBlue's CPU (`between:and:` on a Smi,
+// from OrderedCollection>>at:'s bounds check, fired ~30k times per run, each a
+// fresh name scan). Same safety as the `=` cache: raw old-space pointers
+// (1.24 old space never moves); the selector symbol is canonical (Symbols::New
+// interns) so its RawString* is a stable identity key; flushed by
+// ClearSendCache on every load/reload (both can replace a holder's methods).
+struct ExtCacheKey {
+  dart::Isolate* iso;
+  intptr_t cid;
+  dart::RawString* sel;
+  bool operator==(const ExtCacheKey& o) const {
+    return iso == o.iso && cid == o.cid && sel == o.sel;
+  }
+};
+struct ExtCacheHash {
+  size_t operator()(const ExtCacheKey& k) const {
+    return (reinterpret_cast<size_t>(k.iso) >> 4) ^
+           (static_cast<size_t>(k.cid) * 2654435761u) ^
+           (reinterpret_cast<size_t>(k.sel) >> 3);
+  }
+};
+static std::unordered_map<ExtCacheKey, dart::RawFunction*, ExtCacheHash>
+    g_ext_cache;
+static std::mutex g_ext_mutex;
+
 namespace st {
 void ClearSendCache() {
-  std::lock_guard<std::mutex> lock(g_eq_mutex);
-  g_eq_cache.clear();
+  { std::lock_guard<std::mutex> lock(g_eq_mutex); g_eq_cache.clear(); }
+  { std::lock_guard<std::mutex> lock(g_ext_mutex); g_ext_cache.clear(); }
 }
 }  // namespace st
 
@@ -983,19 +1013,37 @@ void ST_extSendTry(Dart_NativeArguments args) {
     HANDLESCOPE(thread);
     Zone* zone = thread->zone();
     const Object& recv = Object::Handle(zone, Api::UnwrapHandle(recv_h));
-    const char** candidates = ExtHolderCandidates(recv);
     const String& sel = String::Handle(
         zone, Symbols::New(thread, ::st::MangleSelector(selector).c_str()));
+    // Bool is the one type whose holder is NOT a function of cid alone: true
+    // and false share kBoolCid but resolve to True ext vs False ext
+    // (ExtHolderCandidates splits on the value). Never cache a bool receiver;
+    // it always takes the full scan. No hot path sends to bools this way.
+    const bool cacheable = !recv.IsBool();
+    const ExtCacheKey key = {thread->isolate(), recv.GetClassId(), sel.raw()};
     Function& fn = Function::Handle(zone);
-    Class& c = Class::Handle(zone);
-    for (const char** name = candidates; *name != NULL && fn.IsNull();
-         name++) {
-      c = ::st::FindStClassByName(thread, *name);
-      while (!c.IsNull()) {
-        if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
-        fn ^= c.LookupDynamicFunction(sel);
-        if (!fn.IsNull()) break;
-        c ^= c.SuperClass();
+    if (cacheable) {
+      std::lock_guard<std::mutex> lock(g_ext_mutex);
+      std::unordered_map<ExtCacheKey, dart::RawFunction*,
+                         ExtCacheHash>::iterator it = g_ext_cache.find(key);
+      if (it != g_ext_cache.end()) fn ^= it->second;
+    }
+    if (fn.IsNull()) {
+      const char** candidates = ExtHolderCandidates(recv);
+      Class& c = Class::Handle(zone);
+      for (const char** name = candidates; *name != NULL && fn.IsNull();
+           name++) {
+        c = ::st::FindStClassByName(thread, *name);
+        while (!c.IsNull()) {
+          if (!c.is_finalized()) ClassFinalizer::FinalizeClass(c);
+          fn ^= c.LookupDynamicFunction(sel);
+          if (!fn.IsNull()) break;
+          c ^= c.SuperClass();
+        }
+      }
+      if (!fn.IsNull() && cacheable) {
+        std::lock_guard<std::mutex> lock(g_ext_mutex);
+        g_ext_cache[key] = fn.raw();
       }
     }
     if (!fn.IsNull()) {

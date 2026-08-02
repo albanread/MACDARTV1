@@ -837,3 +837,4 @@ backend will compile it exactly as if the parser had produced it.
 
 - [`dart-vm-compiler.md`](dart-vm-compiler.md) — what happens *after* you return the `FlowGraph`: SSA, the optimizer, register allocation, the ARM64 backend, and deopt.
 - [`dart-vm-hosting-languages.md`](dart-vm-hosting-languages.md) — how to *register* a new language's classes/functions so the front-end you build here has something to compile, and which languages are worth it.
+- [`dart_engine_laws.md`](dart_engine_laws.md) — the *performance* companion: the measured laws for making a hosted language fast on the frozen VM (dispatch caches, the inline budget, the funnel trap, profiling recipes) — everything the front end can do once it emits correct IL.

@@ -112,17 +112,17 @@ allocation-bound ones). µs per iteration, warm — lower is better:
 
 | bench     | MACDART | Cog (Pharo 13) | MACVM |
 |-----------|--------:|------:|------:|
-| arith     | **697** |  5203 |  1396 |
-| fib       | **6807** | 18634 | 10790 |
-| sieve     |     197 |   361 | **178** |
-| dict      |     483 |  1021 | **269** |
-| alloc     | **405** |   704 |   578 |
-| richards  | **633** |  2211 |  1438 |
-| deltablue |     297 |   280 | **176** |
+| arith     | 698 | 5221 | 1383 |
+| fib       | 6872 | 18692 | 8955 |
+| sieve     | 195 | 363 | 176 |
+| dict      | 451 | 1017 | 252 |
+| alloc     | 398 | 713 | 591 |
+| richards  | 632 | 2266 | 1084 |
+| deltablue | 299 | 279 | 150 |
 
-Cog is never meaningfully ahead: the closest row, `deltablue`, is 297 vs 280 —
-inside the harness's 4% noise, so a statistical tie rather than a win for either.
-That row was a **4.6× loss** before a twelve-commit front-end arc (1271 → 297 µs)
+Cog is never meaningfully ahead: the closest row, `deltablue`, is 299 vs 279 —
+inside the harness's noise, so a statistical tie rather than a win for either.
+That row was a **4.6× loss** before a twelve-commit front-end arc (1271 → 299 µs)
 that removed dispatch overhead from the Smalltalk layer — helper fast-paths,
 `(isolate, cid, selector)` caches over the extension-holder resolution,
 compile-time symbol interning, per-site block-call lowering. **No VM source was
@@ -132,7 +132,10 @@ record is in [`docs/cog_bench.md`](docs/cog_bench.md).
 
 MACVM still wins the allocation-bound three (sieve, dict, deltablue) — a
 generational scavenger beats a boxing runtime on allocation churn, which is the
-honest structural limit here, not a tuning gap.
+honest structural limit here, not a tuning gap. It has also since narrowed
+MACDART's lead on the compute rows (richards 2.3× → 1.7×) with a register-
+allocator arc of its own, so these numbers are a snapshot of two moving targets,
+not a finish line.
 
 ## Building
 

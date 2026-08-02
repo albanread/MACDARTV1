@@ -21,10 +21,10 @@ Every law here was bought with a measurement and locked behind two gates that
    quiet-machine gated).
 
 The numbers cited are from the 2026-08-02 performance arc (commits `f9008c5` …
-`9438e4a`). Net result, review-start → arc-end (µs/iter, warm, best-of):
-sieve 410→186, dict 599→454, richards 799→628, **deltablue 1271→537**,
+`43d520b`). Net result, review-start → arc-end (µs/iter, warm, best-of):
+sieve 410→186, dict 599→454, richards 799→628, **deltablue 1271→399**,
 alloc 458→390 — **6 of 7 benches ahead of Cog**, the production Squeak/Pharo JIT
-(the seventh, deltablue, closed from a 4.6× loss to 1.9×).
+(the seventh, deltablue, closed from a 4.6× loss to 1.4×).
 
 ---
 
@@ -216,15 +216,30 @@ lookup/store) → **deltablue −8%**, its first real movement (commit `b33286a`
 The same caution applies to `firstWhere`, `sort` comparators, any closure-taking
 core method on a hot path.
 
-### 3.2 Runtime-constructed literals are an allocation per evaluation.
+### 3.2 A symbol is a unique interned object — resolve the literal ONCE, at compile time.
 
-`#sym`, `$c`, and `#(…)` are lowered to runtime helper calls
-(`stSymbol`/`stCharLit`/`stNewList`+append), so they allocate/scan **on every
-evaluation** rather than being frame constants as in a native Smalltalk. Symbol
-interning is now allocation-free on the hit path (§3.1); a full **load-time
-literal pool** (intern at load, stamp a pool index into the AST node, emit
-`Constant`) is sketched but unimplemented, and would also shave the `#forward`
-compare out of the constraint methods' call-site counts.
+A symbol literal must lower to *the* canonical interned object, resolved once
+and referenced directly — identity IS its meaning (`#foo == #foo`,
+`#foo == 'foo' asSymbol`). `#foo` used to lower to `Constant("foo") +
+StaticCall(stSymbol)`, re-discovering the object **by spelling on every
+evaluation** — not how symbols work. Now the builder resolves it at compile time
+(`st::InternStSymbol`) and bakes `Constant(<the StSymbol>)`; the runtime
+`stSymbol`/`asSymbol` route through the same authority, so a compiled literal and
+a runtime-computed symbol are the same object (commit `43d520b`).
+
+Two requirements make the bake sound: the interned object is **old-space** (so
+the `Constant` is stable, §5.1) and **persistent-rooted** (so the cache pointer
+and the baked constant survive GC regardless of what references them). And
+because `dart:cocoa` is compiled lazily, `Class::EnsureIsFinalized` is required
+before its fields are materializable — a bare `LookupClass` hands back a class
+with an empty `fields()`.
+
+Expected bench-neutral (the optimizer hoists the lookup out of *inlined* loops);
+it was a **26% DeltaBlue win** instead — the non-inlined cascade arms (§2.1's
+`inputsDo_`, `execute`, `chooseMethod_`) do `direction == #forward` per call, and
+the lookup can't hoist across an un-inlined call boundary. Baking removed it:
+deltablue 537→399. `$c` and `#(…)` are the same shape and could be baked the same
+way; neither appears in DeltaBlue.
 
 ---
 
@@ -273,10 +288,22 @@ isolate's life. So an interned selector's `RawString*` is a stable identity key
 
 `st_loader.cc` is pulled into every binary; `st_natives.cc` only into the ones
 that link `dart_cocoa`. A symbol the loader references but the natives define
-(e.g. `ClearSendCache`) needs a **weak no-op default** in the loader TU so
-loader-only binaries link, with the strong definition in the natives overriding
-it where ST dispatch actually exists. Same pattern as `macdart_browser_stubs`.
-Verify `build-release dart` **and** `dartui` both link after any such change.
+needs a **weak no-op default** in the loader TU so loader-only binaries link,
+with the strong definition overriding it where ST actually runs. Same pattern as
+`macdart_browser_stubs`. Verify `build-release dart` **and** `dartui` both link
+after any such change.
+
+> **Trap that cost two debugging cycles (worth its own line).** `st_natives.cc`
+> is inside `namespace dart::bin`. A helper written as `namespace st { … }`
+> *inside* that file becomes `dart::bin::st::foo`, which does **not** match the
+> `::st::foo` the header declares and callers use — so the **weak `::st` stub
+> silently wins** and the real definition is dead code. This bit both
+> `InternStSymbol` (every symbol came back nil) and, latently, `ClearSendCache`
+> (its flush was a no-op for weeks — caches never cleared on reload). Fixes:
+> define such helpers in `st_loader.cc` (whose `namespace st` is already
+> top-level), or close/reopen `dart::bin` around a genuine `::st` definition.
+> **Confirm with `nm`:** the intended definition must show as `T __ZN2st…`
+> (strong, top-level `st`), not `__ZN4dart3bin2st…`.
 
 ---
 
@@ -345,14 +372,17 @@ build-st-rel/dart --with-st --inlining_size_threshold=250 --inlining_callee_size
 | 6 | `44d8909` | per-site value-family `ClosureCall` | 1.2 | bench-neutral, poison removed (honest) |
 | 7 | `7d3a92e` | ext-holder dispatch cache | 1.3, 4.2, 5.1 | **deltablue 1132→729, Cog 4.1×→2.6×** |
 | 8 | `9438e4a` | class-side dispatch cache (negative) | 1.3 | **deltablue 729→537, Cog 2.6×→1.9×** |
+| 9 | `43d520b` | compile-time symbol interning | 3.2, 5.1–5.3 | **deltablue 537→399, Cog 1.9×→1.4×** |
+| — | `68a7add` | fix `ClearSendCache` namespace (§5.3 trap) | 5.3 | correctness: caches now flush on reload |
 
 Two levers proven **dead ends** by measurement, saving the work of building them:
 poly-fan devirtualization (§0 forced-inline experiment: ~3 %), and raising
-inliner budgets (deltablue unchanged). After commit 8, DeltaBlue's profile is
-allocation-bound (`Object::Allocate` on top, the name-scan gone) — the honest
-floor for a boxing runtime, and the same shape as MACVM's own DeltaBlue.
-Remaining sketched-not-built levers: the load-time literal pool (§3.2) and OSR
-for hosted loops (§2.4), both cold-path payoffs.
+inliner budgets (deltablue unchanged). DeltaBlue's profile is now allocation-
+bound (`Object::Allocate` on top, the name-scans and per-eval symbol lookups
+gone) — the honest floor for a boxing runtime, the same shape as MACVM's own
+DeltaBlue. The only remaining lever is attacking the boxing itself (escape/reuse
+of the constraint & context objects); sketched-not-built cold-path items: OSR for
+hosted loops (§2.4) and baking `$c` / `#(…)` literals like symbols (§3.2).
 
 ---
 

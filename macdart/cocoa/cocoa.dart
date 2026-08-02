@@ -251,8 +251,19 @@ class StSymbol {
 final Map<String, StSymbol> _stSymbolTable = <String, StSymbol>{};
 
 /// The canonical Symbol for [name] — interned, so `#foo == #foo` by identity.
-StSymbol stSymbol(String name) =>
-    _stSymbolTable.putIfAbsent(name, () => new StSymbol._(name));
+///
+/// Thunk-free on purpose: putIfAbsent's `() => ...` argument allocated a
+/// Context + Closure on EVERY call — a `#sym` literal in a hot method paid
+/// two heap objects per evaluation (deltablue's satisfy_ carried three such
+/// pairs for #forward/#backward, seen directly in the optimized flow graph).
+/// The hit path is now one map read, zero allocations.
+StSymbol stSymbol(String name) {
+  var s = _stSymbolTable[name];
+  if (s != null) return s;
+  s = new StSymbol._(name);
+  _stSymbolTable[name] = s;
+  return s;
+}
 
 bool stIsSymbol(x) => x is StSymbol;
 

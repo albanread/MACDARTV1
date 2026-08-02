@@ -331,6 +331,17 @@ after any such change.
   earlier scoreboard meaningless.
 - **One lever per commit.** Keeps gate attribution clean — you always know which
   change moved which number, and which was noise.
+- **Peephole laws are register-allocation-policy-relative** (the mirror lesson,
+  from applying this document to MACVM — its `docs/peephole_findings.md`). On
+  its spill-all-at-safepoints backend, *both* attempted transfers failed the
+  A/B gate: constant dedup lost because a `movz` remat is cheaper than any
+  `Move` there (and the Moves silently killed its range analysis's
+  ignorable-nil classification), and even a strictly-instruction-removing
+  immediate fold lost 9% on one bench because shrinking a live interval
+  reshuffled the spill set around a send. Same discipline, opposite outcomes:
+  these laws describe *this* VM's substrate, not codegen in general — gate
+  everything, everywhere, and fix the register allocator before trusting
+  instruction-level reasoning on top of it.
 
 ---
 

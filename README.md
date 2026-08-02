@@ -98,6 +98,33 @@ Zero crashes across all 5,033 cases — essentially parity with upstream 1.24.3.
 The remaining failures are tests needing `-D` environment flags, checked-mode
 runs, or Dart-2 features — not VM defects.
 
+## Benchmarks — the second language runs fast, too
+
+The Smalltalk that runs on this VM isn't a toy: the same checksum-verified
+Smalltalk benchmarks run three ways under one microsecond-clocked protocol
+([MACVM's `xvm-bench.sh`](https://github.com/albanread/MACVM/blob/main/scripts/xvm-bench.sh):
+a cold run, 30 warmup iterations, then 41 single-workload samples, best-of-7,
+JIT hot on every VM). **MACDART's Smalltalk-on-the-Dart-VM beats Cog — the
+production Squeak/Pharo JIT — on five of seven**, and splits with the sibling
+[MACVM](https://github.com/albanread/MACVM) Rust Smalltalk VM (MACDART wins the
+compute-bound benches, MACVM wins the allocation-bound ones). µs per iteration,
+warm — lower is better:
+
+| bench     | MACDART | Cog (Pharo 13) | MACVM |
+|-----------|--------:|------:|------:|
+| arith     | **719** |  5223 |  1369 |
+| fib       | **7187** | 18361 | 10741 |
+| sieve     |     410 |   361 | **174** |
+| dict      |     599 |  1021 | **274** |
+| alloc     | **458** |   705 |   588 |
+| richards  | **799** |  2197 |  1446 |
+| deltablue |    1271 |   278 | **176** |
+
+Cog is never the fastest of the three. MACDART loses only `sieve` (narrowly) and
+`deltablue` — the allocation/collection-bound constraint solver, its one real
+weak spot, where the cost is the boxed-instance allocation path, not the
+compiler. The full three-way record is in [`docs/cog_bench.md`](docs/cog_bench.md).
+
 ## Building
 
 The reference sources are **not** vendored in this repo — only the port (the

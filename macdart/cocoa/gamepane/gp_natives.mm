@@ -336,6 +336,9 @@ void Cocoa_gpApply(Dart_NativeArguments args) {
             snd = preset_shoot(a1 > 0 ? a1 : 0.15, rng);
           } else if (strcmp(preset, "explode") == 0) {
             snd = preset_explode(a1 > 0 ? a1 : 1.0, a2 > 0 ? a2 : 0.5, rng);
+          } else if (strcmp(preset, "wah") == 0) {
+            // a1 = base Hz (280 = the saucer), a2 = detune Hz = the wah rate
+            snd = preset_wah(a1 > 0 ? a1 : 280.0, a2 > 0 ? a2 : 5.0, 0.9);
           } else if (strcmp(preset, "powerup") == 0) {
             snd = preset_powerup(a1 > 0 ? a1 : 0.4);
           } else if (strcmp(preset, "hurt") == 0) {

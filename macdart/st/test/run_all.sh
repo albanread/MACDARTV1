@@ -114,6 +114,26 @@ for b in richards deltablue library_bench; do
   fi
 done
 
+# tier 2c — the SFX synth, measured. gp_synth.cc is pure C++ (no Metal, no
+# Dart), so a preset's SHAPE can be asserted: the saucer warble has to actually
+# beat, which "a sound played" would never catch.
+if [ -f "$MACDART/cocoa/gamepane/gp_synth_test.cc" ] && command -v clang++ >/dev/null; then
+  bin="$(mktemp -t gp_synth_test)"
+  if clang++ -std=c++17 -O1 -I "$MACDART/cocoa/gamepane" \
+        "$MACDART/cocoa/gamepane/gp_synth_test.cc" \
+        "$MACDART/cocoa/gamepane/gp_synth.cc" -o "$bin" 2>/dev/null; then
+    o="$("$bin" 2>&1)"
+    if echo "$o" | grep -q "SYNTH OK"; then
+      pass "tier2c sfx synth ($(echo "$o" | grep -c '  ok' | tr -d ' ') checks)"
+    else
+      fail "tier2c sfx synth"; echo "$o" | grep FAIL | head -3 | sed 's/^/        /'
+    fi
+  else
+    fail "tier2c sfx synth (does not build)"
+  fi
+  rm -f "$bin"
+else skip "tier2c sfx synth (no gp_synth_test.cc or clang++)"; fi
+
 # tier 5b — the game plays, headless. Every pane primitive is a no-op without a
 # GUI, so GALAXIGANS (world/49) can be launched, driven and asserted on right
 # here: attract, the fire tap, the dive AI, collision, scoring, death and the

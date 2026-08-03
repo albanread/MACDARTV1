@@ -59,6 +59,16 @@ check value: 'an idle ship dies out and resets' value: g gameState value: #attra
 check value: 'the reset refills the fleet' value: g aliveCount value: 40.
 check value: 'and restores the lives' value: g lives value: 3.
 
+"The bonus saucer crosses and warbles the whole way: the wah is re-triggered on
+ a loop (0.9s a note, six seconds to cross) and stops when it leaves."
+g := Galaxigans launch.
+tap value.
+g summonSaucer.
+1 to: 30 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'the saucer arrives' value: (g saucerReport startsWith: 'saucer at') value: true.
+1 to: 400 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'and leaves again' value: g saucerReport value: 'saucer away'.
+
 "Every level resolves: a cosmos for the shader and five species for the grid,
  walked through the whole table (and one past it, to prove it wraps)."
 g := Galaxigans launch.

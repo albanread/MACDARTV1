@@ -245,7 +245,7 @@ Object subclass: Galaxigans [
       shipX shipSprite lives score hiScore wave respawn
       fleet swayX swayDir diveTimer bombTimer
       bullets bombs sparks level scene theme flap
-      saucer saucerX saucerDir saucerTimer cooldown fireWasDown |
+      saucer saucerX saucerDir saucerTimer saucerWah cooldown fireWasDown |
 
     "--- the field, straight from the original's galaxigans_data.inc ---"
     Galaxigans class >> fieldWidth [ ^640 ]
@@ -260,6 +260,10 @@ Object subclass: Galaxigans [
     Galaxigans class >> divePeriod [ ^60 ]
     Galaxigans class >> bombPeriod [ ^22 ]
     Galaxigans class >> saucerPeriod [ ^420 ]
+    "The original flies its saucer at y=20; here the HUD's own row is up there
+     (5x7 at scale 2 = fourteen pixels from y=8), so it crosses just below,
+     clear of the score."
+    Galaxigans class >> saucerY [ ^30 ]
 
     Galaxigans class >> launch [
         "Open the pane and start a new game."
@@ -390,6 +394,7 @@ Object subclass: Galaxigans [
         diveTimer := self divePeriodNow.
         bombTimer := self class bombPeriod.
         saucerX := -60. saucerDir := 0. saucerTimer := self class saucerPeriod.
+        saucerWah := 0.
         fleet do: [ :a | a setHomeX: a homeX homeY: a homeY kind: a kind ].
         self dressFleet.
         bullets := (1 to: 4) collect: [ :i | GxShot empty ].
@@ -423,6 +428,18 @@ Object subclass: Galaxigans [
             names add: (self class species at: k) name printString ].
         ^'L', level printString, ' ', (self class sceneNames at: scene + 1),
          ' [', (names inject: '' into: [ :a :b | a isEmpty ifTrue: [ b ] ifFalse: [ a, ' ', b ] ]), ']'
+    ]
+
+    "Send the bonus saucer across now, instead of waiting out its 420-frame
+     timer — for a test, or for anyone who wants to hear the warble."
+    summonSaucer [ saucerTimer := 1 ]
+
+    "Where the saucer is and whether its warble is running — for the battery."
+    saucerReport [
+        ^saucerDir = 0
+            ifTrue: [ 'saucer away' ]
+            ifFalse: [ 'saucer at ', saucerX printString,
+                       ' warble in ', saucerWah printString ]
     ]
 
     "Skip to the next wave — the battery's way to walk the level table without
@@ -601,13 +618,26 @@ K:Cmin
                 saucerTimer <= 0 ifTrue: [
                     saucerTimer := self class saucerPeriod.
                     saucerDir := (rng next < 0.5) ifTrue: [ 1 ] ifFalse: [ -1 ].
+                    saucerWah := 0.               "start the warble on arrival"
                     saucerX := saucerDir > 0
                         ifTrue: [ -30 ]
                         ifFalse: [ self class fieldWidth + 30 ] ] ]
             ifFalse: [
                 saucerX := saucerX + (saucerDir * 2).
+                self warble.
                 (saucerX < -40 or: [ saucerX > (self class fieldWidth + 40) ])
                     ifTrue: [ saucerDir := 0. saucer hide ] ]
+    ]
+
+    "The saucer's wah-wah: two sines five Hz apart, beating against each other.
+     One note runs 0.9s and the crossing takes six, so it is re-triggered on a
+     loop while the saucer is on screen — the original does exactly this
+     (PlaySaucerWah), and it is why the warble seems to go on forever and then
+     simply stops when the saucer leaves."
+    warble [
+        saucerWah > 0
+            ifTrue: [ saucerWah := saucerWah - 1 ]
+            ifFalse: [ saucerWah := 50. Sound saucer play ]
     ]
 
     "--- collisions -------------------------------------------------------"
@@ -615,11 +645,12 @@ K:Cmin
     checkCollisions [
         bullets do: [ :b |
             b live ifTrue: [
-                (saucerDir ~= 0 and: [ b hits: saucerX y: 20 halfWidth: 12 halfHeight: 8 ])
+                (saucerDir ~= 0 and: [ b hits: saucerX y: self class saucerY + 4
+                                        halfWidth: 12 halfHeight: 8 ])
                     ifTrue: [
                         b kill.
                         score := score + 200.
-                        self burstAt: saucerX y: 20 colour: 22.
+                        self burstAt: saucerX y: self class saucerY + 4 colour: 22.
                         Sound coin play.
                         saucerDir := 0.
                         saucer moveTo: -80 y: -80 ].
@@ -707,7 +738,7 @@ K:Cmin
                 ifFalse: [ a sprite hide ] ].
         saucerDir = 0
             ifTrue: [ saucer hide ]
-            ifFalse: [ saucer moveTo: saucerX - 10 y: 12 ].
+            ifFalse: [ saucer moveTo: saucerX - 10 y: self class saucerY ].
         (gameState == #playing and: [ respawn = 0 ])
             ifTrue: [ shipSprite moveTo: shipX - 8 y: self class playerY - 7 ]
             ifFalse: [

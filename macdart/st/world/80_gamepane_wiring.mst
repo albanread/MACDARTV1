@@ -78,3 +78,8 @@ Sprite >> hide [
     pane primHide: id.
     ^self
 ]
+
+"The UFO warble — preset 10, beyond MACVM's ten. Two sines a few Hz apart beat
+ against each other; the beat IS the wah, so the pulse rate is the detune, not
+ a tremolo. Loop it while a saucer is on screen (it runs 0.9s)."
+Sound class >> saucer [ ^self preset: 10 ]

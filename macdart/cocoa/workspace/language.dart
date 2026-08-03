@@ -140,9 +140,23 @@ String _stImport(String path) {
           classText[name] = buf;
           classNames.add(name);
           classCat[name] = _worldCategoryOf(stem);  // system category
+          // A file that only REOPENS a class (`Foo >> sel [ … ]`) must extend
+          // what the image already holds, not replace it. Importing one
+          // overlay file on its own — 80_gamepane_wiring.mst, say — used to
+          // rewrite GamePane's whole declaration to just that file's methods,
+          // silently deleting defineSprite:/onStep:/keyHeld: from the image and
+          // leaving the class broken until the whole world was re-imported.
+          // Seed the buffer with the existing declaration instead.
+          if (type != 'class' && _decls.containsKey(name)) {
+            buf.write(_decls[name]);
+            buf.write('\n');
+          }
         } else {
           buf.write('\n\n"— from ' + stem + ' —"\n');
         }
+        // Re-importing an unchanged overlay must not stack another copy of the
+        // same methods onto the declaration.
+        if (buf.toString().contains(chunk)) continue;
         buf.write(chunk);
       } else {
         // vardecl / stmt — the file's init & driver lines, kept in order.

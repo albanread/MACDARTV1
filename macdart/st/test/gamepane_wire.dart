@@ -82,14 +82,27 @@ s moveTo: 42 y: 24.
   // --- sounds (preset map + define-once) --------------------------------------
   stRun('Sound click play. Sound click play. Sound coin play.');
   ops = stGpTake();
+  // Slots are the TOP of the engine's rack: 64 - presets + index, so the last
+  // preset is always slot 63 and the block grows downward as presets are added.
   check('sound op count', ops.length == 5, 'got ' + ops.length.toString());
   check('click defines once then plays',
-      listEq(ops[0], ['gpsound', 61, 'click', 0, 0]) &&
-          listEq(ops[1], ['gpplay', 61]) && listEq(ops[2], ['gpplay', 61]),
+      listEq(ops[0], ['gpsound', 60, 'click', 0, 0]) &&
+          listEq(ops[1], ['gpplay', 60]) && listEq(ops[2], ['gpplay', 60]),
       ops.toString());
   check('coin preset name',
-      listEq(ops[3], ['gpsound', 54, 'coin', 0, 0]) &&
-          listEq(ops[4], ['gpplay', 54]),
+      listEq(ops[3], ['gpsound', 53, 'coin', 0, 0]) &&
+          listEq(ops[4], ['gpplay', 53]),
+      ops.toString());
+
+  // --- the saucer warble (preset 10, past MACVM's ten) ------------------------
+  // The wah is the arcade UFO: two sines 5 Hz apart, beating. Slot 64 would be
+  // off the end of the engine's rack, so the point of this check is that the
+  // eleventh preset still lands inside it and carries the right name.
+  stRun('Sound saucer play. Sound saucer play.');
+  ops = stGpTake();
+  check('wah defines once then plays',
+      ops.length == 3 && listEq(ops[0], ['gpsound', 63, 'wah', 0, 0]) &&
+          listEq(ops[1], ['gpplay', 63]) && listEq(ops[2], ['gpplay', 63]),
       ops.toString());
 
   // --- music (ABC -> gptune once + gpmusic; cached on replay) -----------------

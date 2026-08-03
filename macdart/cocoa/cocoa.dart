@@ -1945,9 +1945,13 @@ bool _stGpBlitWarned = false;
 
 // 43_gamepane.mst's Sound preset numbers, in declaration order, to the synth's
 // preset names (gp_synth.cc preset_* — verified 1:1).
+// Preset 10 (wah) is NOT one of MACVM's ten: it is the arcade UFO warble —
+// two sines a few Hz apart beating against each other — which world/49's bonus
+// saucer loops while it crosses. The engine renders it from the same recipe the
+// assembler original uses (280 Hz, 5 Hz detune).
 const List<String> _stGpPresetNames = const <String>[
   'coin', 'jump', 'zap', 'shoot', 'explode',
-  'powerup', 'hurt', 'click', 'bang', 'blip'
+  'powerup', 'hurt', 'click', 'bang', 'blip', 'wah'
 ];
 
 // Instance <stprim:> passes the RECEIVER first; every helper answers it so the
@@ -2126,9 +2130,12 @@ stGpPlay(snd, preset) {
   if (preset is! int || preset < 0 || preset >= _stGpPresetNames.length) {
     return snd;
   }
-  // The engine's sound slots are 0..63; park the ten ST presets at the top of
-  // that range (54..63), clear of a Dart game's low slots.
-  var slot = 54 + preset;
+  // The engine's sound slots are 0..63; park the ST presets at the TOP of that
+  // range, clear of a Dart game's low slots. The base is derived from the list
+  // rather than written down — adding the eleventh preset (wah) with a hardcoded
+  // 54 put it at slot 64, one past the end of the rack, where the engine
+  // rejects it with "gpsound: slot 0..63" and the sound simply never plays.
+  var slot = 64 - _stGpPresetNames.length + preset;
   if (_stGpSounds[preset] != true) {
     _stGpSounds[preset] = true;
     _stGpCmds.add(<dynamic>['gpsound', slot, _stGpPresetNames[preset], 0, 0]);

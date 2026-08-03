@@ -7,11 +7,19 @@
 import 'dart:cocoa';
 import 'dart:io';
 
+// Several files run in order, so a test can FILE IN what it is about to drive
+// — a game that lives in demos/ is not part of the booted world, and loading it
+// is the first line of its own test rather than a special case in the harness.
 main(List<String> args) {
-  if (args.isEmpty) { stderr.writeln('usage: run_mst.dart file.mst'); exit(2); }
-  var r = stRun(new File(args[0]).readAsStringSync());
-  if (r != null && r.toString().startsWith('ERR')) {
-    stderr.writeln(r);
-    exit(1);
+  if (args.isEmpty) {
+    stderr.writeln('usage: run_mst.dart file.mst [more.mst …]');
+    exit(2);
+  }
+  for (var path in args) {
+    var r = stRun(new File(path).readAsStringSync());
+    if (r != null && r.toString().startsWith('ERR')) {
+      stderr.writeln(path + ': ' + r.toString());
+      exit(1);
+    }
   }
 }

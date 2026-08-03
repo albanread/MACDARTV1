@@ -348,13 +348,6 @@ final List<Map> _kStGames = <Map>[
    'blurb': 'brick-breaking with sound (44_breakout.mst)'},
   {'name': 'Worms', 'cls': 'Worms', 'sel': 'launch',
    'blurb': 'three growing worms, you drive one (48a_worms.mst)'},
-  // The first ST game to ask for a bigger pane. It is a port of the x64
-  // assembler Galaxigans (MRASM/projects/galaxigans) and keeps that game's
-  // 640x360 field and its constants, so the two are comparable line for line
-  // — 320x240 would have meant re-tuning every number in the port.
-  {'name': 'Galaxigans', 'cls': 'Galaxigans', 'sel': 'launch',
-   'size': [640, 360],
-   'blurb': 'Galaxian-style fixed shooter, ported from x64 asm (49_galaxigans.mst)'},
   // 43_gamepane.mst's own doc calls MandelZoom (with Breakout) a "complete
   // worked example", and MandelVM documents its own "Launch from the Demos
   // menu" — both were written expecting a slot here and simply never got
@@ -418,6 +411,19 @@ void _stGameCleanup() {
 // instead — fall back to that class directly, `launch` being the one
 // selector both shipped games already use, so any class following that
 // convention just plays without ever touching this table.
+/// A game's own idea of its pane, via class-side paneWidth/paneHeight; the
+/// two originals' 320x240 when it does not say.
+List _stGameAsksSize(String cls) {
+  try {
+    var w = stInvokeStatic(cls, 'paneWidth', []);
+    var h = stInvokeStatic(cls, 'paneHeight', []);
+    if (w is int && h is int && w >= 32 && h >= 32 && w <= 2048 && h <= 2048) {
+      return <int>[w, h];
+    }
+  } catch (e) {}                    // no such method: it takes the default
+  return <int>[_kStGameW, _kStGameH];
+}
+
 _stGame(String arg) {
   var name = arg.trim().split(' ')[0];
   Map game = null;
@@ -453,7 +459,12 @@ _stGame(String arg) {
   // 'size': [w, h] — the VIEWPORT, for a game that wants more room than the
   // two originals' 320x240. It is still a logical pane the layer blows up with
   // a nearest filter, so this buys pixels, not smoothing.
-  List size = (game['size'] is List) ? game['size'] : [_kStGameW, _kStGameH];
+  //
+  // A game FILED IN from demos/ has no row in the table at all, so it declares
+  // its own: class-side paneWidth/paneHeight, asked for here. That keeps the
+  // resolution with the game (Galaxigans wants its original's 640x360) instead
+  // of in a table the game's author cannot see.
+  List size = (game['size'] is List) ? game['size'] : _stGameAsksSize(game['cls']);
   int vw = size[0], vh = size[1];
   List world = (game['world'] is List) ? game['world'] : [vw, vh];
   var first = (game['direct'] == true)

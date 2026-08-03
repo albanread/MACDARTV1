@@ -1259,7 +1259,7 @@ void buildMenu() {
   for (var d in found) {
     var base = d[1].toString().split('/').last;
     if (base.contains('brickout') || base.contains('invaders') ||
-        base.contains('pong')) {
+        base.contains('pong') || (d.length > 2 && d[2] == 'game')) {
       dartGames.add(d);
     } else {
       shows.add(d);
@@ -1296,7 +1296,6 @@ void buildMenu() {
   if (dartGames.isNotEmpty) menuSep(games);
   menuItem(games, "Smalltalk Breakout", "", (s) => runStGame("Breakout"));
   menuItem(games, "Smalltalk Worms", "", (s) => runStGame("Worms"));
-  menuItem(games, "Smalltalk Galaxigans", "", (s) => runStGame("Galaxigans"));
   menuItem(games, "Smalltalk MandelZoom", "", (s) => runStGame("MandelZoom"));
   menuItem(games, "Smalltalk MandelVM", "", (s) => runStGame("MandelVM"));
   menuItem(games, "Smalltalk FFT", "", (s) => runStGame("FFT"));
@@ -4097,13 +4096,20 @@ List<List<String>> scanDemos() {
     }
     files.sort();
     for (var path in files) {
-      var title;
+      var title, kind = 'demo';
       try {
         for (var line in new File(path).readAsLinesSync().take(5)) {
           // The marker must OPEN the line: a file that merely mentions it in
           // prose (pixmap.dart's header does) is not declaring itself a demo.
+          // `Game:` is the same marker for something PLAYABLE — it lands in the
+          // Games menu instead, so a game dropped in demos/ needs no entry in
+          // any table to be listed where a player looks for it.
           if (line.startsWith('// Demo:')) { title = line.substring(8).trim(); break; }
-          if (line.startsWith('"Demo:')) {   // the ST comment twin
+          if (line.startsWith('// Game:')) {
+            title = line.substring(8).trim(); kind = 'game'; break;
+          }
+          if (line.startsWith('"Demo:') || line.startsWith('"Game:')) {
+            if (line.startsWith('"Game:')) kind = 'game';
             var t = line.substring(6).trim();
             var q = t.indexOf('"');
             title = (q >= 0 ? t.substring(0, q) : t).trim();
@@ -4114,7 +4120,7 @@ List<List<String>> scanDemos() {
       // No header, no listing: files like pixmap.dart are LIBRARIES the demos
       // import, not programs to spawn.
       if (title == null) continue;
-      out.add(<String>[title, path]);
+      out.add(<String>[title, path, kind]);
     }
   } catch (e) {}   // no demos folder: the menu will say so
   return out;
@@ -4290,7 +4296,10 @@ Future runStFileDemo(String title, String path) async {
   catch (e) { log("✗ demo — cannot read " + path); return; }
   var decls = editorDecls(src);
   if (decls.isEmpty) { log("✗ demo — " + path + " has no declarations"); return; }
-  var name;
+  // WHICH class is the game? The one with a class-side `launch` — a file may
+  // hold five (Galaxigans ships the game, an alien, a shot, a spark and a
+  // species), and taking the first one found would start the alien.
+  var name, first;
   var stClassRe = new RegExp(r'subclass:\s*(\w+)\s*\[');
   for (var d in decls) {
     var s = d.toString();
@@ -4299,14 +4308,22 @@ Future runStFileDemo(String title, String path) async {
       var m = stClassRe.firstMatch(s);
       if (m != null) n = m.group(1);
     }
-    if (n != null && name == null) name = n;
+    if (n == null) continue;
+    if (first == null) first = n;
+    if (name == null &&
+        new RegExp(r'\bclass\s*>>\s*launch\b').hasMatch(s)) name = n;
   }
+  if (name == null) name = first;
   if (name == null) { log("✗ demo — no class in " + path); return; }
   var r = await checkDecls(decls);
   if (!r.ok) { log("✗ demo refused — " + r.message); return; }
   var reply = await ask('acceptMany', decls);
   log("✓ installed " + title + " — " + reply.toString());
-  runStGame(name);
+  await runStGame(name);
+  // runStGame points Edit at the launched CLASS; for a filed-in game the file
+  // is the truth (it holds every class, and Save writes back to disk), so it
+  // wins.
+  gDemoEditPath = path; gDemoEditStName = null;
 }
 
 void onDemoMsg(msg) {

@@ -394,7 +394,7 @@ headless verification.
   Headless-tested by `st/test/gamepane_wire.dart` (battery tier); GUI-tested in
   `gui_smoke.sh` (launch → frames tick → gpsnap → stop).
 
-  **GALAXIGANS (world/49) is the driver's proof at scale** — a Galaxian/Galaga
+  **GALAXIGANS (demos/galaxigans.mst) is the driver's proof at scale** — a Galaxian/Galaga
   fixed shooter ported from 6251 lines of x64 assembler
   (`MRASM/projects/galaxigans`) into ~560 lines of Smalltalk, keeping the
   original's own constants so the two are comparable. It brought three things
@@ -411,8 +411,18 @@ headless verification.
     engine's ids itself and maps ST's onto them, cleared with the rest of the
     per-run state by `stGpReset`.
 
+  It is a FILED-IN game, not part of the world: it lives in `demos/` with the
+  other playable files, so picking it from the Games menu installs its five
+  classes into the running image and the Edit button opens THE FILE — every
+  class — where Save writes back to disk. Three things make that work for a
+  multi-class game: the header marker `"Game: …"` routes a scanned file to the
+  Games menu, `runStFileDemo` launches the class with a class-side `launch`
+  (taking the first class found would have started the alien), and the game
+  declares its own pane through class-side `paneWidth`/`paneHeight` rather than
+  needing a row in `_kStGames`.
+
   It is driven headless in the battery (`st/test/galaxigans_smoke.mst`, tier
-  5b): with no window every pane primitive is a no-op, so attract, the fire
+  5b, which files the game in first): with no window every pane primitive is a no-op, so attract, the fire
   tap, the dive AI, collision, scoring, death, the game-over reset and every
   level of the table all run and are asserted on. `Random new` is seeded 1, so
   the run is identical every time.

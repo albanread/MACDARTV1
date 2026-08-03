@@ -1,6 +1,14 @@
-"49_galaxigans.mst — GALAXIGANS: a Galaxian/Galaga-style fixed shooter for the
+"Game: Galaxigans — Galaxian-style fixed shooter, ported from x64 assembler"
+"galaxigans.mst — GALAXIGANS: a Galaxian/Galaga-style fixed shooter for the
  native Metal game pane, ported from the x64 assembler original in
  MRASM/projects/galaxigans (6251 lines of .was across 35 files).
+
+ THIS FILE IS THE GAME. It lives in demos/ with the other playable files, not
+ in the built-in world: picking it from the Games menu files its classes into
+ the running image and starts it, and the Edit button opens THIS FILE — all
+ five classes — where Save writes back to disk. A game in st/world/ would be
+ part of the system image instead: editable only one class at a time through
+ the Browser, and overwritten by the next world import.
 
  The port is deliberately FAITHFUL to that game's numbers rather than a vague
  homage — every constant below comes from its galaxigans_data.inc, so the two
@@ -250,6 +258,10 @@ Object subclass: Galaxigans [
     "--- the field, straight from the original's galaxigans_data.inc ---"
     Galaxigans class >> fieldWidth [ ^640 ]
     Galaxigans class >> fieldHeight [ ^360 ]
+    "The pane I want when I am filed in from demos/ — the driver asks a game
+     for these rather than keeping its resolution in a table elsewhere."
+    Galaxigans class >> paneWidth [ ^self fieldWidth ]
+    Galaxigans class >> paneHeight [ ^self fieldHeight ]
     Galaxigans class >> playerY [ ^310 ]
     Galaxigans class >> cols [ ^8 ]
     Galaxigans class >> rows [ ^5 ]

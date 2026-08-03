@@ -134,12 +134,15 @@ if [ -f "$MACDART/cocoa/gamepane/gp_synth_test.cc" ] && command -v clang++ >/dev
   rm -f "$bin"
 else skip "tier2c sfx synth (no gp_synth_test.cc or clang++)"; fi
 
-# tier 5b — the game plays, headless. Every pane primitive is a no-op without a
-# GUI, so GALAXIGANS (world/49) can be launched, driven and asserted on right
-# here: attract, the fire tap, the dive AI, collision, scoring, death and the
-# game-over reset. Random is seeded 1, so the run is the same every time.
-if [ -f "$HERE/galaxigans_smoke.mst" ]; then
-  o="$("$DART" --with-st "$HERE/run_mst.dart" "$HERE/galaxigans_smoke.mst" 2>&1)"
+# tier 5b — the game plays, headless. GALAXIGANS is a FILED-IN game (it lives in
+# demos/ with the other playable files, not in the booted world), so the test
+# loads that file first and then drives it: attract, the fire tap, the dive AI,
+# collision, scoring, death, the game-over reset, the saucer's warble and every
+# level. Every pane primitive is a no-op without a GUI, and Random is seeded 1,
+# so the run is the same every time.
+GAME="$MACDART/cocoa/workspace/demos/galaxigans.mst"
+if [ -f "$HERE/galaxigans_smoke.mst" ] && [ -f "$GAME" ]; then
+  o="$("$DART" --with-st "$HERE/run_mst.dart" "$GAME" "$HERE/galaxigans_smoke.mst" 2>&1)"
   if echo "$o" | grep -q "GALAXIGANS OK"; then
     pass "tier5b galaxigans ($(echo "$o" | grep 'after 900' | sed 's/^ *//'))"
   else

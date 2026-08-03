@@ -79,9 +79,12 @@ chk "doit equality"      "true false false true" \
 # ST games on the Metal pane (GAMEPANE_PLAN.md §8): launch, let a few frames
 # tick, snapshot the pane's honest texture, stop. Needs the world in the image.
 if [ "$world" = 1 ]; then
-  # Galaxigans is the one game that opens a NON-default pane (640x360) and the
-  # only user of the ST text overlay, so it is worth its own launch check.
-  chk "stgame galaxigans" "ok"        "$(ctl stgame Galaxigans)"
+  # Galaxigans is a FILED-IN game: `demorun` is the path a player takes from the
+  # Games menu — read demos/galaxigans.mst, install its five classes into the
+  # running image, launch the one with a class-side launch. It is also the only
+  # game that opens a non-default pane (640x360, which it declares itself) and
+  # the only user of the ST text overlay.
+  chk "filed-in galaxigans" "started"  "$(ctl demorun galaxigans)"
   sleep 2
   case "$(ctl gpstat)" in
     *640*360*) ok "galaxigans pane" "640x360" ;;

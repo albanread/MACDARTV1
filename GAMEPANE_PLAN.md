@@ -451,6 +451,18 @@ headless verification.
   reproducible and asserted on headless — spread 0 in formation, tens of pixels
   mid-dance, and CHANGING as it breathes.
 
+  **Fourth pass — the capture boss and its beam.** The boss's lifecycle is the
+  original's state machine (idle/enter/station/descend/charge/beam/return),
+  including the rule that it never appears when the player is on a last pilot.
+  The tractor beam needed the one thing the ST GamePane still could not reach:
+  the PER-SCANLINE palette (`gplinepal`). The beam is a cone drawn once in
+  palette index 1, and it flows by rewriting what index 1 means on each
+  scanline — the copper-bar mechanism, the original's own `BeamCascade`, and no
+  pixel redrawn per frame. `GamePane>>linePaletteAt:index:r:g:b:` opens that to
+  every ST game, not just this one. The boss also brought the pilot row (the
+  lives, as figures the beam actually comes for) and a second beating preset,
+  `Sound bossHum` — the saucer's wah an octave and a half down.
+
   Layer 0 is now reachable from Smalltalk too (`GamePane>>shader:` /
   `shaderParam:value:`): the original's twelve HLSL cosmos scenes — nebula,
   galaxy, black hole, alien world, moon, supernova, wormhole, gas giant,

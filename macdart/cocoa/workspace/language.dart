@@ -95,6 +95,46 @@ String _stReloadAll() {
 // numbered world stems keep their boot order). The slicing comes from the
 // parse-only stOutline native; chunks start at an item's line and run to the
 // next item's, so leading comments travel with what they describe.
+/// The vendored Smalltalk world, handed over by the UI isolate at spawn — this
+/// isolate runs from a mutable copy in /tmp, so it cannot resolve it itself.
+String _stWorldDir;
+String _worldDir() {
+  if (_stWorldDir == null) return null;
+  return new Directory(_stWorldDir).existsSync() ? _stWorldDir : null;
+}
+
+/// The image's world must not silently lag the FILES. It carries a signature
+/// (file count + total bytes, written by _stImport); when the vendored world no
+/// longer matches it, re-import.
+///
+/// This used to live only in start-st-gui.sh, so an image started any other way
+/// — start-gui.sh, which is the documented launcher — kept whatever world it had
+/// forever. Editing a world file then produced a failure far from the cause: a
+/// method the file defines is simply absent, and the first symptom is
+/// "NoSuchMethodError: 'play' was called on null" from a game that asked the
+/// image for something the file has and the image does not.
+void _refreshStaleWorld() {
+  var dir = _worldDir();
+  if (dir == null) return;
+  var files = <String>[];
+  for (var f in new Directory(dir).listSync()) {
+    if (f.path.endsWith('.mst')) files.add(f.path);
+  }
+  if (files.isEmpty) return;
+  var bytes = 0;
+  for (var f in files) bytes += new File(f).lengthSync();
+  var want = files.length.toString() + '-' + bytes.toString();
+  var have = '';
+  try {
+    var rows = _db.query("SELECT value FROM meta WHERE key='stworld_sig'");
+    if (rows.isNotEmpty) have = rows[0][0].toString();
+  } catch (e) { return; }          // no meta table: no world imported yet
+  if (have.isEmpty || have == want) return;
+  var r = _stImport(dir);
+  _ui.send(<dynamic>['tr',
+      'st: image world was stale (' + have + ' -> ' + want + ') — ' + r]);
+}
+
 String _stImport(String path) {
   var files = <String>[];
   if (FileSystemEntity.isDirectorySync(path)) {
@@ -1081,6 +1121,7 @@ main(List args, SendPort uiPort) {
   // read-only real-source view of dart:core / dart:cocoa / …
   if (args.length > 2 && args[2] != null) _sdkLibDir = args[2].toString();
   if (args.length > 3 && args[3] != null) _cocoaSrcPath = args[3].toString();
+  if (args.length > 4 && args[4] != null) _stWorldDir = args[4].toString();
   if (args.length > 1 && args[1] != null && (args[1] as String).length > 0) {
     _db = new Db.open(args[1]);
     if (_db.isOpen) {
@@ -1095,6 +1136,7 @@ main(List args, SendPort uiPort) {
           '(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, label TEXT,'
           ' name TEXT, existed INTEGER, kind TEXT, category TEXT, source TEXT)');
       _loadFromImage();
+      _refreshStaleWorld();
     }
   }
   var rp = new ReceivePort();

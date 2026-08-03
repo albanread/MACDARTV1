@@ -1584,9 +1584,14 @@ Future spawnLanguage() async {
   // read-only libraries (dart:core, dart:cocoa, …), not just mirror signatures.
   var sdkLib = Platform.script.resolve('../../sdk/lib').toFilePath();
   var cocoaSrc = Platform.script.resolve('../cocoa.dart').toFilePath();
+  // The language isolate runs from a MUTABLE COPY in /tmp (it rewrites its own
+  // root file on reload), so it cannot find anything by its own script path.
+  // The vendored Smalltalk world is one of those things, and it needs it to
+  // notice when the image's copy has gone stale — so hand it over from here.
+  var worldDir = Platform.script.resolve('../../st/world/').toFilePath();
   gLangIsolate = await Isolate.spawnUri(
       Uri.parse('file://' + gScratch),
-      <String>[gScratch, gDbPath, sdkLib, cocoaSrc], gFromLang.sendPort,
+      <String>[gScratch, gDbPath, sdkLib, cocoaSrc, worldDir], gFromLang.sendPort,
       onError: errPort.sendPort, onExit: exitPort.sendPort, errorsAreFatal: false);
   gLang = await handshake.future;
   errPort.listen((e) {

@@ -32,9 +32,19 @@
  shoot), and the triumphal VICTORY DANCE the survivors perform over the
  game-over card.
 
- What is still NOT ported: the capture boss and its tractor beam, the beam FX
- layer, the pilot-token row, the high-score table and its nano-TCL dev
- channel.
+ And now the CAPTURE BOSS with its tractor beam, and the pilot row it comes
+ for: the boss enters, stations, descends to the middle of the field, charges,
+ and fires a beam down into your pilots. One rises up it; if it reaches the
+ boss that life is gone, and if you shoot the boss first the pilot drops home
+ saved and you take 500. It will not appear at all when you are down to a last
+ pilot — the original's own rule, and the right one.
+
+ The beam is drawn ONCE per frame as a cone in palette index 1, and flows by
+ rewriting what index 1 MEANS on each scanline — the pane's per-line palette,
+ which is the copper-bar mechanism and the original's own (BeamCascade). No
+ pixel is redrawn to animate it.
+
+ What is still NOT ported: the high-score table and its nano-TCL dev channel.
 
  Controls: Left/Right steer, Space fires (tap, no autofire — the original's
  shoot_held/shoot_release beat). Launch from the GAMES menu, or a Workspace:
@@ -228,6 +238,111 @@ Object subclass: GxMine [
     ]
 ]
 
+"--- the capture boss ---"
+"I am the capture boss: a 32x32 crab that comes for your PILOTS, not your ship.
+ I enter from the top, hover, then descend to the middle of the field, charge,
+ and fire a tractor beam down into the row of pilots along the bottom. A pilot
+ rises up the beam; if it reaches me you lose that life. Shoot me while I am
+ down there and the pilot drops home, saved, and I am worth 500.
+
+ The lifecycle is the original's (galaxigans_boss.was): idle, enter, station,
+ descend, charge, beam, return — with its own rule that I never appear, and
+ never grab, when the player is down to a LAST pilot. Bullying someone out of
+ their final life is not a mechanic, it is just cruelty."
+Object subclass: GxBoss [
+    | state x y anim timer beamT sprite |
+
+    GxBoss class >> empty [ ^self new setIdle ]
+    setIdle [
+        state := #idle. x := 304. y := -36. anim := 0. beamT := 0.
+        timer := Galaxigans bossFirst.
+        ^self
+    ]
+
+    state [ ^state ]
+    x [ ^x ]
+    y [ ^y ]
+    beamT [ ^beamT ]
+    sprite [ ^sprite ]
+    sprite: s [ sprite := s ]
+    isIdle [ ^state == #idle ]
+    "Down where a bullet can reach me — descending, charging or firing."
+    isVulnerable [
+        ^state == #descend or: [ state == #charge or: [ state == #beam ] ]
+    ]
+    isBeaming [ ^state == #charge or: [ state == #beam ] ]
+
+    "Which of my four frames: two idle poses alternating, then the charge and
+     beam poses — the emitter eye grows, which is the tell."
+    frame [
+        state == #beam ifTrue: [ ^3 ].
+        state == #charge ifTrue: [ ^2 ].
+        ^(anim // 16) \\ 2
+    ]
+
+    "The beam's mouth, and how far down it has grown."
+    beamX [ ^x + 16 ]
+    beamTop [ ^y + 24 ]
+    beamBottom: fieldH [
+        state == #beam ifTrue: [ ^350 ].
+        ^(y + 24 + (beamT * 14)) min: 350
+    ]
+
+    wake [ state := #enter. x := 304. y := -36. anim := 0 ]
+    retreat [ state := #return ]
+    vanish [ state := #idle. y := -60. timer := Galaxigans bossRespawn ]
+
+    "One frame. Answers a symbol the game acts on: #none, #charged (start the
+     hum), #grab (a pilot is in the beam) or #done."
+    stepWithLives: lives enabled: enabled [
+        anim := anim + 1.
+        state == #idle ifTrue: [
+            (enabled and: [ lives > 1 ]) ifFalse: [ ^#none ].
+            timer := timer - 1.
+            timer > 0 ifTrue: [ ^#none ].
+            self wake.
+            ^#warn ].
+        state == #enter ifTrue: [
+            y < Galaxigans bossStationY
+                ifTrue: [ y := y + 2 ]
+                ifFalse: [ state := #station. timer := Galaxigans bossDwell ].
+            ^#none ].
+        state == #station ifTrue: [
+            timer := timer - 1.
+            timer > 0 ifTrue: [ ^#none ].
+            "Down to the last pilot? Give up and go home."
+            lives <= 1 ifTrue: [ state := #return. ^#none ].
+            state := #descend.
+            ^#none ].
+        state == #descend ifTrue: [
+            x := x < 304 ifTrue: [ x + 3 ] ifFalse: [ x - 3 ].
+            y < Galaxigans bossCaptureY
+                ifTrue: [ y := y + 3. ^#none ].
+            state := #charge. beamT := 0.
+            ^#charged ].
+        state == #charge ifTrue: [
+            beamT := beamT + 1.
+            beamT < Galaxigans beamCharge ifTrue: [ ^#none ].
+            state := #beam. beamT := 0.
+            ^#charged ].
+        state == #beam ifTrue: [
+            beamT := beamT + 1.
+            beamT >= Galaxigans beamHold ifTrue: [ state := #return. ^#done ].
+            ^#grab ].
+        state == #return ifTrue: [
+            y := y - 4.
+            y < -40 ifTrue: [ self vanish ].
+            ^#none ].
+        ^#none
+    ]
+
+    "A bullet in my 32x32 box, while I am down."
+    hits: bx y: by [
+        ^self isVulnerable and: [
+            bx >= x and: [ bx < (x + 32) and: [ by >= y and: [ by < (y + 32) ] ] ] ]
+    ]
+]
+
 "--- explosion debris ---"
 "I am one spark of an explosion: a coloured pixel with a velocity and a life.
  A burst of me is the whole particle system — the original ran the same idea
@@ -300,6 +415,7 @@ Object subclass: Galaxigans [
       fleet swayX swayDir diveTimer bombTimer
       bullets bombs mines sparks level scene theme flap danceT
       mineDrops saucerDrops
+      boss bossOn pilots abducting abducteeX abducteeY beamPhase pilotsTaken
       saucer saucerX saucerDir saucerTimer saucerWah saucerBombT
       cooldown fireWasDown |
 
@@ -331,6 +447,19 @@ Object subclass: Galaxigans [
     Galaxigans class >> danceAngleStep [ ^6 ]
     Galaxigans class >> danceRadStep [ ^10 ]
     Galaxigans class >> danceLength [ ^420 ]
+
+    "The capture boss (galaxigans_data.inc), and the pilot row it comes for."
+    Galaxigans class >> bossFirst [ ^40 ]
+    Galaxigans class >> bossDwell [ ^60 ]
+    Galaxigans class >> bossRespawn [ ^360 ]
+    Galaxigans class >> bossStationY [ ^18 ]
+    Galaxigans class >> bossCaptureY [ ^140 ]
+    Galaxigans class >> bossScore [ ^500 ]
+    Galaxigans class >> beamCharge [ ^30 ]
+    Galaxigans class >> beamHold [ ^90 ]
+    Galaxigans class >> pilotRowY [ ^344 ]
+    Galaxigans class >> pilotX0 [ ^14 ]
+    Galaxigans class >> pilotGap [ ^16 ]
     "The original flies its saucer at y=20; here the HUD's own row is up there
      (5x7 at scale 2 = fourteen pixels from y=8), so it crosses just below,
      clear of the score."
@@ -410,6 +539,21 @@ Object subclass: Galaxigans [
         saucer colorAt: 4 r: 255 g: 220 b: 90.
         saucer hide.
 
+        "The capture boss: one sprite, four frames."
+        boss := GxBoss empty.
+        boss sprite: (pane defineSprite: (self class bossArt at: 1)).
+        2 to: 4 do: [ :k | boss sprite addFrame: (self class bossArt at: k) ].
+        self paintSprite: boss sprite with: self class bossPalette count: 12.
+        boss sprite hide.
+
+        "The pilots: one sprite per life, standing in a row along the bottom.
+         These are what the boss's beam comes for."
+        pilots := (1 to: 4) collect: [ :i | | spr |
+            spr := pane defineSprite: self class pilotArt.
+            self paintSprite: spr with: self class pilotPalette count: 7.
+            spr hide.
+            spr ].
+
         "Six mines, each a sprite carrying all eight spin frames."
         mines := (1 to: 6) collect: [ :i | GxMine empty ].
         mines do: [ :m | | spr pal |
@@ -439,6 +583,14 @@ Object subclass: Galaxigans [
                 spr hide.
                 alien sprite: spr.
                 fleet add: alien ] ]
+    ]
+
+    paintSprite: aSprite with: pal count: n [
+        1 to: n do: [ :k |
+            aSprite colorAt: k
+                r: (pal at: (k - 1) * 3 + 1)
+                g: (pal at: (k - 1) * 3 + 2)
+                b: (pal at: (k - 1) * 3 + 3) ]
     ]
 
     "Dress the fleet for this level: each row becomes one species — its art is
@@ -489,6 +641,10 @@ Object subclass: Galaxigans [
         bombs := (1 to: 6) collect: [ :i | GxShot empty ].
         mines do: [ :m | m kill ].
         mineDrops := 0. saucerDrops := 0.
+        bossOn := ((self class levels at: level) at: 3) = 1.
+        boss setIdle.
+        abducting := 0. abducteeX := 0. abducteeY := 0. beamPhase := 0.
+        pilotsTaken isNil ifTrue: [ pilotsTaken := 0 ].
         sparks := OrderedCollection new
     ]
 
@@ -524,6 +680,10 @@ Object subclass: Galaxigans [
      timer — for a test, or for anyone who wants to hear the warble."
     summonSaucer [ saucerTimer := 1 ]
 
+    "Set the lives, so a test can put the player on their last pilot — the one
+     state the boss is supposed to leave alone."
+    setLives: n [ lives := n ]
+
     "Start the victory dance now, without dying three times for it."
     danceNow [
         gameState := #over.
@@ -549,6 +709,21 @@ Object subclass: Galaxigans [
             a alive ifTrue: [
                 d := d + (a y - a homeY) abs. n := n + 1 ] ].
         ^n = 0 ifTrue: [ 0 ] ifFalse: [ d // n ]
+    ]
+
+    "The boss's state and what the beam is doing — for the battery."
+    bossReport [
+        ^boss state printString,
+         (abducting = 1 ifTrue: [ ' abducting' ] ifFalse: [
+            abducting = 2 ifTrue: [ ' freeing' ] ifFalse: [ '' ] ])
+    ]
+    bossOn [ ^bossOn ]
+    "How many pilots the boss has actually carried off — a LIFETIME count, so a
+     test is not fooled by the game resetting under it."
+    pilotsTaken [ ^pilotsTaken ]
+    abductReport [
+        ^'abductee y ', abducteeY printString, ' target ', (boss y + 26) printString,
+         ' beamT ', boss beamT printString
     ]
 
     "Where the saucer is and whether its warble is running — for the battery."
@@ -648,6 +823,7 @@ K:Cmin
         self stepFleet.
         self stepSaucer.
         self stepMines.
+        self stepBoss.
         self stepSparks.
         self checkCollisions.
         (fleet anySatisfy: [ :a | a alive ]) ifFalse: [
@@ -799,6 +975,97 @@ K:Cmin
         mines do: [ :m | m stepIn: self class fieldHeight ]
     ]
 
+    "--- the capture boss ---------------------------------------------------"
+
+    stepBoss [
+        | event |
+        "A freed pilot falls home from wherever the beam had got it to — that
+         runs in ANY boss state, including after the boss is gone."
+        abducting = 2 ifTrue: [
+            abducteeY := abducteeY + 5.
+            abducteeY >= self class pilotRowY ifTrue: [ abducting := 0 ] ].
+
+        event := boss stepWithLives: lives enabled: bossOn.
+        event == #warn ifTrue: [ Sound hurt play ].
+        event == #charged ifTrue: [ Sound bossHum play ].
+        event == #done ifTrue: [ self releasePilot ].
+        event == #grab ifTrue: [ self dragPilot ].
+        boss isBeaming ifTrue: [ self cascadeBeam ]
+    ]
+
+    "The abduction: a pilot leaves the row and rises up the beam. It reaching
+     the boss costs a life — and if that was the last one, the aliens have won
+     and the dance begins."
+    dragPilot [
+        abducting = 0 ifTrue: [
+            lives <= 1 ifTrue: [ ^self ].       "never take the last pilot"
+            abducting := 1.
+            abducteeX := boss beamX - 6.
+            abducteeY := self class pilotRowY.
+            ^self ].
+        abducting = 1 ifFalse: [ ^self ].
+        abducteeY := abducteeY - 3.
+        abducteeY > (boss y + 26) ifTrue: [ ^self ].
+        "It made it to the boss."
+        lives := lives - 1.
+        pilotsTaken := pilotsTaken + 1.
+        abducting := 0.
+        Sound hurt play.
+        self burstAt: boss beamX y: boss y + 26 colour: 22.
+        lives <= 0
+            ifTrue: [
+                gameState := #over.
+                stateTimer := self class danceLength.
+                danceT := 0.
+                boss vanish ]
+            ifFalse: [ boss retreat ]
+    ]
+
+    "The beam times out with nobody taken: whatever is halfway up falls home."
+    releasePilot [
+        abducting = 1 ifTrue: [ abducting := 2 ]
+    ]
+
+    "Shooting the boss frees any pilot in the beam (it drops home, saved) and
+     pays 500 — the best thing on the screen, and the reason to take the risk
+     of standing under a tractor beam."
+    checkBossHit [
+        bullets do: [ :b |
+            (b live and: [ boss hits: b x y: b y ]) ifTrue: [
+                b kill.
+                score := score + self class bossScore.
+                self burstAt: boss x + 16 y: boss y + 16 colour: 23.
+                Sound explode play.
+                self releasePilot.
+                boss retreat.
+                ^self ] ]
+    ]
+
+    "The beam's colour FLOWS without redrawing a pixel: the cone is drawn once
+     in palette index 1, and index 1 means something different on every
+     scanline. Stepping the ramp by (y + phase) each frame sends the bands
+     downward — the copper-bar trick, and the original's own (BeamCascade)."
+    cascadeBeam [
+        | top bot ramp |
+        top := boss beamTop.
+        bot := boss beamBottom: self class fieldHeight.
+        ramp := self class beamRamp.
+        beamPhase := beamPhase + 1.
+        top to: bot do: [ :y |
+            (y >= 0 and: [ y < self class fieldHeight ]) ifTrue: [ | k |
+                k := ((y - top + beamPhase) // 2) \\ 8.
+                pane linePaletteAt: y index: 1
+                     r: (ramp at: k * 3 + 1)
+                     g: (ramp at: k * 3 + 2)
+                     b: (ramp at: k * 3 + 3) ] ]
+    ]
+
+    "The cyan energy ramp, pulsing dim -> white -> dim so it reads as flow."
+    Galaxigans class >> beamRamp [
+        ^#(16 48 64   28 96 120   48 152 184   88 200 232
+           176 244 255   88 200 232   48 152 184   28 96 120)
+    ]
+
     "The saucer's wah-wah: two sines five Hz apart, beating against each other.
      One note runs 0.9s and the crossing takes six, so it is re-triggered on a
      loop while the saucer is on screen — the original does exactly this
@@ -833,6 +1100,8 @@ K:Cmin
                             Sound explode play.
                             a kill.
                             a sprite hide ] ] ] ] ].
+
+        self checkBossHit.
 
         "Shooting a mine is the treat: 150, the best points on the screen."
         bullets do: [ :b |
@@ -912,8 +1181,25 @@ K:Cmin
         bombs do: [ :b |
             b live ifTrue: [
                 pane fill: b x - 2 y: b y width: 4 height: 6 color: 21 ] ].
+        self drawBeam.
         self placeSprites.
         self drawHud
+    ]
+
+    "The tractor beam: a cone widening from the boss's mouth to the floor,
+     drawn ONCE per frame in palette index 1 — whose colour the cascade has
+     already made different on every scanline. Half-width goes 4 -> 20 down its
+     length, which is the original's own taper."
+    drawBeam [
+        | top bot span |
+        boss isBeaming ifFalse: [ ^self ].
+        top := boss beamTop.
+        bot := boss beamBottom: self class fieldHeight.
+        span := (bot - top) max: 1.
+        top to: bot do: [ :y |
+            | hw |
+            hw := 4 + ((y - top) * 16 // span).
+            pane fill: boss beamX - hw y: y width: hw * 2 height: 1 color: 1 ]
     ]
 
     placeSprites [
@@ -930,6 +1216,10 @@ K:Cmin
             m live
                 ifTrue: [ m sprite moveTo: m x - 8 y: m y - 8 frame: m frame ]
                 ifFalse: [ m sprite hide ] ].
+        boss isIdle
+            ifTrue: [ boss sprite hide ]
+            ifFalse: [ boss sprite moveTo: boss x y: boss y frame: boss frame ].
+        self placePilots.
         saucerDir = 0
             ifTrue: [ saucer hide ]
             ifFalse: [ saucer moveTo: saucerX - 10 y: self class saucerY ].
@@ -940,6 +1230,22 @@ K:Cmin
                 (respawn > 0 and: [ (respawn // 4) \\ 2 = 0 ])
                     ifTrue: [ shipSprite moveTo: shipX - 8 y: self class playerY - 7 ]
                     ifFalse: [ shipSprite hide ] ]
+    ]
+
+    "The pilots standing along the bottom: one per life. A pilot in the beam has
+     LEFT the row — it is drawn wherever the beam has dragged it to, and it is
+     still yours until it reaches the boss."
+    placePilots [
+        | inRow |
+        inRow := abducting > 0 ifTrue: [ lives - 1 ] ifFalse: [ lives ].
+        1 to: pilots size do: [ :i |
+            i <= inRow
+                ifTrue: [ (pilots at: i)
+                            moveTo: self class pilotX0 + ((i - 1) * self class pilotGap)
+                            y: self class pilotRowY ]
+                ifFalse: [ (pilots at: i) hide ] ].
+        abducting > 0 ifTrue: [
+            (pilots at: pilots size) moveTo: abducteeX y: abducteeY ]
     ]
 
     drawHud [
@@ -1009,10 +1315,12 @@ K:Cmin
      scene is which of the twelve backdrops the layer-0 shader draws; levels
      past the last row wrap it, and the dive cadence keeps tightening."
     Galaxigans class >> levels [
+        "{cosmos scene, formation theme, capture boss?} — the original's own
+         table, boss column and all: it turns up every third level."
         ^#(
-            #(0 1)  #(1 2)  #(2 3)   #(3 4)
-            #(4 1)  #(5 2)  #(6 3)   #(7 4)
-            #(8 1)  #(9 2)  #(10 3)  #(11 4)
+            #(0 1 0)  #(1 2 0)  #(2 3 1)   #(3 4 0)
+            #(4 1 0)  #(5 2 1)  #(6 3 0)   #(7 4 0)
+            #(8 1 1)  #(9 2 0)  #(10 3 0)  #(11 4 1)
         )
     ]
 
@@ -1331,6 +1639,34 @@ fragment float4 fmain(VOut in [[stage_in]], constant Uniforms& u [[buffer(0)]]) 
         "Dark metal ramp, spike grey, and the red trigger light — the
          original's minePal, slot 9."
         ^#(24 24 32 48 56 64 80 88 104 120 128 144 176 184 200 96 104 120 128 32 24 255 64 48)
+    ]
+
+    Galaxigans class >> bossArt [
+        "The capture boss, 32x32, four frames from the original's
+         galaxigans_bossart.was: two idle poses it alternates between, then
+         the charging and firing poses — the emitter eye grows through them,
+         which is the tell that the beam is coming."
+        ^#(
+            '................................/...........1........1.........../...........1........1.........../..........11.......141........../..........141.....1441........../.........14441...1.1441........./.........1341.1111.1431........./.........13341444414331........./.........13334444443331........./........1133334444333311......../..........144444444441........../..........144444444441........../.........18844444444881........./.......117773344443377711......./....11177333339AA93333377111..../..117776333333ABBA333333677711../.1776663333333ABBA3333333666771./.11666333333339AA93333333366611./...16333333333333333333333361.../...11333333333333333333333311.../.....1333332333333332333331...../......13333222333322233331....../.......133312223322213331......./........131.12222221.131......../.........12121111112121........./..........121......121........../..........121......121........../..........121......121........../...........1........1.........../...........1........1.........../...........1........1.........../................................'
+            '................................/...........1........1.........../...........1........1.........../..........11.......141........../..........141.....1441........../.........14441...1.1441........./.........1341.1111.1431........./.........13341444414331........./.........13334444443331........./........1133334444333311......../..........144444444441........../..........144444444441........../.......111884444444488111......./..1111177777334444337777711111../.17777766333339AA93333366777771./.1166663333333ABBA3333333666611./...16333333333ABBA33333333361.../...113333333339AA933333333311.../.....1333333333333333333331...../......13333333333333333331....../......13333233333333233331....../.......133322233332223331......./........1331222332221331......../.........11.12222221.11........./.........12121111112121........./..........121......121........../..........121......121........../..........121......121........../...........1........1.........../...........1........1.........../...........1........1.........../................................'
+            '................................/...........1........1.........../...........1........1.........../..........11.......141........../..........141.....1441........../.........14441...1.1441........./.........1341.1111.1431........./.........13341444414331........./.........13334444443331........./........1133334444333311......../..........144444444441........../..........144444444441........../.........18844444444881........./.......11777339BB93377711......./....1117733339BCCB9333377111..../..11777633333BCCCCB33333677711../.177666333333BCCCCB333333666771./.1166633333339BCCB9333333366611./...163333333339BB933333333361.../...11333333333333333333333311.../.....1333332333333332333331...../......13333222333322233331....../.......133312223322213331......./........131.12222221.131......../.........12121111112121........./..........121......121........../..........121......121........../..........121......121........../...........1........1.........../...........1........1.........../...........1........1.........../................................'
+            '................................/...........1........1.........../...........1........1.........../..........11.......141........../..........141.....1441........../.........14441...1.1441........./.........1341.1111.1431........./.........13341444414331........./.........13334444443331........./........1133334444333311......../..........144444444441........../..........144444444441........../.........188444AA444881........./.......117779ACCCCA977711......./....111773399CCCCCC993377111..../..1177763339ACCCCCCA9333677711../117766633339ACCCCCCA933336667711/.166633333399CCCCCC993333336661./..11333333339ACCCCA93333333311../..1.13333333399AA99333333331.1../.....1133332339999332333311...../.......133322233332223331......./........1331222332221331......../.........11.12222221.11........./.........12121111112121........./..........121......121........../..........121......121........../..........121......121........../...........1........1.........../...........1........1.........../...........1........1.........../................................'
+        )
+    ]
+
+    Galaxigans class >> bossPalette [
+        "bossCapPal: purple body, gold trim, cyan emitter eye."
+        ^#(32 8 40 72 24 88 104 48 120 136 72 152 176 108 192 208 128 224 200 160 48 255 224 96 32 96 160 64 192 255 176 236 255 255 255 255)
+    ]
+
+    Galaxigans class >> pilotArt [
+        "A pilot: one of your lives, standing in the row along the bottom.
+         The boss's beam comes for THESE, not for the ship."
+        ^'............/...111111.../..13466631../..16666661../..16666661../...133331.../..13333221../113333322211/133337722221/133333322221/113333322211/..13333221../..13311221../...11..11.../...11..11.../...11..11...'
+    ]
+
+    Galaxigans class >> pilotPalette [
+        ^#(32 40 48 160 168 184 232 236 244 255 255 255 0 0 0 48 192 255 255 192 64)
     ]
 
     "--- the art ----------------------------------------------------------"

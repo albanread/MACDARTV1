@@ -11,6 +11,22 @@ STestCase subclass: TestControl [
         self check: ((5 > 3) and: [ 2 < 4 ]) is: true label: 'and: both'.
         self check: ((5 < 3) or: [ 2 < 4 ]) is: true label: 'or: short-circuit'.
 
+        "--- Boolean EQUALITY. `true = true` used to be the only one that
+             worked: it takes the identity fast path, while every other pair
+             fell through to a dispatch a Dart bool has no method for and threw
+             'Class bool has no method =' — so any code comparing a COMPUTED
+             Boolean blew up rather than answering false. ---"
+        self check: (true = true) is: true label: 'true = true'.
+        self check: (true = false) is: false label: 'true = false'.
+        self check: (false = false) is: true label: 'false = false'.
+        self check: (false = true) is: false label: 'false = true'.
+        self check: ((3 < 4) = (4 > 3)) is: true label: 'computed Booleans compare'.
+        self check: ((3 > 4) = (4 < 3)) is: true label: 'both false compare equal'.
+        self check: (true = 1) is: false label: 'true = 1'.
+        self check: (false = nil) is: false label: 'false = nil'.
+        self check: (nil = false) is: false label: 'nil = false'.
+        self check: (true ~= false) is: true label: 'true ~= false'.
+
         "--- the nil-test family (inlined; works on a LITERAL nil too) ---"
         self check: (nil ifNil: [ 'wasNil' ]) is: 'wasNil' label: 'nil ifNil:'.
         self check: (5 ifNil: [ 'wasNil' ]) is: 5 label: 'non-nil ifNil: -> receiver'.

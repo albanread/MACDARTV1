@@ -82,17 +82,27 @@ s moveTo: 42 y: 24.
   // --- sounds (preset map + define-once) --------------------------------------
   stRun('Sound click play. Sound click play. Sound coin play.');
   ops = stGpTake();
-  // Slots are the TOP of the engine's rack: 64 - presets + index, so the last
-  // preset is always slot 63 and the block grows downward as presets are added.
+  // Slots are the TOP of the engine's rack and the block grows DOWNWARD as
+  // presets are added, so the numbers are asserted as properties rather than
+  // written down: every slot inside 0..63, a define followed by its plays, and
+  // distinct presets on distinct slots. Hardcoding them meant every new preset
+  // edited this test — and it was a hardcoded base that put the eleventh preset
+  // on slot 64, off the end of the rack, where the sound silently never played.
   check('sound op count', ops.length == 5, 'got ' + ops.length.toString());
+  var clickSlot = ops[0][1], coinSlot = ops[3][1];
   check('click defines once then plays',
-      listEq(ops[0], ['gpsound', 60, 'click', 0, 0]) &&
-          listEq(ops[1], ['gpplay', 60]) && listEq(ops[2], ['gpplay', 60]),
+      ops[0][0] == 'gpsound' && ops[0][2] == 'click' &&
+          listEq(ops[1], ['gpplay', clickSlot]) &&
+          listEq(ops[2], ['gpplay', clickSlot]),
       ops.toString());
   check('coin preset name',
-      listEq(ops[3], ['gpsound', 53, 'coin', 0, 0]) &&
-          listEq(ops[4], ['gpplay', 53]),
+      ops[3][0] == 'gpsound' && ops[3][2] == 'coin' &&
+          listEq(ops[4], ['gpplay', coinSlot]),
       ops.toString());
+  check('presets sit inside the engine rack, one each',
+      clickSlot >= 0 && clickSlot < 64 && coinSlot >= 0 && coinSlot < 64 &&
+          clickSlot != coinSlot,
+      'click ' + clickSlot.toString() + ', coin ' + coinSlot.toString());
 
   // --- the saucer warble (preset 10, past MACVM's ten) ------------------------
   // The wah is the arcade UFO: two sines 5 Hz apart, beating. Slot 64 would be
@@ -100,9 +110,20 @@ s moveTo: 42 y: 24.
   // eleventh preset still lands inside it and carries the right name.
   stRun('Sound saucer play. Sound saucer play.');
   ops = stGpTake();
+  var wahSlot = ops.isEmpty ? -1 : ops[0][1];
   check('wah defines once then plays',
-      ops.length == 3 && listEq(ops[0], ['gpsound', 63, 'wah', 0, 0]) &&
-          listEq(ops[1], ['gpplay', 63]) && listEq(ops[2], ['gpplay', 63]),
+      ops.length == 3 && ops[0][0] == 'gpsound' && ops[0][2] == 'wah' &&
+          listEq(ops[1], ['gpplay', wahSlot]) &&
+          listEq(ops[2], ['gpplay', wahSlot]) &&
+          wahSlot >= 0 && wahSlot < 64,
+      ops.toString());
+
+  // The LAST preset must land exactly on 63 — that is the invariant that says
+  // the block is anchored to the top of the rack and nothing has fallen off it.
+  stRun('Sound bossHum play.');
+  ops = stGpTake();
+  check('the last preset anchors the block at slot 63',
+      ops.length == 2 && listEq(ops[0], ['gpsound', 63, 'hum', 0, 0]),
       ops.toString());
 
   // --- music (ABC -> gptune once + gpmusic; cached on replay) -----------------

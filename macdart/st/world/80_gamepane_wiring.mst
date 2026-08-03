@@ -83,3 +83,13 @@ Sprite >> hide [
  against each other; the beat IS the wah, so the pulse rate is the detune, not
  a tremolo. Loop it while a saucer is on screen (it runs 0.9s)."
 Sound class >> saucer [ ^self preset: 10 ]
+
+"The capture boss's tractor hum — the same beating trick as the saucer, an
+ octave and a half down and slower (110 Hz, 4 Hz apart)."
+Sound class >> bossHum [ ^self preset: 11 ]
+
+"The PER-SCANLINE palette. Indices 1..15 can hold a different colour on every
+ line of the pane, so a shape drawn ONCE in one of them changes colour down the
+ screen and animates by rewriting the line colours — no pixel redrawn. This is
+ the copper-bar mechanism, and it is how world/49's tractor beam flows."
+GamePane >> linePaletteAt: line index: i r: r g: g b: b [ <stprim: stGpLinePal> ]

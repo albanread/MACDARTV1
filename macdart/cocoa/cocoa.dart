@@ -454,6 +454,13 @@ String _stStr(x) {
 stEquals(a, b) {
   if (identical(a, b)) return true;
   if (a is num) return a == b;
+  // Booleans are Dart bools here, and they have no ST `=` method — so anything
+  // that reached the native dispatch below threw. `true = true` hid it by
+  // taking the identical() fast path; `false = true`, `true = false` and every
+  // comparison of a computed Boolean did not. Found by a test asserting
+  // `g lives < livesBefore` and getting "Class 'bool' has no method '='"
+  // instead of `false`.
+  if (a is bool || b is bool) return identical(a, b);
   return _stEqualsSlow(a, b);
 }
 _stEqualsSlow(a, b) {
@@ -1951,7 +1958,7 @@ bool _stGpBlitWarned = false;
 // assembler original uses (280 Hz, 5 Hz detune).
 const List<String> _stGpPresetNames = const <String>[
   'coin', 'jump', 'zap', 'shoot', 'explode',
-  'powerup', 'hurt', 'click', 'bang', 'blip', 'wah'
+  'powerup', 'hurt', 'click', 'bang', 'blip', 'wah', 'hum'
 ];
 
 // Instance <stprim:> passes the RECEIVER first; every helper answers it so the
@@ -1965,6 +1972,15 @@ stGpClearRGB(p, r, g, b) {
 }
 stGpPal(p, i, r, g, b) { _stGpCmds.add(<dynamic>['gppal', i, r, g, b]); return p; }
 stGpCls(p, i) { _stGpCmds.add(<dynamic>['gpcls', i]); return p; }
+// The PER-SCANLINE palette (indices 1..15): the copper-bar mechanism. A shape
+// drawn once in index 1 changes colour down the screen and animates by
+// rewriting the line colours, with no pixel touched per frame — which is how
+// the original's tractor beam flows (world/49's boss) and how its copper bars
+// work. The engine has always had it; Smalltalk could not reach it.
+stGpLinePal(p, line, i, r, g, b) {
+  _stGpCmds.add(<dynamic>['gplinepal', line, i, r, g, b]);
+  return p;
+}
 stGpPset(p, x, y, c) { _stGpCmds.add(<dynamic>['gppset', x, y, c]); return p; }
 stGpLine(p, x0, y0, x1, y1, c) {
   _stGpCmds.add(<dynamic>['gpline', x0, y0, x1, y1, c]);

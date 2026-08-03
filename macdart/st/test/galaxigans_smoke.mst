@@ -11,7 +11,7 @@
  Prints one line per check and a final GALAXIGANS OK / GALAXIGANS FAILED — the
  battery (run_all.sh) greps for the OK."
 
-| g fails check tap play spread1 spread2 |
+| g fails check tap play spread1 spread2 seen livesBefore |
 fails := 0.
 check := [ :label :got :want |
     got = want
@@ -97,6 +97,46 @@ check value: 'and the pinwheel breathes' value: spread1 = spread2 value: false.
 Transcript showCr: '  spread ', spread1 printString, ' then ', spread2 printString.
 check value: 'the dance ends and the game resets' value:
     ([ 1 to: 500 do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #attract.
+
+"The capture boss: it comes for the PILOTS, not the ship. Level 3 is the first
+ the table gives one to. Watched all the way through its lifecycle — enter,
+ station, descend, charge, beam — and the abduction that costs a life."
+g := Galaxigans launch.
+tap value.
+g forceNextWave. g forceNextWave.
+check value: 'level 3 fields a boss' value: g bossOn value: true.
+seen := OrderedCollection new.
+livesBefore := g lives.
+1 to: 900 do: [ :i |
+    GamePane stepWithKeys: 0.
+    (seen includes: g bossReport) ifFalse: [ seen add: g bossReport ] ].
+check value: 'the boss enters' value: (seen includes: '#enter') value: true.
+check value: 'stations, then descends' value:
+    ((seen includes: '#station') and: [ seen includes: '#descend' ]) value: true.
+check value: 'charges the beam' value: (seen includes: '#charge') value: true.
+check value: 'fires it and takes a pilot' value:
+    (seen includes: '#beam abducting') value: true.
+check value: 'which costs a pilot' value: g pilotsTaken value: 1.
+Transcript showCr: '  boss states seen: ', seen printString.
+
+"Its own rule: never bully the player out of a LAST pilot. On one life the boss
+ does not appear AT ALL (and if lives fall to one while it is already out, it
+ gives up at the station and leaves). Watched only while the game is actually
+ playing, so a reset underneath cannot be mistaken for the rule holding."
+g := Galaxigans launch.
+tap value.
+g forceNextWave. g forceNextWave.
+g setLives: 1.
+seen := OrderedCollection new.
+1 to: 900 do: [ :i |
+    g gameState == #playing ifTrue: [
+        GamePane stepWithKeys: 0.
+        (seen includes: g bossReport) ifFalse: [ seen add: g bossReport ] ] ].
+check value: 'on a last pilot the boss never even wakes' value:
+    (seen includes: '#enter') value: false.
+check value: 'so it never fires the beam' value:
+    (seen includes: '#beam abducting') value: false.
+check value: 'and takes nothing' value: g pilotsTaken value: 0.
 
 "Every level resolves: a cosmos for the shader and five species for the grid,
  walked through the whole table (and one past it, to prove it wraps)."

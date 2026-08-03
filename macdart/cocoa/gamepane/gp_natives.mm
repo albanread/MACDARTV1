@@ -339,6 +339,11 @@ void Cocoa_gpApply(Dart_NativeArguments args) {
           } else if (strcmp(preset, "wah") == 0) {
             // a1 = base Hz (280 = the saucer), a2 = detune Hz = the wah rate
             snd = preset_wah(a1 > 0 ? a1 : 280.0, a2 > 0 ? a2 : 5.0, 0.9);
+          } else if (strcmp(preset, "hum") == 0) {
+            // The capture boss's tractor hum: the same beating trick an octave
+            // and a half down, slower — the original's AudioBoot bakes it as
+            // Wah(110, 4).
+            snd = preset_wah(a1 > 0 ? a1 : 110.0, a2 > 0 ? a2 : 4.0, 1.1);
           } else if (strcmp(preset, "powerup") == 0) {
             snd = preset_powerup(a1 > 0 ? a1 : 0.4);
           } else if (strcmp(preset, "hurt") == 0) {

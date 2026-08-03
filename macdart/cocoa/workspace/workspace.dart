@@ -1296,6 +1296,7 @@ void buildMenu() {
   if (dartGames.isNotEmpty) menuSep(games);
   menuItem(games, "Smalltalk Breakout", "", (s) => runStGame("Breakout"));
   menuItem(games, "Smalltalk Worms", "", (s) => runStGame("Worms"));
+  menuItem(games, "Smalltalk Galaxigans", "", (s) => runStGame("Galaxigans"));
   menuItem(games, "Smalltalk MandelZoom", "", (s) => runStGame("MandelZoom"));
   menuItem(games, "Smalltalk MandelVM", "", (s) => runStGame("MandelVM"));
   menuItem(games, "Smalltalk FFT", "", (s) => runStGame("FFT"));

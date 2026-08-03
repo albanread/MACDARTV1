@@ -334,6 +334,13 @@ final List<Map> _kStGames = <Map>[
    'blurb': 'brick-breaking with sound (44_breakout.mst)'},
   {'name': 'Worms', 'cls': 'Worms', 'sel': 'launch',
    'blurb': 'three growing worms, you drive one (48a_worms.mst)'},
+  // The first ST game to ask for a bigger pane. It is a port of the x64
+  // assembler Galaxigans (MRASM/projects/galaxigans) and keeps that game's
+  // 640x360 field and its constants, so the two are comparable line for line
+  // — 320x240 would have meant re-tuning every number in the port.
+  {'name': 'Galaxigans', 'cls': 'Galaxigans', 'sel': 'launch',
+   'size': [640, 360],
+   'blurb': 'Galaxian-style fixed shooter, ported from x64 asm (49_galaxigans.mst)'},
   // 43_gamepane.mst's own doc calls MandelZoom (with Breakout) a "complete
   // worked example", and MandelVM documents its own "Launch from the Demos
   // menu" — both were written expecting a slot here and simply never got
@@ -429,10 +436,15 @@ _stGame(String arg) {
   // 'world': [w, h] opens an indexed pane LARGER than the viewport (default
   // world == viewport, i.e. no scrollable margin at all) — needed for
   // scrollTo:y: (world/84_gamepane_buffers.mst) to have anywhere to pan into.
-  List world = (game['world'] is List) ? game['world'] : [_kStGameW, _kStGameH];
+  // 'size': [w, h] — the VIEWPORT, for a game that wants more room than the
+  // two originals' 320x240. It is still a logical pane the layer blows up with
+  // a nearest filter, so this buys pixels, not smoothing.
+  List size = (game['size'] is List) ? game['size'] : [_kStGameW, _kStGameH];
+  int vw = size[0], vh = size[1];
+  List world = (game['world'] is List) ? game['world'] : [vw, vh];
   var first = (game['direct'] == true)
-      ? <List>[<dynamic>['gpopen', _kStGameW, _kStGameH, _kStGameW, _kStGameH, 1]]
-      : <List>[<dynamic>['gpopen', _kStGameW, _kStGameH, world[0], world[1]]];
+      ? <List>[<dynamic>['gpopen', vw, vh, vw, vh, 1]]
+      : <List>[<dynamic>['gpopen', vw, vh, world[0], world[1]]];
   for (var c in setup) first.add(c);
   _ui.send(<dynamic>['draw', first]);  // gpopen is SETUP, not a frame
   return 'ok';

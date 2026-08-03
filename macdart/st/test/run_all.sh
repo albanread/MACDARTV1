@@ -114,6 +114,19 @@ for b in richards deltablue library_bench; do
   fi
 done
 
+# tier 5b — the game plays, headless. Every pane primitive is a no-op without a
+# GUI, so GALAXIGANS (world/49) can be launched, driven and asserted on right
+# here: attract, the fire tap, the dive AI, collision, scoring, death and the
+# game-over reset. Random is seeded 1, so the run is the same every time.
+if [ -f "$HERE/galaxigans_smoke.mst" ]; then
+  o="$("$DART" --with-st "$HERE/run_mst.dart" "$HERE/galaxigans_smoke.mst" 2>&1)"
+  if echo "$o" | grep -q "GALAXIGANS OK"; then
+    pass "tier5b galaxigans ($(echo "$o" | grep 'after 900' | sed 's/^ *//'))"
+  else
+    fail "tier5b galaxigans"; echo "$o" | grep -E "FAIL|ERR|xception" | head -3 | sed 's/^/        /'
+  fi
+else skip "tier5b galaxigans (missing)"; fi
+
 # tier 6 — GUI smoke (opt-in; needs a window server)
 if [ "$WANT_GUI" = 1 ]; then
   if [ -x "$HERE/gui_smoke.sh" ]; then

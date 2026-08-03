@@ -1,0 +1,64 @@
+"galaxigans_smoke.mst — drive GALAXIGANS with no window at all.
+
+ The game is Smalltalk over GamePane, and every pane primitive is a documented
+ no-op in a headless VM — so the whole thing (attract, the fire tap, the dive
+ AI, bullets, bombs, collision, scoring, death and the game-over reset) runs
+ and can be asserted on without a GUI. That is the point of the port: a game
+ you can unit-test.
+
+     dart --with-st macdart/st/test/run_mst.dart macdart/st/test/galaxigans_smoke.mst
+
+ Prints one line per check and a final GALAXIGANS OK / GALAXIGANS FAILED — the
+ battery (run_all.sh) greps for the OK."
+
+| g fails check tap play |
+fails := 0.
+check := [ :label :got :want |
+    got = want
+        ifTrue: [ Transcript showCr: '  ok    ', label ]
+        ifFalse: [
+            fails := fails + 1.
+            Transcript showCr: '  FAIL  ', label,
+                ' — got ', got printString, ', want ', want printString ] ].
+"One tap of fire: pressed for a frame, released the next. Holding does nothing
+ (the original's no-autofire rule), so a test that never releases never shoots."
+tap := [ GamePane stepWithKeys: 16. GamePane stepWithKeys: 0 ].
+"n frames of play, tapping fire every 12 and sweeping left then right."
+play := [ :n |
+    1 to: n do: [ :i | | mask |
+        mask := 0.
+        (i \\ 12) = 0 ifTrue: [ mask := mask + 16 ].
+        (i \\ 300) < 150 ifTrue: [ mask := mask + 1 ] ifFalse: [ mask := mask + 2 ].
+        GamePane stepWithKeys: mask ] ].
+
+g := Galaxigans launch.
+check value: 'opens on the title' value: g gameState value: #attract.
+check value: 'the fleet is full' value: g aliveCount value: 40.
+
+1 to: 30 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'the title ignores an idle frame' value: g gameState value: #attract.
+
+tap value.
+check value: 'fire starts the game' value: g gameState value: #playing.
+
+play value: 900.
+check value: 'the fleet takes losses' value: g aliveCount < 40 value: true.
+check value: 'and they score' value: g score > 0 value: true.
+Transcript showCr: '  after 900 frames: ', g summary.
+
+"Left alone against a FULL fleet, the divers reach the ship: three deaths, game
+ over, and back to the title. The whole lifecycle in one loop, nobody at the
+ keyboard. (A fresh game, because the fleet above is nearly cleared and eleven
+ survivors take far longer to find a stationary ship.) Random is seeded 1, so
+ this is the same run every time — the numbers below are exact, not typical."
+g := Galaxigans launch.
+tap value.
+check value: 'a fresh game starts full' value: g aliveCount value: 40.
+1 to: 2500 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'an idle ship dies out and resets' value: g gameState value: #attract.
+check value: 'the reset refills the fleet' value: g aliveCount value: 40.
+check value: 'and restores the lives' value: g lives value: 3.
+
+Transcript showCr: (fails = 0
+    ifTrue: [ 'GALAXIGANS OK' ]
+    ifFalse: [ 'GALAXIGANS FAILED (', fails printString, ')' ]).

@@ -79,6 +79,15 @@ chk "doit equality"      "true false false true" \
 # ST games on the Metal pane (GAMEPANE_PLAN.md §8): launch, let a few frames
 # tick, snapshot the pane's honest texture, stop. Needs the world in the image.
 if [ "$world" = 1 ]; then
+  # Galaxigans is the one game that opens a NON-default pane (640x360) and the
+  # only user of the ST text overlay, so it is worth its own launch check.
+  chk "stgame galaxigans" "ok"        "$(ctl stgame Galaxigans)"
+  sleep 2
+  case "$(ctl gpstat)" in
+    *640*360*) ok "galaxigans pane" "640x360" ;;
+    *) bad "galaxigans pane" "$(ctl gpstat)" ;;
+  esac
+  ctl demostop >/dev/null 2>&1
   chk "stgame breakout"   "ok"        "$(ctl stgame Breakout)"
   sleep 2
   st1="$(ctl gpstat)"; sleep 1; st2="$(ctl gpstat)"

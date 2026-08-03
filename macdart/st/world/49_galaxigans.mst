@@ -1,0 +1,703 @@
+"49_galaxigans.mst — GALAXIGANS: a Galaxian/Galaga-style fixed shooter for the
+ native Metal game pane, ported from the x64 assembler original in
+ MRASM/projects/galaxigans (6251 lines of .was across 35 files).
+
+ The port is deliberately FAITHFUL to that game's numbers rather than a vague
+ homage — every constant below comes from its galaxigans_data.inc, so the two
+ can be compared side by side: a 640x360 field, an 8x5 formation of 16x16
+ aliens on a 56x34 grid from (96,56), sway +/-16 at 1px a frame, a dive every 60
+ frames that peels for 12 then homes, divers returning down the screen at 4px a
+ frame to re-dock in their own slot, 4 bullets at 7px a frame on an 8-frame
+ cooldown, 6 bombs at 4px a frame every 22, a bonus saucer every 420 frames
+ worth 200, and a 90-frame respawn beat.
+
+ The dive AI is the heart of Galaga and the most interesting thing to port. It
+ is the original's, transcribed: each dive gets a random seed whose bits ARE the
+ flight plan — weave speed ((seed>>3)&7)+3, weave phase (seed>>8)&255, weave
+ amplitude (seed&7)+2, plus a 'fast' bit raising the descent cap from 8 to 10
+ and a 'hard' bit tripling the homing pull. So no two swoops trace the same
+ curve, and the fleet's behaviour is emergent rather than scripted.
+
+ What is NOT ported (the original's later sprints): the capture boss and its
+ tractor beam, the spinning mines, the beam FX layer, the pilot-token row, the
+ victory dance, the high-score table and its nano-TCL dev channel. The core loop
+ — formation, dives, bombs, bullets, collision, saucer, explosions, lives,
+ waves — is all here.
+
+ Controls: Left/Right steer, Space fires (tap, no autofire — the original's
+ shoot_held/shoot_release beat). Launch from the GAMES menu, or a Workspace:
+     Galaxigans launch
+
+ This runs on a 640x360 pane, wider than the 320x240 the other Smalltalk games
+ open (macdart/cocoa/workspace/language.dart, _kStGames 'size'), so there is
+ room for a real fleet and a HUD in the pane's own 5x7 font."
+
+"--- one alien: a slot in the formation, and its own flight plan while diving ---"
+"I am one Galaxigan. In formation I track my home slot plus the fleet's sway;
+ when launched I fly my own swooping dive at the player, drop out of the bottom
+ of the field, and glide back down from the top into my slot to dive again. My
+ dive is not scripted: the random seed I am launched with packs the weave speed,
+ phase and amplitude, and two behaviour bits, so every swoop is different."
+Object subclass: Galaxigan [
+    | x y homeX homeY state kind dt seed bank alive sprite |
+
+    Galaxigan class >> homeX: hx homeY: hy kind: aKind [
+        ^self new setHomeX: hx homeY: hy kind: aKind
+    ]
+
+    setHomeX: hx homeY: hy kind: aKind [
+        homeX := hx. homeY := hy. kind := aKind.
+        x := hx. y := hy.
+        state := #form. dt := 0. seed := 0. bank := 0. alive := true.
+        ^self
+    ]
+
+    x [ ^x ]
+    y [ ^y ]
+    homeX [ ^homeX ]
+    homeY [ ^homeY ]
+    kind [ ^kind ]
+    state [ ^state ]
+    alive [ ^alive ]
+    isDiving [ ^state == #dive ]
+    sprite [ ^sprite ]
+    sprite: s [ sprite := s ]
+
+    kill [ alive := false. state := #dead ]
+
+    "Score is by row: the front rank is worth least, and a diver is worth
+     double — the arcade's own bargain, take the risk for the points."
+    points [
+        | base |
+        base := kind == #butterfly ifTrue: [ 80 ] ifFalse: [ 50 ].
+        ^state == #dive ifTrue: [ base * 2 ] ifFalse: [ base ]
+    ]
+
+    "Launch me at the player. The seed IS the flight plan (see the class
+     comment); dt drives both the descent ramp and the weave."
+    diveWithSeed: s [
+        state := #dive. dt := 0. seed := s
+    ]
+
+    "One frame of formation flight: sit in my slot, carried by the sway."
+    followFormation: swayX [
+        x := homeX + swayX. y := homeY. bank := 0
+    ]
+
+    "One frame of the glide home: drop from above the field into my own slot,
+     tracking the swaying column on the way in."
+    returnStep: swayX [
+        y := y + 4.
+        x := homeX + swayX.
+        bank := 0.
+        y >= homeY ifTrue: [ y := homeY. state := #form ]
+    ]
+
+    "One frame of the dive — the ported swoop. Answers true when I have left
+     the bottom of the field and should re-enter from the top."
+    diveStep: playerX height: fieldH [
+        | vy weave amp speed phase pull |
+        dt := dt + 1.
+        vy := 2 + (dt // 4).
+        vy := vy min: ((seed bitAnd: 128) = 0 ifTrue: [ 8 ] ifFalse: [ 10 ]).
+        y := y + vy.
+        speed := ((seed bitShift: -3) bitAnd: 7) + 3.
+        phase := ((seed bitShift: -8) bitAnd: 255).
+        amp := (seed bitAnd: 7) + 2.
+        weave := (Galaxigans sineAt: dt * speed + phase) * amp // 256.
+        "The peel: for the first 12 steps I only weave, so I break formation
+         outward before I start hunting. After that the homing pull leans me
+         toward the player — gently, or hard if my seed says so."
+        dt >= 12 ifTrue: [
+            pull := (seed bitAnd: 64) = 0 ifTrue: [ 1 ] ifFalse: [ 3 ].
+            weave := x < playerX
+                ifTrue: [ weave + pull ]
+                ifFalse: [ weave - pull ] ].
+        x := x + weave.
+        bank := weave sign.
+        y > (fieldH + 8) ifTrue: [ ^true ].
+        ^false
+    ]
+
+    "Re-enter from above, ready to glide back into my slot."
+    reenterAt: swayX [
+        state := #return. dt := 0. x := homeX + swayX. y := -20
+    ]
+
+    "My hit box, generous by half a pixel in the player's favour."
+    hits: px y: py halfWidth: hw [
+        ^alive and: [ (x - px) abs < (hw + 8) and: [ (y - py) abs < 12 ] ]
+    ]
+]
+
+"--- a shot: one player bullet, or one enemy bomb ---"
+"I am one projectile in a fixed-size pool — a player bullet flying up, or an
+ enemy bomb falling. The pool never grows during play: the original DIMs four
+ bullets and six bombs, and running out IS the game's rate limit."
+Object subclass: GxShot [
+    | x y dy live |
+
+    "`super new` is not compilable here (the ST engine's flow-graph builder
+     refuses self/super in a class-method receiver position), so the pool asks
+     for `empty` rather than overriding new."
+    GxShot class >> empty [ ^self new setDead ]
+    setDead [ live := false. x := 0. y := 0. dy := 0. ^self ]
+
+    x [ ^x ]
+    y [ ^y ]
+    live [ ^live ]
+    kill [ live := false ]
+
+    fireFrom: ax y: ay dy: ady [
+        x := ax. y := ay. dy := ady. live := true
+    ]
+
+    "Advance one frame; answers false when I leave the field."
+    stepIn: fieldH [
+        live ifFalse: [ ^false ].
+        y := y + dy.
+        (y < -8 or: [ y > (fieldH + 8) ]) ifTrue: [ live := false. ^false ].
+        ^true
+    ]
+
+    hits: tx y: ty halfWidth: hw halfHeight: hh [
+        ^live and: [ (x - tx) abs < hw and: [ (y - ty) abs < hh ] ]
+    ]
+]
+
+"--- explosion debris ---"
+"I am one spark of an explosion: a coloured pixel with a velocity and a life.
+ A burst of me is the whole particle system — the original ran the same idea
+ through its PtBurst/PtUpdate pool."
+Object subclass: GxSpark [
+    | x y vx vy life colour |
+
+    GxSpark class >> at: ax y: ay vx: avx vy: avy colour: c [
+        ^self new setX: ax y: ay vx: avx vy: avy colour: c
+    ]
+    setX: ax y: ay vx: avx vy: avy colour: c [
+        x := ax. y := ay. vx := avx. vy := avy. colour := c. life := 18. ^self
+    ]
+
+    x [ ^x ]
+    y [ ^y ]
+    colour [ ^colour ]
+    live [ ^life > 0 ]
+
+    step [
+        x := x + vx. y := y + vy. vy := vy + 1. life := life - 1
+    ]
+]
+
+"--- the game ---"
+"I am GALAXIGANS, a Galaxian/Galaga-style fixed shooter on the native game
+ pane, ported from an x64 assembler original (see the file comment). Left and
+ Right steer, Space fires — one shot per press, four in flight. Shoot the
+ formation before it dives you out of lives; the bonus saucer overhead is worth
+ 200. Launch me from the GAMES menu or a Workspace: Galaxigans launch."
+Object subclass: Galaxigans [
+    <classVars: Sine>
+
+    | pane rng gameState stateTimer frame
+      shipX shipSprite lives score hiScore wave respawn
+      fleet swayX swayDir diveTimer bombTimer
+      bullets bombs sparks stars
+      saucer saucerX saucerDir saucerTimer cooldown fireWasDown |
+
+    "--- the field, straight from the original's galaxigans_data.inc ---"
+    Galaxigans class >> fieldWidth [ ^640 ]
+    Galaxigans class >> fieldHeight [ ^360 ]
+    Galaxigans class >> playerY [ ^310 ]
+    Galaxigans class >> cols [ ^8 ]
+    Galaxigans class >> rows [ ^5 ]
+    Galaxigans class >> colGap [ ^56 ]
+    Galaxigans class >> rowGap [ ^34 ]
+    Galaxigans class >> gridX [ ^96 ]
+    Galaxigans class >> gridY [ ^56 ]
+    Galaxigans class >> divePeriod [ ^60 ]
+    Galaxigans class >> bombPeriod [ ^22 ]
+    Galaxigans class >> saucerPeriod [ ^420 ]
+
+    Galaxigans class >> launch [
+        "Open the pane and start a new game."
+        ^self new start
+    ]
+
+    "A 256-entry sine table in [-256,256], built once. The original carried a
+     sineLUT in .DATA for exactly this reason: the dive weave asks for a sine
+     per diver per frame, and a table keeps the whole flight path in integers —
+     no float in the inner loop, and the same curve every run."
+    Galaxigans class >> sineAt: i [
+        Sine isNil ifTrue: [ self buildSine ].
+        ^Sine at: (i \\ 256) + 1
+    ]
+    Galaxigans class >> buildSine [
+        | t |
+        t := Array new: 256.
+        1 to: 256 do: [ :k |
+            t at: k put: (((k - 1) * 6.283185307179586 / 256.0) sin * 256.0) rounded ].
+        Sine := t
+    ]
+
+    start [
+        pane := GamePane new.
+        rng := Random new.
+        frame := 0.
+        hiScore := 0.
+        self buildPalette.
+        self buildStars.
+        self buildSprites.
+        self newGame.
+        pane onStep: [ self step ]; run.
+        ^self
+    ]
+
+    "--- setup ------------------------------------------------------------"
+
+    buildPalette [
+        "The indexed background layer: 16 space, 17..19 the three star depths,
+         20 bullet, 21 bomb, 22 spark hot, 23 spark cool. Sprites carry their
+         own 16-colour palettes and are not in this table."
+        pane paletteAt: 16 r: 6   g: 6   b: 16.
+        pane paletteAt: 17 r: 70  g: 70  b: 90.
+        pane paletteAt: 18 r: 140 g: 140 b: 170.
+        pane paletteAt: 19 r: 230 g: 230 b: 255.
+        pane paletteAt: 20 r: 255 g: 240 b: 120.
+        pane paletteAt: 21 r: 255 g: 90  b: 220.
+        pane paletteAt: 22 r: 255 g: 200 b: 60.
+        pane paletteAt: 23 r: 255 g: 80  b: 40.
+    ]
+
+    buildStars [
+        "Three depths of star, the far ones dim and slow. Each is [x, y, speed,
+         colour] — a plain Array per star, cheaper than an object for something
+         with no behaviour."
+        stars := Array new: 72.
+        1 to: 72 do: [ :i | | depth |
+            depth := (i \\ 3) + 1.
+            stars at: i put: (Array with: (rng next * self class fieldWidth) truncated
+                                    with: (rng next * self class fieldHeight) truncated
+                                    with: depth
+                                    with: 16 + depth) ]
+    ]
+
+    buildSprites [
+        "One sprite instance per alien (the pane's Smalltalk face defines and
+         places in one call), plus the ship and the saucer. Dead aliens are
+         parked off-screen rather than destroyed — the fleet is a fixed pool,
+         exactly as the original's 40-slot table."
+        | art |
+        shipSprite := pane defineSprite: self class shipArt.
+        shipSprite colorAt: 1 r: 230 g: 240 b: 255.
+        shipSprite colorAt: 2 r: 255 g: 140 b: 40.
+        shipSprite colorAt: 3 r: 60  g: 140 b: 255.
+        shipSprite colorAt: 4 r: 255 g: 70  b: 70.
+
+        saucer := pane defineSprite: self class saucerArt.
+        saucer colorAt: 1 r: 220 g: 220 b: 230.
+        saucer colorAt: 2 r: 120 g: 120 b: 140.
+        saucer colorAt: 3 r: 90  g: 220 b: 255.
+        saucer colorAt: 4 r: 255 g: 220 b: 90.
+        saucer moveTo: -80 y: -80.
+
+        fleet := OrderedCollection new.
+        1 to: self class rows do: [ :r |
+            1 to: self class cols do: [ :c | | alien kind |
+                kind := r <= 2 ifTrue: [ #butterfly ] ifFalse: [ #bee ].
+                alien := Galaxigan
+                    homeX: self class gridX + ((c - 1) * self class colGap)
+                    homeY: self class gridY + ((r - 1) * self class rowGap)
+                    kind: kind.
+                art := kind == #butterfly
+                    ifTrue: [ self class butterflyArt ]
+                    ifFalse: [ self class beeArt ].
+                alien sprite: (pane defineSprite: art).
+                self paint: alien sprite kind: kind row: r.
+                fleet add: alien ] ]
+    ]
+
+    paint: aSprite kind: kind row: r [
+        "Each rank gets its own hue, so the fleet reads as ranks at a glance."
+        kind == #butterfly
+            ifTrue: [
+                aSprite colorAt: 1 r: 220 g: 90  b: 240.
+                aSprite colorAt: 2 r: 90  g: 30  b: 120.
+                aSprite colorAt: 3 r: 120 g: 160 b: 255.
+                aSprite colorAt: 4 r: 255 g: 240 b: 120.
+                aSprite colorAt: 5 r: 20  g: 20  b: 40 ]
+            ifFalse: [
+                aSprite colorAt: 1 r: 255 g: 210 b: 60.
+                aSprite colorAt: 2 r: 150 g: 60  b: 20.
+                aSprite colorAt: 3 r: 255 g: 90  b: 60.
+                aSprite colorAt: 4 r: 255 g: 255 b: 220.
+                aSprite colorAt: 5 r: 30  g: 20  b: 10 ]
+    ]
+
+    newGame [
+        score := 0.
+        lives := 3.
+        wave := 1.
+        gameState := #attract.
+        stateTimer := 0.
+        self startWave
+    ]
+
+    startWave [
+        "Rebuild the fleet's state (the objects persist; a wave is a reset, not
+         a reallocation) and re-arm the timers."
+        shipX := self class fieldWidth // 2.
+        respawn := 0.
+        cooldown := 0.
+        fireWasDown := false.
+        swayX := 0. swayDir := 1.
+        diveTimer := self divePeriodNow.
+        bombTimer := self class bombPeriod.
+        saucerX := -60. saucerDir := 0. saucerTimer := self class saucerPeriod.
+        fleet do: [ :a | a setHomeX: a homeX homeY: a homeY kind: a kind ].
+        bullets := (1 to: 4) collect: [ :i | GxShot empty ].
+        bombs := (1 to: 6) collect: [ :i | GxShot empty ].
+        sparks := OrderedCollection new
+    ]
+
+    "Each wave dives harder — the original ramps gDivePeriod the same way."
+    divePeriodNow [ ^(self class divePeriod - (wave - 1 * 6)) max: 18 ]
+
+    "State, readable — for a headless test or a scripted probe. The game runs
+     perfectly well with no window (every pane primitive is a no-op there), so
+     the whole of it can be driven and asserted on from the battery."
+    gameState [ ^gameState ]
+    score [ ^score ]
+    lives [ ^lives ]
+    wave [ ^wave ]
+    aliveCount [
+        | n |
+        n := 0.
+        fleet do: [ :a | a alive ifTrue: [ n := n + 1 ] ].
+        ^n
+    ]
+
+    summary [
+        ^gameState printString, ' score ', score printString,
+         ' lives ', lives printString, ' wave ', wave printString,
+         ' alive ', self aliveCount printString
+    ]
+
+    "--- the frame --------------------------------------------------------"
+
+    step [
+        frame := frame + 1.
+        self stepStars.
+        gameState == #playing ifTrue: [ self stepPlay ].
+        gameState == #attract ifTrue: [ self stepAttract ].
+        gameState == #cleared ifTrue: [ self stepCleared ].
+        gameState == #over ifTrue: [ self stepOver ].
+        self draw.
+        pane present
+    ]
+
+    stepAttract [
+        "The title waits for fire, and the fleet sways behind it."
+        self swayFleet.
+        fleet do: [ :a | a alive ifTrue: [ a followFormation: swayX ] ].
+        (self firePressed) ifTrue: [
+            gameState := #playing.
+            self startWave.
+            (Tune fromAbc: 'T:galaxigans
+M:4/4
+L:1/8
+K:Cmin
+|: c2 G2 c2 g2 | f2 c2 f2 c2 | G2 c2 G2 c2 | c8 :|') playOnce ]
+    ]
+
+    stepCleared [
+        stateTimer := stateTimer - 1.
+        stateTimer <= 0 ifTrue: [
+            wave := wave + 1.
+            gameState := #playing.
+            self startWave ]
+    ]
+
+    stepOver [
+        stateTimer := stateTimer - 1.
+        self stepSparks.
+        stateTimer <= 0 ifTrue: [
+            score > hiScore ifTrue: [ hiScore := score ].
+            self newGame ]
+    ]
+
+    stepPlay [
+        respawn > 0
+            ifTrue: [ respawn := respawn - 1 ]
+            ifFalse: [ self stepShip ].
+        self stepBullets.
+        self stepBombs.
+        self swayFleet.
+        self stepFleet.
+        self stepSaucer.
+        self stepSparks.
+        self checkCollisions.
+        (fleet anySatisfy: [ :a | a alive ]) ifFalse: [
+            gameState := #cleared. stateTimer := 120 ]
+    ]
+
+    "--- the player -------------------------------------------------------"
+
+    stepShip [
+        | speed |
+        speed := 4.
+        (pane keyHeld: GamePane keyLeft) ifTrue: [ shipX := shipX - speed ].
+        (pane keyHeld: GamePane keyRight) ifTrue: [ shipX := shipX + speed ].
+        shipX := (shipX max: 12) min: self class fieldWidth - 12.
+        cooldown > 0 ifTrue: [ cooldown := cooldown - 1 ].
+        self firePressed ifTrue: [ self fire ]
+    ]
+
+    "Tap to fire: the key must be RELEASED between shots (the original's
+     shoot_held / shoot_release_frames). Holding Space does nothing."
+    firePressed [
+        | down pressed |
+        down := pane keyHeld: GamePane keyA.
+        pressed := down and: [ fireWasDown not ].
+        fireWasDown := down.
+        ^pressed
+    ]
+
+    fire [
+        cooldown > 0 ifTrue: [ ^self ].
+        bullets do: [ :b |
+            b live ifFalse: [
+                b fireFrom: shipX y: self class playerY - 12 dy: -7.
+                cooldown := 8.
+                Sound shoot play.
+                ^self ] ]
+    ]
+
+    stepBullets [
+        bullets do: [ :b | b stepIn: self class fieldHeight ]
+    ]
+
+    "--- the fleet --------------------------------------------------------"
+
+    swayFleet [
+        swayX := swayX + swayDir.
+        swayX >= 16 ifTrue: [ swayDir := -1 ].
+        swayX <= -16 ifTrue: [ swayDir := 1 ]
+    ]
+
+    stepFleet [
+        diveTimer := diveTimer - 1.
+        diveTimer <= 0 ifTrue: [
+            diveTimer := self divePeriodNow.
+            self launchDiver ].
+        bombTimer := bombTimer - 1.
+        bombTimer <= 0 ifTrue: [
+            bombTimer := self class bombPeriod.
+            self dropBomb ].
+        fleet do: [ :a |
+            a alive ifTrue: [
+                a state == #dive
+                    ifTrue: [
+                        (a diveStep: shipX height: self class fieldHeight)
+                            ifTrue: [ a reenterAt: swayX ] ]
+                    ifFalse: [
+                        a state == #return
+                            ifTrue: [ a returnStep: swayX ]
+                            ifFalse: [ a followFormation: swayX ] ] ] ]
+    ]
+
+    "Pick a live alien still sitting in formation and launch it, with a random
+     seed for its flight plan."
+    launchDiver [
+        | candidates |
+        candidates := OrderedCollection new.
+        fleet do: [ :a |
+            (a alive and: [ a state == #form ]) ifTrue: [ candidates add: a ] ].
+        candidates isEmpty ifTrue: [ ^self ].
+        (candidates at: (rng next * candidates size) truncated + 1)
+            diveWithSeed: (rng next * 65535) truncated
+    ]
+
+    "The lowest diver drops the bomb — a bomb from the back of the formation
+     would be a free hit on nobody."
+    dropBomb [
+        | lowest |
+        lowest := nil.
+        fleet do: [ :a |
+            (a alive and: [ a isDiving ]) ifTrue: [
+                (lowest isNil or: [ a y > lowest y ]) ifTrue: [ lowest := a ] ] ].
+        lowest isNil ifTrue: [ ^self ].
+        bombs do: [ :b |
+            b live ifFalse: [
+                b fireFrom: lowest x y: lowest y + 10 dy: 4.
+                ^self ] ]
+    ]
+
+    stepBombs [
+        bombs do: [ :b | b stepIn: self class fieldHeight ]
+    ]
+
+    "--- the bonus saucer -------------------------------------------------"
+
+    stepSaucer [
+        saucerDir = 0
+            ifTrue: [
+                saucerTimer := saucerTimer - 1.
+                saucerTimer <= 0 ifTrue: [
+                    saucerTimer := self class saucerPeriod.
+                    saucerDir := (rng next < 0.5) ifTrue: [ 1 ] ifFalse: [ -1 ].
+                    saucerX := saucerDir > 0
+                        ifTrue: [ -30 ]
+                        ifFalse: [ self class fieldWidth + 30 ] ] ]
+            ifFalse: [
+                saucerX := saucerX + (saucerDir * 2).
+                (saucerX < -40 or: [ saucerX > (self class fieldWidth + 40) ])
+                    ifTrue: [ saucerDir := 0. saucer moveTo: -80 y: -80 ] ]
+    ]
+
+    "--- collisions -------------------------------------------------------"
+
+    checkCollisions [
+        bullets do: [ :b |
+            b live ifTrue: [
+                (saucerDir ~= 0 and: [ b hits: saucerX y: 20 halfWidth: 12 halfHeight: 8 ])
+                    ifTrue: [
+                        b kill.
+                        score := score + 200.
+                        self burstAt: saucerX y: 20 colour: 22.
+                        Sound coin play.
+                        saucerDir := 0.
+                        saucer moveTo: -80 y: -80 ].
+                b live ifTrue: [
+                    fleet do: [ :a |
+                        (b live and: [ a hits: b x y: b y halfWidth: 4 ]) ifTrue: [
+                            b kill.
+                            score := score + a points.
+                            self burstAt: a x y: a y colour: 23.
+                            Sound explode play.
+                            a kill.
+                            a sprite moveTo: -60 y: -60 ] ] ] ] ].
+
+        respawn > 0 ifTrue: [ ^self ].
+        bombs do: [ :b |
+            (b hits: shipX y: self class playerY halfWidth: 8 halfHeight: 10)
+                ifTrue: [ b kill. self loseLife ] ].
+        fleet do: [ :a |
+            (a isDiving and: [ a hits: shipX y: self class playerY halfWidth: 6 ])
+                ifTrue: [
+                    self burstAt: a x y: a y colour: 23.
+                    a kill.
+                    a sprite moveTo: -60 y: -60.
+                    self loseLife ] ]
+    ]
+
+    loseLife [
+        self burstAt: shipX y: self class playerY colour: 22.
+        Sound hurt play.
+        lives := lives - 1.
+        respawn := 90.
+        shipX := self class fieldWidth // 2.
+        lives <= 0 ifTrue: [ gameState := #over. stateTimer := 180 ]
+    ]
+
+    "--- explosions -------------------------------------------------------"
+
+    burstAt: bx y: by colour: c [
+        | n |
+        n := 14.
+        1 to: n do: [ :i | | ang |
+            ang := (i * 256 // n).
+            sparks add: (GxSpark
+                at: bx y: by
+                vx: (Galaxigans sineAt: ang) * 5 // 256
+                vy: (Galaxigans sineAt: ang + 64) * 5 // 256 - 2
+                colour: c) ].
+        sparks size > 240 ifTrue: [ sparks removeFirst ]
+    ]
+
+    stepSparks [
+        | keep |
+        keep := OrderedCollection new.
+        sparks do: [ :s | s step. s live ifTrue: [ keep add: s ] ].
+        sparks := keep
+    ]
+
+    stepStars [
+        1 to: stars size do: [ :i | | s |
+            s := stars at: i.
+            s at: 2 put: (s at: 2) + (s at: 3).
+            (s at: 2) > self class fieldHeight ifTrue: [
+                s at: 2 put: 0.
+                s at: 1 put: (rng next * self class fieldWidth) truncated ] ]
+    ]
+
+    "--- drawing ----------------------------------------------------------"
+
+    draw [
+        pane cls: 16.
+        stars do: [ :s |
+            pane point: (s at: 1) y: (s at: 2) color: (s at: 4) ].
+        sparks do: [ :s |
+            pane fill: s x y: s y width: 2 height: 2 color: s colour ].
+        bullets do: [ :b |
+            b live ifTrue: [
+                pane fill: b x - 1 y: b y width: 3 height: 8 color: 20 ] ].
+        bombs do: [ :b |
+            b live ifTrue: [
+                pane fill: b x - 2 y: b y width: 4 height: 6 color: 21 ] ].
+        self placeSprites.
+        self drawHud
+    ]
+
+    placeSprites [
+        "Sprites are placed by their top-left, so everything is drawn from its
+         centre minus half its art."
+        fleet do: [ :a |
+            a alive ifTrue: [ a sprite moveTo: a x - 8 y: a y - 8 ] ].
+        saucerDir = 0
+            ifFalse: [ saucer moveTo: saucerX - 10 y: 12 ].
+        (gameState == #playing and: [ respawn = 0 ])
+            ifTrue: [ shipSprite moveTo: shipX - 8 y: self class playerY - 7 ]
+            ifFalse: [
+                "Blink through the respawn pause instead of vanishing."
+                (respawn > 0 and: [ (respawn // 4) \\ 2 = 0 ])
+                    ifTrue: [ shipSprite moveTo: shipX - 8 y: self class playerY - 7 ]
+                    ifFalse: [ shipSprite moveTo: -60 y: -60 ] ]
+    ]
+
+    drawHud [
+        pane textClear.
+        pane text: 'SCORE ', score printString
+             x: 10 y: 8 r: 255 g: 255 b: 255 scale: 2.
+        pane text: 'HI ', (hiScore max: score) printString
+             x: 250 y: 8 r: 255 g: 220 b: 90 scale: 2.
+        pane text: 'WAVE ', wave printString
+             x: 440 y: 8 r: 140 g: 220 b: 255 scale: 2.
+        pane text: 'SHIPS ', lives printString
+             x: 10 y: 336 r: 120 g: 200 b: 255 scale: 2.
+        gameState == #attract ifTrue: [
+            pane text: 'GALAXIGANS' x: 176 y: 140 r: 255 g: 210 b: 60 scale: 5.
+            pane text: 'SPACE TO START   ARROWS TO STEER'
+                 x: 152 y: 200 r: 220 g: 220 b: 255 scale: 2 ].
+        gameState == #cleared ifTrue: [
+            pane text: 'WAVE CLEARED' x: 200 y: 160 r: 120 g: 255 b: 140 scale: 4 ].
+        gameState == #over ifTrue: [
+            pane text: 'GAME OVER' x: 220 y: 160 r: 255 g: 90 b: 90 scale: 4 ]
+    ]
+
+    "--- the art ----------------------------------------------------------"
+    "16x16-cell sprites, 4 bits per pixel: '.' is transparent, 1..5 index the
+     per-sprite palette set in paint:kind:row:."
+
+    Galaxigans class >> beeArt [
+        ^'....2......2..../.....2....2...../......1111....../.....115511...../....11155111..../...3111111113.../..331114441133../.33111144441133./.33111111111133./..331111111133../...2211..1122.../....22....22....'
+    ]
+    Galaxigans class >> butterflyArt [
+        ^'......3..3....../.....33..33...../....33111133..../...3311551133.../..331151151133../.33111111111133./..331144441133../.33111444411133./.33111111111133./..331111111133../...2211111122.../....22....22....'
+    ]
+    Galaxigans class >> shipArt [
+        ^'.......11......./.......11......./......1441....../......1441....../.....114411...../.....114411...../....11144111..../...3111441113.../..331111111133../.33111144441133./.33111111111133./.33.11111111.33./..3..111111..3../......2..2......'
+    ]
+    Galaxigans class >> saucerArt [
+        ^'........2222......../......22444422....../....224444444422..../..2111111111111112../..2133333333333312../..2111111111111112../....221111111122..../........2222........'
+    ]
+]

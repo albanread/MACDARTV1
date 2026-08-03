@@ -36,3 +36,18 @@ GamePane >> primMoveSprite: id x: x y: y [ <stprim: stGpMoveSprite> ]
 
 Sound >> primPlay: n [ <stprim: stGpPlay> ]
 Tune >> primPlayTune: s [ <stprim: stGpPlayTune> ]
+
+"The HUD text overlay — NEW here, not part of MACVM's corpus (its pane had
+ seven-segment digits and drew every letter as an empty box, so its GamePane
+ never offered text at all). This pane carries a real 5x7 ASCII atlas over the
+ indexed layer, in RGB rather than palette indices; `scale` blocks each font
+ pixel, so one font covers a HUD and a title screen. The overlay is RETAINED
+ between frames: a changing score wants textClear first, or each frame prints
+ over the last until the digits are solid blocks."
+GamePane >> textClear [ <stprim: stGpTextClear> ]
+GamePane >> text: aString x: x y: y r: r g: g b: b scale: k [
+    <stprim: stGpText>
+]
+GamePane >> text: aString x: x y: y r: r g: g b: b [
+    ^self text: aString x: x y: y r: r g: g b: b scale: 1
+]

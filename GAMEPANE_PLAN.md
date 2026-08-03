@@ -390,9 +390,32 @@ headless verification.
   pushing the drained buffer. The UI routes those lang pushes into `_onDemoMsg`
   (`gStGameActive`) — exactly "a driver, not a rewrite". Music works: an ABC
   twin (`_stAbcParse`) lives in dart:cocoa → `gptune`+`gpmusic`; SFX presets
-  park at slots 54..63. Games menu: Brickout/Invaders/Pong + the two ST games.
+  park at slots 54..63. Games menu: Brickout/Invaders/Pong + the ST games.
   Headless-tested by `st/test/gamepane_wire.dart` (battery tier); GUI-tested in
   `gui_smoke.sh` (launch → frames tick → gpsnap → stop).
+
+  **GALAXIGANS (world/49) is the driver's proof at scale** — a Galaxian/Galaga
+  fixed shooter ported from 6251 lines of x64 assembler
+  (`MRASM/projects/galaxigans`) into ~560 lines of Smalltalk, keeping the
+  original's own constants so the two are comparable. It brought three things
+  the driver did not have:
+  - **a pane size per game** (`_kStGames` `'size': [w,h]`) — it opens the
+    original's 640x360 field instead of the two originals' 320x240;
+  - **HUD text for Smalltalk** (`GamePane>>text:x:y:r:g:b:[scale:]`,
+    `textClear`) over the pane's 5x7 atlas;
+  - **wire-owned sprite ids.** The engine numbers defs/instances from 0 on
+    every `gpopen`; Smalltalk's `GamePane class>>nextId` is monotonic for the
+    life of the isolate. Relaunching a game therefore had the second run's
+    sprites refused ("id out of sequence") and every move after "gpplace: bad
+    instance" — an invisible fleet. `stGpDefineSprite` now allocates the
+    engine's ids itself and maps ST's onto them, cleared with the rest of the
+    per-run state by `stGpReset`.
+
+  It is driven headless in the battery (`st/test/galaxigans_smoke.mst`, tier
+  5b): with no window every pane primitive is a no-op, so attract, the fire
+  tap, the dive AI, collision, scoring, death and the game-over reset all run
+  and are asserted on. `Random new` is seeded 1, so the run is identical every
+  time.
 - whether the M4 shader layer accepts arbitrary MSL from game files (it is
   compiled at runtime; a bad shader must fail as a logged error, never an
   abort);

@@ -1938,6 +1938,8 @@ bool _stGpRunning = false;
 var _stGpPane; // the GamePane instance `run` was sent to (the driver's handle)
 Map<int, bool> _stGpSounds = <int, bool>{}; // preset -> gpsound already shipped
 Map<String, int> _stGpTunes = <String, int>{}; // abc source -> tune slot
+Map<int, int> _stGpSpriteIds = <int, int>{};  // ST's monotonic id -> engine id
+int _stGpNextSprite = 0;
 int _stGpNextTune = 0;
 bool _stGpBlitWarned = false;
 
@@ -2000,6 +2002,22 @@ stGpBlitSlots(p, mode, src, dst, sx, sy, dx, dy, w, h, value) {
   return p;
 }
 
+// --- the HUD text overlay (layer 3) ------------------------------------------
+// The pane's own 5x7 atlas, drawn OVER the indexed layer and the sprites, in
+// RGB rather than palette indices (it is a separate texture, not part of the
+// buffer). Retained between frames like everything else here, so a changing
+// score wants textClear first — otherwise each frame prints over the last and
+// the digits silt up into blocks.
+stGpTextClear(p) { _stGpCmds.add(<dynamic>['gptextclear']); return p; }
+// The parameters arrive in the SMALLTALK selector's order — the stprim lowering
+// pushes self then the method's arguments left to right, so
+// `text: aString x: x y: y …` hands over (pane, string, x, y, …). Declaring
+// them in the wire's order instead drew the y-coordinate as the label.
+stGpText(p, s, x, y, r, g, b, scale) {
+  _stGpCmds.add(<dynamic>['gptext', x, y, s.toString(), r, g, b, scale]);
+  return p;
+}
+
 stGpPresent(p) => p; // the driver's tick drain IS the frame boundary
 stGpBlit(p, bytes) {
   if (!_stGpBlitWarned) {
@@ -2037,20 +2055,34 @@ stGpDirectBlit(p, bytes) {
   }
   return p;
 }
+// ST merges define+place ("defines the pixel art and places me"): one ST id
+// serves as both the definition and the instance (separate namespaces
+// engine-side); park it offscreen until the game's first moveTo:.
+//
+// The ENGINE numbers its defs and instances from 0 on every gpopen and rejects
+// anything out of sequence, while Smalltalk's GamePane hands out a monotonic
+// NextId that keeps climbing for the life of the isolate. Relaunch a game and
+// those two disagree — the second run's sprites were refused ("id out of
+// sequence") and every move after them was "gpplace: bad instance", i.e. an
+// invisible fleet. So the wire owns the engine's id space and maps ST's ids
+// onto it; the map is per-run state, cleared by stGpReset with everything else.
 stGpDefineSprite(p, id, rows) {
-  // ST merges define+place ("defines the pixel art and places me"): one id
-  // serves as both the definition and the instance (separate namespaces
-  // engine-side); park it offscreen until the game's first moveTo:.
-  _stGpCmds.add(<dynamic>['gpsprite', id, rows.toString()]);
-  _stGpCmds.add(<dynamic>['gpspawn', id, id, -100, -100]);
+  var e = _stGpNextSprite++;
+  _stGpSpriteIds[id] = e;
+  _stGpCmds.add(<dynamic>['gpsprite', e, rows.toString()]);
+  _stGpCmds.add(<dynamic>['gpspawn', e, e, -100, -100]);
   return p;
 }
 stGpSpriteColor(p, id, i, r, g, b) {
-  _stGpCmds.add(<dynamic>['gpspritepal', id, i, r, g, b]);
+  var e = _stGpSpriteIds[id];
+  if (e == null) return p;                 // a handle from a previous run
+  _stGpCmds.add(<dynamic>['gpspritepal', e, i, r, g, b]);
   return p;
 }
 stGpMoveSprite(p, id, x, y) {
-  _stGpCmds.add(<dynamic>['gpplace', id, x, y, 0, 1.0, 0.0, 1.0]);
+  var e = _stGpSpriteIds[id];
+  if (e == null) return p;
+  _stGpCmds.add(<dynamic>['gpplace', e, x, y, 0, 1.0, 0.0, 1.0]);
   return p;
 }
 stGpPlay(snd, preset) {
@@ -2108,6 +2140,8 @@ void stGpReset() {
   _stGpSounds = <int, bool>{};
   _stGpTunes = <String, int>{};
   _stGpNextTune = 0;
+  _stGpSpriteIds = <int, int>{};
+  _stGpNextSprite = 0;
 }
 
 // --- ABC notation -> flat MIDI events (the ST game wire's music half) --------

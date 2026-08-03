@@ -463,6 +463,16 @@ headless verification.
   lives, as figures the beam actually comes for) and a second beating preset,
   `Sound bossHum` — the saucer's wah an octave and a half down.
 
+  **The music.** The original's four melodic cues are transcribed note for note
+  from its inline ABC — title (GM 52 choir), stage clear (GM 9 glockenspiel),
+  saucer arrival (GM 91 pad) and 'Alien Victory' (GM 80 square lead), the tune
+  the aliens dance to. One dialect difference, in the port's favour: the
+  assembler writes `%%MIDI program <voice> <gm#>` while this pane's ABC reader
+  takes the GM number directly, so `program 1 80` becomes `program 80`. That
+  the instrument survives is asserted at the wire (gamepane_wire.dart reads the
+  compiled MIDI and checks the dance emits a program change to 80) — "a tune
+  played" would not have caught a misread program field.
+
   Layer 0 is now reachable from Smalltalk too (`GamePane>>shader:` /
   `shaderParam:value:`): the original's twelve HLSL cosmos scenes — nebula,
   galaxy, black hole, alien world, moon, supernova, wormhole, gas giant,

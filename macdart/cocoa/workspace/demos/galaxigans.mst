@@ -44,6 +44,13 @@
  which is the copper-bar mechanism and the original's own (BeamCascade). No
  pixel is redrawn to animate it.
 
+ And the music: the original's four melodic cues (galaxigans_music.was) are
+ transcribed note for note — the choir build on the title screen, the
+ glockenspiel fanfare for a cleared wave, the pad swell that announces the
+ saucer, and 'Alien Victory', the square-lead triumph the aliens dance to when
+ they have taken your last ship. Its percussion cues are not ported: the pane's
+ SFX presets already play that part, and doubling them would only muddy it.
+
  What is still NOT ported: the high-score table and its nano-TCL dev channel.
 
  Controls: Left/Right steer, Space fires (tap, no autofire — the original's
@@ -685,10 +692,15 @@ Object subclass: Galaxigans [
     setLives: n [ lives := n ]
 
     "Start the victory dance now, without dying three times for it."
-    danceNow [
+    danceNow [ self beginDance ]
+
+    "The aliens have won: they leave formation, and their own tune plays over
+     it — the square-lead 'Alien Victory' from the original's music file."
+    beginDance [
         gameState := #over.
         stateTimer := self class danceLength.
-        danceT := 0
+        danceT := 0.
+        (Tune fromAbc: self class tuneAlienVictory) playOnce
     ]
 
     "How many mines are in the field, and where the fleet is relative to its
@@ -767,11 +779,7 @@ Object subclass: Galaxigans [
         (self firePressed) ifTrue: [
             gameState := #playing.
             self startWave.
-            (Tune fromAbc: 'T:galaxigans
-M:4/4
-L:1/8
-K:Cmin
-|: c2 G2 c2 g2 | f2 c2 f2 c2 | G2 c2 G2 c2 | c8 :|') playOnce ]
+            (Tune fromAbc: self class tuneTitle) playOnce ]
     ]
 
     stepCleared [
@@ -827,7 +835,9 @@ K:Cmin
         self stepSparks.
         self checkCollisions.
         (fleet anySatisfy: [ :a | a alive ]) ifFalse: [
-            gameState := #cleared. stateTimer := 120 ]
+            gameState := #cleared.
+            stateTimer := 120.
+            (Tune fromAbc: self class tuneStageClear) playOnce ]
     ]
 
     "--- the player -------------------------------------------------------"
@@ -936,6 +946,7 @@ K:Cmin
                     saucerTimer := self class saucerPeriod.
                     saucerDir := (rng next < 0.5) ifTrue: [ 1 ] ifFalse: [ -1 ].
                     saucerWah := 0.               "start the warble on arrival"
+                    (Tune fromAbc: self class tuneSaucer) playOnce.
                     saucerX := saucerDir > 0
                         ifTrue: [ -30 ]
                         ifFalse: [ self class fieldWidth + 30 ] ] ]
@@ -1013,11 +1024,7 @@ K:Cmin
         Sound hurt play.
         self burstAt: boss beamX y: boss y + 26 colour: 22.
         lives <= 0
-            ifTrue: [
-                gameState := #over.
-                stateTimer := self class danceLength.
-                danceT := 0.
-                boss vanish ]
+            ifTrue: [ self beginDance. boss vanish ]
             ifFalse: [ boss retreat ]
     ]
 
@@ -1139,10 +1146,7 @@ K:Cmin
         lives := lives - 1.
         respawn := 90.
         shipX := self class fieldWidth // 2.
-        lives <= 0 ifTrue: [
-            gameState := #over.
-            stateTimer := self class danceLength.
-            danceT := 0 ]
+        lives <= 0 ifTrue: [ self beginDance ]
     ]
 
     "--- explosions -------------------------------------------------------"
@@ -1667,6 +1671,66 @@ fragment float4 fmain(VOut in [[stage_in]], constant Uniforms& u [[buffer(0)]]) 
 
     Galaxigans class >> pilotPalette [
         ^#(32 40 48 160 168 184 232 236 244 255 255 255 0 0 0 48 192 255 255 192 64)
+    ]
+
+
+    "--- the original's music cues (galaxigans_music.was) -------------------"
+    "Transcribed note for note from the assembler's inline ABC, which its own
+     header traces back to the FreeBASIC original's MUSIC slots. One change,
+     and it is a dialect difference rather than a liberty: the assembler writes
+     `%%MIDI program <voice> <gm#>`, and this pane's ABC reader takes the GM
+     number directly — so `program 1 80` becomes `program 80`, and the square
+     lead is the square lead."
+
+    "Slot 10, 'Alien Victory' — the square-lead triumph the aliens dance to when
+     they have taken your last ship. GM 80, C minor, and it is THEIR tune: the
+     player never hears it in victory."
+    Galaxigans class >> tuneAlienVictory [
+        ^'X:1
+M:4/4
+L:1/8
+Q:1/4=210
+%%MIDI program 80
+K:Cm
+V:1
+G,4 _B,4 | c4 _e4 | _e2d2c2_B2 | G,8 | G,2G,2_A,2_B,2 | c2_e2g2_e2 | c4_B4 | G,8 | _E2F2G2_A2 | _B2c2_e2g2 | f/e/d/c/_B/A/_A/G/ | _E8 |'
+    ]
+
+    "Slot 14, 'Stage Alert' — the ominous choir build on the title screen."
+    Galaxigans class >> tuneTitle [
+        ^'X:1
+M:4/4
+L:1/8
+Q:1/4=84
+%%MIDI program 52
+K:Am
+V:1
+z4 A,2 E2 | A2 c2 e2 d2 | c4 B4 | A8 |'
+    ]
+
+    "Slot 13, 'You Win!' — the glockenspiel fanfare for a cleared wave."
+    Galaxigans class >> tuneStageClear [
+        ^'X:1
+M:4/4
+L:1/8
+Q:1/4=234
+%%MIDI program 9
+K:C
+V:1
+ceg c'' e''c''ba | gecG c2 z2 | fac''f'' e''d''c''b | c''4 |'
+    ]
+
+    "Slot 12, 'Saucer Wooh' — the pad swell that announces the bonus saucer,
+     under the warble rather than instead of it (the original plays both)."
+    Galaxigans class >> tuneSaucer [
+        ^'X:1
+M:4/4
+L:1/8
+Q:1/4=160
+%%MIDI program 91
+K:C
+V:1
+G z G z | GABc cBAG |'
     ]
 
     "--- the art ----------------------------------------------------------"

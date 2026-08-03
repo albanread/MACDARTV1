@@ -192,6 +192,33 @@ g run.
   stInvokeStatic('GamePane', 'reset', []);
   stGpReset();
 
+  // --- the game's music cues, at the wire ------------------------------------
+  // The victory dance has a TUNE — the original's square-lead 'Alien Victory'
+  // (GM 80). Asserting it here rather than in the ST smoke test because this is
+  // where the compiled MIDI is visible: the check is that the dance emits a
+  // tune AND that the tune is the right instrument, which "a tune played" would
+  // not catch if the ABC's program field were misread.
+  // Resolved against THIS script, not the working directory — the battery runs
+  // it from its own folder, where a relative path quietly reads nothing.
+  var gamePath = Platform.script
+      .resolve('../../cocoa/workspace/demos/galaxigans.mst').toFilePath();
+  stRun(new File(gamePath).readAsStringSync());
+  stGpTake();
+  stRun('Galaxigans launch. GamePane stepWithKeys: 16. GamePane stepWithKeys: 0.');
+  stGpTake();
+  stRun('Galaxigans current danceNow.');
+  var danceOps = stGpTake();
+  var danceProgram = -1;
+  for (var o in danceOps) {
+    if (o[0] != 'gptune') continue;
+    var ev = o[3];
+    for (var i = 0; i + 3 < ev.length; i += 4) {
+      if (ev[i + 1] == 192) danceProgram = ev[i + 2];
+    }
+  }
+  check('the victory dance plays the aliens their tune',
+      danceProgram == 80, 'GM program ' + danceProgram.toString());
+
   print(fails == 0 ? '== WIRE GREEN ==' : '== $fails FAILURE(S) ==');
   exit(fails == 0 ? 0 : 1);
 }

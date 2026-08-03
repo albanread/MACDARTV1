@@ -59,6 +59,18 @@ check value: 'an idle ship dies out and resets' value: g gameState value: #attra
 check value: 'the reset refills the fleet' value: g aliveCount value: 40.
 check value: 'and restores the lives' value: g lives value: 3.
 
+"Every level resolves: a cosmos for the shader and five species for the grid,
+ walked through the whole table (and one past it, to prove it wraps)."
+g := Galaxigans launch.
+tap value.
+1 to: 13 do: [ :lv |
+    | rep |
+    rep := g levelReport.
+    (rep isEmpty or: [ g aliveCount ~= 40 ])
+        ifTrue: [ fails := fails + 1. Transcript showCr: '  FAIL  level ', lv printString ]
+        ifFalse: [ Transcript showCr: '  ok    ', rep ].
+    g forceNextWave ].
+
 Transcript showCr: (fails = 0
     ifTrue: [ 'GALAXIGANS OK' ]
     ifFalse: [ 'GALAXIGANS FAILED (', fails printString, ')' ]).

@@ -51,3 +51,30 @@ GamePane >> text: aString x: x y: y r: r g: g b: b scale: k [
 GamePane >> text: aString x: x y: y r: r g: g b: b [
     ^self text: aString x: x y: y r: r g: g b: b scale: 1
 ]
+
+"The shader background (layer 0) and multi-frame sprites — also NEW here. A
+ Smalltalk game can now compile its own MSL for the bottom layer and animate a
+ sprite from frames held on its definition, which is what world/49's twelve
+ cosmos backdrops and its flapping fleet need."
+GamePane >> shader: mslSource [ <stprim: stGpShader> ]
+GamePane >> shaderParam: index value: aNumber [ <stprim: stGpShaderParam> ]
+GamePane >> primAddFrame: id rows: hexRows [ <stprim: stGpAddFrame> ]
+GamePane >> primPlace: id x: x y: y frame: f [ <stprim: stGpPlaceFrame> ]
+GamePane >> primHide: id [ <stprim: stGpHide> ]
+
+Sprite >> addFrame: hexRows [
+    "Add another frame of art to my definition (same size as the first).
+     Answer myself, so frames can be chained onto a fresh sprite."
+    pane primAddFrame: id rows: hexRows.
+    ^self
+]
+Sprite >> moveTo: x y: y frame: f [
+    "Move me and pick which frame of my definition to show."
+    pane primPlace: id x: x y: y frame: f.
+    ^self
+]
+Sprite >> hide [
+    "Stop drawing me until the next moveTo:."
+    pane primHide: id.
+    ^self
+]

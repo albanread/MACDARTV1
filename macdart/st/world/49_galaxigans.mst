@@ -39,7 +39,7 @@
  dive is not scripted: the random seed I am launched with packs the weave speed,
  phase and amplitude, and two behaviour bits, so every swoop is different."
 Object subclass: Galaxigan [
-    | x y homeX homeY state kind dt seed bank alive sprite |
+    | x y homeX homeY state kind dt seed bank alive sprite species |
 
     Galaxigan class >> homeX: hx homeY: hy kind: aKind [
         ^self new setHomeX: hx homeY: hy kind: aKind
@@ -57,6 +57,13 @@ Object subclass: Galaxigan [
     homeX [ ^homeX ]
     homeY [ ^homeY ]
     kind [ ^kind ]
+    species [ ^species ]
+
+    "My species is an index into the game's creature library; my two flap
+     frames sit at (index-1)*2 and +1 on my sprite's definition, which carries
+     every species' art (see Galaxigans>>buildSprites)."
+    species: anIndex name: aName [ species := anIndex. kind := aName ]
+    frameFor: flap [ ^(species isNil ifTrue: [ 1 ] ifFalse: [ species ]) - 1 * 2 + flap ]
     state [ ^state ]
     alive [ ^alive ]
     isDiving [ ^state == #dive ]
@@ -68,8 +75,10 @@ Object subclass: Galaxigan [
     "Score is by row: the front rank is worth least, and a diver is worth
      double — the arcade's own bargain, take the risk for the points."
     points [
+        "The rarer species (higher up the library) are worth more, and a diver
+         is worth double — the arcade's own bargain, take the risk for points."
         | base |
-        base := kind == #butterfly ifTrue: [ 80 ] ifFalse: [ 50 ].
+        base := 40 + ((species isNil ifTrue: [ 1 ] ifFalse: [ species ]) * 10).
         ^state == #dive ifTrue: [ base * 2 ] ifFalse: [ base ]
     ]
 
@@ -189,6 +198,40 @@ Object subclass: GxSpark [
     ]
 ]
 
+"--- one alien species: its art, its animation, its palette ---"
+"I am one species of Galaxigan — two frames of 16x16 art and the ten-colour
+ palette they index. Both come VERBATIM from the assembler original's creature
+ library (galaxigans_aliens2.was): its rows are '.'-plus-hex exactly like the
+ pane's own defineSprite: format, and its palette is the comment block above
+ each table. Ten of us exist; a level's formation theme picks five, one per
+ row of the grid."
+Object subclass: GxSpecies [
+    | name art art2 palette |
+
+    GxSpecies class >> name: n art: a art2: b palette: p [
+        ^self new setName: n art: a art2: b palette: p
+    ]
+    setName: n art: a art2: b palette: p [
+        name := n. art := a. art2 := b. palette := p. ^self
+    ]
+
+    name [ ^name ]
+    art [ ^art ]
+    art2 [ ^art2 ]
+
+    "Paint my ten colours onto a sprite. The palette array is flat — r,g,b per
+     index, index 1 first (0 is the sprite format's transparent)."
+    paint: aSprite [
+        1 to: 10 do: [ :i |
+            aSprite
+                colorAt: i
+                r: (palette at: (i - 1) * 3 + 1)
+                g: (palette at: (i - 1) * 3 + 2)
+                b: (palette at: (i - 1) * 3 + 3) ].
+        ^self
+    ]
+]
+
 "--- the game ---"
 "I am GALAXIGANS, a Galaxian/Galaga-style fixed shooter on the native game
  pane, ported from an x64 assembler original (see the file comment). Left and
@@ -196,12 +239,12 @@ Object subclass: GxSpark [
  formation before it dives you out of lives; the bonus saucer overhead is worth
  200. Launch me from the GAMES menu or a Workspace: Galaxigans launch."
 Object subclass: Galaxigans [
-    <classVars: Sine>
+    <classVars: Sine Species Current>
 
     | pane rng gameState stateTimer frame
       shipX shipSprite lives score hiScore wave respawn
       fleet swayX swayDir diveTimer bombTimer
-      bullets bombs sparks stars
+      bullets bombs sparks level scene theme flap
       saucer saucerX saucerDir saucerTimer cooldown fireWasDown |
 
     "--- the field, straight from the original's galaxigans_data.inc ---"
@@ -223,6 +266,10 @@ Object subclass: Galaxigans [
         ^self new start
     ]
 
+    "The game that is running, if any — so a script (or the Workspace) can
+     reach it: `Galaxigans current forceNextWave`, `Galaxigans current summary`."
+    Galaxigans class >> current [ ^Current ]
+
     "A 256-entry sine table in [-256,256], built once. The original carried a
      sineLUT in .DATA for exactly this reason: the dive weave asks for a sine
      per diver per frame, and a table keeps the whole flight path in integers —
@@ -240,12 +287,13 @@ Object subclass: Galaxigans [
     ]
 
     start [
+        Current := self.
         pane := GamePane new.
         rng := Random new.
         frame := 0.
         hiScore := 0.
         self buildPalette.
-        self buildStars.
+        pane shader: self class cosmosShader.   "layer 0: the twelve cosmos"
         self buildSprites.
         self newGame.
         pane onStep: [ self step ]; run.
@@ -255,38 +303,23 @@ Object subclass: Galaxigans [
     "--- setup ------------------------------------------------------------"
 
     buildPalette [
-        "The indexed background layer: 16 space, 17..19 the three star depths,
-         20 bullet, 21 bomb, 22 spark hot, 23 spark cool. Sprites carry their
-         own 16-colour palettes and are not in this table."
-        pane paletteAt: 16 r: 6   g: 6   b: 16.
-        pane paletteAt: 17 r: 70  g: 70  b: 90.
-        pane paletteAt: 18 r: 140 g: 140 b: 170.
-        pane paletteAt: 19 r: 230 g: 230 b: 255.
+        "The indexed layer is drawn OVER the shader, so it is cleared to index
+         0 (transparent) every frame and carries only what the game plots:
+         20 bullet, 21 bomb, 22/23 spark. The background is the shader's now —
+         which is also where the original's stars live."
         pane paletteAt: 20 r: 255 g: 240 b: 120.
         pane paletteAt: 21 r: 255 g: 90  b: 220.
         pane paletteAt: 22 r: 255 g: 200 b: 60.
         pane paletteAt: 23 r: 255 g: 80  b: 40.
     ]
 
-    buildStars [
-        "Three depths of star, the far ones dim and slow. Each is [x, y, speed,
-         colour] — a plain Array per star, cheaper than an object for something
-         with no behaviour."
-        stars := Array new: 72.
-        1 to: 72 do: [ :i | | depth |
-            depth := (i \\ 3) + 1.
-            stars at: i put: (Array with: (rng next * self class fieldWidth) truncated
-                                    with: (rng next * self class fieldHeight) truncated
-                                    with: depth
-                                    with: 16 + depth) ]
-    ]
-
     buildSprites [
-        "One sprite instance per alien (the pane's Smalltalk face defines and
-         places in one call), plus the ship and the saucer. Dead aliens are
-         parked off-screen rather than destroyed — the fleet is a fixed pool,
-         exactly as the original's 40-slot table."
-        | art |
+        "One sprite instance per formation slot, built ONCE — and each of them
+         carries EVERY species' art as frames: ten species x two flap frames,
+         all 16x16, so a level change is a frame offset and a repaint, not a
+         new sprite. (The pane's Smalltalk face defines and places in one call,
+         and the engine numbers defs per pane-open, so re-defining forty
+         sprites a level would pile up definitions for no reason.)"
         shipSprite := pane defineSprite: self class shipArt.
         shipSprite colorAt: 1 r: 230 g: 240 b: 255.
         shipSprite colorAt: 2 r: 255 g: 140 b: 40.
@@ -298,45 +331,43 @@ Object subclass: Galaxigans [
         saucer colorAt: 2 r: 120 g: 120 b: 140.
         saucer colorAt: 3 r: 90  g: 220 b: 255.
         saucer colorAt: 4 r: 255 g: 220 b: 90.
-        saucer moveTo: -80 y: -80.
+        saucer hide.
 
         fleet := OrderedCollection new.
         1 to: self class rows do: [ :r |
-            1 to: self class cols do: [ :c | | alien kind |
-                kind := r <= 2 ifTrue: [ #butterfly ] ifFalse: [ #bee ].
+            1 to: self class cols do: [ :c | | alien spr |
                 alien := Galaxigan
                     homeX: self class gridX + ((c - 1) * self class colGap)
                     homeY: self class gridY + ((r - 1) * self class rowGap)
-                    kind: kind.
-                art := kind == #butterfly
-                    ifTrue: [ self class butterflyArt ]
-                    ifFalse: [ self class beeArt ].
-                alien sprite: (pane defineSprite: art).
-                self paint: alien sprite kind: kind row: r.
+                    kind: #grunt.
+                spr := pane defineSprite: (self class species at: 1) art.
+                spr addFrame: (self class species at: 1) art2.
+                2 to: self class species size do: [ :k |
+                    spr addFrame: (self class species at: k) art.
+                    spr addFrame: (self class species at: k) art2 ].
+                spr hide.
+                alien sprite: spr.
                 fleet add: alien ] ]
     ]
 
-    paint: aSprite kind: kind row: r [
-        "Each rank gets its own hue, so the fleet reads as ranks at a glance."
-        kind == #butterfly
-            ifTrue: [
-                aSprite colorAt: 1 r: 220 g: 90  b: 240.
-                aSprite colorAt: 2 r: 90  g: 30  b: 120.
-                aSprite colorAt: 3 r: 120 g: 160 b: 255.
-                aSprite colorAt: 4 r: 255 g: 240 b: 120.
-                aSprite colorAt: 5 r: 20  g: 20  b: 40 ]
-            ifFalse: [
-                aSprite colorAt: 1 r: 255 g: 210 b: 60.
-                aSprite colorAt: 2 r: 150 g: 60  b: 20.
-                aSprite colorAt: 3 r: 255 g: 90  b: 60.
-                aSprite colorAt: 4 r: 255 g: 255 b: 220.
-                aSprite colorAt: 5 r: 30  g: 20  b: 10 ]
+    "Dress the fleet for this level: each row becomes one species — its art is
+     already loaded as frames, so this is a frame offset plus its palette."
+    dressFleet [
+        | rowSpecies |
+        rowSpecies := self class themes at: theme.
+        1 to: fleet size do: [ :i | | a row sp |
+            a := fleet at: i.
+            row := (i - 1) // self class cols + 1.
+            sp := self class species at: (rowSpecies at: row).
+            a species: (rowSpecies at: row) name: sp name.
+            sp paint: a sprite ]
     ]
 
     newGame [
         score := 0.
         lives := 3.
         wave := 1.
+        flap := 0.
         gameState := #attract.
         stateTimer := 0.
         self startWave
@@ -344,7 +375,13 @@ Object subclass: Galaxigans [
 
     startWave [
         "Rebuild the fleet's state (the objects persist; a wave is a reset, not
-         a reallocation) and re-arm the timers."
+         a reallocation), pick this level's cosmos and formation, and re-arm the
+         timers. The level table wraps, so wave 13 is level 1's backdrop again —
+         with wave 13's dive cadence."
+        level := (wave - 1) \\ self class levels size + 1.
+        scene := (self class levels at: level) at: 1.
+        theme := (self class levels at: level) at: 2.
+        pane shaderParam: 0 value: scene.
         shipX := self class fieldWidth // 2.
         respawn := 0.
         cooldown := 0.
@@ -354,6 +391,7 @@ Object subclass: Galaxigans [
         bombTimer := self class bombPeriod.
         saucerX := -60. saucerDir := 0. saucerTimer := self class saucerPeriod.
         fleet do: [ :a | a setHomeX: a homeX homeY: a homeY kind: a kind ].
+        self dressFleet.
         bullets := (1 to: 4) collect: [ :i | GxShot empty ].
         bombs := (1 to: 6) collect: [ :i | GxShot empty ].
         sparks := OrderedCollection new
@@ -376,6 +414,25 @@ Object subclass: Galaxigans [
         ^n
     ]
 
+    "Which cosmos and which creatures this level fields — the level table,
+     read back. Used by the battery to walk all twelve."
+    levelReport [
+        | names |
+        names := OrderedCollection new.
+        (self class themes at: theme) do: [ :k |
+            names add: (self class species at: k) name printString ].
+        ^'L', level printString, ' ', (self class sceneNames at: scene + 1),
+         ' [', (names inject: '' into: [ :a :b | a isEmpty ifTrue: [ b ] ifFalse: [ a, ' ', b ] ]), ']'
+    ]
+
+    "Skip to the next wave — the battery's way to walk the level table without
+     playing twelve waves out."
+    forceNextWave [
+        wave := wave + 1.
+        self startWave.
+        gameState := #playing
+    ]
+
     summary [
         ^gameState printString, ' score ', score printString,
          ' lives ', lives printString, ' wave ', wave printString,
@@ -386,7 +443,6 @@ Object subclass: Galaxigans [
 
     step [
         frame := frame + 1.
-        self stepStars.
         gameState == #playing ifTrue: [ self stepPlay ].
         gameState == #attract ifTrue: [ self stepAttract ].
         gameState == #cleared ifTrue: [ self stepCleared ].
@@ -551,7 +607,7 @@ K:Cmin
             ifFalse: [
                 saucerX := saucerX + (saucerDir * 2).
                 (saucerX < -40 or: [ saucerX > (self class fieldWidth + 40) ])
-                    ifTrue: [ saucerDir := 0. saucer moveTo: -80 y: -80 ] ]
+                    ifTrue: [ saucerDir := 0. saucer hide ] ]
     ]
 
     "--- collisions -------------------------------------------------------"
@@ -575,7 +631,7 @@ K:Cmin
                             self burstAt: a x y: a y colour: 23.
                             Sound explode play.
                             a kill.
-                            a sprite moveTo: -60 y: -60 ] ] ] ] ].
+                            a sprite hide ] ] ] ] ].
 
         respawn > 0 ifTrue: [ ^self ].
         bombs do: [ :b |
@@ -586,7 +642,7 @@ K:Cmin
                 ifTrue: [
                     self burstAt: a x y: a y colour: 23.
                     a kill.
-                    a sprite moveTo: -60 y: -60.
+                    a sprite hide.
                     self loseLife ] ]
     ]
 
@@ -621,21 +677,12 @@ K:Cmin
         sparks := keep
     ]
 
-    stepStars [
-        1 to: stars size do: [ :i | | s |
-            s := stars at: i.
-            s at: 2 put: (s at: 2) + (s at: 3).
-            (s at: 2) > self class fieldHeight ifTrue: [
-                s at: 2 put: 0.
-                s at: 1 put: (rng next * self class fieldWidth) truncated ] ]
-    ]
-
     "--- drawing ----------------------------------------------------------"
 
     draw [
-        pane cls: 16.
-        stars do: [ :s |
-            pane point: (s at: 1) y: (s at: 2) color: (s at: 4) ].
+        "Index 0 is transparent, so clearing to it leaves the SHADER visible
+         underneath — the indexed layer carries only the game's own pixels."
+        pane cls: 0.
         sparks do: [ :s |
             pane fill: s x y: s y width: 2 height: 2 color: s colour ].
         bullets do: [ :b |
@@ -650,10 +697,16 @@ K:Cmin
 
     placeSprites [
         "Sprites are placed by their top-left, so everything is drawn from its
-         centre minus half its art."
+         centre minus half its art. The fleet flaps: every eighth frame the
+         whole formation switches to its species' second frame."
+        flap := (frame // 8) \\ 2.
         fleet do: [ :a |
-            a alive ifTrue: [ a sprite moveTo: a x - 8 y: a y - 8 ] ].
+            a alive
+                ifTrue: [ a sprite moveTo: a x - 8 y: a y - 8
+                                   frame: (a frameFor: flap) ]
+                ifFalse: [ a sprite hide ] ].
         saucerDir = 0
+            ifTrue: [ saucer hide ]
             ifFalse: [ saucer moveTo: saucerX - 10 y: 12 ].
         (gameState == #playing and: [ respawn = 0 ])
             ifTrue: [ shipSprite moveTo: shipX - 8 y: self class playerY - 7 ]
@@ -661,7 +714,7 @@ K:Cmin
                 "Blink through the respawn pause instead of vanishing."
                 (respawn > 0 and: [ (respawn // 4) \\ 2 = 0 ])
                     ifTrue: [ shipSprite moveTo: shipX - 8 y: self class playerY - 7 ]
-                    ifFalse: [ shipSprite moveTo: -60 y: -60 ] ]
+                    ifFalse: [ shipSprite hide ] ]
     ]
 
     drawHud [
@@ -672,6 +725,8 @@ K:Cmin
              x: 250 y: 8 r: 255 g: 220 b: 90 scale: 2.
         pane text: 'WAVE ', wave printString
              x: 440 y: 8 r: 140 g: 220 b: 255 scale: 2.
+        pane text: (self class sceneNames at: scene + 1)
+             x: 440 y: 336 r: 150 g: 150 b: 190 scale: 2.
         pane text: 'SHIPS ', lives printString
              x: 10 y: 336 r: 120 g: 200 b: 255 scale: 2.
         gameState == #attract ifTrue: [
@@ -679,9 +734,354 @@ K:Cmin
             pane text: 'SPACE TO START   ARROWS TO STEER'
                  x: 152 y: 200 r: 220 g: 220 b: 255 scale: 2 ].
         gameState == #cleared ifTrue: [
-            pane text: 'WAVE CLEARED' x: 200 y: 160 r: 120 g: 255 b: 140 scale: 4 ].
+            pane text: 'WAVE CLEARED' x: 200 y: 150 r: 120 g: 255 b: 140 scale: 4.
+            pane text: 'NEXT: ', (self class sceneNames
+                                     at: ((self class levels
+                                             at: wave \\ self class levels size + 1)
+                                          at: 1) + 1)
+                 x: 200 y: 200 r: 220 g: 220 b: 255 scale: 2 ].
         gameState == #over ifTrue: [
             pane text: 'GAME OVER' x: 220 y: 160 r: 255 g: 90 b: 90 scale: 4 ]
+    ]
+
+
+    "--- the creature library, the level table, and the cosmos --------------"
+
+    "Ten species, built once. Their art and palettes are the assembler's own."
+    Galaxigans class >> species [
+        "Built one at a time: Array class>>with: stops at five arguments, and
+         ten species is exactly the kind of place that runs out."
+        Species isNil ifTrue: [
+            Species := Array new: 10.
+            Species at: 1  put: self gruntSpecies.
+            Species at: 2  put: self mothSpecies.
+            Species at: 3  put: self beetleSpecies.
+            Species at: 4  put: self scorpionSpecies.
+            Species at: 5  put: self mantisSpecies.
+            Species at: 6  put: self hornetSpecies.
+            Species at: 7  put: self jellyfishSpecies.
+            Species at: 8  put: self spiderSpecies.
+            Species at: 9  put: self stingraySpecies.
+            Species at: 10 put: self squidSpecies ].
+        ^Species
+    ]
+
+    "Formation themes: the species for grid rows 1..5, top row first (and the
+     top row is the toughest). The original ships four themes and rotates them
+     through the level table — classic, then the newer species, then a mix."
+    Galaxigans class >> themes [
+        ^#(
+            #(6 2 1 1 3)      "classic:   hornet moth grunt grunt beetle"
+            #(6 9 2 3 1)      "+ray:      hornet stingray moth beetle grunt"
+            #(10 7 9 8 5)     "new-heavy: squid jellyfish stingray spider mantis"
+            #(7 6 9 4 2)      "full mix:  jellyfish hornet stingray scorpion moth"
+        )
+    ]
+
+    "The level table, ported row for row: {cosmos scene, formation theme}. The
+     scene is which of the twelve backdrops the layer-0 shader draws; levels
+     past the last row wrap it, and the dive cadence keeps tightening."
+    Galaxigans class >> levels [
+        ^#(
+            #(0 1)  #(1 2)  #(2 3)   #(3 4)
+            #(4 1)  #(5 2)  #(6 3)   #(7 4)
+            #(8 1)  #(9 2)  #(10 3)  #(11 4)
+        )
+    ]
+
+    Galaxigans class >> sceneNames [
+        ^#('NEBULA' 'GALAXY' 'BLACK HOLE' 'ALIEN WORLD' 'MOON' 'SUPERNOVA'
+           'WORMHOLE' 'GAS GIANT' 'AURORA' 'PULSAR' 'PLASMA' 'BINARY STARS')
+    ]
+
+    "The twelve cosmos backdrops, as one Metal fragment shader with the scene in
+     shader parameter 0. Translated from the original's HLSL (its starfield
+     module compiles the same twelve scenes for D3D) — same maths, same
+     constants, Metal spelling: frac->fract, lerp->mix, and the aspect the
+     original hardcodes as 1.7778 taken from the uniform instead."
+    Galaxigans class >> cosmosShader [
+        ^'float h21(float2 p) { return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453); }
+
+float3 scNebula(float2 uv, float t) {
+    float px = uv.x * 640.0, py = uv.y * 360.0;
+    float n = sin(px*0.011 + t*0.30) + sin(py*0.014 - t*0.20)
+            + sin((px+py)*0.007 + t*0.15) + sin((px-py)*0.009 - t*0.10);
+    float neb = (n + 4.0) * 0.125;
+    float3 col = float3(0.015 + neb*0.05, 0.010 + neb*0.03, 0.055 + neb*0.20);
+    for (int L = 0; L < 3; L++) {
+        float sp = 16.0 + float(L)*30.0, cell = 13.0 + float(L)*6.0;
+        float2 cp = float2(px, py - t*sp) / cell;
+        float2 gi = floor(cp);
+        float h = h21(gi);
+        if (h > 0.90) {
+            float2 sub = fract(cp) - 0.5;
+            float d = dot(sub, sub);
+            float tw = 0.55 + 0.45*sin(t*3.0 + h*50.0);
+            col += saturate(1.0 - d*55.0) * tw * (0.45 + 0.5*float(L));
+        }
+    }
+    return col;
+}
+
+float3 scGalaxy(float2 uv, float t, float aspect) {
+    float2 c = uv - 0.5; c.x *= aspect;
+    float r = length(c); float a = atan2(c.y, c.x);
+    float spiral = sin(2.0*(a + t*0.15) + 6.5*log(r + 0.06));
+    float arm = smoothstep(0.0, 0.7, spiral) * exp(-r*2.6);
+    float core = exp(-r*r*38.0);
+    float3 col = float3(0.04, 0.02, 0.09);
+    col += arm * float3(0.45, 0.40, 0.85) * 0.7;
+    col += core * float3(1.0, 0.9, 0.7);
+    col += arm * 0.35 * float3(0.8, 0.5, 0.95) * (0.5 + 0.5*sin(r*60.0 - t));
+    float2 sg = c*70.0; float2 sgi = floor(sg); float sh = h21(sgi);
+    float2 ssb = fract(sg) - 0.5; float sd = dot(ssb, ssb);
+    col += (sh > 0.93 ? 1.0 : 0.0) * saturate(1.0 - sd*55.0) * 0.6 * saturate(1.4 - r*2.0);
+    return col;
+}
+
+float3 scBlack(float2 uv, float t, float aspect) {
+    float2 c = uv - 0.5; c.x *= aspect;
+    float r = length(c); float a = atan2(c.y, c.x);
+    float horizon = smoothstep(0.12, 0.105, r);
+    float rr = (r - 0.19)*8.5; float ring = exp(-rr*rr);
+    float swirl = 0.55 + 0.45*sin(a*3.0 - t*2.2 + 22.0*r);
+    float3 disk = ring * swirl * float3(1.0, 0.55, 0.18);
+    float2 lp = c * (1.0 + 0.04/(r*r + 0.02));
+    float2 sg = lp*72.0; float2 sgi = floor(sg); float sh = h21(sgi);
+    float2 ssb = fract(sg) - 0.5; float sd = dot(ssb, ssb);
+    float stars = (sh > 0.95 ? 1.0 : 0.0) * saturate(1.0 - sd*45.0) * smoothstep(0.11, 0.15, r);
+    float3 col = disk + stars*0.7 + float3(0.02, 0.01, 0.03);
+    col *= (1.0 - horizon);
+    return col;
+}
+
+float3 scAlien(float2 uv, float t, float aspect) {
+    float3 sky = mix(float3(0.02,0.05,0.08), float3(0.10,0.03,0.13), uv.y);
+    float2 pc = uv - float2(0.5, 1.18); pc.x *= aspect;
+    float pr = length(pc); float planet = smoothstep(0.63, 0.62, pr);
+    float bands = 0.5 + 0.5*sin(pc.y*34.0 + sin(pc.x*7.0 + t*0.2)*2.2);
+    float3 psurf = mix(float3(0.20,0.45,0.18), float3(0.55,0.70,0.30), bands);
+    float z = sqrt(saturate(0.40 - pr*pr));
+    float lit = saturate(dot(normalize(float3(pc.x, pc.y, z*1.5)),
+                             normalize(float3(-0.5, -0.6, 0.6))));
+    psurf *= 0.25 + 0.95*lit;
+    float3 col = mix(sky, psurf, planet);
+    float st = h21(floor(uv * float2(220.0, 130.0)));
+    col += (st > 0.985 ? 1.0 : 0.0) * (1.0 - planet) * 0.8;
+    float2 mc = uv - float2(0.80, 0.22); mc.x *= aspect; float mr = length(mc);
+    float moon = smoothstep(0.05, 0.045, mr);
+    float ml = saturate(dot(normalize(float3(mc.x, mc.y, 0.05)),
+                            normalize(float3(-0.4, -0.5, 0.7))));
+    col = mix(col, float3(0.55,0.52,0.48) * (0.4 + 0.7*ml), moon);
+    return col;
+}
+
+float craterH(float2 uv) {
+    float h = 0.0;
+    for (int k = 0; k < 3; k++) {
+        float sc = 5.0 * pow(1.8, float(k));
+        float2 p = uv*sc; float2 gi = floor(p); float2 gf = fract(p) - 0.5;
+        float2 off = float2(h21(gi) - 0.5, h21(gi + 3.3) - 0.5) * 0.5;
+        float d = length(gf - off); float rad = 0.16 + 0.16*h21(gi + 7.7);
+        float rim = smoothstep(rad + 0.05, rad, d) * smoothstep(rad - 0.06, rad, d);
+        float bowl = smoothstep(rad, 0.0, d);
+        h += (rim*0.6 - bowl*0.35) / (float(k) + 1.0);
+    }
+    return h;
+}
+
+float3 scMoon(float2 uv, float t, float aspect) {
+    float2 uvp = uv + float2(t*0.008, 0.0); uvp.x *= aspect;
+    float cr = craterH(uvp);
+    float fine = h21(floor(uv * float2(320.0, 180.0))) * 0.05;
+    float3 col = float3(0.22,0.22,0.24) + cr*float3(0.55,0.54,0.58) + fine;
+    return saturate(col);
+}
+
+float3 scNova(float2 uv, float t, float aspect) {
+    float2 c = uv - 0.5; c.x *= aspect;
+    float r = length(c); float a = atan2(c.y, c.x);
+    float ph = fract(t*0.12);
+    float er = (r - ph*0.75)*7.0; float ring = exp(-er*er);
+    float core = exp(-r*r*26.0) * (1.3 - ph);
+    float rays = 0.6 + 0.4*sin(a*20.0 + t);
+    float3 col = float3(0.05, 0.02, 0.05);
+    col += core * float3(1.0, 0.92, 0.7);
+    col += ring * float3(1.0, 0.55, 0.25) * rays;
+    float st = h21(floor(c*55.0));
+    col += (st > 0.95 ? 1.0 : 0.0) * 0.35 * saturate(1.3 - r);
+    return col;
+}
+
+float3 scWormhole(float2 uv, float t, float aspect) {
+    float2 c = uv - 0.5; c.x *= aspect;
+    float r = length(c) + 0.05; float a = atan2(c.y, c.x);
+    float depth = 0.32/r + t*0.6;
+    float ring = 0.5 + 0.5*sin(depth*9.0);
+    float twist = 0.5 + 0.5*sin(a*6.0 + depth*2.5);
+    float3 col = mix(float3(0.02,0.04,0.10), float3(0.20,0.55,0.95), ring*twist);
+    col *= saturate(r*2.6);
+    col += exp(-r*r*55.0) * float3(0.7, 0.85, 1.0);
+    return col;
+}
+
+float3 scGasGiant(float2 uv, float t, float aspect) {
+    float2 c = uv - float2(0.5, 0.44); c.x *= aspect;
+    float r = length(c); float planet = smoothstep(0.32, 0.31, r);
+    float lat = c.y/0.33;
+    float bands = 0.5 + 0.5*sin(lat*15.0 + sin(lat*4.0 + t*0.1)*1.4);
+    float3 surf = mix(float3(0.55,0.42,0.24), float3(0.85,0.72,0.46), bands);
+    float2 sp = c - float2(0.11, -0.04);
+    float spot = smoothstep(0.06, 0.0, length(sp * float2(1.0, 1.7)));
+    surf = mix(surf, float3(0.82,0.32,0.20), spot*0.7);
+    float z = sqrt(saturate(0.105 - r*r));
+    float lit = saturate(dot(normalize(float3(c.x, c.y, z*3.0)),
+                             normalize(float3(-0.5, -0.3, 0.8))));
+    surf *= 0.30 + 0.9*lit;
+    float2 rc = c * float2(1.0, 3.4); float rr = length(rc);
+    float ring = smoothstep(0.40, 0.43, rr) * smoothstep(0.60, 0.57, rr)
+               * (0.55 + 0.45*sin(rr*90.0));
+    float3 col = float3(0.02, 0.02, 0.05);
+    float st = h21(floor(uv * float2(220.0, 130.0)));
+    col += (st > 0.985 ? 1.0 : 0.0) * 0.7;
+    col = mix(col, float3(0.75,0.68,0.52), ring * (1.0 - planet));
+    col = mix(col, surf, planet);
+    return col;
+}
+
+float3 scAurora(float2 uv, float t) {
+    float3 col = float3(0.01, 0.02, 0.05);
+    float st = h21(floor(uv * float2(200.0, 120.0)));
+    col += (st > 0.98 ? 1.0 : 0.0) * 0.6 * smoothstep(0.55, 0.0, uv.y);
+    float fil = 0.62 + 0.38*sin(uv.x*140.0 + sin(uv.y*8.0)*2.0 + t*1.5);
+    for (int i = 0; i < 4; i++) {
+        float fi = float(i);
+        float cx = 0.18 + fi*0.22 + 0.13*sin(uv.y*3.0 + t*0.4 + fi*1.7);
+        float fx = (uv.x - cx)*11.0; float band = exp(-fx*fx);
+        float hh = smoothstep(0.04, 0.42, uv.y) * (1.0 - smoothstep(0.50, 0.96, uv.y));
+        float3 ac = mix(float3(0.1,0.95,0.45), float3(0.45,0.2,0.9), fract(fi*0.37));
+        col += band * hh * fil * ac * 0.75;
+    }
+    return col;
+}
+
+float3 scPulsar(float2 uv, float t, float aspect) {
+    float2 c = uv - 0.5; c.x *= aspect;
+    float r = length(c); float a = atan2(c.y, c.x);
+    float core = exp(-r*r*70.0);
+    float beam = pow(abs(cos(a - t*1.5)), 40.0) + pow(abs(cos(a - t*1.5 + 3.14159)), 40.0);
+    beam *= exp(-r*1.6);
+    float3 col = float3(0.02, 0.03, 0.06);
+    col += core * float3(0.85, 0.92, 1.0);
+    col += beam * float3(0.45, 0.65, 1.0);
+    float st = h21(floor(c*60.0));
+    col += (st > 0.97 ? 1.0 : 0.0) * 0.45;
+    return col;
+}
+
+float3 scPlasma(float2 uv, float t) {
+    float px = uv.x*6.0, py = uv.y*4.0;
+    float v = sin(px + t) + sin(py*1.3 - t*0.7) + sin((px+py)*0.8 + t*0.5)
+            + sin(length(float2(px, py) - 3.0)*2.2 - t);
+    float3 col = 0.5 + 0.5*cos(float3(v, v + 2.1, v + 4.2));
+    col *= float3(0.42, 0.30, 0.52);
+    return col;
+}
+
+float3 scBinary(float2 uv, float t, float aspect) {
+    float2 c = uv - 0.5; c.x *= aspect;
+    float2 s1 = float2(cos(t*0.4), sin(t*0.4)) * 0.16;
+    float2 s2 = -s1;
+    float d1 = length(c - s1), d2 = length(c - s2);
+    float3 col = float3(0.02, 0.02, 0.05);
+    col += exp(-d1*d1*150.0)*float3(1.0,0.8,0.5) + exp(-d1*9.0)*float3(0.35,0.25,0.12);
+    col += exp(-d2*d2*150.0)*float3(0.6,0.8,1.0) + exp(-d2*9.0)*float3(0.16,0.26,0.4);
+    float st = h21(floor(c*52.0));
+    col += (st > 0.97 ? 1.0 : 0.0) * 0.4;
+    return col;
+}
+
+fragment float4 fmain(VOut in [[stage_in]], constant Uniforms& u [[buffer(0)]]) {
+    float t = u.time;
+    int sc = int(u.p[0] + 0.5);
+    float2 uv = in.uv;
+    float a = u.aspect;
+    float3 col;
+    if (sc == 1) col = scGalaxy(uv, t, a);
+    else if (sc == 2) col = scBlack(uv, t, a);
+    else if (sc == 3) col = scAlien(uv, t, a);
+    else if (sc == 4) col = scMoon(uv, t, a);
+    else if (sc == 5) col = scNova(uv, t, a);
+    else if (sc == 6) col = scWormhole(uv, t, a);
+    else if (sc == 7) col = scGasGiant(uv, t, a);
+    else if (sc == 8) col = scAurora(uv, t);
+    else if (sc == 9) col = scPulsar(uv, t, a);
+    else if (sc == 10) col = scPlasma(uv, t);
+    else if (sc == 11) col = scBinary(uv, t, a);
+    else col = scNebula(uv, t);
+    return float4(col, 1.0);
+}'
+    ]
+
+    Galaxigans class >> gruntSpecies [
+        ^GxSpecies name: #grunt
+            art: '................/..A........A..../...1......1...../....122222....../...12333321...../..1234443321..../8.123454432.8.../8.234595432.8.../7.2349A9432.7.../7.123454321.7.../6..1233321..6.../...12.22.21...../..1..1..1..1..../.1...1..1...1.../................/................'
+            art2: '................/...A......A...../....1....1....../....122222....../...12333321...../..1234443321..../6.123454432.6.../7.234595432.7.../8.2349A9432.8.../8.123454321.8.../7..1233321..7.../...12.22.21...../..1..1..1..1..../.1...1..1...1.../................/................'
+            palette: #(32 8 16 196 32 48 232 64 56 255 104 80 255 176 136 128 48 16 200 104 32 240 168 64 48 224 255 255 255 255)
+    ]
+    Galaxigans class >> mothSpecies [
+        ^GxSpecies name: #moth
+            art: '..1.1666.1.1..../...1.676.1....../.1234167614321../12345168651432../1239A1686193A21./12345167651432../1234516861432.../.1234168614321../..123416861432../...1231676132.../....123676321.../.....12676321.../......1676.1..../.......171....../................/................'
+            art2: '....1666.1....../...1.676.1....../...1234674321.../...1235685321.../..1239A6A9321.../..12341686143.../...1234686431.../...12341686431../....123168631.../....1231676321../.....123676321../......1267631.../......1.676.1.../.......171....../................/................'
+            palette: #(32 24 8 96 72 40 144 112 64 192 160 104 232 216 168 72 40 16 128 80 48 184 136 88 255 64 32 255 224 96)
+    ]
+    Galaxigans class >> beetleSpecies [
+        ^GxSpecies name: #beetle
+            art: '......9..9....../.8....19.91....8/..8..1A6A.1..8../...112344211..../..1234545432.1../8.1234565432.18./.1123476743211../.1234565654321../.1234545454321../8.12344544321.8./..1123443211..../8..1123321..8.../.8...12.21...8../..8..1..1..8..../...8.8..8.8...../................'
+            art2: '......9..9....../..8...19.91...8./...8.1A6A.1.8.../...112344211..../...1234545432.1./.8.1234565432.8./.1123455543211../.1234575754321../.1234545454321../.8.12344544321.8/...1123443211.../...81123321.8.../....812.218...../...8.1..1.8...../....8.8..8.8..../................'
+            palette: #(16 8 24 56 32 96 88 48 152 120 72 200 168 120 240 32 16 64 32 192 160 16 160 136 255 192 32 255 48 96)
+    ]
+    Galaxigans class >> scorpionSpecies [
+        ^GxSpecies name: #scorpion
+            art: '8......99......8/78....1991....87/.67..167761..76./..1..16776.1..1./...1234554321.../..123445544321../.12344A55A44321./.12344555554321./.12344544454321./..1234454432.1../...12344432...../....123321..199./....1.221..1991./...1...1...1991./..1.........199./................'
+            art2: '..8.......199.../..78.....1991.../...671..19910.../....16.16991..../...1234554321.../..123445544321../.12344A55A44321./.12344555554321./.12344544454321./..1234454432.1../...12344432...../....123321....../....1.221.1.1.../...1...1.1.1..../..1.....1......./................'
+            palette: #(24 4 0 128 48 16 176 88 24 224 136 40 255 192 80 96 24 8 160 56 16 216 104 40 64 255 128 255 32 32)
+    ]
+    Galaxigans class >> mantisSpecies [
+        ^GxSpecies name: #mantis
+            art: '..8..........8../..78........87../...7.19.91.7..../...8.9A.A9.8..../..87.149941.78../.87...1331...78./.8.1112442111.8./..712345543217../..7.1234543.17../...8.123432.8.../....1234321...../....1234321...../.....12321....../.....12321....../....1.2.21.1..../...1.......1....'
+            art2: '................/....19.91......./....9A.A9......./...149941......./....1331......../.8.1112442111.8./.78.12345543.87./..7.1234543.17../..87.123432.78../...8.1234321.8../...87.12321.78../....1.12321.1.../.....12321....../.....12321....../....1.2.21.1..../...1.......1....'
+            palette: #(8 24 0 32 96 24 56 136 40 88 184 64 144 232 104 16 64 16 44 120 32 76 168 56 255 224 32 16 8 0)
+    ]
+    Galaxigans class >> hornetSpecies [
+        ^GxSpecies name: #hornet
+            art: '88...1991...88../.88.1923291.88../..8.19A6A91.8.../78..1234321..87./78..1634361..87./78..1234321..87./.8..1645461..8../....1234321...../.....16461....../.....12321....../.....16461....../......1231....../......16461...../.......121A...../........1A....../................'
+            art2: '................/....1991......../..8.1923291.8.../.88.19A6A91.88../788.1234321.887./78..1634361..87./78..1234321..87./.8..1645461..8../....1234321...../.....16461....../.....12321....../.....16461....../......1231....../......16A1....../.......1A......./................'
+            palette: #(24 8 0 128 80 0 192 136 0 240 192 32 255 240 128 16 0 0 80 64 48 192 176 160 255 48 16 224 224 255)
+    ]
+    Galaxigans class >> jellyfishSpecies [
+        ^GxSpecies name: #jellyfish
+            art: '....1A....A1..../...1234334321.../..123455554321../.12345566554321./.12455677654421./1234556776554321/1234556666554321/1234455555544321/.112344554431121/.8.18.18.18.18../..8.8..8..8.8.../...9..8..8..9.../...8..9..9..8.../..9...8..8...9../..8...9..9...8../...9...9.9...9..'
+            art2: '.....1AA1......./....123321....../...12455421...../..1234566432..../..1245677542..../.123456776543.../.123456666543.../.123445555443.../.112344444321.../..1123443211..../...8.8.8.8....../....8.9.8.9...../....9.8.9.8...../.....989.89...../......898.9...../.......99.......'
+            palette: #(16 8 40 48 44 112 72 72 168 104 112 216 156 176 255 255 64 192 255 144 224 80 224 224 160 255 255 255 255 255)
+    ]
+    Galaxigans class >> spiderSpecies [
+        ^GxSpecies name: #spider
+            art: '6............6../.7..6....6..7.../..8.7....7.8..../8..87.99.78..8../.8..1.99.1..8.../..8.1234321.8.../...1234543210.../8.12345554321.8./7.12345554321.7./8.12345554321.8./..1234543210..../...12343210...../..8.123210.8..../.8.7.1AA1.7.8.../8..7..AA..7..8../..6........6....'
+            art2: '................/..6........6..../...7.6..6.7...../....87.78......./8..8.99.8..8..../.8..1.99.1.8..../..8.1234321.8.../...1234543210.../.7.12345554321.7/.8.12345554321.8/...1234543210.../....12343210..../...87123218...../..8..1AA1..8..../.8..7.AA.7..8.../..6..8..8..6....'
+            palette: #(16 4 4 72 20 20 120 32 32 168 56 56 216 104 88 48 16 16 96 48 48 144 96 88 255 224 64 255 255 255)
+    ]
+    Galaxigans class >> stingraySpecies [
+        ^GxSpecies name: #stingray
+            art: '......1221....../.....123321...../...112344211..../..1234999432..../.123459A95432.../1234556665432..1/123456777654321./12345677A7654321/.123456777654321/..1234567654321./...12345654321../....123443218.../.....1232.18..../......121.8...../.......1.8....../........8.......'
+            art2: '1..........1..../.12......21...../..1234..4321..../..1234999432..../.123459A95432.../.123455666543.../12345677765432../12345677A765432./123456777654321./.12345677654321./..123456654321../...8123443210.../....81232.1...../.....81.121...../......8.1......./.......8........'
+            palette: #(4 16 24 24 64 88 40 104 136 64 152 184 112 200 224 12 40 56 192 216 224 255 128 32 32 255 176 255 255 255)
+    ]
+    Galaxigans class >> squidSpecies [
+        ^GxSpecies name: #squid
+            art: '......1221....../.....123321...../....12344321..../...1234554321.../...1239AA9321.../...123A99A321.../...1234554321.../...1234554321.../....12333221..../.6..1234421..6../76.16788761.67../87.7.6776.7.78../.8.8.6.6.8.8..../..7.7.6.6.7.7.../.8.8...6...8.8../8.8....6....8.8.'
+            art2: '......1221....../.....123321...../....12344321..../...1234554321.../...1239AA9321.../...123A99A321.../...1234554321.../...1234554321.../....12333221..../....12344321..../...167887761..../..76.67876.67.../.87.8.676.8.78../.8.7.86.68.7.8../..8.8.7.7.8.8.../...87.....78....'
+            palette: #(24 4 32 112 32 88 160 48 128 208 80 168 255 136 208 96 24 72 192 56 136 255 112 192 32 240 240 16 32 48)
     ]
 
     "--- the art ----------------------------------------------------------"

@@ -2018,6 +2018,43 @@ stGpText(p, s, x, y, r, g, b, scale) {
   return p;
 }
 
+// --- layer 0: the shader background, and sprite animation ------------------
+// The pane's bottom layer is a fragment shader compiled at runtime from the
+// game's own MSL (the header supplies VOut and Uniforms{time, aspect, p[8]});
+// a compile error comes back as a logged string, never an abort. Dart games
+// have had this since M4 — these two verbs give Smalltalk the same layer.
+stGpShader(p, src) {
+  _stGpCmds.add(<dynamic>['gpshader', src.toString()]);
+  return p;
+}
+stGpShaderParam(p, i, v) {
+  _stGpCmds.add(<dynamic>['gpparam', i, v]);
+  return p;
+}
+
+// A sprite DEF can carry several frames of the same size; an instance picks one
+// per place. That is how a fleet flaps its wings without a second sprite each.
+stGpAddFrame(p, id, rows) {
+  var e = _stGpSpriteIds[id];
+  if (e == null) return p;
+  _stGpCmds.add(<dynamic>['gpframe', e, rows.toString()]);
+  return p;
+}
+stGpPlaceFrame(p, id, x, y, frame) {
+  var e = _stGpSpriteIds[id];
+  if (e == null) return p;
+  _stGpCmds.add(<dynamic>['gpplace', e, x, y, frame, 1.0, 0.0, 1.0]);
+  return p;
+}
+// Honest hiding: the engine's own visible flag, rather than parking a sprite
+// off-screen and hoping the viewport never grows to meet it.
+stGpHide(p, id) {
+  var e = _stGpSpriteIds[id];
+  if (e == null) return p;
+  _stGpCmds.add(<dynamic>['gphide', e]);
+  return p;
+}
+
 stGpPresent(p) => p; // the driver's tick drain IS the frame boundary
 stGpBlit(p, bytes) {
   if (!_stGpBlitWarned) {

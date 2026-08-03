@@ -413,9 +413,30 @@ headless verification.
 
   It is driven headless in the battery (`st/test/galaxigans_smoke.mst`, tier
   5b): with no window every pane primitive is a no-op, so attract, the fire
-  tap, the dive AI, collision, scoring, death and the game-over reset all run
-  and are asserted on. `Random new` is seeded 1, so the run is identical every
-  time.
+  tap, the dive AI, collision, scoring, death, the game-over reset and every
+  level of the table all run and are asserted on. `Random new` is seeded 1, so
+  the run is identical every time.
+
+  **Second pass — the species library, the levels, and layer 0.** The
+  assembler's ten creatures (`galaxigans_aliens2.was`) port VERBATIM: its art
+  rows are `'.'`-plus-hex, character for character the format `defineSprite:`
+  takes, and its palettes are the comment block above each table. Each of the
+  forty formation sprites is defined once carrying ALL twenty frames (ten
+  species x two flap frames), so a level change is a frame offset and a
+  repaint rather than forty new definitions. That needed two more wire verbs —
+  `Sprite>>addFrame:` (`gpframe`) and `moveTo:y:frame:`/`hide` (`gpplace`
+  frame index / `gphide`) — and the twelve-row level table (cosmos scene +
+  formation theme) came across as literal arrays.
+
+  Layer 0 is now reachable from Smalltalk too (`GamePane>>shader:` /
+  `shaderParam:value:`): the original's twelve HLSL cosmos scenes — nebula,
+  galaxy, black hole, alien world, moon, supernova, wormhole, gas giant,
+  aurora, pulsar, plasma, binary stars — are translated to MSL with the same
+  maths and constants (`frac`->`fract`, `lerp`->`mix`, the hardcoded 1.7778
+  aspect taken from the uniform). The indexed layer clears to index 0
+  (transparent) so the shader shows through, which also retired the game's own
+  plotted starfield: the scenes carry their own parallax stars, exactly as the
+  original's starfield module did.
 - whether the M4 shader layer accepts arbitrary MSL from game files (it is
   compiled at runtime; a bad shader must fail as a logged error, never an
   abort);

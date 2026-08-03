@@ -438,6 +438,19 @@ headless verification.
   frame index / `gphide`) — and the twelve-row level table (cosmos scene +
   formation theme) came across as literal arrays.
 
+  **Third pass — the mine and the dance.** The saucer's rare SPINNING MINE
+  (`galaxigans_mine.was`) drops in place of a bomb about one time in eight, at
+  the original's own ratio, drifts down half a pixel a frame while turning a
+  full circle every 32, and is both threat and treat: it kills the ship on
+  contact and pays 150 to shoot. Its eight rotation frames come across as
+  sprite frames on one definition — the same `addFrame:` the fleet's flap uses.
+  The triumphal VICTORY DANCE (`galaxigans_dance.was`) replaces the flat
+  game-over pause: every survivor leaves formation and orbits the middle of the
+  field on a pinwheel whose radius breathes at half the angular rate, integer
+  sines throughout (the table the dive weave already needed), so it is exactly
+  reproducible and asserted on headless — spread 0 in formation, tens of pixels
+  mid-dance, and CHANGING as it breathes.
+
   Layer 0 is now reachable from Smalltalk too (`GamePane>>shader:` /
   `shaderParam:value:`): the original's twelve HLSL cosmos scenes — nebula,
   galaxy, black hole, alien world, moon, supernova, wormhole, gas giant,

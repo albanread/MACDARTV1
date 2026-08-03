@@ -11,7 +11,7 @@
  Prints one line per check and a final GALAXIGANS OK / GALAXIGANS FAILED — the
  battery (run_all.sh) greps for the OK."
 
-| g fails check tap play |
+| g fails check tap play spread1 spread2 |
 fails := 0.
 check := [ :label :got :want |
     got = want
@@ -68,6 +68,35 @@ g summonSaucer.
 check value: 'the saucer arrives' value: (g saucerReport startsWith: 'saucer at') value: true.
 1 to: 400 do: [ :i | GamePane stepWithKeys: 0 ].
 check value: 'and leaves again' value: g saucerReport value: 'saucer away'.
+
+"The saucer's rare spinning mine: one drop in eight, and it hangs in the field
+ long after a bomb would have gone. Counted rather than sampled — a live count
+ alone would miss one that had already drifted off the bottom."
+g := Galaxigans launch.
+tap value.
+g summonSaucer.
+1 to: 600 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'the saucer drops mines' value: (g mineReport includesSubstring: 'dropped 2') value: true.
+Transcript showCr: '  ', g mineReport.
+
+"The victory dance: the survivors leave their slots and orbit the middle of the
+ field on a breathing pinwheel. In formation every alien sits ON its home row,
+ so the spread from home is 0; mid-dance it is tens of pixels and CHANGES as
+ the radius breathes."
+g := Galaxigans launch.
+tap value.
+1 to: 60 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'in formation, nobody has left home' value: g danceSpread value: 0.
+g danceNow.
+1 to: 30 do: [ :i | GamePane stepWithKeys: 0 ].
+spread1 := g danceSpread.
+1 to: 90 do: [ :i | GamePane stepWithKeys: 0 ].
+spread2 := g danceSpread.
+check value: 'the dance takes them off their slots' value: spread1 > 20 value: true.
+check value: 'and the pinwheel breathes' value: spread1 = spread2 value: false.
+Transcript showCr: '  spread ', spread1 printString, ' then ', spread2 printString.
+check value: 'the dance ends and the game resets' value:
+    ([ 1 to: 500 do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #attract.
 
 "Every level resolves: a cosmos for the shader and five species for the grid,
  walked through the whole table (and one past it, to prove it wraps)."

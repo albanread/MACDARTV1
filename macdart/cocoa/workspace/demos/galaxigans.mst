@@ -26,11 +26,15 @@
  and a 'hard' bit tripling the homing pull. So no two swoops trace the same
  curve, and the fleet's behaviour is emergent rather than scripted.
 
- What is NOT ported (the original's later sprints): the capture boss and its
- tractor beam, the spinning mines, the beam FX layer, the pilot-token row, the
- victory dance, the high-score table and its nano-TCL dev channel. The core loop
- — formation, dives, bombs, bullets, collision, saucer, explosions, lives,
- waves — is all here.
+ Ported since: the ten-species creature library and the twelve-level table with
+ the original's own cosmos shaders (layer 0), the saucer's beating wah-wah, its
+ rare SPINNING MINE (threat and treat — it kills the ship, and it pays 150 to
+ shoot), and the triumphal VICTORY DANCE the survivors perform over the
+ game-over card.
+
+ What is still NOT ported: the capture boss and its tractor beam, the beam FX
+ layer, the pilot-token row, the high-score table and its nano-TCL dev
+ channel.
 
  Controls: Left/Right steer, Space fires (tap, no autofire — the original's
  shoot_held/shoot_release beat). Launch from the GAMES menu, or a Workspace:
@@ -136,6 +140,9 @@ Object subclass: Galaxigan [
         ^false
     ]
 
+    "Put me exactly here — the victory dance flies the fleet itself."
+    moveToX: ax y: ay [ x := ax. y := ay. bank := 0 ]
+
     "Re-enter from above, ready to glide back into my slot."
     reenterAt: swayX [
         state := #return. dt := 0. x := homeX + swayX. y := -20
@@ -179,6 +186,45 @@ Object subclass: GxShot [
 
     hits: tx y: ty halfWidth: hw halfHeight: hh [
         ^live and: [ (x - tx) abs < hw and: [ (y - ty) abs < hh ] ]
+    ]
+]
+
+
+"--- the saucer's rare spinning mine ---"
+"I am a space mine: the bonus saucer drops me instead of a bomb about one time
+ in eight. I drift down slowly, spinning, and I am both threat and treat —
+ touching the ship kills it, shooting me pays 150. The original files me under
+ 'the rare spinning mine the saucer sometimes drops' and gives me eight
+ rotation frames; I turn one full circle every 32 frames."
+Object subclass: GxMine [
+    | x y anim live sprite |
+
+    GxMine class >> empty [ ^self new setDead ]
+    setDead [ live := false. x := 0. y := 0. anim := 0. ^self ]
+
+    x [ ^x ]
+    y [ ^y ]
+    live [ ^live ]
+    kill [ live := false ]
+    sprite [ ^sprite ]
+    sprite: s [ sprite := s ]
+    "Eight frames, advancing every fourth tick."
+    frame [ ^(anim // 4) \\ 8 ]
+
+    dropAt: ax y: ay [ x := ax. y := ay. anim := 0. live := true ]
+
+    "Half a pixel a frame: it drifts DOWN on the odd ticks only, so it hangs in
+     the field far longer than a bomb and has to be dealt with."
+    stepIn: fieldH [
+        live ifFalse: [ ^false ].
+        anim := anim + 1.
+        (anim bitAnd: 1) = 1 ifTrue: [ y := y + 1 ].
+        y > (fieldH + 8) ifTrue: [ live := false. ^false ].
+        ^true
+    ]
+
+    hits: tx y: ty halfWidth: hw halfHeight: hh [
+        ^live and: [ (x - tx) abs < (hw + 8) and: [ (y - ty) abs < (hh + 8) ] ]
     ]
 ]
 
@@ -252,8 +298,10 @@ Object subclass: Galaxigans [
     | pane rng gameState stateTimer frame
       shipX shipSprite lives score hiScore wave respawn
       fleet swayX swayDir diveTimer bombTimer
-      bullets bombs sparks level scene theme flap
-      saucer saucerX saucerDir saucerTimer saucerWah cooldown fireWasDown |
+      bullets bombs mines sparks level scene theme flap danceT
+      mineDrops saucerDrops
+      saucer saucerX saucerDir saucerTimer saucerWah saucerBombT
+      cooldown fireWasDown |
 
     "--- the field, straight from the original's galaxigans_data.inc ---"
     Galaxigans class >> fieldWidth [ ^640 ]
@@ -272,10 +320,23 @@ Object subclass: Galaxigans [
     Galaxigans class >> divePeriod [ ^60 ]
     Galaxigans class >> bombPeriod [ ^22 ]
     Galaxigans class >> saucerPeriod [ ^420 ]
+    "The triumphal dance (galaxigans_dance.was): the survivors orbit the middle
+     of the field on a breathing-radius pinwheel while the game-over card sits
+     over them. Centre is the field's, the radius breathes R0 +/- R1, and each
+     alien is offset around the wheel by its index."
+    Galaxigans class >> danceCX [ ^320 ]
+    Galaxigans class >> danceCY [ ^180 ]
+    Galaxigans class >> danceR0 [ ^95 ]
+    Galaxigans class >> danceR1 [ ^70 ]
+    Galaxigans class >> danceAngleStep [ ^6 ]
+    Galaxigans class >> danceRadStep [ ^10 ]
+    Galaxigans class >> danceLength [ ^420 ]
     "The original flies its saucer at y=20; here the HUD's own row is up there
      (5x7 at scale 2 = fourteen pixels from y=8), so it crosses just below,
      clear of the score."
     Galaxigans class >> saucerY [ ^30 ]
+    Galaxigans class >> saucerBombGap [ ^28 ]
+    Galaxigans class >> mineScore [ ^150 ]
 
     Galaxigans class >> launch [
         "Open the pane and start a new game."
@@ -349,6 +410,20 @@ Object subclass: Galaxigans [
         saucer colorAt: 4 r: 255 g: 220 b: 90.
         saucer hide.
 
+        "Six mines, each a sprite carrying all eight spin frames."
+        mines := (1 to: 6) collect: [ :i | GxMine empty ].
+        mines do: [ :m | | spr pal |
+            spr := pane defineSprite: (self class mineArt at: 1).
+            2 to: 8 do: [ :k | spr addFrame: (self class mineArt at: k) ].
+            pal := self class minePalette.
+            1 to: 8 do: [ :k |
+                spr colorAt: k
+                    r: (pal at: (k - 1) * 3 + 1)
+                    g: (pal at: (k - 1) * 3 + 2)
+                    b: (pal at: (k - 1) * 3 + 3) ].
+            spr hide.
+            m sprite: spr ].
+
         fleet := OrderedCollection new.
         1 to: self class rows do: [ :r |
             1 to: self class cols do: [ :c | | alien spr |
@@ -407,10 +482,13 @@ Object subclass: Galaxigans [
         bombTimer := self class bombPeriod.
         saucerX := -60. saucerDir := 0. saucerTimer := self class saucerPeriod.
         saucerWah := 0.
+        saucerBombT := self class saucerBombGap.
         fleet do: [ :a | a setHomeX: a homeX homeY: a homeY kind: a kind ].
         self dressFleet.
         bullets := (1 to: 4) collect: [ :i | GxShot empty ].
         bombs := (1 to: 6) collect: [ :i | GxShot empty ].
+        mines do: [ :m | m kill ].
+        mineDrops := 0. saucerDrops := 0.
         sparks := OrderedCollection new
     ]
 
@@ -445,6 +523,33 @@ Object subclass: Galaxigans [
     "Send the bonus saucer across now, instead of waiting out its 420-frame
      timer — for a test, or for anyone who wants to hear the warble."
     summonSaucer [ saucerTimer := 1 ]
+
+    "Start the victory dance now, without dying three times for it."
+    danceNow [
+        gameState := #over.
+        stateTimer := self class danceLength.
+        danceT := 0
+    ]
+
+    "How many mines are in the field, and where the fleet is relative to its
+     formation — the two new features, readable for the battery."
+    mineReport [
+        | n |
+        n := 0.
+        mines do: [ :m | m live ifTrue: [ n := n + 1 ] ].
+        ^'mines ', n printString, ' (dropped ', mineDrops printString,
+         ' of ', saucerDrops printString, ' saucer drops)'
+    ]
+
+    "How far the fleet has left its slots: 0 in formation, large mid-dance."
+    danceSpread [
+        | d n |
+        d := 0. n := 0.
+        fleet do: [ :a |
+            a alive ifTrue: [
+                d := d + (a y - a homeY) abs. n := n + 1 ] ].
+        ^n = 0 ifTrue: [ 0 ] ifFalse: [ d // n ]
+    ]
 
     "Where the saucer is and whether its warble is running — for the battery."
     saucerReport [
@@ -502,12 +607,35 @@ K:Cmin
             self startWave ]
     ]
 
+    "Game over: the survivors break formation and dance. Ported from the
+     original's AlienDance — the angle steps once a frame plus each alien's own
+     offset around the wheel, and the radius breathes at HALF that rate, so the
+     pinwheel opens and closes as it turns. Integer sines throughout (the same
+     256-entry table the dive weave uses), so it is exactly reproducible."
     stepOver [
         stateTimer := stateTimer - 1.
+        danceT := danceT + 1.
+        self dance.
         self stepSparks.
         stateTimer <= 0 ifTrue: [
             score > hiScore ifTrue: [ hiScore := score ].
             self newGame ]
+    ]
+
+    dance [
+        | i |
+        i := 0.
+        fleet do: [ :a |
+            a alive ifTrue: [ | radius angle |
+                radius := self class danceR0 +
+                    ((Galaxigans sineAt: (danceT // 2) + (i * self class danceRadStep))
+                        * self class danceR1 // 256).
+                angle := danceT + (i * self class danceAngleStep).
+                a moveToX: self class danceCX +
+                        ((Galaxigans sineAt: angle + 64) * radius // 256)
+                  y: self class danceCY +
+                        ((Galaxigans sineAt: angle) * radius // 256).
+                i := i + 1 ] ]
     ]
 
     stepPlay [
@@ -519,6 +647,7 @@ K:Cmin
         self swayFleet.
         self stepFleet.
         self stepSaucer.
+        self stepMines.
         self stepSparks.
         self checkCollisions.
         (fleet anySatisfy: [ :a | a alive ]) ifFalse: [
@@ -637,8 +766,37 @@ K:Cmin
             ifFalse: [
                 saucerX := saucerX + (saucerDir * 2).
                 self warble.
+                self saucerDrop.
                 (saucerX < -40 or: [ saucerX > (self class fieldWidth + 40) ])
                     ifTrue: [ saucerDir := 0. saucer hide ] ]
+    ]
+
+    "The saucer lobs something from its belly every 28 frames while it is over
+     the field — and about one drop in eight is a MINE rather than a bomb, which
+     is the original's own ratio (Rng & 7). The rare one is the interesting one:
+     a bomb is gone in two seconds, a mine hangs there."
+    saucerDrop [
+        (saucerX < 0 or: [ saucerX > (self class fieldWidth - 16) ]) ifTrue: [ ^self ].
+        saucerBombT := saucerBombT - 1.
+        saucerBombT > 0 ifTrue: [ ^self ].
+        saucerBombT := self class saucerBombGap.
+        saucerDrops := saucerDrops + 1.
+        (rng next * 8) truncated = 0
+            ifTrue: [
+                mines do: [ :m |
+                    m live ifFalse: [
+                        m dropAt: saucerX y: self class saucerY + 12.
+                        mineDrops := mineDrops + 1.
+                        ^self ] ] ]
+            ifFalse: [
+                bombs do: [ :b |
+                    b live ifFalse: [
+                        b fireFrom: saucerX y: self class saucerY + 12 dy: 4.
+                        ^self ] ] ]
+    ]
+
+    stepMines [
+        mines do: [ :m | m stepIn: self class fieldHeight ]
     ]
 
     "The saucer's wah-wah: two sines five Hz apart, beating against each other.
@@ -676,7 +834,24 @@ K:Cmin
                             a kill.
                             a sprite hide ] ] ] ] ].
 
+        "Shooting a mine is the treat: 150, the best points on the screen."
+        bullets do: [ :b |
+            b live ifTrue: [
+                mines do: [ :m |
+                    (b live and: [ m hits: b x y: b y halfWidth: 4 halfHeight: 4 ])
+                        ifTrue: [
+                            b kill.
+                            m kill.
+                            m sprite hide.
+                            score := score + self class mineScore.
+                            self burstAt: m x y: m y colour: 22.
+                            Sound bang play ] ] ] ].
+
         respawn > 0 ifTrue: [ ^self ].
+        "And touching one is the threat."
+        mines do: [ :m |
+            (m hits: shipX y: self class playerY halfWidth: 6 halfHeight: 6)
+                ifTrue: [ m kill. m sprite hide. self loseLife ] ].
         bombs do: [ :b |
             (b hits: shipX y: self class playerY halfWidth: 8 halfHeight: 10)
                 ifTrue: [ b kill. self loseLife ] ].
@@ -695,7 +870,10 @@ K:Cmin
         lives := lives - 1.
         respawn := 90.
         shipX := self class fieldWidth // 2.
-        lives <= 0 ifTrue: [ gameState := #over. stateTimer := 180 ]
+        lives <= 0 ifTrue: [
+            gameState := #over.
+            stateTimer := self class danceLength.
+            danceT := 0 ]
     ]
 
     "--- explosions -------------------------------------------------------"
@@ -748,6 +926,10 @@ K:Cmin
                 ifTrue: [ a sprite moveTo: a x - 8 y: a y - 8
                                    frame: (a frameFor: flap) ]
                 ifFalse: [ a sprite hide ] ].
+        mines do: [ :m |
+            m live
+                ifTrue: [ m sprite moveTo: m x - 8 y: m y - 8 frame: m frame ]
+                ifFalse: [ m sprite hide ] ].
         saucerDir = 0
             ifTrue: [ saucer hide ]
             ifFalse: [ saucer moveTo: saucerX - 10 y: self class saucerY ].
@@ -784,7 +966,9 @@ K:Cmin
                                           at: 1) + 1)
                  x: 200 y: 200 r: 220 g: 220 b: 255 scale: 2 ].
         gameState == #over ifTrue: [
-            pane text: 'GAME OVER' x: 220 y: 160 r: 255 g: 90 b: 90 scale: 4 ]
+            pane text: 'GAME OVER' x: 220 y: 160 r: 255 g: 90 b: 90 scale: 4.
+            pane text: 'SCORE ', score printString
+                 x: 236 y: 210 r: 255 g: 220 b: 120 scale: 2 ]
     ]
 
 
@@ -1125,6 +1309,28 @@ fragment float4 fmain(VOut in [[stage_in]], constant Uniforms& u [[buffer(0)]]) 
             art: '......1221....../.....123321...../....12344321..../...1234554321.../...1239AA9321.../...123A99A321.../...1234554321.../...1234554321.../....12333221..../.6..1234421..6../76.16788761.67../87.7.6776.7.78../.8.8.6.6.8.8..../..7.7.6.6.7.7.../.8.8...6...8.8../8.8....6....8.8.'
             art2: '......1221....../.....123321...../....12344321..../...1234554321.../...1239AA9321.../...123A99A321.../...1234554321.../...1234554321.../....12333221..../....12344321..../...167887761..../..76.67876.67.../.87.8.676.8.78../.8.7.86.68.7.8../..8.8.7.7.8.8.../...87.....78....'
             palette: #(24 4 32 112 32 88 160 48 128 208 80 168 255 136 208 96 24 72 192 56 136 255 112 192 32 240 240 16 32 48)
+    ]
+
+    Galaxigans class >> mineArt [
+        "The spinning mine's eight rotation frames, lifted from the
+         original's galaxigans_mineart.was. Frame = (anim >> 2) & 7, so it
+         turns a full circle every 32 frames."
+        ^#(
+            '................/.......77......./......7887....../...26.7887.62.../...6661111666.../....61544416..../....15444431..../.26614444331662./.26614443331662./....14433321..../....61333216..../...6661111666.../...26..66..62.../.......66......./.......22......./................'
+            '................/.......22......./.......66......./...26..66.787.../...6661111888.../....614554187.../....14444441..../.26614444441662./.26613333331662./....13333331..../....61322316..../...6661111666.../...26..66..62.../.......66......./.......22......./................'
+            '................/.......22......./.......66......./...26..66..62.../...6661111666.../....61444516..../....1344445177../.26613344441887./.26613334441887./....1233344177../....61233316..../...6661111666.../...26..66..62.../.......66......./.......22......./................'
+            '................/.......22......./.......66......./...26..66..62.../...6661111666.../....61334416..../....13334441..../.26612334451662./.26612344451662./....13334441..../....613344187.../...6661111888.../...26..66.787.../.......66......./.......22......./................'
+            '................/.......22......./.......66......./...26..66..62.../...6661111666.../....61233316..../....12333441..../.26613334441662./.26613344441662./....13444451..../....61444516..../...6661111666.../...26.7887.62.../......7887....../.......77......./................'
+            '................/.......22......./.......66......./...26..66..62.../...6661111666.../....61322316..../....13333331..../.26613334331662./.26614444441662./....14444441..../...781455416..../...8881111666.../...787.66..62.../.......66......./.......22......./................'
+            '................/.......22......./.......66......./...26..66..62.../...6661111666.../....61333216..../..7714433321..../.78814443331662./.78814444331662./..7715444431..../....61544416..../...6661111666.../...26..66..62.../.......66......./.......22......./................'
+            '................/.......22......./.......66......./...787.66..62.../...8881111666.../...781443316..../....14443331..../.26615443321662./.26615443321662./....14443331..../....61443316..../...6661111666.../...26..66..62.../.......66......./.......22......./................'
+        )
+    ]
+
+    Galaxigans class >> minePalette [
+        "Dark metal ramp, spike grey, and the red trigger light — the
+         original's minePal, slot 9."
+        ^#(24 24 32 48 56 64 80 88 104 120 128 144 176 184 200 96 104 120 128 32 24 255 64 48)
     ]
 
     "--- the art ----------------------------------------------------------"

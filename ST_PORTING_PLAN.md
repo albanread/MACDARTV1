@@ -394,3 +394,54 @@ control, exceptions, reflection.
 
 Every gap the self-validating suites surfaced (14 fixes above) is now green.
 The suites stand at **6 suites / 188 assertions**, part of the pre-push battery.
+
+## 9c. Open engine gap — the class side is SILENT on a miss
+
+A class-side send that resolves to nothing answers `nil`; an instance-side one
+raises `doesNotUnderstand`. Smalltalk's whole dispatch story hangs off dNU, so
+the class side being mute is a semantic hole, and it is an active bug-hider:
+it concealed four standard constructors that were simply never defined —
+`with:` on OrderedCollection/Set/Bag and `WriteStream with:`, all evaluating
+to nil at every call — plus `Transcript basicPrint:`, which the
+primitive-coverage probe had been recording as "printed, survived" about a
+send that only ever did the surviving. Those five are now fixed and pinned by
+`features/test_class_side.mst`. **The silence is not fixed**, because closing
+it uncovers a deeper bug it had been masking.
+
+Minimal repro (with the fallback routed to a raising helper):
+
+```smalltalk
+| c |
+c := [ Set totallyBogusSelector ].
+[ c value ] on: Error do: [ :e | nil ].
+'foo' asUppercase        "-> at:put: lands on a Type, not a String"
+```
+
+What is known:
+
+- The FIRST exception raised out of a class-side miss **through a first-class
+  block** leaves class-value dispatch broken. Afterwards the world's own
+  `self class new: n` idiom (`String>>asUppercase`) answers the class instead
+  of an instance, so `at:put:` is sent to a Type. Damage surfaces in code that
+  never went near the bad send — whole suites later.
+- Raise any other exception through that same shape first (`1 // 0` /
+  ZeroDivide) and the class-side miss is then harmless. One-time-init plus
+  re-entrancy.
+- Both throw flavours corrupt — an ST `Error` via `stError`, and a Dart
+  `NoSuchMethodError` via `stSend` — so it is the RE-ENTRY into class dispatch
+  while the failed lookup is still in flight, not the exception kind.
+- Ruled out by experiment: the `g_cls_decide` decision cache
+  (`MACDART_CLS_DECIDE=0` still corrupts), JIT warm-up (20k raises, then the
+  send is clean), sharing a call site with the hot instance-send helper (a
+  dedicated `stSendClass` corrupts identically), and the library additions
+  (removing them changes nothing).
+- Inline `[ ... ] on: Error do: [ ... ]` does NOT corrupt; the block must be
+  first-class (stored in a variable, then `value`d).
+
+Silence is bad; intermittent corruption of unrelated String code is worse, so
+the fallback stays soft until the re-entrancy is fixed. The likely shape of the
+fix is to make the miss path allocate nothing and resolve nothing — pre-build
+the dNU error at world-load time, or hand the raise off to a point where class
+dispatch is no longer in flight — then flip `st_flow_graph_builder.cc`'s
+fallback to the raising helper and restore the raise/message assertions to
+`test_class_side.mst`.

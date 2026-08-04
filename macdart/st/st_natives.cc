@@ -419,8 +419,28 @@ static void STSendCommon(Dart_NativeArguments args, bool probe) {
     }
     if (fn.IsNull()) {
       if (!probe) {
-        err = "stSend: " + std::string(cls.ToCString()) +
-              " has no method '" + selector + "'";
+        // Name the receiver the way a Smalltalk programmer would. On a
+        // CLASS-side miss the receiver is the class VALUE — a Type — whose
+        // Dart class is the internal `_Type`, so the honest-but-useless
+        // "Class _Type@0150898 has no method 'today'" was all you got. Say
+        // "Date class" instead: the metaclass split is how these sends
+        // resolve, so it is also literally what missed.
+        std::string who;
+        if (recv.IsType()) {
+          const Class& tc = Class::Handle(zone, Type::Cast(recv).type_class());
+          who = std::string(String::Handle(zone, tc.Name()).ToCString());
+          // Drop the " ext" holder suffix: Dart's String/int are sealed, so
+          // Smalltalk's protocol for them lives in `Object ext`-style holder
+          // classes. That is an implementation detail of the bridge and has
+          // no business in an error a Smalltalk programmer reads — same
+          // stripping the class-reporting path already does.
+          const size_t n = who.size();
+          if (n >= 4 && who.compare(n - 4, 4, " ext") == 0) who.erase(n - 4);
+          who += " class";
+        } else {
+          who = std::string(cls.ToCString());
+        }
+        err = "stSend: " + who + " has no method '" + selector + "'";
       }
     } else {
       const Array& arr = Array::Handle(zone, Array::New(n + 1));

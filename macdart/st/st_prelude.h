@@ -204,6 +204,14 @@ Object subclass: Transcript [
     Transcript class >> show: s [ <stprim: stTrShow> ]
     Transcript class >> cr [ <stprim: stTrCr> ]
     Transcript class >> showCr: s [ Transcript show: s. Transcript cr ]
+    "basicPrint: is the low-level write the world's TranscriptStream defines
+     show: in terms of, and portable code reaches for it directly. THIS
+     Transcript — the prelude class — is what the name resolves to, not the
+     world's `Transcript := TranscriptStream new` instance, so it needs its
+     own. It answered nil in silence until class-side doesNotUnderstand
+     started speaking: the primitive-coverage probe had been asserting
+     'printed, survived' about a send that only ever did the surviving."
+    Transcript class >> basicPrint: s [ Transcript show: s ]
 ]
 )PRELUDE";
 

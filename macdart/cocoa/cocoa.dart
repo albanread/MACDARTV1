@@ -557,10 +557,18 @@ final List _stNoArgs = const [];
 stSendExt0(receiver, String selector) => stSendExt(receiver, selector, _stNoArgs);
 
 /// Like stSendExt but GRACEFUL on a total miss: answers nil instead of throwing.
-/// The class-name send fallback uses it so a reflective send that resolves
-/// (`Integer superclass`) works, while a genuinely unknown class-side send
-/// (`Transcript basicPrint:`) answers nil exactly as the old compile-time
-/// bailout did — no surprise doesNotUnderstand where there used to be none.
+/// The SOFT send: "invoke this if it exists". For genuinely optional protocol
+/// — the app runner asking a user class for a `stop` it need not define — where
+/// absence is an expected answer, not an error.
+///
+/// It is ALSO still the compiled class-send fallback, and there it is wrong:
+/// an undefined class-side selector answers nil in silence rather than raising
+/// doesNotUnderstand, which hid four missing library methods (`with:` on the
+/// growable collections, `WriteStream with:`) until someone probed for them.
+/// Closing that hole exposed a re-entrancy bug it had been masking — see the
+/// KNOWN GAP note at the class-send fallback in st_flow_graph_builder.cc — so
+/// the silence stays until that is fixed. For a genuinely optional send this
+/// function is the right tool; for the class fallback it is a placeholder.
 stSendExtOrNil(receiver, String selector, List args) {
   var hit = _stExtSendTry(receiver, selector, args);
   if (hit != null) return hit[0];

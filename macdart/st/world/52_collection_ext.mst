@@ -63,6 +63,27 @@ Object subclass: Collection [
     Collection class >> withAll: aCollection <Collection> ^ <Self> [
         ^self new addAll: aCollection; yourself
     ]
+
+    "The `with:` family — the everyday literal constructor (`Set with: 1
+     with: 2`). Array and String define their own on the fixed-size shape;
+     these are the growable ones, and until now they did not exist AT ALL.
+     Nobody noticed because a missing class-side selector used to answer nil
+     in silence rather than raising doesNotUnderstand, so `OrderedCollection
+     with: 3` quietly evaluated to nil for as long as the class has existed.
+     The dNU hole is closed; these are the methods it was hiding."
+    Collection class >> with: a <Object> ^ <Self> [
+        ^self new add: a; yourself
+    ]
+    Collection class >> with: a <Object> with: b <Object> ^ <Self> [
+        ^self new add: a; add: b; yourself
+    ]
+    Collection class >> with: a <Object> with: b <Object> with: c <Object> ^ <Self> [
+        ^self new add: a; add: b; add: c; yourself
+    ]
+    Collection class >> with: a <Object> with: b <Object> with: c <Object>
+                       with: d <Object> ^ <Self> [
+        ^self new add: a; add: b; add: c; add: d; yourself
+    ]
 ]
 
 ArrayedCollection subclass: Array [

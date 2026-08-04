@@ -22,9 +22,24 @@ Object subclass: WriteStream [
         s setOn: aCollection.
         ^s
     ]
+    "`with:` is `on:`'s appending twin: the stream starts at the END of what
+     it is given, so writes extend the existing contents instead of
+     overwriting them from zero. Standard protocol, and it was missing —
+     `WriteStream with: 'abc'` answered nil in silence until class-side
+     doesNotUnderstand started speaking up."
+    WriteStream class >> with: aCollection <SequenceableCollection> ^ <WriteStream> [
+        | s |
+        s := self basicNew.
+        s setOn: aCollection.
+        s setToEnd.
+        ^s
+    ]
     setOn: aCollection <SequenceableCollection> [
         collection := aCollection.
         position := 0.
+    ]
+    setToEnd [
+        position := collection size.
     ]
     grow [
         self growTo: (collection size max: 4) * 2.

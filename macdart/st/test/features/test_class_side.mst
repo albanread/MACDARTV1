@@ -1,0 +1,77 @@
+"Feature test: the class-side constructors that a dispatch hole had been
+ hiding.
+
+ A class-side send that resolves to nothing answers nil instead of raising
+ doesNotUnderstand (the KNOWN GAP at the class-send fallback in
+ st_flow_graph_builder.cc — closing it exposes a re-entrancy bug, so it stays
+ open for now). Instance sends have always raised; the class side does not.
+ The cost of that silence was four standard constructors that were simply
+ never defined, and which every caller therefore evaluated to nil: `with:` on
+ OrderedCollection/Set/Bag, and `WriteStream with:`. Nothing complained, so
+ nobody looked.
+
+ These assertions are the fix, pinned. They are worth having on their own
+ merit, and when the fallback is finally made loud they become its regression
+ net too."
+STestCase subclass: TestClassSide [
+    tests [
+        "--- the `with:` family on the GROWABLE collections ---
+             Array and String always had their own (the fixed-size shape:
+             `new:` then at:put:). These inherit from Collection class, which
+             builds with `self new` + add:."
+        self check: (Set with: 1) size is: 1 label: 'Set with:'.
+        self check: (Set with: 1 with: 2) size is: 2 label: 'Set with:with:'.
+        self check: (Set with: 1 with: 1) size is: 1 label: 'Set with: dedupes'.
+        self check: (OrderedCollection with: 3) first is: 3
+             label: 'OrderedCollection with:'.
+        self check: (OrderedCollection with: 1 with: 2) size is: 2
+             label: 'OrderedCollection with:with:'.
+        self check: (OrderedCollection with: 1 with: 2 with: 3) last is: 3
+             label: 'OrderedCollection with:with:with:'.
+        self check: (OrderedCollection with: 1 with: 2 with: 3 with: 4) size is: 4
+             label: 'OrderedCollection with: x4'.
+        self check: (Bag with: 5) size is: 1 label: 'Bag with:'.
+        self check: (Bag with: 5 with: 5) size is: 2
+             label: 'Bag with: keeps duplicates'.
+
+        "Argument order is preserved for the sequenceable one — add: in order,
+         not reversed."
+        self check: (OrderedCollection with: 'a' with: 'b') first is: 'a'
+             label: 'with: preserves argument order'.
+
+        "The inherited factory must build the SUBCLASS, not Collection — the
+         same trap `withAll:` fell into once, where `self new` from an
+         inherited factory took a bare-basicNew path that skipped the
+         subclass's own init."
+        self assert: ((Set with: 1) isKindOf: Set) label: 'with: answers a Set'.
+        self assert: ((OrderedCollection with: 1) isKindOf: OrderedCollection)
+             label: 'with: answers an OrderedCollection'.
+        self assert: ((Bag with: 1) isKindOf: Bag) label: 'with: answers a Bag'.
+
+        "The fixed-size ones keep their own versions — the bridge table for the
+         1-arg String case, the ST methods above it for the rest."
+        self check: (Array with: 1 with: 2) size is: 2 label: 'Array with: still works'.
+        self check: (String with: $a) is: 'a' label: 'String with: still works'.
+        self check: (String with: $a with: $b) is: 'ab' label: 'String with:with:'.
+
+        "--- WriteStream with:, `on:`'s appending twin ---
+             on: starts at zero and overwrites; with: starts at the END, so
+             writes extend what is already there."
+        self check: ((WriteStream with: 'abc') nextPutAll: 'de'; contents) is: 'abcde'
+             label: 'WriteStream with: appends'.
+        self check: ((WriteStream on: String new) nextPutAll: 'de'; contents) is: 'de'
+             label: 'WriteStream on: still starts empty'.
+        self check: (WriteStream with: '') contents is: ''
+             label: 'WriteStream with: an empty seed'.
+
+        "--- Transcript basicPrint: ---
+             The low-level write the world's TranscriptStream defines show: in
+             terms of. The name `Transcript` resolves to the PRELUDE class, not
+             to the world's `Transcript := TranscriptStream new` instance, and
+             the prelude class did not have it — so the primitive-coverage
+             probe had been asserting 'printed, survived' about a send that
+             only ever did the surviving."
+        self assert: (Transcript basicPrint: '') notNil
+             label: 'basicPrint: answers something'.
+    ]
+]

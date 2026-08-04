@@ -616,6 +616,42 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
   // self-healing — the next optimized-compile request re-creates the thread.
   BackgroundCompiler::Stop(Thread::Current()->isolate());
 
+  // LAZY-PARSE GUARD (the class-side-dNU corruption, 2026-08-04). Core-
+  // snapshot classes finalize their MEMBERS lazily: _Type boots with
+  // is_finalized()=false and functions()=empty, and the patched
+  // _Type.noSuchMethod (runtime/lib/type_patch.dart — the hook that gives a
+  // Smalltalk class value its class-side dispatch) only comes into existence
+  // when Class::EnsureIsFinalized runs Compiler::CompileClass over it. The ST
+  // engine, however, must use the OTHER finalizer on its own classes
+  // (ClassFinalizer::FinalizeClass — types only, no member parse; ST classes
+  // have no token stream for the Dart parser), and finalizing an ST holder
+  // CASCADES through its signature/super types into marking _Type finalized
+  // — with its members never parsed, and EnsureIsFinalized a no-op from then
+  // on. The patch method becomes permanently unreachable: every noSuchMethod
+  // dispatcher parsed afterwards static-binds Object.noSuchMethod (the
+  // parser's documented fallback), class values lose class-side dispatch, and
+  // `Behavior new:`'s stub answers the TYPE ITSELF for `self class new: n` —
+  // corrupting String>>asUppercase and friends whole test-suites away from
+  // the cause. Which sends died depended on nothing more than whether
+  // anything had happened to look at _Type before the first ST ext-walk ran.
+  //
+  // So: force the FULL finalization of the Type family (and Object, the NSM
+  // root) BEFORE any ST class is loaded or finalized. Idempotent, ~zero cost
+  // after the first call, and it makes the boot deterministic instead of a
+  // race between whoever touches _Type first.
+  {
+    Thread* thread = Thread::Current();
+    Zone* zone = thread->zone();
+    Class& c = Class::Handle(
+        zone, thread->isolate()->class_table()->At(kTypeCid));
+    Error& err = Error::Handle(zone);
+    while (!c.IsNull()) {
+      err = c.EnsureIsFinalized(thread);
+      if (!err.IsNull()) break;  // never seen; the guard must not break loads
+      c = c.SuperClass();
+    }
+  }
+
   // Any load can add or replace methods — stale (cid -> Function) dispatch
   // cache entries would then dispatch to the OLD method body.
   ClearSendCache();

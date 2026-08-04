@@ -557,18 +557,53 @@ final List _stNoArgs = const [];
 stSendExt0(receiver, String selector) => stSendExt(receiver, selector, _stNoArgs);
 
 /// Like stSendExt but GRACEFUL on a total miss: answers nil instead of throwing.
+/// The compiled CLASS-SEND fallback: resolve a selector against a class VALUE
+/// (a Type) — ext holders (Behavior/ClassDescription/Class, the reflective
+/// protocol), then the ST class chain — and when nothing answers, raise a
+/// proper Smalltalk Error ("Set class does not understand bogusWith:"),
+/// catchable by on:do: exactly like an instance-side doesNotUnderstand.
+///
+/// This fallback answered nil for months ("no surprise dNU where there used
+/// to be none"), and the silence hid five never-written methods. The first
+/// attempt to make it raise appeared to corrupt unrelated String code whole
+/// suites later — that was NOT the raise: core-snapshot classes finalize
+/// members lazily, and an ST ext-chain walk could mark _Type finalized with
+/// its members never parsed, killing the patched _Type.noSuchMethod for the
+/// whole process (see the LAZY-PARSE GUARD in st_loader.cc, which fixes it at
+/// the root). With the guard in place the raise is safe.
+///
+/// Deliberately its own function rather than stSendExt: stSendExt is the hot
+/// instance-send helper, and mixing class VALUES into its call-site type
+/// feedback costs the optimizer; it also skips stSendExt's getter-collision
+/// branch, which exists for native receivers a class value can never be.
+stSendClass(receiver, String selector, List args) {
+  var hit = _stExtSendTry(receiver, selector, args);
+  if (hit != null) return hit[0];
+  var box = _stSendTry(receiver, selector, args);
+  if (box != null) return box[0];
+  return stError(receiver, stClassSendMissText(receiver, selector));
+}
+
+/// "Set class does not understand bogusWith:" — the class-side miss named the
+/// way a Smalltalk programmer thinks about it. Class values print as Dart
+/// Types (`_Type@0150898`), and the bridge's holders carry an " ext" suffix
+/// (an artifact of Dart's sealed String/int); neither belongs in an error
+/// anyone reads.
+String stClassSendMissText(receiver, String selector) {
+  var name = stClassNameOf(receiver);
+  if (name == null) name = receiver.toString();
+  if (name.endsWith(' ext')) name = name.substring(0, name.length - 4);
+  var sel = selector.endsWith('_') ? selector.replaceAll('_', ':') : selector;
+  return name + ' class does not understand ' + sel;
+}
+
 /// The SOFT send: "invoke this if it exists". For genuinely optional protocol
 /// — the app runner asking a user class for a `stop` it need not define — where
 /// absence is an expected answer, not an error.
 ///
-/// It is ALSO still the compiled class-send fallback, and there it is wrong:
-/// an undefined class-side selector answers nil in silence rather than raising
-/// doesNotUnderstand, which hid four missing library methods (`with:` on the
-/// growable collections, `WriteStream with:`) until someone probed for them.
-/// Closing that hole exposed a re-entrancy bug it had been masking — see the
-/// KNOWN GAP note at the class-send fallback in st_flow_graph_builder.cc — so
-/// the silence stays until that is fixed. For a genuinely optional send this
-/// function is the right tool; for the class fallback it is a placeholder.
+/// It is NOT the class-send fallback (that is stSendClass above, which
+/// raises): reach for this one only when you can name why a miss is a
+/// legitimate answer rather than an error.
 stSendExtOrNil(receiver, String selector, List args) {
   var hit = _stExtSendTry(receiver, selector, args);
   if (hit != null) return hit[0];

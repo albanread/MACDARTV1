@@ -1713,34 +1713,18 @@ Fragment StGraphBuilder::TranslateClassSend(const Class& cls,
   // Type), which reaches those through the Type ext-holders (Behavior ext ->
   // ClassDescription ext -> ...) exactly as a runtime reflective send does.
   //
-  // KNOWN GAP — a miss here answers nil instead of raising doesNotUnderstand,
-  // and that silence is wrong. It hid four missing library methods for months
-  // (`with:` on OrderedCollection/Set/Bag, `WriteStream with:`) and a probe
-  // that asserted `Transcript basicPrint:` "printed, survived" about a send
-  // which only ever did the surviving. Those four are fixed; the silence is
-  // not, because closing it exposes a deeper bug it had been masking:
-  //
-  //   | c |  c := [ Set totallyBogusSelector ].
-  //   [ c value ] on: Error do: [ :e | nil ].
-  //   'foo' asUppercase           "-> at:put: lands on a Type, not a String"
-  //
-  // The FIRST exception raised out of a class-side miss, through a
-  // first-class block, leaves class-value dispatch broken: the world's own
-  // `self class new: n` idiom (String>>asUppercase) then answers the class
-  // instead of an instance, and the damage surfaces in code that never went
-  // near the bad send. Warm the path with any other exception first and it
-  // never happens — the signature of re-entrancy during a one-time init,
-  // since raising re-enters class dispatch (stError -> stNew('Error')) while
-  // the failed lookup is still in flight. Both throw flavours corrupt (ST
-  // Error and Dart NoSuchMethodError), so it is the re-entry, not the
-  // exception kind.
-  //
-  // Silence is bad; intermittent corruption of unrelated String code is
-  // worse. This stays soft until the re-entrancy is fixed, then flips to a
-  // raising helper — see ST_PORTING_PLAN.md §9c for the repro.
+  // stSendClass: a genuine miss RAISES the same doesNotUnderstand an
+  // instance-side miss raises. This fallback answered nil for months, and the
+  // silence hid five never-written methods (`with:` on the growable
+  // collections, `WriteStream with:`, `Transcript basicPrint:`). The first
+  // attempt to make it loud appeared to corrupt unrelated String code and was
+  // reverted; the real culprit was the lazily-parsed _Type class losing its
+  // patched noSuchMethod to an ST finalization cascade — fixed at the root by
+  // the LAZY-PARSE GUARD in st_loader.cc, after which the raise is safe.
+  // Missing methods are now loud on both sides of the metaclass split.
   {
     const Function& send =
-        Function::ZoneHandle(zone_, LookupCocoaFunction("stSendExtOrNil"));
+        Function::ZoneHandle(zone_, LookupCocoaFunction("stSendClass"));
     const Function& new_list =
         Function::ZoneHandle(zone_, LookupCocoaFunction("stNewList"));
     const Function& append =

@@ -395,53 +395,42 @@ control, exceptions, reflection.
 Every gap the self-validating suites surfaced (14 fixes above) is now green.
 The suites stand at **6 suites / 188 assertions**, part of the pre-push battery.
 
-## 9c. Open engine gap — the class side is SILENT on a miss
+## 9c. RESOLVED — the class side raises, and the "re-entrancy" was lazy parsing
 
-A class-side send that resolves to nothing answers `nil`; an instance-side one
-raises `doesNotUnderstand`. Smalltalk's whole dispatch story hangs off dNU, so
-the class side being mute is a semantic hole, and it is an active bug-hider:
-it concealed four standard constructors that were simply never defined —
-`with:` on OrderedCollection/Set/Bag and `WriteStream with:`, all evaluating
-to nil at every call — plus `Transcript basicPrint:`, which the
-primitive-coverage probe had been recording as "printed, survived" about a
-send that only ever did the surviving. Those five are now fixed and pinned by
-`features/test_class_side.mst`. **The silence is not fixed**, because closing
-it uncovers a deeper bug it had been masking.
+A class-side send that resolved to nothing used to answer `nil` (instance-side
+misses always raised). The silence hid five never-written methods — `with:` on
+OrderedCollection/Set/Bag, `WriteStream with:`, `Transcript basicPrint:` — all
+fixed and pinned by `features/test_class_side.mst`.
 
-Minimal repro (with the fallback routed to a raising helper):
+The first attempt to make the miss raise appeared to corrupt UNRELATED String
+code whole suites later (`at:put:` landing on a Type out of
+`String>>asUppercase`), was blamed on "re-entrancy during a one-time init",
+and reverted. The real mechanism, established by instrumentation and fixed at
+the root:
 
-```smalltalk
-| c |
-c := [ Set totallyBogusSelector ].
-[ c value ] on: Error do: [ :e | nil ].
-'foo' asUppercase        "-> at:put: lands on a Type, not a String"
-```
+- **Core-snapshot classes finalize their members lazily.** `_Type` boots with
+  `is_finalized()=false` and an EMPTY function table; the patched
+  `_Type.noSuchMethod` (runtime/lib/type_patch.dart — what gives a Smalltalk
+  class value its class-side dispatch) only exists after
+  `Class::EnsureIsFinalized` runs the parser over the class.
+- **The ST engine must use the types-only finalizer on its own classes**
+  (`ClassFinalizer::FinalizeClass` — ST classes have no token stream for the
+  Dart parser), and finalizing an ST holder ("Behavior ext") CASCADES through
+  its signature/super types into marking `_Type` finalized — with members
+  never parsed, and `EnsureIsFinalized` a permanent no-op from then on.
+- Every noSuchMethod dispatcher parsed after that binds `Object.noSuchMethod`
+  (the 1.24 parser's documented fallback when resolution fails), so class
+  values lose class-side dispatch; the ext chain then resolves `new:` to
+  `Behavior>>new:`, whose `basicNew:` stub answers the TYPE ITSELF. Which
+  sends died depended only on whether ANYTHING had happened to look at
+  `_Type` before the first ST ext-walk — hence "warming with ZeroDivide"
+  appearing to matter, first-resolution immunity, probes that healed the bug
+  by looking at it, and every other red herring in the original note.
 
-What is known:
-
-- The FIRST exception raised out of a class-side miss **through a first-class
-  block** leaves class-value dispatch broken. Afterwards the world's own
-  `self class new: n` idiom (`String>>asUppercase`) answers the class instead
-  of an instance, so `at:put:` is sent to a Type. Damage surfaces in code that
-  never went near the bad send — whole suites later.
-- Raise any other exception through that same shape first (`1 // 0` /
-  ZeroDivide) and the class-side miss is then harmless. One-time-init plus
-  re-entrancy.
-- Both throw flavours corrupt — an ST `Error` via `stError`, and a Dart
-  `NoSuchMethodError` via `stSend` — so it is the RE-ENTRY into class dispatch
-  while the failed lookup is still in flight, not the exception kind.
-- Ruled out by experiment: the `g_cls_decide` decision cache
-  (`MACDART_CLS_DECIDE=0` still corrupts), JIT warm-up (20k raises, then the
-  send is clean), sharing a call site with the hot instance-send helper (a
-  dedicated `stSendClass` corrupts identically), and the library additions
-  (removing them changes nothing).
-- Inline `[ ... ] on: Error do: [ ... ]` does NOT corrupt; the block must be
-  first-class (stored in a variable, then `value`d).
-
-Silence is bad; intermittent corruption of unrelated String code is worse, so
-the fallback stays soft until the re-entrancy is fixed. The likely shape of the
-fix is to make the miss path allocate nothing and resolve nothing — pre-build
-the dNU error at world-load time, or hand the raise off to a point where class
-dispatch is no longer in flight — then flip `st_flow_graph_builder.cc`'s
-fallback to the raising helper and restore the raise/message assertions to
-`test_class_side.mst`.
+**The fix** is the LAZY-PARSE GUARD in `st_loader.cc` (top of Loader::Load):
+force `EnsureIsFinalized` over the Type family before any ST class loads.
+With it, the raising fallback (`stSendClass` in dart:cocoa, wired in
+st_flow_graph_builder.cc) is safe: a class-side miss raises "`Set class does
+not understand bogusWith:`" — an on:do:-catchable ST Error — through every
+calling shape, asserted by TestClassSide (34 checks) including the exact
+shapes that used to corrupt.

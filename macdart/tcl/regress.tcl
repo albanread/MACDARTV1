@@ -96,6 +96,23 @@ check "back to v1"         [ui doit {new VerT().v()}] 1
 ui remove VerT
 after 800
 
+section "the editor lexes the language it is holding"
+# A Smalltalk "..." comment is a Dart STRING to the Dart lexer — and one that
+# ends at the newline, so line 1 came out red and every line after it was lexed
+# as code: a multi-line comment rendered as a rainbow. Which is most of this
+# corpus. `edlex` reports the language chosen and the characters per kind, so
+# the property can be asserted instead of eyeballed.
+ui tab 4
+ui edsettext {"A comment\n mentioning Integer and 42 and 'quotes'."\nObject subclass: Demo [\n    add: n [ ^n + 1 ]\n]}
+after 400
+check "smalltalk is lexed as smalltalk" \
+    [ui edlex] "smalltalk 8 spans plain=15 comment=52 number=1 type=10"
+ui edsettext {// a Dart comment mentioning int and 42\nclass Demo {\n  int add(int n) => n + 1;\n}}
+after 400
+check "and dart is still lexed as dart" \
+    [ui edlex] "dart 9 spans plain=5 keyword=11 comment=39 number=1 type=4"
+ui edsettext {}
+
 section "the browser slices whole methods"
 # The source pane is a hand-scanned slice of the class's own text — a SECOND
 # reader of the grammar st_parser.cc owns. These are the shapes that used to

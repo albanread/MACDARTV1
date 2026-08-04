@@ -405,7 +405,10 @@ static NSColor* ColorForKind(int64_t kind) {
   switch (kind) {
     case 1: return [NSColor systemPurpleColor];  // keyword
     case 2: return [NSColor systemRedColor];      // string
-    case 3: return [NSColor systemGreenColor];    // comment
+    // Grey, not green: a comment is the one run you want to read PAST, and in
+    // this corpus a Smalltalk class documents itself in a "..." block that can
+    // be forty lines. secondaryLabelColor also follows light/dark on its own.
+    case 3: return [NSColor secondaryLabelColor];  // comment
     case 4: return [NSColor systemBlueColor];     // number
     case 5: return [NSColor systemTealColor];     // type (Capitalized ident)
     default: return [NSColor textColor];          // identifier / other

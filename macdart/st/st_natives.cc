@@ -479,6 +479,10 @@ struct EqCacheEntry {
   intptr_t cid;
   dart::RawFunction* fn;
 };
+// THREADING: read/written under g_eq_mutex from any isolate's mutator (the
+// caches are keyed by Isolate*, so entries never cross heaps). The raw
+// pointers parked here are old-space and 1.24's old space never moves; they
+// could only dangle across a reload, and ClearSendCache flushes them there.
 static std::vector<EqCacheEntry> g_eq_cache;
 static std::mutex g_eq_mutex;
 
@@ -545,6 +549,9 @@ struct ClsDecision {
   ClsAction action;
 };
 static std::unordered_map<ExtCacheKey, ClsDecision, ExtCacheHash> g_cls_decide;
+// THREADING: one mutex over all three ext/cls maps; every access site locks it
+// (audited 2026-08-04), including ClearSendCache. Values are old-space raw
+// pointers — see the g_eq_cache note; the same reload-flush contract applies.
 static std::mutex g_ext_mutex;
 
 }  // namespace bin

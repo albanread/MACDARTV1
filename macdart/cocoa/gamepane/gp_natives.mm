@@ -320,7 +320,10 @@ void Cocoa_gpApply(Dart_NativeArguments args) {
         if (slot < 0 || slot >= kMaxSfxSlots) verr = "gpsound: slot 0..63";
         else if (preset == NULL) verr = "gpsound: preset name needed";
         else {
-          static Lcg rng(12345);            // deterministic across a session
+          // Deterministic across a session. Static-local, but single-threaded
+          // by construction: gpApply only ever runs on the UI isolate's
+          // mutator (the pane's whole contract), so no lock.
+          static Lcg rng(12345);
           double a1 = cn > 3 ? ElDouble(c, 3) : 0.0;
           double a2 = cn > 4 ? ElDouble(c, 4) : 0.0;
           Sound snd;

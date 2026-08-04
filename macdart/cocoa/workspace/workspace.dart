@@ -983,9 +983,132 @@ List<int> lexDart(String s) {
   return out;
 }
 
+
+// --- Smalltalk ---------------------------------------------------------------
+// The Dart lexer cannot read this dialect, and the way it fails is loud: a `"`
+// opens a Dart string that ENDS AT THE NEWLINE, so the first line of a
+// Smalltalk comment came out as a string and every line after it was lexed as
+// CODE — a multi-line comment rendered as a rainbow of keywords, numbers and
+// types. Which is most of this corpus, since its classes document themselves in
+// long "..." blocks.
+//
+// So: lex Smalltalk as Smalltalk. Comments are "..." (doubled "" escapes,
+// spanning lines), strings are '...' (doubled ''), plus $c characters, #symbols
+// and #(literal arrays), radix and scaled numbers, and <pragmas>.
+final Set<String> _stKeywords = new Set<String>.from(<String>[
+  'self', 'super', 'true', 'false', 'nil', 'thisContext',
+]);
+
+List<int> lexSmalltalk(String s) {
+  var out = <int>[];
+  var n = s.length, i = 0;
+  while (i < n) {
+    var c = s.codeUnitAt(i);
+    if (c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D) { i++; continue; }
+    if (c == 0x22) {                                    // "comment", "" escapes
+      var st = i; i++;
+      while (i < n) {
+        if (s.codeUnitAt(i) == 0x22) {
+          if (i + 1 < n && s.codeUnitAt(i + 1) == 0x22) { i += 2; continue; }
+          i++; break;
+        }
+        i++;
+      }
+      out..add(st)..add(i - st)..add(3); continue;
+    }
+    if (c == 0x27) {                                    // 'string', '' escapes
+      var st = i; i++;
+      while (i < n) {
+        if (s.codeUnitAt(i) == 0x27) {
+          if (i + 1 < n && s.codeUnitAt(i + 1) == 0x27) { i += 2; continue; }
+          i++; break;
+        }
+        i++;
+      }
+      out..add(st)..add(i - st)..add(2); continue;
+    }
+    if (c == 0x24) {                                    // $c character literal
+      var st = i;
+      i += (i + 1 < n) ? 2 : 1;
+      out..add(st)..add(i - st)..add(2); continue;
+    }
+    if (c == 0x23) {                                    // #symbol / #(array
+      var st = i; i++;
+      if (i < n && s.codeUnitAt(i) == 0x27) {           // #'quoted symbol'
+        i++;
+        while (i < n && s.codeUnitAt(i) != 0x27) i++;
+        if (i < n) i++;
+      } else {
+        while (i < n) {
+          var d = s.codeUnitAt(i);
+          if (_isIdentPart(d) || d == 0x3A) i++; else break;   // keyword runs
+        }
+      }
+      out..add(st)..add(i - st)..add(5); continue;      // a literal, like a type
+    }
+    if (c == 0x3C && _stPragmaAt(s, i)) {               // <primitive: 42>
+      var st = i;
+      while (i < n && s.codeUnitAt(i) != 0x3E) i++;
+      if (i < n) i++;
+      out..add(st)..add(i - st)..add(1); continue;
+    }
+    if (_isDigit(c)) {                                  // 42, 3.14, 16r1F, 2e8
+      var st = i;
+      while (i < n) {
+        var d = s.codeUnitAt(i);
+        if (_isDigit(d) || d == 0x2E || d == 0x72 || d == 0x65 || d == 0x73 ||
+            _isHex(d)) {
+          // a '.' only continues the number when a digit follows (else it is
+          // the statement terminator)
+          if (d == 0x2E && !(i + 1 < n && _isDigit(s.codeUnitAt(i + 1)))) break;
+          i++;
+        } else break;
+      }
+      out..add(st)..add(i - st)..add(4); continue;
+    }
+    if (_isIdentStart(c)) {                             // identifier / keyword
+      var st = i; i++;
+      while (i < n && _isIdentPart(s.codeUnitAt(i))) i++;
+      if (i < n && s.codeUnitAt(i) == 0x3A) i++;        // a keyword part, at:put:
+      var word = s.substring(st, i);
+      var kind = _stKeywords.contains(word) ? 1 : (_isUpper(c) ? 5 : 0);
+      out..add(st)..add(i - st)..add(kind); continue;
+    }
+    i++;                                                // punctuation / binary
+  }
+  return out;
+}
+
+/// `<` opens a pragma when what follows is a keyword (`<primitive: 42>`,
+/// `<stprim: foo>`) — otherwise it is the binary selector `<`.
+bool _stPragmaAt(String s, int i) {
+  var j = i + 1;
+  while (j < s.length && s.codeUnitAt(j) == 0x20) j++;
+  var st = j;
+  while (j < s.length && _isIdentPart(s.codeUnitAt(j))) j++;
+  return j > st && j < s.length && s.codeUnitAt(j) == 0x3A;
+}
+
+/// Is this buffer Smalltalk? The shapes that only occur there: a class
+/// definition, a method reopen, or a `st>` do-it. Deliberately cheap and
+/// deliberately conservative — Dart source must never be lexed as Smalltalk.
+bool looksSmalltalk(String s) {
+  if (s == null || s.isEmpty) return false;
+  if (new RegExp(r'^\s*st>', multiLine: true).hasMatch(s)) return true;
+  if (new RegExp(r'\bsubclass:\s*\w+\s*\[').hasMatch(s)) return true;
+  if (new RegExp(r'(?:^|\n)\s*\w+(?:\s+class)?\s*>>\s*\w').hasMatch(s)) return true;
+  if (new RegExp(r'(?:^|\n)\s*\w+\s+extend\s*\[').hasMatch(s)) return true;
+  return false;
+}
+
+const List<String> _kSpanKindNames = const <String>[
+  'plain', 'keyword', 'string', 'comment', 'number', 'type'
+];
+
 void highlightView(Cocoa tv) {
   if (tv == null) return;
-  applySpans(tv, lexDart(tv.string().UTF8String()));
+  var src = tv.string().UTF8String();
+  applySpans(tv, looksSmalltalk(src) ? lexSmalltalk(src) : lexDart(src));
 }
 
 void highlight() => highlightView(gEditor);
@@ -1615,6 +1738,24 @@ Future respawnLanguage(String why) async {
   gRespawning = true;
   log("⚠ " + why + " — restarting language isolate…");
   gLang = null;
+  // A PAUSED isolate does not honour kill: Isolate.kill's OOB message queues
+  // behind the debugger pause and is dropped with it, so a "restarted" isolate
+  // that was sitting at a breakpoint lived on as a ZOMBIE. getVM then listed
+  // two ws_lang isolates, vmsResolveTarget attached to the corpse (first
+  // match), and every breakpoint after that was armed in an isolate nothing
+  // would ever run again — the regress suite's paused/locals/eval trio, dead
+  // deterministic. Resume every language isolate through the vm-service before
+  // killing, so the kill lands in a running message loop. (No service = no
+  // debugger = nothing can be paused, so skipping is sound, not lucky.)
+  if (await vmsConnect()) {
+    var vm = await vmsCall('getVM');
+    if (vm != null) {
+      for (var iso in vm['isolates']) {
+        if (!iso['name'].toString().contains('macdart_ws_lang')) continue;
+        await vmsCall('resume', <String, dynamic>{'isolateId': iso['id']});
+      }
+    }
+  }
   try { if (gLangIsolate != null) gLangIsolate.kill(priority: Isolate.IMMEDIATE); } catch (e) {}
   // If the old isolate died sitting at a breakpoint, no Resume event is ever
   // coming for it. Left alone, gDbgPaused stays true and every ask() is refused
@@ -1625,6 +1766,22 @@ Future respawnLanguage(String why) async {
   await spawnLanguage();   // boots from the image
   gRespawning = false;
   log("language isolate restarted (declarations reloaded from the image)");
+  // Suspenders to the resume-first belt: if an old isolate is somehow still
+  // listed, say so loudly — a silent zombie cost an afternoon of phantom
+  // debugger failures before this existed.
+  if (await vmsConnect()) {
+    var vm = await vmsCall('getVM');
+    if (vm != null) {
+      var n = 0;
+      for (var iso in vm['isolates']) {
+        if (iso['name'].toString().contains('macdart_ws_lang')) n++;
+      }
+      if (n > 1) {
+        log("⚠ " + (n - 1).toString() + " old language isolate(s) did not die "
+            "— the debugger may attach to a corpse; restart the workspace");
+      }
+    }
+  }
   guiEvent('languageRestarted', <String, String>{'why': why});
   stBrowserEmbed();   // the embedded ST browser died with its isolate
   if (gLangIsolateId != null && gDbgIsLang) {   // the debugger was ON the language
@@ -2078,6 +2235,29 @@ Future<String> handle(String line) async {
     case 'findsel': findNavigate(int.parse(arg)); return "ok";
     case 'edsettext': edSetText(arg.replaceAll('\\n', '\n')); return "ok";
     case 'edtext': return edText();
+    // How the Editor's buffer is being LEXED — the language chosen and the run
+    // lengths per kind. Colour is the one thing a screenshot proves and a test
+    // cannot, so the test asserts the spans instead: "the whole comment is one
+    // run of kind 3" is exactly the property that broke when a Smalltalk
+    // comment was lexed as a Dart string.
+    case 'edlex': {
+      var src = edText();
+      var st = looksSmalltalk(src);
+      var spans = st ? lexSmalltalk(src) : lexDart(src);
+      var chars = <int, int>{};
+      for (var i = 0; i + 2 < spans.length; i += 3) {
+        var k = spans[i + 2];
+        chars[k] = (chars.containsKey(k) ? chars[k] : 0) + spans[i + 1];
+      }
+      var o = <String>[st ? 'smalltalk' : 'dart',
+                       (spans.length ~/ 3).toString() + ' spans'];
+      for (var k in <int>[0, 1, 2, 3, 4, 5]) {
+        if (chars.containsKey(k)) {
+          o.add(_kSpanKindNames[k] + '=' + chars[k].toString());
+        }
+      }
+      return o.join(' ');
+    }
     case 'edstatus': return gEdStatus.stringValue().UTF8String();
     case 'edpick': gEdPicker.selectItemWithTitle(arg); return "ok";
     case 'edclasses': { var o = <String>[]; for (var i = 0; i < gEdPicker.numberOfItems(); i++) o.add(gEdPicker.itemTitleAtIndex(i).UTF8String()); return o.join(','); }
@@ -2606,8 +2786,19 @@ Future vmsCall(String method, [Map params]) async {
 Future<bool> vmsResolveTarget() async {
   var vm = await vmsCall('getVM');
   if (vm == null) return false;
+  // The LAST ws_lang in the list: getVM lists in creation order, and any
+  // earlier one is a leftover from a respawn — attaching there arms
+  // breakpoints in an isolate nothing will ever run again.
+  var target;
   for (var iso in vm['isolates']) {
-    if (!iso['name'].toString().contains('macdart_ws_lang')) continue;
+    if (iso['name'].toString().contains('macdart_ws_lang')) target = iso;
+  }
+  {
+    var iso = target;
+    if (iso == null) {
+      dbgStatus("debugger: no language isolate found");
+      return false;
+    }
     gLangIsolateId = iso['id'];
     var info = await vmsCall('getIsolate', <String, dynamic>{'isolateId': gLangIsolateId});
     if (info == null || info['rootLib'] == null) return false;
@@ -2617,8 +2808,6 @@ Future<bool> vmsResolveTarget() async {
     gLangScriptId = lib['scripts'][0]['id'];
     return true;
   }
-  dbgStatus("debugger: no language isolate found");
-  return false;
 }
 
 String _dbgIsoLabel(String name, String id) {

@@ -128,8 +128,14 @@ namespace eval dartui {
         binary scan [_take 2] cucu b0 b1
         set opcode [expr {$b0 & 0x0f}]
         set len [expr {$b1 & 0x7f}]
-        if {$len == 126} { _need 2; binary scan [_take 2] Su len }
-        if {$len == 127} { _need 8; binary scan [_take 8] Wu len }
+        # elseif, NOT two ifs: when the 16-bit extended length is EXACTLY 127,
+        # a second independent `if` matched the freshly-scanned value and ate 8
+        # payload bytes as a bogus 64-bit length — one poisoned reply size
+        # (127 bytes on the nose) desynced the connection for good. The growing
+        # request id shifts every reply's size, so WHICH command died moved
+        # around between runs; it cost two days as a phantom server hang.
+        if {$len == 126} { _need 2; binary scan [_take 2] Su len } \
+        elseif {$len == 127} { _need 8; binary scan [_take 8] Wu len }
         _need $len
         set payload [_take $len]
         if {$opcode == 8} { error "dartui: server closed the connection" }

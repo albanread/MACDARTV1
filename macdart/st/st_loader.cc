@@ -28,6 +28,7 @@
 #include <unordered_map>
 
 #include "vm/class_finalizer.h"
+#include "vm/compiler.h"
 #include "vm/dart_api_impl.h"
 #include "vm/dart_api_state.h"
 #include "vm/isolate.h"
@@ -42,9 +43,22 @@ namespace st {
 // register carry raw `kernel_function` pointers into these trees, so the trees
 // must never be freed. (Sprint 3's compiler hook will read these markers.)
 static std::vector<ProgramNode*> g_retained_programs;
+// THREADING: every isolate that loads .mst funnels through these globals — the
+// main isolate boots a world under --with-st, the workspace's language isolate
+// imports one of its own, and either can be reloading while the other runs.
+// push_back on a bare vector and a bare counter increment both race; the
+// counter collision is the loud one (two loads minting the same st:mst/N URL
+// trips Library::Register's unique-URL assert). One mutex, held only around
+// the C++ globals themselves — the VM work either side is per-isolate.
+static std::mutex g_loader_mutex;
 // Monotonic counter giving each load a distinct library URL (Library::Register
 // asserts the URL is not already present).
 static int g_load_counter = 0;
+
+static int NextLoadNumber() {
+  std::lock_guard<std::mutex> lock(g_loader_mutex);
+  return g_load_counter++;
+}
 
 namespace {
 
@@ -509,6 +523,26 @@ dart::RawInstance* InternStSymbol(dart::Thread* thread, const char* name) {
         g_symbol_intern.find(key);
     if (it != g_symbol_intern.end()) return it->second;
   }
+  // THREADING: everything below is mutator-contract work — Instance/String
+  // allocation, EnsureIsFinalized, and above all
+  // persistent_handles().AllocateHandle(), which is a BARE freelist pop
+  // (dart_api_state.h): the public API guards it with DARTSCOPE, i.e.
+  // "the isolate's mutator thread only". This function is ALSO reached from
+  // st::BuildGraph on the BACKGROUND compiler thread (optimized recompiles of
+  // methods holding a #symbol literal). Racing the mutator's own
+  // Dart_NewPersistentHandle — and dart:cocoa wraps EVERY ObjC object in one —
+  // can hand the same freelist node to both threads; one set_raw overwrites
+  // the other, and the Constant baked into code becomes garbage. That is the
+  // intermittent boot crash of 2026-08-02..04: EXC_BAD_ACCESS at a small
+  // offset inside FlowGraphCompiler::VisitBlocks (LoadObjectHelper reading a
+  // field of the garbage "object"), clustered in the GUI where wrap traffic
+  // is heavy, never reproducible headless. On a non-mutator thread answer
+  // null: the builder's documented fallback lowers the literal through the
+  // runtime path instead, which re-enters here ON the mutator at first
+  // execution — identity is preserved, and the hit path above (a plain
+  // locked map read of an immortal old-space pointer) stays safe from any
+  // thread.
+  if (!thread->IsMutatorThread()) return dart::Instance::null();
   Zone* zone = thread->zone();
   const Library& cocoa = Library::Handle(
       zone, Library::LookupLibrary(
@@ -570,6 +604,18 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
                   bool allow_reopen) {
   using namespace dart;
 
+  // THREADING: a load REPLACES functions and classes the BACKGROUND COMPILER
+  // may be reading at this very moment — an optimized compile in flight holds
+  // raw pointers into the world being swapped, and finishing it against the
+  // new one crashed the process inside the compiler (the 2026-08-02..04
+  // cluster: FlowGraphInliner::TryInlineRecognizedMethod and
+  // Assembler::LoadObjectHelper, each stack sitting right after this loader's
+  // own [lastwins] lines in the log — i.e. mid-reload). The VM's own debugger
+  // stops the background compiler before touching code it can see
+  // (debugger.cc); a reload deserves exactly the same courtesy. Stop() is
+  // self-healing — the next optimized-compile request re-creates the thread.
+  BackgroundCompiler::Stop(Thread::Current()->isolate());
+
   // Any load can add or replace methods — stale (cid -> Function) dispatch
   // cache entries would then dispatch to the OLD method body.
   ClearSendCache();
@@ -577,7 +623,10 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
   // Retain the AST for the isolate's lifetime BEFORE stamping any marker into
   // it (a failed load still leaves valid marker targets rather than danglers).
   ProgramNode* program = program_owned.release();
-  g_retained_programs.push_back(program);
+  {
+    std::lock_guard<std::mutex> lock(g_loader_mutex);
+    g_retained_programs.push_back(program);
+  }
 
   ClassTable table;
   Aggregate(program, &table);
@@ -717,7 +766,7 @@ bool Loader::Load(std::unique_ptr<ProgramNode> program_owned,
   const String& url = String::Handle(
       zone, (url_override != 0)
                 ? String::New(url_override, Heap::kOld)
-                : String::NewFormatted("st:mst/%d", g_load_counter++));
+                : String::NewFormatted("st:mst/%d", NextLoadNumber()));
   const String& src = String::Handle(zone, String::New(source.c_str()));
   Library& library = Library::Handle(zone, Library::New(url));
   // Import dart:core so ST classes can later resolve/call it (this replicates

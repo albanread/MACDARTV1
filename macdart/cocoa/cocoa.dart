@@ -2470,6 +2470,15 @@ void setSplitMinSize(Cocoa splitView, double minSize) {
 }
 
 void _applySpans(int textStorage, List spans) native "Cocoa_applySpans";
+void _quitOnClose(int window) native "Cocoa_quitOnClose";
+
+/// Closing [window] terminates the app — for a window that IS the app (the
+/// workspace, a standalone game). Without it the red close button leaves the
+/// process alive and headless, holding the vm-service port. Windows a program
+/// merely OPENS (the ST world's own NSWindows) must not use this.
+void quitOnClose(Cocoa window) {
+  _quitOnClose(window.handle);
+}
 
 /// Colour [textView] with syntax-highlight runs: a flat `[start, len, kind, …]`
 /// list (kind: 1 keyword, 2 string, 3 comment, 4 number, 5 type, else default).

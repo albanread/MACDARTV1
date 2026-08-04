@@ -345,6 +345,7 @@ void buildStandaloneWindow(String title) {
       [0.0, 0.0, 900.0, 600.0], styleMask: 15, backing: 2, defer: false);
   gWindow.setTitle(title);
   gWindow.setContentMinSize([320.0, 240.0]);
+  quitOnClose(gWindow);
   gContent = gWindow.contentView();
   gAppPane = Cocoa.cls("NSView").alloc().initWithFrame([0.0, 0.0, 900.0, 600.0]);
   gAppPane.setAutoresizingMask(kWidthSizable + kHeightSizable);
@@ -389,6 +390,7 @@ void buildStandaloneGameWindow(String title) {
       [0.0, 0.0, 848.0, 480.0], styleMask: 15, backing: 2, defer: false);  // 2x a 424x240 game
   gWindow.setTitle(title);
   gWindow.setContentMinSize([424.0, 240.0]);
+  quitOnClose(gWindow);
   gContent = gWindow.contentView();
   gDemoImage = Cocoa.cls("NSImage").alloc().initWithSize([kDemoW, kDemoH]);
   gDemoView = Cocoa.cls("NSImageView").alloc().initWithFrame([0.0, 0.0, 848.0, 480.0]);
@@ -407,6 +409,7 @@ void buildWindow() {
   gWindow.setTitle("MACDART Workspace");
   // Below this the panes stop being usable, so don't let the window get there.
   gWindow.setContentMinSize([680.0, 480.0]);
+  quitOnClose(gWindow);   // the red close button quits, same as Cmd-Q
   gContent = gWindow.contentView();
   buildChrome();
   gWindow.center();

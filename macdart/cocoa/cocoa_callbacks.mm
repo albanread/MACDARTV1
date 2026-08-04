@@ -415,6 +415,41 @@ static NSColor* ColorForKind(int64_t kind) {
   }
 }
 
+// --- quit on close -----------------------------------------------------------
+// The IDE window IS the app: closing it must end the process. Without this the
+// red close button deallocated the NSWindow and left dartui running headless —
+// gWindow became a stale handle, the 4 Hz metrics tick logged "STALE HANDLE …
+// 'display'" several times a second forever, and the corpse kept the
+// vm-service port, so the next ./start-gui.sh refused to start ("something is
+// already listening"). terminate: is the exact path the Quit menu item already
+// takes (stdItem "terminate:"), so shutdown behaviour is identical to Cmd-Q.
+static Class g_close_class = nil;
+static id g_close_delegate = nil;
+
+static void WindowWillCloseIMP(id self, SEL _cmd, id note) {
+  (void)self; (void)_cmd; (void)note;
+  [NSApp terminate:nil];
+}
+
+// _quitOnClose(int window): closing this window terminates the app. One shared
+// delegate for the process (NSWindow holds its delegate UNRETAINED, so it must
+// never be freed) — every window that is "the app" gets the same one.
+void Cocoa_quitOnClose(Dart_NativeArguments args) {
+  int64_t wh = 0;
+  Dart_IntegerToInt64(Dart_GetNativeArgument(args, 0), &wh);
+  NSWindow* w = (NSWindow*)(id)wh;
+  if (w == nil) return;
+  if (g_close_class == nil) {
+    g_close_class =
+        objc_allocateClassPair([NSObject class], "MacdartQuitOnClose", 0);
+    class_addMethod(g_close_class, sel_registerName("windowWillClose:"),
+                    (IMP)WindowWillCloseIMP, "v@:@");
+    objc_registerClassPair(g_close_class);
+    g_close_delegate = [[g_close_class alloc] init];
+  }
+  [w setDelegate:g_close_delegate];
+}
+
 // _applySpans(int textStorage, List<int> runs): flat [start,len,kind, ...].
 void Cocoa_applySpans(Dart_NativeArguments args) {
   int64_t tsh = 0;

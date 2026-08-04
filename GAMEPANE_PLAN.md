@@ -473,6 +473,22 @@ headless verification.
   compiled MIDI and checks the dance emits a program change to 80) — "a tune
   played" would not have caught a misread program field.
 
+  **Fifth pass — the hall of fame, persisted the Smalltalk way.** The last
+  gameplay subsystem: after the dance the score slots into a six-row table as
+  YOU (the original's InsertHiScore, sorted, last row dropped) and the table
+  shows for 360 frames. The persistence is the point: the hall is a CLASS IN
+  THE IMAGE (GxHallOfFame) whose whole state is one class-side method, created
+  and rewritten by the game through STHostService acceptEditorClass: — the
+  same parse-checked, image-persisted, hot-reloading path the Browser's own
+  Accept uses. Scores survive a full app restart; the hall is browsable and
+  editable as source; and it lives OUTSIDE demos/galaxigans.mst so re-filing
+  the game in cannot clobber it. One consequence worth knowing: the accept
+  hot-reloads the image, which replaces the running game's own class —
+  instances morph (the workspace contract) but class variables reset, so the
+  game re-registers its Current handle after every save. Headless there is no
+  image host: saveHall's ERR reply is shrugged off and the whole flow still
+  runs, which is how the battery drives it.
+
   Layer 0 is now reachable from Smalltalk too (`GamePane>>shader:` /
   `shaderParam:value:`): the original's twelve HLSL cosmos scenes — nebula,
   galaxy, black hole, alien world, moon, supernova, wormhole, gas giant,

@@ -54,7 +54,7 @@ Transcript showCr: '  after 900 frames: ', g summary.
 g := Galaxigans launch.
 tap value.
 check value: 'a fresh game starts full' value: g aliveCount value: 40.
-1 to: 2500 do: [ :i | GamePane stepWithKeys: 0 ].
+1 to: 2900 do: [ :i | GamePane stepWithKeys: 0 ].
 check value: 'an idle ship dies out and resets' value: g gameState value: #attract.
 check value: 'the reset refills the fleet' value: g aliveCount value: 40.
 check value: 'and restores the lives' value: g lives value: 3.
@@ -95,8 +95,28 @@ spread2 := g danceSpread.
 check value: 'the dance takes them off their slots' value: spread1 > 20 value: true.
 check value: 'and the pinwheel breathes' value: spread1 = spread2 value: false.
 Transcript showCr: '  spread ', spread1 printString, ' then ', spread2 printString.
-check value: 'the dance ends and the game resets' value:
-    ([ 1 to: 500 do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #attract.
+check value: 'the dance hands off to the hall of fame' value:
+    ([ 1 to: 320 do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #hiscore.
+check value: 'and the table times out into attract' value:
+    ([ 1 to: 370 do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #attract.
+
+"The hall of fame: a qualifying score slots in sorted, named YOU, and the
+ sixth row drops off; a losing score changes nothing. Headless the persistence
+ call answers ERR (no image host) and the game keeps its in-memory table —
+ the whole flow runs without a window, which is the point."
+g := Galaxigans launch.
+tap value.
+g setScore: 12345.
+g danceNow.
+1 to: 800 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: '12345 takes row four' value:
+    ((g hallReport includesSubstring: '4 YOU 12345') and:
+     [ (g hallReport includesSubstring: 'WOW') not ]) value: true.
+g setScore: 50.
+g danceNow.
+1 to: 800 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'a losing score changes nothing' value:
+    (g hallReport includesSubstring: 'new row 0') value: true.
 
 "The capture boss: it comes for the PILOTS, not the ship. Level 3 is the first
  the table gives one to. Watched all the way through its lifecycle — enter,

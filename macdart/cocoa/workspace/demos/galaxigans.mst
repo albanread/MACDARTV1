@@ -51,7 +51,15 @@
  they have taken your last ship. Its percussion cues are not ported: the pane's
  SFX presets already play that part, and doubling them would only muddy it.
 
- What is still NOT ported: the high-score table and its nano-TCL dev channel.
+ And the HIGH-SCORE TABLE — with the port's best trick: the hall of fame is a
+ CLASS IN THE IMAGE (GxHallOfFame), created and rewritten by the game itself
+ through the browser's own checked accept, so your scores are source, they are
+ browsable, and they survive a full restart because the image is the source of
+ truth. It is deliberately not part of this file: re-filing the game in can
+ never clobber it.
+
+ What is still NOT ported: the original's nano-TCL dev channel — this
+ workspace's own control plane already does that job.
 
  Controls: Left/Right steer, Space fires (tap, no autofire — the original's
  shoot_held/shoot_release beat). Launch from the GAMES menu, or a Workspace:
@@ -421,7 +429,7 @@ Object subclass: Galaxigans [
       shipX shipSprite lives score hiScore wave respawn
       fleet swayX swayDir diveTimer bombTimer
       bullets bombs mines sparks level scene theme flap danceT
-      mineDrops saucerDrops
+      mineDrops saucerDrops hiTable hiNewRow
       boss bossOn pilots abducting abducteeX abducteeY beamPhase pilotsTaken
       saucer saucerX saucerDir saucerTimer saucerWah saucerBombT
       cooldown fireWasDown |
@@ -454,6 +462,70 @@ Object subclass: Galaxigans [
     Galaxigans class >> danceAngleStep [ ^6 ]
     Galaxigans class >> danceRadStep [ ^10 ]
     Galaxigans class >> danceLength [ ^420 ]
+    Galaxigans class >> hiscoreLength [ ^360 ]
+
+    "--- the hall of fame: a CLASS IN THE IMAGE, written by the game ---------"
+    "The original keeps six rows in .DATA — ACE 30000 down to WOW 4000 — and
+     slots your score in as YOU. Here the table is a real class,
+     GxHallOfFame, that the game CREATES AND REWRITES through the browser's
+     own checked accept (STHostService acceptEditorClass:): parse-checked,
+     persisted in the SQLite image, hot-reloaded live. Your scores survive a
+     restart because they live in the image — and the hall is BROWSABLE: open
+     GxHallOfFame in the Browser and there they are, as source. It is a
+     separate class, not part of this file, precisely so that re-filing the
+     game in from the Games menu can never clobber it."
+    Galaxigans class >> defaultHall [
+        ^#( #('ACE' 30000) #('ZAP' 22000) #('BUG' 16000)
+            #('FOE' 11000) #('POW' 7000)  #('WOW' 4000) )
+    ]
+
+    "The persisted hall if the image holds one, else the defaults. Resolved by
+     REFLECTION rather than a bare global: naming an undefined class in source
+     would be a compile error, and headless (no image host) the class simply
+     never exists."
+    Galaxigans class >> loadHall [
+        | cls rows |
+        cls := ClassMirror allClasses
+                   detect: [ :c | c name = 'GxHallOfFame' ] ifNone: [ nil ].
+        cls isNil ifTrue: [ ^self defaultHall asOrderedCollection ].
+        rows := [ cls table ] on: Error do: [ :e | nil ].
+        ^(rows isNil ifTrue: [ self defaultHall ] ifFalse: [ rows ])
+             asOrderedCollection
+    ]
+
+    "GxHallOfFame's whole source, holding [rows] as a literal table."
+    Galaxigans class >> hallSourceFor: rows [
+        | w |
+        w := WriteStream on: String new.
+        w nextPutAll: '"GxHallOfFame - the Galaxigans high-score table. WRITTEN BY THE GAME:'; nl.
+        w nextPutAll: ' each new score re-accepts this class through the same checked path the'; nl.
+        w nextPutAll: ' Browser uses, so the table persists in the image and survives restarts.'; nl.
+        w nextPutAll: ' Edit it here if you like - it is only source."'; nl.
+        w nextPutAll: 'Object subclass: GxHallOfFame ['; nl.
+        w nextPutAll: '    GxHallOfFame class >> table ['; nl.
+        w nextPutAll: '        ^#('.
+        rows do: [ :r |
+            w nextPutAll: ' #('''.
+            w nextPutAll: (r at: 1).
+            w nextPutAll: ''' '.
+            w nextPutAll: (r at: 2) printString.
+            w nextPutAll: ')' ].
+        w nextPutAll: ' )'; nl.
+        w nextPutAll: '    ]'; nl.
+        w nextPutAll: ']'; nl.
+        ^w contents
+    ]
+
+    "Persist [rows] as GxHallOfFame. In the GUI this goes through the image
+     host and answers 'OK ...'; headless there is no host and the reply is an
+     ERR string — the game keeps its in-memory table and shrugs, which is why
+     the battery can drive the whole flow without a window."
+    Galaxigans class >> saveHall: rows [
+        | reply |
+        reply := STHostService new onMain
+                     acceptEditorClass: (self hallSourceFor: rows).
+        ^reply printString
+    ]
 
     "The capture boss (galaxigans_data.inc), and the pilot row it comes for."
     Galaxigans class >> bossFirst [ ^40 ]
@@ -482,6 +554,7 @@ Object subclass: Galaxigans [
     "The game that is running, if any — so a script (or the Workspace) can
      reach it: `Galaxigans current forceNextWave`, `Galaxigans current summary`."
     Galaxigans class >> current [ ^Current ]
+    Galaxigans class >> register: aGame [ Current := aGame ]
 
     "A 256-entry sine table in [-256,256], built once. The original carried a
      sineLUT in .DATA for exactly this reason: the dive weave asks for a sine
@@ -501,6 +574,8 @@ Object subclass: Galaxigans [
 
     start [
         Current := self.
+        hiTable := Galaxigans loadHall.
+        hiNewRow := 0.
         pane := GamePane new.
         rng := Random new.
         frame := 0.
@@ -687,6 +762,22 @@ Object subclass: Galaxigans [
      timer — for a test, or for anyone who wants to hear the warble."
     summonSaucer [ saucerTimer := 1 ]
 
+    "Set the score — so a test (or a workspace doit) can walk a chosen score
+     into the hall without earning it."
+    setScore: n [ score := n ]
+
+    "The hall as one line per row — for the battery and the control plane."
+    hallReport [
+        | w |
+        w := WriteStream on: String new.
+        1 to: hiTable size do: [ :i | | r |
+            r := hiTable at: i.
+            w nextPutAll: i printString, ' ', (r at: 1), ' ', (r at: 2) printString.
+            w nl ].
+        w nextPutAll: 'new row ', hiNewRow printString.
+        ^w contents
+    ]
+
     "Set the lives, so a test can put the player on their last pilot — the one
      state the boss is supposed to leave alone."
     setLives: n [ lives := n ]
@@ -768,6 +859,7 @@ Object subclass: Galaxigans [
         gameState == #attract ifTrue: [ self stepAttract ].
         gameState == #cleared ifTrue: [ self stepCleared ].
         gameState == #over ifTrue: [ self stepOver ].
+        gameState == #hiscore ifTrue: [ self stepHiscores ].
         self draw.
         pane present
     ]
@@ -802,7 +894,41 @@ Object subclass: Galaxigans [
         self stepSparks.
         stateTimer <= 0 ifTrue: [
             score > hiScore ifTrue: [ hiScore := score ].
-            self newGame ]
+            self enterHiscores ]
+    ]
+
+    "The dance is over: slot the score into the hall (sorted, six rows, named
+     YOU — the original's own InsertHiScore), persist the hall through the
+     image host if one is listening, and show the table for a few seconds
+     before the attract resumes."
+    enterHiscores [
+        | fresh inserted |
+        hiNewRow := 0.
+        fresh := OrderedCollection new.
+        inserted := false.
+        hiTable do: [ :r |
+            (inserted not and: [ score > (r at: 2) ]) ifTrue: [
+                fresh add: (Array with: 'YOU' with: score).
+                inserted := true.
+                hiNewRow := fresh size ].
+            fresh add: r ].
+        inserted ifTrue: [
+            [ fresh size > 6 ] whileTrue: [ fresh removeLast ].
+            hiTable := fresh.
+            Galaxigans saveHall: hiTable.
+            "The accept HOT-RELOADS the image, which replaces this game's own
+             class and resets its class variables — the instance survives by
+             morph (that is the workspace's contract), but the Current handle
+             comes back nil. Put ourselves back so the control plane, and the
+             next save, still find the running game."
+            Galaxigans register: self ].
+        gameState := #hiscore.
+        stateTimer := self class hiscoreLength
+    ]
+
+    stepHiscores [
+        stateTimer := stateTimer - 1.
+        stateTimer <= 0 ifTrue: [ self newGame ]
     ]
 
     dance [
@@ -1209,7 +1335,16 @@ Object subclass: Galaxigans [
     placeSprites [
         "Sprites are placed by their top-left, so everything is drawn from its
          centre minus half its art. The fleet flaps: every eighth frame the
-         whole formation switches to its species' second frame."
+         whole formation switches to its species' second frame. The high-score
+         scene stands alone: everything hides while the table is up."
+        gameState == #hiscore ifTrue: [
+            fleet do: [ :a | a sprite hide ].
+            mines do: [ :m | m sprite hide ].
+            boss sprite hide.
+            pilots do: [ :spr | spr hide ].
+            saucer hide.
+            shipSprite hide.
+            ^self ].
         flap := (frame // 8) \\ 2.
         fleet do: [ :a |
             a alive
@@ -1252,7 +1387,42 @@ Object subclass: Galaxigans [
             (pilots at: pilots size) moveTo: abducteeX y: abducteeY ]
     ]
 
+    "Six digits, zero-padded — the arcade's own score format (HiFmt)."
+    score6: n [
+        | t |
+        t := n printString.
+        [ t size < 6 ] whileTrue: [ t := '0', t ].
+        ^t
+    ]
+
+    drawHiscores [
+        | y r |
+        pane textClear.
+        pane text: 'H I G H   S C O R E S'
+             x: 130 y: 46 r: 255 g: 210 b: 60 scale: 3.
+        y := 110.
+        1 to: hiTable size do: [ :i |
+            r := hiTable at: i.
+            "The row you just took blinks gold; the rest sit quiet."
+            (i = hiNewRow and: [ (frame // 8) \\ 2 = 0 ])
+                ifTrue: [
+                    pane text: i printString, '  ', (r at: 1), '  ', (self score6: (r at: 2))
+                         x: 190 y: y r: 255 g: 220 b: 90 scale: 2 ]
+                ifFalse: [
+                    pane text: i printString, '  ', (r at: 1), '  ', (self score6: (r at: 2))
+                         x: 190 y: y
+                         r: (i = hiNewRow ifTrue: [ 255 ] ifFalse: [ 150 ])
+                         g: (i = hiNewRow ifTrue: [ 220 ] ifFalse: [ 200 ])
+                         b: (i = hiNewRow ifTrue: [ 90 ] ifFalse: [ 255 ])
+                         scale: 2 ].
+            y := y + 26 ].
+        hiNewRow > 0 ifTrue: [
+            pane text: 'A PLACE IN THE HALL'
+                 x: 208 y: 300 r: 120 g: 255 b: 140 scale: 2 ]
+    ]
+
     drawHud [
+        gameState == #hiscore ifTrue: [ ^self drawHiscores ].
         pane textClear.
         pane text: 'SCORE ', score printString
              x: 10 y: 8 r: 255 g: 255 b: 255 scale: 2.

@@ -459,8 +459,24 @@ class StGraphBuilder {
     return instructions;
   }
   Fragment StoreStaticField(const Field& field) {
+    // A BACKGROUND compile must not hang IL on the ORIGINAL Field: the
+    // mutator can move the original's guarded state under the background
+    // compiler, so the store takes a clone — the same MayCloneField rule
+    // both Dart front ends follow (kernel_to_il.cc:2598), and the rule
+    // Instruction::CheckField asserts in debug builds. This tripped for
+    // real: a long ST run's hot class-variable store hit the background
+    // optimizer and aborted every debug-build session at
+    // intermediate_language.cc:51. LOADS are exempt BY DESIGN — a Field
+    // pushed as a CONSTANT must be the original (ConstantInstr asserts
+    // IsOriginal), which is why LoadStaticField above clones nothing.
+    const Field* store_field = &field;
+    if ((Compiler::IsBackgroundCompilation() ||
+         FLAG_force_clone_compiler_objects) &&
+        field.IsOriginal()) {
+      store_field = &Field::ZoneHandle(zone_, field.CloneFromOriginal());
+    }
     StoreStaticFieldInstr* store = new (zone_)
-        StoreStaticFieldInstr(field, Pop(), TokenPosition::kNoSource);
+        StoreStaticFieldInstr(*store_field, Pop(), TokenPosition::kNoSource);
     return Fragment(store);  // a store produces no value (no Push)
   }
   Fragment PushArgument() {

@@ -1992,6 +1992,20 @@ void gpFullscreen(bool on) => _gpFullscreen(on ? 1 : 0);
 List _stGpCmds = <List>[];
 bool _stGpRunning = false;
 var _stGpPane; // the GamePane instance `run` was sent to (the driver's handle)
+// The frame loop's two blocks. These live HERE, not in GamePane's class
+// variables, because an image accept RELOADS THE WHOLE ST WORLD: every class
+// is rebuilt and its class-side state comes back nil. A running game whose
+// StepBlock was nilled that way is not slowed or interrupted — it is over. The
+// UI timer keeps inviting frames and every one finds nothing to run, so the
+// game freezes on whatever frame it was showing, alive and responsive and
+// permanently still. That is not a hypothetical: Galaxigans persists its high
+// scores BY accepting a class, so finishing a qualifying game froze the hall of
+// fame forever, and editing any class in the Browser froze whatever was
+// playing. Dart-side state has none of that fragility — it survives the reload
+// the same way _stGpRunning and the sprite maps below already do, so a game
+// plays straight through an accept and the world stays reloadable.
+var _stGpStep;      // the per-frame block registered by GamePane>>onStep:
+var _stGpTeardown;  // the one-shot cleanup block registered by onReset:
 Map<int, bool> _stGpSounds = <int, bool>{}; // preset -> gpsound already shipped
 Map<String, int> _stGpTunes = <String, int>{}; // abc source -> tune slot
 Map<int, int> _stGpSpriteIds = <int, int>{};  // ST's monotonic id -> engine id
@@ -2227,6 +2241,17 @@ stGpPlayTune(tn, abc) {
 stGpRun(p) { _stGpRunning = true; _stGpPane = p; return p; }
 stGpStop(p) { _stGpRunning = false; return p; }
 
+// The frame-loop blocks (see _stGpStep above for WHY they are Dart-side).
+// Instance-side helpers take the receiver first and answer it, so `onStep:`
+// still chains — `pane onStep: [...]; run` is how every game starts.
+stGpOnStep(p, blk) { _stGpStep = blk; return p; }
+stGpOnReset(p, blk) { _stGpTeardown = blk; return p; }
+// Class-side helpers take no receiver (the builder pushes one only for
+// instance methods), which is why these read as bare getters.
+stGpStepBlock() => _stGpStep;
+stGpResetBlock() => _stGpTeardown;
+stGpClearBlocks() { _stGpStep = null; _stGpTeardown = null; return null; }
+
 /// Drain and return the command buffer (the driver ships it as one
 /// `['draw', cmds]`). Answers a fresh list; the buffer restarts empty.
 List stGpTake() {
@@ -2241,11 +2266,15 @@ bool stGpIsRunning() => _stGpRunning;
 /// The pane instance `run` was sent to (for the driver's bookkeeping).
 dynamic stGpPane() => _stGpPane;
 
-/// Reset the whole wire between games: buffer, run flag, sound/tune caches.
+/// Reset the whole wire between games: buffer, run flag, blocks, sound/tune
+/// caches. Surviving a world reload is the point of holding the blocks here —
+/// surviving the NEXT GAME is not, so they are dropped with everything else.
 void stGpReset() {
   _stGpCmds = <List>[];
   _stGpRunning = false;
   _stGpPane = null;
+  _stGpStep = null;
+  _stGpTeardown = null;
   _stGpSounds = <int, bool>{};
   _stGpTunes = <String, int>{};
   _stGpNextTune = 0;

@@ -30,6 +30,44 @@ GamePane >> present [ <stprim: stGpPresent> ]
 GamePane >> blit: aByteArray [ <stprim: stGpBlit> ]
 GamePane >> run [ <stprim: stGpRun> ]
 GamePane >> stop [ <stprim: stGpStop> ]
+
+"The frame loop's two blocks move to the Dart side (dart:cocoa's _stGpStep /
+ _stGpTeardown). 43 keeps them in GamePane's CLASS VARIABLES, which is exactly
+ right for MACVM and exactly wrong here: in this workspace an accept reloads
+ the whole ST world, so every class-side variable comes back nil while the
+ game object itself survives by morph. A game that loses its StepBlock that way
+ is not interrupted, it is ENDED — the UI timer goes on inviting frames and
+ every one finds nothing to run, so the game freezes on its current frame,
+ alive and permanently still. Galaxigans persists its high scores BY accepting
+ a class, so a qualifying game froze the hall of fame forever; editing any
+ class in the Browser froze whatever was playing. Same selectors, same arity,
+ same chaining contract (onStep: answers the receiver) — the corpus stays
+ verbatim and its own comments stay true, the storage just moved somewhere a
+ reload cannot reach."
+GamePane >> onStep: aBlock [ <stprim: stGpOnStep> ]
+GamePane >> onReset: aBlock [ <stprim: stGpOnReset> ]
+GamePane class >> stepBlock [ <stprim: stGpStepBlock> ]
+GamePane class >> resetBlock [ <stprim: stGpResetBlock> ]
+GamePane class >> clearBlocks [ <stprim: stGpClearBlocks> ]
+
+"43's own bodies, reading the blocks from their new home. stepWithKeys: stays
+ THE single entry to a frame — the UI tick, the stepper and every headless test
+ all come through here, so a stepped frame is the same frame taken by hand."
+GamePane class >> stepWithKeys: mask [
+    | b |
+    Keys := mask.
+    b := self stepBlock.
+    b isNil ifFalse: [ b value ].
+    ^self
+]
+GamePane class >> reset [
+    | r |
+    r := self resetBlock.
+    r isNil ifFalse: [ r value ].
+    self clearBlocks.
+    Keys := 0.
+    ^self
+]
 GamePane >> primDefineSprite: id rows: hexRows [ <stprim: stGpDefineSprite> ]
 GamePane >> primSpriteColor: id index: index r: r g: g b: b [ <stprim: stGpSpriteColor> ]
 GamePane >> primMoveSprite: id x: x y: y [ <stprim: stGpMoveSprite> ]

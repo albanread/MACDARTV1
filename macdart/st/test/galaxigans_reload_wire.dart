@@ -21,11 +21,15 @@
 //   1. the FIX — the shipped saveHall (storeEditorClass: -> the host's storeClass
 //      verb, which persists and makes ONE class live, no world reload) leaves the
 //      loop running, and the table times out into attract;
-//   2. the HAZARD is real — the same flow against the old accept behaviour
-//      (a full stLoadFresh of GamePane) freezes at #hiscore forever. So if
-//      someone points saveHall back at acceptEditorClass:, half 1 fails.
+//   2. the ROOT FIX — even a full accept-style world reload leaves the loop
+//      running, because onStep:/onReset: hold their blocks in dart:cocoa rather
+//      than in GamePane's class variables (world/80_gamepane_wiring.mst), where
+//      no reload can nil them. Half 1 protects the save path; half 2 protects
+//      every OTHER reload — accepting any class in the Browser while a game is
+//      playing used to freeze it the same way.
 //
-// Usage: dart --with-st galaxigans_reload_wire.dart <galaxigans.mst> <43_gamepane.mst>
+// Usage: dart --with-st galaxigans_reload_wire.dart <galaxigans.mst>
+//        <43_gamepane.mst> <80_gamepane_wiring.mst>
 import 'dart:cocoa';
 import 'dart:io';
 
@@ -59,11 +63,13 @@ String playIntoTheHallAndOut() {
 
 main(List<String> args) {
   print('MACDART galaxigans reload-wire test (headless)');
-  if (args.length < 2) {
-    stderr.writeln('usage: galaxigans_reload_wire.dart <galaxigans.mst> <43_gamepane.mst>');
+  if (args.length < 3) {
+    stderr.writeln('usage: galaxigans_reload_wire.dart <galaxigans.mst>'
+        ' <43_gamepane.mst> <80_gamepane_wiring.mst>');
     exit(2);
   }
   var gpSrc = new File(args[1]).readAsStringSync();
+  var wiringSrc = new File(args[2]).readAsStringSync();
 
   var lr = stRun(new File(args[0]).readAsStringSync());
   check('galaxigans loads into the world', !lr.toString().startsWith('ERR'), lr.toString());
@@ -89,17 +95,28 @@ main(List<String> args) {
       stInvokeStatic('GxHallOfFame', 'table', []).toString().contains('YOU'),
       stInvokeStatic('GxHallOfFame', 'table', []).toString());
 
-  // --- 2. the hazard is real: the old accept behaviour freezes the loop -------
-  // Same game, same save, but the host reloads the world the way acceptEditorClass:
-  // did. If this ever STOPS freezing, the loop no longer depends on reloaded
-  // class-side state and half 1's protection has become unnecessary.
+  // --- 2. the hazard is DEAD at the root -------------------------------------
+  // This half used to assert the opposite — that a world-reloading save freezes
+  // the loop — with a note that if it ever stopped freezing, the loop no longer
+  // depended on reloaded class-side state. That is now true by construction:
+  // onStep:/onReset: keep their blocks in dart:cocoa rather than in GamePane's
+  // class variables (world/80_gamepane_wiring.mst), and a reload cannot reach
+  // Dart-side state. So half 1's store is no longer the only thing standing
+  // between a save and a dead game: even a full accept-style world reload now
+  // leaves the frame loop running.
+  //
+  // The reload must carry the WIRING OVERLAY as well as the corpus file, which
+  // is what a real accept does — _stReloadAll rebuilds every decl as one fresh
+  // load, so 80 lands with 43 and its methods win. Reloading 43 alone would put
+  // the corpus's own class-variable versions back on top and freeze the loop for
+  // a reason the GUI can never produce.
   stHostHook = (verb, a) {
-    stLoadFresh(gpSrc);                          // what the full accept did to the loop
+    stLoadFresh(gpSrc + '\n\n' + wiringSrc);     // what a full accept does to the loop
     return 'OK test-reload';
   };
-  var frozen = playIntoTheHallAndOut();
-  check('a world-reloading save DOES freeze the loop (the bug, reproduced)',
-      frozen.contains('hiscore'), frozen);
+  var reloaded = playIntoTheHallAndOut();
+  check('a full world reload no longer freezes the loop (blocks live Dart-side)',
+      reloaded.contains('attract'), reloaded);
 
   print(fails == 0 ? 'RELOAD-WIRE OK' : ('RELOAD-WIRE ' + fails.toString() + ' FAILED'));
   exit(fails == 0 ? 0 : 1);

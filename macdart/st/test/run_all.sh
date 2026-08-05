@@ -156,7 +156,9 @@ else skip "tier5b galaxigans (missing)"; fi
 # leaves the loop running (the table times out into attract) AND that the old
 # world-reloading accept still freezes it — the bug, kept reproducible.
 if [ -f "$HERE/galaxigans_reload_wire.dart" ] && [ -f "$GAME" ]; then
-  rw="$("$DART" --with-st "$HERE/galaxigans_reload_wire.dart" "$GAME" "$MACDART/st/world/43_gamepane.mst" 2>&1)"
+  rw="$("$DART" --with-st "$HERE/galaxigans_reload_wire.dart" "$GAME" \
+        "$MACDART/st/world/43_gamepane.mst" \
+        "$MACDART/st/world/80_gamepane_wiring.mst" 2>&1)"
   if echo "$rw" | grep -q "RELOAD-WIRE OK"; then
     pass "tier5c galaxigans hall save ($(echo "$rw" | grep -cE '^  ok ') checks)"
   else

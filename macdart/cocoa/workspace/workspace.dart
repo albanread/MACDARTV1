@@ -2202,7 +2202,12 @@ Future<String> handle(String line) async {
       repaint();
       return "ok";
     }
-    case 'demostop': stopDemo("stopped"); return "ok";
+    // `demostop` is THE stop verb — it ends a Dart demo, an ST demo and an ST
+    // game alike, since all three are the same pull demo to this isolate.
+    // `stgamestop` is accepted because `stgame` starts one and the language
+    // isolate has answered that name all along; only the UI route was missing,
+    // so the obvious guess used to come back "ERR: unknown stgamestop".
+    case 'demostop': case 'stgamestop': stopDemo("stopped"); return "ok";
     case 'demoedit': {
       await demoEdit();
       return (gEdClass == null && gEdFile == null)

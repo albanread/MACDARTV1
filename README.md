@@ -208,7 +208,10 @@ scroll offset — never raw pixels, applied atomically so there is no
 mid-frame tearing. For workloads that want the pixels anyway (a live Julia
 set, a software rasterizer), a direct-framebuffer mode hands a Dart isolate a
 `Uint8List` that *is* the GPU's own shared memory — writes land with no copy
-and no protocol. Full design in [`GAMEPANE_PLAN.md`](GAMEPANE_PLAN.md).
+and no protocol. Full design in [`GAMEPANE_PLAN.md`](GAMEPANE_PLAN.md); the
+Smalltalk games that ride it — what a game *is* here, the six that ship, how to
+write another, and how to drive one from a script — are in
+[`GAME_LIBRARY.md`](GAME_LIBRARY.md).
 
 Pong is the minimal worked example (← → or A/D, space to serve). Sprite
 Invaders and Brickout are the two full games: sprites, a destructible

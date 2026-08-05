@@ -120,6 +120,19 @@ if [ "$world" = 1 ]; then
   else bad "parked stays parked" "drifted: $w1 -> $w2"; fi
   chk "gpkeys inject"     "keys: 16"  "$(ctl gpkeys 16)"
   ctl gpkeys - >/dev/null
+  # Editing ANY class while a game plays used to end it: an accept reloads the
+  # whole world, and the frame loop's step block used to live in GamePane's
+  # class variables, which come back nil. The block is Dart-side now
+  # (world/80_gamepane_wiring.mst), so the game must play straight through one.
+  # The probe's own answer proves the accept really reloaded, so a silently
+  # failed accept cannot pass this by leaving the game undisturbed.
+  ctl gprun >/dev/null
+  ctl doit "st> STHostService new acceptEditorClass: 'Object subclass: GxReloadProbe [ GxReloadProbe class >> ping [ ^42 ] ]'" >/dev/null 2>&1
+  chk "accept landed (world reloaded)" "42" "$(ctl doit 'st> GxReloadProbe ping')"
+  e1="$(ctl gpwhere)"; sleep 1; e2="$(ctl gpwhere)"
+  if [ "$e1" != "$e2" ] && [ "${e2#running}" != "$e2" ]; then
+    ok "game survives a Browser accept" "$e2"
+  else bad "game survives a Browser accept" "froze at $e2"; fi
   ctl gprun >/dev/null; r1="$(ctl gpwhere)"; sleep 1; r2="$(ctl gpwhere)"
   if [ "$r1" != "$r2" ]; then ok "gprun resumes the pull loop" "$r2"
   else bad "gprun resumes the pull loop" "still frozen at $r2"; fi

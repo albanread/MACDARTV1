@@ -2227,6 +2227,20 @@ Future<String> handle(String line) async {
       return f.isEmpty ? "clean" : f.join('\n');
     }
     case 'gpstat': return gpStat().toString();
+    // The frame stepper (language isolate — that is where the frame loop is).
+    // A game is a loop of discrete frames, so pausing between them IS the
+    // debugger: park it, take frames by hand, and read or poke the running game
+    // with an ordinary `doit` in between. `gpsnap` after a step shows you the
+    // exact frame you just took.
+    //   gppause | gpstep [n] | gprun | gpwhere | gpkeys <mask|->
+    case 'gppause': case 'gprun': case 'gpwhere': {
+      var r = await ask(cmd, '');
+      return r == null ? 'ERR: ' + cmd + ' timed out' : r.toString();
+    }
+    case 'gpstep': case 'gpkeys': {
+      var r = await ask(cmd, arg.trim());
+      return r == null ? 'ERR: ' + cmd + ' timed out' : r.toString();
+    }
     case 'gpfull': gpFullscreen(arg.trim() == '1'); return "ok";
     case 'tab': {
       if (arg.trim().isEmpty) return gTab.toString();   // read the current tab

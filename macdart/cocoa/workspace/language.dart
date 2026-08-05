@@ -439,6 +439,7 @@ int _stGameMask(List keycodes) {
 }
 
 void _stGameCleanup() {
+  _gpResetStepper();          // a parked stepper must never outlive its game
   if (_stGameTick != null) { _stGameTick.close(); _stGameTick = null; }
   // Fire the game's onReset: block and clear StepBlock/Keys, then the wire.
   try { stInvokeStatic('GamePane', 'reset', []); } catch (e) {}
@@ -487,6 +488,7 @@ _stGame(String arg) {
     return 'ERR ' + name + ' never sent GamePane>>run';
   }
   var setup = stGpTake();
+  _gpResetStepper();          // frame 0, free-running, real keyboard
   _stGameTick = new ReceivePort();
   _stGameTick.listen(_stGameOnTick);
   _ui.send(<dynamic>['port', _stGameTick.sendPort]);
@@ -515,23 +517,127 @@ _stGame(String arg) {
   return 'ok';
 }
 
-// One UI tick: keystate in, one stepped frame out.
-void _stGameOnTick(gs) {
-  if (_stGameTick == null) return;     // stopped between ticks
-  var keys = (gs is List && gs.isNotEmpty && gs[0] is List)
-      ? gs[0] as List : const [];
+// --- frame stepping (the Tcl-driven stepper) --------------------------------
+// A game's whole frame is ONE `GamePane stepWithKeys:` call, invited by the UI
+// timer ~33 times a second. That makes a frame-granularity debugger nearly
+// free: gate the invitation, and the loop stops between frames with everything
+// — the pane, the image, the running game object — still live and inspectable.
+// No breakpoints, no stack surgery, no pausing the isolate: while parked we
+// simply decline to step, so the control plane stays as responsive as ever and
+// `doit` can read (or poke) the game between frames.
+//
+// End-of-frame and start-of-frame are the SAME instant here, because nothing
+// runs between the last statement of frame N and the first of frame N+1 — so
+// one park point serves both readings. Look at what the frame produced with
+// `gpwhere` / `doit` / `gpsnap` (that is the end of N); set up what the next
+// one will see with `gpkeys` and `doit` (that is the start of N+1).
+bool _gpParked = false;      // parked between frames?
+int _gpFrameNo = 0;          // frames stepped since this game started
+int _gpLastOps = 0;          // draw ops the last stepped frame produced
+int _gpKeys = -1;            // injected key mask (-1 = the real keyboard)
+
+/// Frame counters belong to a RUN, not to the driver — a new game starts at 0.
+/// Parking does not survive either: a game you launch always plays.
+void _gpResetStepper() {
+  _gpParked = false; _gpFrameNo = 0; _gpLastOps = 0; _gpKeys = -1;
+}
+
+String _gpWhere() {
+  if (_stGameTick == null) return 'no game running';
+  var b = new StringBuffer();
+  b.write(_gpParked ? 'parked' : 'running');
+  b.write(' frame ');
+  b.write(_gpFrameNo);
+  b.write(' ops ');
+  b.write(_gpLastOps);
+  b.write(_gpKeys >= 0 ? (' keys ' + _gpKeys.toString()) : ' keys live');
+  return b.toString();
+}
+
+/// ONE frame: step the game, ship what it drew. The single place a frame
+/// happens — the UI tick and the stepper both come through here, so a stepped
+/// frame is not a different kind of frame, it is the same one taken by hand.
+/// Answers false if the game ended (and has been cleaned up).
+bool _gpOneFrame(int mask) {
   try {
-    stInvokeStatic('GamePane', 'stepWithKeys:', [_stGameMask(keys)]);
+    stInvokeStatic('GamePane', 'stepWithKeys:', [mask]);
   } catch (e) {
     _ui.send(<dynamic>['done', 'ST game error: ' + e.toString()]);
     _stGameCleanup();
-    return;
+    return false;
   }
-  _ui.send(<dynamic>['draw', stGpTake()]);
+  var ops = stGpTake();
+  _gpFrameNo++;
+  _gpLastOps = ops is List ? ops.length : 0;
+  _ui.send(<dynamic>['draw', ops]);
   if (!stGpIsRunning()) {              // the game sent GamePane>>stop
     _ui.send(<dynamic>['done', 'game over']);
     _stGameCleanup();
+    return false;
   }
+  return true;
+}
+
+/// `gpstep [n]` — park, then take n frames (default 1) RIGHT NOW and answer
+/// where that left the game. Deliberately not "let the timer deliver n frames":
+/// a stepper you have to wait 30ms a frame for is useless for scripting, and
+/// waiting would also mean the reply could not describe the result. Stepping
+/// 600 frames to reach the next attract flip is instant.
+String _gpStep(String arg) {
+  if (_stGameTick == null) return 'ERR no game running';
+  var n = int.parse(arg.trim(), onError: (_) => 1);
+  if (n < 1) n = 1;
+  _gpParked = true;                       // the UI tick keeps its hands off
+  var keys = _gpKeys >= 0 ? _gpKeys : 0;  // stepping is keyboard-free; see gpkeys
+  for (var i = 0; i < n; i++) {
+    if (!_gpOneFrame(keys)) return 'game ended at frame ' + _gpFrameNo.toString();
+  }
+  return _gpWhere();
+}
+
+String _gpPause() {
+  if (_stGameTick == null) return 'ERR no game running';
+  _gpParked = true;
+  return _gpWhere();
+}
+
+String _gpRun() {
+  if (_stGameTick == null) return 'ERR no game running';
+  _gpParked = false;
+  return _gpWhere();
+}
+
+/// `gpkeys <mask>` — what the next stepped frames see instead of the keyboard
+/// (bits: left 1, right 2, up 4, down 8, A 16, B 32), or `-` to hand control
+/// back. This is the "act at the start of the frame" half of the stepper: hold
+/// fire for one frame and watch exactly what that frame does with it.
+String _gpKeysCmd(String arg) {
+  var s = arg.trim();
+  if (s.isEmpty || s == '-' || s == 'off') { _gpKeys = -1; return 'keys: keyboard'; }
+  var v = int.parse(s, onError: (_) => -1);
+  if (v < 0) return 'ERR gpkeys <mask 0..63 | ->';
+  _gpKeys = v;
+  return 'keys: ' + v.toString();
+}
+
+// One UI tick: keystate in, one stepped frame out — unless the stepper has the
+// loop parked, in which case the tick is declined and the game simply waits.
+void _stGameOnTick(gs) {
+  if (_stGameTick == null) return;     // stopped between ticks
+  if (_gpParked) {
+    // Parked: step nothing, but STILL answer the invitation. The UI schedules
+    // the next tick from inside the paint it does for this one, so a tick that
+    // goes unanswered ends the pull loop for good — park by declining silently
+    // and `gprun` would resume a game nobody was inviting any more. An empty
+    // batch applies no ops and re-presents the frame we stopped on (the native
+    // begin_frame only opens a command buffer; it does not clear), so the pane
+    // holds its picture and the pump stays primed.
+    _ui.send(<dynamic>['draw', const []]);
+    return;
+  }
+  var keys = (gs is List && gs.isNotEmpty && gs[0] is List)
+      ? gs[0] as List : const [];
+  _gpOneFrame(_gpKeys >= 0 ? _gpKeys : _stGameMask(keys));
 }
 
 _stGameStop(String arg) { _stGameCleanup(); return 'ok'; }
@@ -1260,6 +1366,14 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'stgame') out = _stGame(arg.toString());
       else if (cmd == 'stgamestop') out = _stGameStop(arg.toString());
       else if (cmd == 'stgames') out = _stGameList();
+      // the frame stepper — a game is a loop of discrete frames, so these are
+      // the whole debugger it needs: park it, take frames one at a time, and
+      // read (or poke) the world between them with the ordinary `doit`.
+      else if (cmd == 'gpstep') out = _gpStep(arg.toString());
+      else if (cmd == 'gppause') out = _gpPause();
+      else if (cmd == 'gprun') out = _gpRun();
+      else if (cmd == 'gpwhere') out = _gpWhere();
+      else if (cmd == 'gpkeys') out = _gpKeysCmd(arg.toString());
       else if (cmd == 'sthaltarm') out = stHaltArm(arg);
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();

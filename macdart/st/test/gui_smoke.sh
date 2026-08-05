@@ -103,6 +103,26 @@ if [ "$world" = 1 ]; then
   chk "stgame gpsnap"     "ok"        "$(ctl gpsnap /tmp/stgame.png)"
   if [ -s /tmp/stgame.png ]; then ok "stgame snapshot" "$(wc -c </tmp/stgame.png | tr -d ' ') bytes"
   else bad "stgame snapshot" "missing/empty /tmp/stgame.png"; fi
+  # The frame stepper: park the loop, take frames by hand, resume. The two
+  # things that can silently break it are (a) a step that does not actually
+  # advance a frame, and (b) a park that stops answering the UI's invitation —
+  # the next tick is scheduled from inside the paint, so an unanswered one ends
+  # the pull loop and `gprun` would resume a game nobody is inviting. Both are
+  # checked: frozen while parked, and moving again after gprun.
+  p1="$(ctl gppause)"; s1="$(ctl gpstep)"; s2="$(ctl gpstep)"
+  f1="$(echo "$p1" | sed -n 's/.*frame \([0-9]*\).*/\1/p')"
+  f3="$(echo "$s2" | sed -n 's/.*frame \([0-9]*\).*/\1/p')"
+  if [ -n "$f1" ] && [ -n "$f3" ] && [ "$f3" = "$((f1 + 2))" ]; then
+    ok "gpstep one frame each" "$s1 -> $s2"
+  else bad "gpstep one frame each" "$p1 / $s1 / $s2"; fi
+  w1="$(ctl gpwhere)"; sleep 1; w2="$(ctl gpwhere)"
+  if [ "$w1" = "$w2" ]; then ok "parked stays parked" "$w2"
+  else bad "parked stays parked" "drifted: $w1 -> $w2"; fi
+  chk "gpkeys inject"     "keys: 16"  "$(ctl gpkeys 16)"
+  ctl gpkeys - >/dev/null
+  ctl gprun >/dev/null; r1="$(ctl gpwhere)"; sleep 1; r2="$(ctl gpwhere)"
+  if [ "$r1" != "$r2" ]; then ok "gprun resumes the pull loop" "$r2"
+  else bad "gprun resumes the pull loop" "still frozen at $r2"; fi
   chk "stgame stop"       "ok"        "$(ctl demostop)"
 else
   skip "stgame breakout" "no world in this image"

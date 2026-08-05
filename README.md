@@ -233,6 +233,19 @@ typo'd selector, an unknown class, or a call that would overflow the
 bridge's 8-register float-argument limit, before the code ever runs. Design
 in [`COCOA_STATIC_CHECK_PLAN.md`](COCOA_STATIC_CHECK_PLAN.md).
 
+A running **game** gets a debugger of its own shape, because a game is not a
+call stack — it is a loop of discrete frames. Its whole frame is one
+`GamePane stepWithKeys:` invited by the UI timer, so gating that invitation is
+the entire mechanism: `gppause` parks the loop between frames, `gpstep [n]`
+takes frames by hand (immediately, not at 33fps — stepping a thousand frames to
+reach the next attract flip is instant), `gpwhere` reports where you are and how
+many draw ops the last frame produced, `gpkeys <mask>` feeds the next frames a
+held-key mask instead of the keyboard, and `gprun` hands the loop back. Nothing
+is suspended while parked, so the ordinary `doit` reads *and pokes* the live
+game between frames, and `gpsnap` writes the exact frame you stopped on to PNG.
+Hold fire for one frame and watch the op count jump from 62 to 463 as the wave
+forms — that is the whole feature, and it cost far less than the debugger.
+
 ## Apps, and running them standalone
 
 Beyond demos, an *app* is an ordinary image class with a `build(ui)` method that

@@ -94,7 +94,7 @@ ZLIB
 # extract. Idempotent: skip if already applied.
 if patch -p1 --dry-run -d "$DEST" < "$HERE/../patches/macdart-port.patch" >/dev/null 2>&1; then
   patch -p1 -d "$DEST" < "$HERE/../patches/macdart-port.patch"
-  echo "extract: applied macdart-port.patch (3 VM fixes)"
+  echo "extract: applied macdart-port.patch (VM fixes incl. the frame-printer hardening)"
 else
   echo "extract: macdart-port.patch already applied (or does not apply) — skipping"
 fi

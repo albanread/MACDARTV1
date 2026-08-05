@@ -699,3 +699,168 @@
      }
      const LocalVarDescriptors& var_descs = LocalVarDescriptors::Handle(
          parsed_function->node_sequence()->scope()->GetVarDescriptors(function));
+--- a/runtime/vm/debugger.h
++++ b/runtime/vm/debugger.h
+@@ -335,7 +335,15 @@
+   // Print the activation frame into |jsobj|. if |full| is false, script
+   // and local variable objects are only references. if |full| is true,
+   // the complete script, function, and, local variable objects are included.
+-  void PrintToJSONObject(JSONObject* jsobj, bool full = false);
++  // |with_vars| = false prints the frame's location WITHOUT reading its
++  // variables — for frames of code that is RUNNING rather than paused
++  // (the synthesized kResume top frame), where slots may be uninitialized
++  // (a stack-overflow check interrupts at function entry) or optimized
++  // away, and reading them can fault (MACDART: SEGV in VariableAt when a
++  // service getIsolate landed while Smalltalk-built code was mid-flight).
++  void PrintToJSONObject(JSONObject* jsobj,
++                         bool full = false,
++                         bool with_vars = true);
+ 
+   RawObject* GetAsyncAwaiter();
+   RawObject* GetCausalStack();
+@@ -343,7 +351,7 @@
+   bool HandlesException(const Instance& exc_obj);
+ 
+  private:
+-  void PrintToJSONObjectRegular(JSONObject* jsobj, bool full);
++  void PrintToJSONObjectRegular(JSONObject* jsobj, bool full, bool with_vars);
+   void PrintToJSONObjectAsyncCausal(JSONObject* jsobj, bool full);
+   void PrintToJSONObjectAsyncSuspensionMarker(JSONObject* jsobj, bool full);
+   void PrintToJSONObjectAsyncActivation(JSONObject* jsobj, bool full);
+--- a/runtime/vm/debugger.cc
++++ b/runtime/vm/debugger.cc
+@@ -1111,7 +1111,18 @@
+   if (deopt_frame_.IsNull()) {
+     return GetVariableValue(LocalVarAddress(fp(), slot_index));
+   } else {
+-    return deopt_frame_.At(LocalVarIndex(deopt_frame_offset_, slot_index));
++    // The var descriptors describe the UNOPTIMIZED frame; this frame's values
++    // come from the deopt materialization, which holds only what the
++    // optimizer's environment knew. A descriptor slot beyond it (Smalltalk-
++    // built functions allocate builder temps the environment never carries)
++    // used to read out of the array — in release, straight into whatever
++    // heap memory followed. Answer the optimizer's own sentinel instead,
++    // exactly what an honestly-elided variable reports.
++    const intptr_t index = LocalVarIndex(deopt_frame_offset_, slot_index);
++    if ((index < 0) || (index >= deopt_frame_.Length())) {
++      return Symbols::OptimizedOut().raw();
++    }
++    return deopt_frame_.At(index);
+   }
+ }
+ 
+@@ -1218,20 +1229,33 @@
+ RawObject* ActivationFrame::GetContextVar(intptr_t var_ctx_level,
+                                           intptr_t ctx_slot) {
+   const Context& ctx = GetSavedCurrentContext();
+-  ASSERT(!ctx.IsNull());
++  // A frame whose context slot has not been (or is no longer) a real context
++  // has nothing to read a context variable from.
++  if (ctx.IsNull()) {
++    return Symbols::OptimizedOut().raw();
++  }
+ 
+   // The context level at the PC/token index of this activation frame.
+   intptr_t frame_ctx_level = ContextLevel();
+ 
++  // On any mismatch between the descriptors and the frame's actual chain,
++  // ANSWER THE SENTINEL rather than read anyway: the old code printed a
++  // diagnostic and then fell through to the very out-of-bounds ctx.At the
++  // diagnostic had just described (release strips the ASSERTs between), and
++  // the diagnostic itself dumped the suspect context. Debug builds keep the
++  // loud asserts.
+   intptr_t level_diff = frame_ctx_level - var_ctx_level;
+   if (level_diff == 0) {
+     if ((ctx_slot < 0) || (ctx_slot >= ctx.num_variables())) {
+-      PrintContextMismatchError(ctx_slot, frame_ctx_level, var_ctx_level);
++      ASSERT((ctx_slot >= 0) && (ctx_slot < ctx.num_variables()));
++      return Symbols::OptimizedOut().raw();
+     }
+-    ASSERT((ctx_slot >= 0) && (ctx_slot < ctx.num_variables()));
+     return ctx.At(ctx_slot);
+   } else {
+-    ASSERT(level_diff > 0);
++    if (level_diff < 0) {
++      ASSERT(level_diff > 0);
++      return Symbols::OptimizedOut().raw();
++    }
+     Context& var_ctx = Context::Handle(ctx.raw());
+     while (level_diff > 0 && !var_ctx.IsNull()) {
+       level_diff--;
+@@ -1239,10 +1263,10 @@
+     }
+     if (var_ctx.IsNull() || (ctx_slot < 0) ||
+         (ctx_slot >= var_ctx.num_variables())) {
+-      PrintContextMismatchError(ctx_slot, frame_ctx_level, var_ctx_level);
++      ASSERT(!var_ctx.IsNull());
++      ASSERT((ctx_slot >= 0) && (ctx_slot < var_ctx.num_variables()));
++      return Symbols::OptimizedOut().raw();
+     }
+-    ASSERT(!var_ctx.IsNull());
+-    ASSERT((ctx_slot >= 0) && (ctx_slot < var_ctx.num_variables()));
+     return var_ctx.At(ctx_slot);
+   }
+ }
+@@ -1362,9 +1386,11 @@
+ }
+ 
+ 
+-void ActivationFrame::PrintToJSONObject(JSONObject* jsobj, bool full) {
++void ActivationFrame::PrintToJSONObject(JSONObject* jsobj,
++                                        bool full,
++                                        bool with_vars) {
+   if (kind_ == kRegular) {
+-    PrintToJSONObjectRegular(jsobj, full);
++    PrintToJSONObjectRegular(jsobj, full, with_vars);
+   } else if (kind_ == kAsyncCausal) {
+     PrintToJSONObjectAsyncCausal(jsobj, full);
+   } else if (kind_ == kAsyncSuspensionMarker) {
+@@ -1377,7 +1403,9 @@
+ }
+ 
+ 
+-void ActivationFrame::PrintToJSONObjectRegular(JSONObject* jsobj, bool full) {
++void ActivationFrame::PrintToJSONObjectRegular(JSONObject* jsobj,
++                                               bool full,
++                                               bool with_vars) {
+   const Script& script = Script::Handle(SourceScript());
+   jsobj->AddProperty("type", "Frame");
+   jsobj->AddProperty("kind", KindToCString(kind_));
+@@ -1391,6 +1419,18 @@
+     // location.
+     jsobj->AddProperty("script", script, !full);
+   }
++  // A frame that is RUNNING (not stopped at a debugger safe point) has no
++  // trustworthy variables to print: an interrupt lands wherever it lands —
++  // at a function-entry stack-overflow check the slots (including the saved
++  // context, whose descriptor carries no visibility range) are still
++  // uninitialized, and optimized frames materialize only what the deopt
++  // environment knew. Reading them is how a service getIsolate once took
++  // down the whole GUI mid-Smalltalk. Location and function still print;
++  // the caller says whether variables are safe (with_vars).
++  if (!with_vars) {
++    JSONArray jsvars(jsobj, "vars");
++    return;
++  }
+   {
+     JSONArray jsvars(jsobj, "vars");
+     const int num_vars = NumLocalVariables();
+--- a/runtime/vm/service_event.cc
++++ b/runtime/vm/service_event.cc
+@@ -226,7 +226,15 @@
+   }
+   if ((top_frame() != NULL) && Isolate::Current()->compilation_allowed()) {
+     JSONObject jsFrame(&jsobj, "topFrame");
+-    top_frame()->PrintToJSONObject(&jsFrame);
++    // A kResume event's top frame is SYNTHESIZED for an isolate that is
++    // still RUNNING (Isolate::PrintJSON answering getIsolate): it says where
++    // execution is, but its slots are live and untrustworthy — an interrupt
++    // at a function-entry stack-overflow check sees them uninitialized, and
++    // reading them once SEGV'd the GUI mid-Smalltalk. Real pause events
++    // (breakpoint, exception, step) are at safe points and keep their
++    // variables.
++    top_frame()->PrintToJSONObject(&jsFrame, false,
++                                   kind() != ServiceEvent::kResume);
+     intptr_t index = 0;  // Avoid ambiguity in call to AddProperty.
+     jsFrame.AddProperty("index", index);
+   }

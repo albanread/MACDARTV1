@@ -156,6 +156,38 @@ else
   skip "st app" "no world in this image"
 fi
 
+# The sprite editor (SPRITE_EDITOR_PLAN.md): its scripted face drives the SAME
+# handlers the mouse does. Paint two pixels and assert the EXACT hex rows; save
+# through the store path; prove the sheet is a live image class by running its
+# own installOn: against a real GamePane; mutate and load back (the load must
+# revert the mutation); and the preview pane must be owned + snappable.
+if [ "$world" = 1 ]; then
+  chk "sprited opens"     "ok"  "$(ctl sprited)"
+  ctl spednew >/dev/null                 # the editor persists state; start clean
+  ctl spedtool pencil >/dev/null; ctl spedcolor 6 >/dev/null
+  ctl spedpaint 0 0 >/dev/null; ctl spedpaint 1 0 >/dev/null
+  row1="$(ctl spedrows | cut -d/ -f1)"
+  if [ "$row1" = "6600000000000000" ]; then ok "sped paints exact pixels" "$row1"
+  else bad "sped paints exact pixels" "row1: $row1"; fi
+  chk "sped saves via store"  "OK stored SmokeSprite"  "$(ctl spedsave SmokeSprite)"
+  case "$(ctl spedlist)" in *SmokeSprite*) ok "sped sheet listed" "SmokeSprite";;
+    *) bad "sped sheet listed" "$(ctl spedlist)";; esac
+  chk "sheet installOn: answers a live Sprite" "'Sprite'" \
+      "$(ctl doit "st> | p | p := GamePane new. ^(SmokeSprite installOn: p) class name")"
+  ctl spedcolor 3 >/dev/null; ctl spedpaint 5 5 >/dev/null
+  ctl spedload SmokeSprite >/dev/null
+  row6="$(ctl spedrows | cut -d/ -f6)"
+  if [ "$row6" = "0000000000000000" ]; then ok "sped load reverts the mutation" "row6 clean"
+  else bad "sped load reverts the mutation" "row6: $row6"; fi
+  case "$(ctl spedstat)" in pane\ *) ok "sped owns the preview pane" "$(ctl spedstat)";;
+    *) bad "sped owns the preview pane" "$(ctl spedstat)";; esac
+  rm -f /tmp/sped_smoke.png
+  chk "sped preview snaps" "ok /tmp/sped_smoke.png" "$(ctl gpsnap /tmp/sped_smoke.png)"
+  chk "sprited closes"    "ok"  "$(ctl spritedclose)"
+else
+  skip "sprite editor" "no world in this image"
+fi
+
 # scan the live log for anything that smells like a broken pane
 if [ -f "$LOG" ] && grep -qiE "NoSuchMethod|StSymbol|Cocoa: send to a released|Smalltalk browser: ERR|Unhandled exception" "$LOG"; then
   bad "log clean" "$(grep -iE 'NoSuchMethod|StSymbol|browser: ERR' "$LOG" | tail -1)"

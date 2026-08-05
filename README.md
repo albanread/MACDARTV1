@@ -211,7 +211,12 @@ set, a software rasterizer), a direct-framebuffer mode hands a Dart isolate a
 and no protocol. Full design in [`GAMEPANE_PLAN.md`](GAMEPANE_PLAN.md); the
 Smalltalk games that ride it — what a game *is* here, the six that ship, how to
 write another, and how to drive one from a script — are in
-[`GAME_LIBRARY.md`](GAME_LIBRARY.md).
+[`GAME_LIBRARY.md`](GAME_LIBRARY.md). Their art has its own tool: **Games ▸
+Sprite Editor**, a utility window of Cocoa controls around the real Metal pane
+— paint the 16-colour sprites, edit the palette, flip through animation frames
+with the engine itself previewing at 1x/2x/4x — and Save writes the sheet as
+an ordinary class in the image whose `installOn: pane` hands a game the whole
+sprite in one send ([`SPRITE_EDITOR_PLAN.md`](SPRITE_EDITOR_PLAN.md)).
 
 Pong is the minimal worked example (← → or A/D, space to serve). Sprite
 Invaders and Brickout are the two full games: sprites, a destructible

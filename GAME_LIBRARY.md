@@ -204,10 +204,45 @@ every invitation, with an empty batch — no ops applied, and the native
 `begin_frame` opens a command buffer rather than clearing, so the pane holds the
 frame you stopped on.
 
+## The sprite editor
+
+**Games ▸ Sprite Editor** opens a real utility window — Cocoa controls around
+the actual Metal pane — for drawing the sprites everything above renders:
+pixels on a checkerboard grid (click paints, drag strokes), the 16-entry
+per-sprite palette (swatches + RGB sliders; entry 0 is transparent and wears a
+diagonal to say so), animation frames (add/dup/del, played by the engine
+itself at a chosen fps), and a live preview showing the art at 1x/2x/4x —
+rendered by the same engine a game uses, because the preview area literally
+hosts the engine's view. Design notes in
+[`SPRITE_EDITOR_PLAN.md`](SPRITE_EDITOR_PLAN.md).
+
+**A saved sheet is source in the image** (the hall-of-fame doctrine): Save
+writes an ordinary class through the store path — parse-checked, persistent,
+Browser-editable, and no world reload, so nothing running is disturbed. The
+whole consumption API is one send:
+
+```smalltalk
+ship := ShipSprites installOn: pane.   "art + frames + palette, ready to move"
+ship moveTo: 100 y: 80.
+```
+
+Copy Code exports the raw `defineSprite:`/`addFrame:`/`colorAt:` calls instead,
+for art pasted straight into a game. The editor and a running game share the
+one engine: launching a game borrows the pane away from the preview, and the
+editor's Preview button takes it back.
+
+Scripted face (same handlers the mouse drives): `sprited` / `spritedclose`,
+`spednew`, `spedtool pencil|fill|pick`, `spedcolor <0-15>`, `spedrgb r g b`,
+`spedpaint x y`, `spedframe add|dup|del|next|prev`, `spedrows` (the current
+frame as exact hex rows), `spedname`, `spedsave [Name]`, `spedload <Name>`,
+`spedlist`, `spedstat`. The document model is pure Dart
+(`cocoa/workspace/spriteed_model.dart`), tested headless in the battery.
+
 ## Testing
 
 | Tier | What it proves |
 |---|---|
+| `st/test/spriteed_model_test.dart` | the sprite editor's document — pixels/frames/palette ops, hex-row round-trip, sheet-class source — pure Dart, no world |
 | `st/test/gamepane_wire.dart` | the exact `gp*` ops a game ships, headless — overlay, helpers, sound map, ABC compiler and step loop all agree, before any pixel exists |
 | `st/test/galaxigans_smoke.mst` | a real game played through: dive, fire, collisions, waves, the dance, the hall of fame, the attract timeout |
 | `st/test/galaxigans_reload_wire.dart` | the save path does not kill the frame loop, and a full world reload no longer can either |

@@ -66,6 +66,19 @@ if [ -f "$HERE/run_features.dart" ]; then
   fi
 else skip "tier2b feature suites (driver not present)"; fi
 
+# tier 2b-sprited — the sprite editor's document model (pure Dart, no world:
+# pixels/frames/palette, hex-row emit+parse round-trip, sheet-class source).
+# The window imports the SAME file, so the model the GUI edits is the model
+# asserted here.
+if [ -f "$HERE/spriteed_model_test.dart" ]; then
+  sm="$("$DART" "$HERE/spriteed_model_test.dart" 2>&1)"
+  if echo "$sm" | grep -qE "SPRITEED-MODEL OK"; then
+    pass "tier2b sprite editor model ($(echo "$sm" | grep -cE '^  ok ') checks)"
+  else
+    fail "tier2b sprite editor model"; echo "$sm" | grep -iE "FAIL" | head -4 | sed 's/^/        /'
+  fi
+else skip "tier2b sprite editor model (driver not present)"; fi
+
 # tier 2b-game — the ST game wire, asserted headless (GamePane primitives ->
 # gp* draw ops; Breakout/Worms boot and draw frames through it, no GUI needed).
 if [ -f "$HERE/gamepane_wire.dart" ]; then

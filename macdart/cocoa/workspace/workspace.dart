@@ -11,6 +11,8 @@ import 'dart:convert';
 import 'dart:async';
 import 'dart:developer';
 
+import 'spriteed_model.dart';   // the sprite editor's document (pure, tested)
+
 Cocoa gWindow, gContent, gTabView, gEditor, gTranscript;
 SendPort gLang;
 List<String> gLog = <String>[];
@@ -1426,6 +1428,8 @@ void buildMenu() {
   menuItem(games, "Smalltalk MandelVM", "", (s) => runStGame("MandelVM"));
   menuItem(games, "Smalltalk FFT", "", (s) => runStGame("FFT"));
   menuSep(games);
+  menuItem(games, "Sprite Editor", "", (s) => spriteEdShow(''));
+  menuSep(games);
   menuItem(games, "Stop Game", "", (s) => stopDemo("stopped"));
 
   // Apps: your own Cocoa apps, running on the App pane. The examples in apps/
@@ -2383,6 +2387,12 @@ Future<String> handle(String line) async {
     }
     case 'stdemo': runStDemo(arg.trim().isEmpty ? 'Waves' : arg.trim()); return "ok";
     case 'stgame': runStGame(arg.trim().isEmpty ? 'Breakout' : arg.trim()); return "ok";
+    // The sprite editor's scripted face — same handlers the mouse drives.
+    case 'sprited': case 'spritedclose': case 'spedstat': case 'spedrows':
+    case 'spedpaint': case 'spedcolor': case 'spedrgb': case 'spedtool':
+    case 'spedframe': case 'spedname': case 'spedsave': case 'spedload':
+    case 'spedlist': case 'speddump': case 'spednew':
+      return await spriteEdVerb(cmd, arg.trim());
     case 'kill': await respawnLanguage("manual kill"); return "ok";
     case 'quit':
       Cocoa.cls("NSApplication").sharedApplication().terminate(null); return "ok";
@@ -3961,6 +3971,10 @@ bool gGpMode = false;
 Cocoa gGpView;
 
 void gpEnter(List cmds) {
+  // The engine's NSView is a singleton: opening it here re-parents it away
+  // from wherever it was — including the sprite editor's preview box. Tell
+  // the editor it lost the pane, so its rebuilds stop until it re-acquires.
+  spriteEdPaneTaken();
   var o = cmds[0];
   int gi(int i, int dflt) =>
       (o.length > i && o[i] is num) ? (o[i] as num).toInt() : dflt;
@@ -6436,4 +6450,650 @@ main(List<String> args) async {
     if (d != null) await runScannedDemo(d[0], d[1]);  // opens the game pane on its first frame
     else gWindow.setTitle(standaloneGame + " — no such game/demo");
   }
+}
+
+// === The Sprite Editor (SPRITE_EDITOR_PLAN.md) ===============================
+// A paint program for the game library, in its own window: the 16-colour
+// sprites the pane renders — pixels, per-sprite palette, frames — edited with
+// the mouse and saved as SOURCE in the image (a sheet class with installOn:,
+// the hall-of-fame doctrine: your art is source). The document model lives in
+// spriteed_model.dart, pure and headless-tested; this section is only views,
+// mouse, and the pane preview.
+//
+// The preview IS the real engine: gpOpen returns the engine's NSView and this
+// window parents it like the demos tab does. Defs and frames are append-only
+// engine-side, so an edit never mutates engine state — the preview rebuilds
+// from scratch each time (reopen + ONE gpApply batch; apply is atomic and ends
+// in a present, so the glass never shows a partial rebuild). The engine is a
+// singleton: launching a game re-parents the view away (gpEnter's hook tells
+// us), and the Preview button takes it back.
+
+Cocoa gSpWindow;
+Cocoa gSpGridView, gSpGridImg;
+Cocoa gSpPalView, gSpPalImg;
+Cocoa gSpNameField, gSpWField, gSpHField;
+Cocoa gSpFrameLbl, gSpStatusLbl, gSpRgbLbl;
+Cocoa gSpRSlider, gSpGSlider, gSpBSlider;
+Cocoa gSpFpsSlider, gSpPlayChk;
+Cocoa gSpLoadPopup;
+Cocoa gSpPreviewBox;
+Map<String, Cocoa> gSpToolBtns = <String, Cocoa>{};
+
+SpriteDoc gSpDoc;
+int gSpFrame = 0;                 // the frame under edit
+int gSpColor = 15;                // the active palette index
+String gSpTool = 'pencil';        // pencil | fill | pick
+bool gSpOwnsPane = false;         // the engine view is in OUR preview box
+Timer gSpPreviewTimer;            // coalesces preview rebuilds
+
+const double kSpGridPx = 432.0;   // the editing canvas, square
+const double kSpPalW = 256.0, kSpPalH = 64.0;   // 8x2 swatches of 32px
+
+// --- window ------------------------------------------------------------------
+
+void spriteEdShow(String loadName) {
+  if (gSpDoc == null) gSpDoc = new SpriteDoc();
+  if (gSpWindow == null) spBuildWindow();
+  gSpWindow.makeKeyAndOrderFront(null);
+  // A scripted `sprited` arrives with some other app frontmost; the menu
+  // path is already active, so this is a no-op there.
+  Cocoa.cls("NSApplication").sharedApplication().activateIgnoringOtherApps(true);
+  // Take the pane for the preview unless a game is actually playing on it —
+  // stealing a running game on a menu click would be rude; the Preview button
+  // is the deliberate version.
+  if (!gSpOwnsPane && !gGpMode) spAcquirePane();
+  if (loadName != null && loadName.isNotEmpty) spLoadSheet(loadName);
+  spRepaintAll();
+}
+
+void spriteEdPaneTaken() {
+  if (!gSpOwnsPane) return;
+  gSpOwnsPane = false;
+  spStatus("a game took the pane — Preview takes it back");
+}
+
+void spStatus(String s) {
+  if (gSpStatusLbl != null) gSpStatusLbl.setStringValue(s);
+}
+
+void spBuildWindow() {
+  // titled | closable | miniaturizable — deliberately NOT resizable: the grid
+  // and pane are fixed-pitch surfaces, and a fixed layout keeps every frame
+  // computation honest. The red button HIDES the window (there is no close
+  // notification in the bridge, and releasedWhenClosed=false keeps the window
+  // object alive), so state survives and the menu item brings it straight back.
+  gSpWindow = Cocoa.cls("NSWindow").alloc().initWithContentRect(
+      [0.0, 0.0, 980.0, 560.0], styleMask: 7, backing: 2, defer: false);
+  gSpWindow.setTitle("Sprite Editor");
+  gSpWindow.setReleasedWhenClosed(false);
+  var c = gSpWindow.contentView();
+
+  // --- left: the editing grid + tools ---
+  gSpGridImg = Cocoa.cls("NSImage").alloc().initWithSize([kSpGridPx, kSpGridPx]);
+  gSpGridView = Cocoa.cls("NSImageView").alloc()
+      .initWithFrame([12.0, 116.0, kSpGridPx, kSpGridPx]);
+  gSpGridView.setImageScaling(3);
+  gSpGridView.setImage(gSpGridImg);
+  c.addSubview(gSpGridView);
+  // Click paints a dot (or fills / picks); pan paints a stroke. Both come
+  // through the generic action proxy the app canvas already proves; the point
+  // is read synchronously (a deferred read gets a stale/default point) and
+  // only the DELIVERY is deferred.
+  var clickG = Cocoa.cls("NSClickGestureRecognizer").alloc().init();
+  gSpGridView.addGestureRecognizer(clickG);
+  gTargets.add(onAction(clickG, (s) {
+    var pt = clickG.locationInView(gSpGridView);
+    if (pt is List && pt.length >= 2) {
+      var x = (pt[0] as num).toDouble(), y = kSpGridPx - (pt[1] as num).toDouble();
+      defer(() => spPointer(x, y, false));
+    }
+  }));
+  var panG = Cocoa.cls("NSPanGestureRecognizer").alloc().init();
+  gSpGridView.addGestureRecognizer(panG);
+  gTargets.add(onAction(panG, (s) {
+    var pt = panG.locationInView(gSpGridView);
+    if (pt is List && pt.length >= 2) {
+      var x = (pt[0] as num).toDouble(), y = kSpGridPx - (pt[1] as num).toDouble();
+      defer(() => spPointer(x, y, true));
+    }
+  }));
+
+  var ty = 84.0;
+  spToolBtn(c, 'pencil', "Pencil", [12.0, ty, 64.0, 24.0]);
+  spToolBtn(c, 'fill',   "Fill",   [80.0, ty, 56.0, 24.0]);
+  spToolBtn(c, 'pick',   "Pick",   [140.0, ty, 56.0, 24.0]);
+  button(c, "◀", [212.0, ty, 32.0, 24.0], (s) { spShift(-1, 0); });
+  button(c, "▶", [246.0, ty, 32.0, 24.0], (s) { spShift(1, 0); });
+  button(c, "▲", [280.0, ty, 32.0, 24.0], (s) { spShift(0, -1); });
+  button(c, "▼", [314.0, ty, 32.0, 24.0], (s) { spShift(0, 1); });
+  button(c, "Clear", [356.0, ty, 56.0, 24.0], (s) {
+    gSpDoc.clearFrame(gSpFrame);
+    spEdited();
+  });
+
+  gSpStatusLbl = label(c, [12.0, 8.0, 956.0, 18.0]);
+  spStatus("pencil, colour 15 — click or drag to paint");
+
+  // --- right column ---
+  var rx = 456.0;
+  var nameLbl = label(c, [rx, 528.0, 44.0, 18.0]);
+  nameLbl.setStringValue("Name");
+  gSpNameField = Cocoa.cls("NSTextField").alloc()
+      .initWithFrame([rx + 46.0, 524.0, 150.0, 24.0]);
+  gSpNameField.setStringValue(gSpDoc == null ? "Sprite" : gSpDoc.name);
+  c.addSubview(gSpNameField);
+  var wLbl = label(c, [rx + 206.0, 528.0, 18.0, 18.0]);
+  wLbl.setStringValue("W");
+  gSpWField = Cocoa.cls("NSTextField").alloc()
+      .initWithFrame([rx + 226.0, 524.0, 44.0, 24.0]);
+  c.addSubview(gSpWField);
+  var hLbl = label(c, [rx + 276.0, 528.0, 18.0, 18.0]);
+  hLbl.setStringValue("H");
+  gSpHField = Cocoa.cls("NSTextField").alloc()
+      .initWithFrame([rx + 296.0, 524.0, 44.0, 24.0]);
+  c.addSubview(gSpHField);
+  button(c, "Resize", [rx + 348.0, 524.0, 64.0, 24.0], (s) { spResizeFromFields(); });
+
+  // Palette: one canvas, 16 swatches — a click selects; the sliders edit the
+  // selection. Cheaper and prettier than sixteen NSButtons.
+  gSpPalImg = Cocoa.cls("NSImage").alloc().initWithSize([kSpPalW, kSpPalH]);
+  gSpPalView = Cocoa.cls("NSImageView").alloc()
+      .initWithFrame([rx, 448.0, kSpPalW, kSpPalH]);
+  gSpPalView.setImageScaling(3);
+  gSpPalView.setImage(gSpPalImg);
+  c.addSubview(gSpPalView);
+  var palClick = Cocoa.cls("NSClickGestureRecognizer").alloc().init();
+  gSpPalView.addGestureRecognizer(palClick);
+  gTargets.add(onAction(palClick, (s) {
+    var pt = palClick.locationInView(gSpPalView);
+    if (pt is List && pt.length >= 2) {
+      var x = (pt[0] as num).toDouble(), y = kSpPalH - (pt[1] as num).toDouble();
+      var col = (x / 32.0).floor(), row = (y / 32.0).floor();
+      if (col >= 0 && col < 8 && row >= 0 && row < 2) {
+        defer(() { spSelectColor(row * 8 + col); });
+      }
+    }
+  }));
+
+  gSpRSlider = spSlider(c, [rx + 268.0, 492.0, 150.0, 20.0]);
+  gSpGSlider = spSlider(c, [rx + 268.0, 470.0, 150.0, 20.0]);
+  gSpBSlider = spSlider(c, [rx + 268.0, 448.0, 150.0, 20.0]);
+  gSpRgbLbl = label(c, [rx + 424.0, 466.0, 88.0, 18.0]);
+
+  gSpFrameLbl = label(c, [rx, 404.0, 92.0, 18.0]);
+  button(c, "<",   [rx + 94.0, 400.0, 30.0, 24.0], (s) { spGotoFrame(gSpFrame - 1); });
+  button(c, ">",   [rx + 126.0, 400.0, 30.0, 24.0], (s) { spGotoFrame(gSpFrame + 1); });
+  button(c, "Add", [rx + 164.0, 400.0, 46.0, 24.0], (s) {
+    gSpFrame = gSpDoc.addFrame();
+    spEdited();
+  });
+  button(c, "Dup", [rx + 212.0, 400.0, 46.0, 24.0], (s) {
+    var ni = gSpDoc.dupFrame(gSpFrame);
+    if (ni >= 0) { gSpFrame = ni; spEdited(); }
+  });
+  button(c, "Del", [rx + 260.0, 400.0, 46.0, 24.0], (s) {
+    if (gSpDoc.delFrame(gSpFrame)) {
+      if (gSpFrame >= gSpDoc.frames.length) gSpFrame = gSpDoc.frames.length - 1;
+      spEdited();
+    } else {
+      spStatus("the last frame stays — a sprite with no frames is nothing");
+    }
+  });
+
+  gSpPlayChk = Cocoa.cls("NSButton").alloc()
+      .initWithFrame([rx, 368.0, 60.0, 22.0]);
+  gSpPlayChk.setButtonType(3);
+  gSpPlayChk.setTitle("Play");
+  gSpPlayChk.setState(1);
+  c.addSubview(gSpPlayChk);
+  gTargets.add(onAction(gSpPlayChk, (s) { defer(spPreviewMark); }));
+  gSpFpsSlider = spSlider(c, [rx + 66.0, 368.0, 150.0, 20.0]);
+  gSpFpsSlider.setMinValue(1.0);
+  gSpFpsSlider.setMaxValue(30.0);
+  gSpFpsSlider.setDoubleValue(8.0);
+
+  // The preview box: 512x256 view, 256x128 logical pane — exactly 2x, so the
+  // engine's nearest-filter upscale lands on whole pixels.
+  gSpPreviewBox = Cocoa.cls("NSView").alloc()
+      .initWithFrame([rx, 96.0, 512.0, 256.0]);
+  c.addSubview(gSpPreviewBox);
+
+  button(c, "Preview", [rx, 56.0, 70.0, 24.0], (s) { spAcquirePane(); spPreviewMark(); });
+  button(c, "Save", [rx + 78.0, 56.0, 60.0, 24.0], (s) { spSave(); });
+  gSpLoadPopup = Cocoa.cls("NSPopUpButton").alloc()
+      .initWithFrame([rx + 146.0, 56.0, 170.0, 24.0], pullsDown: true);
+  gSpLoadPopup.addItemWithTitle("Load…");
+  c.addSubview(gSpLoadPopup);
+  gTargets.add(onAction(gSpLoadPopup, (s) {
+    var t = gSpLoadPopup.titleOfSelectedItem().UTF8String();
+    if (t != null && t != "Load…" && !t.startsWith("(")) {
+      defer(() { spLoadSheet(t); });
+    }
+  }));
+  button(c, "Copy Code", [rx + 324.0, 56.0, 88.0, 24.0], (s) { spCopyCode(); });
+  button(c, "New", [rx + 420.0, 56.0, 52.0, 24.0], (s) { spNew(); });
+
+  gSpWindow.center();
+}
+
+void spToolBtn(Cocoa parent, String tool, String title, List frame) {
+  var b = button(parent, title, frame, (s) {
+    gSpTool = tool;
+    spSyncTools();
+    spStatus(tool + ", colour " + gSpColor.toString());
+  });
+  b.setButtonType(2);              // toggle — shows the active tool pressed
+  gSpToolBtns[tool] = b;
+  if (tool == gSpTool) b.setState(1);
+}
+
+void spSyncTools() {
+  gSpToolBtns.forEach((t, b) { b.setState(t == gSpTool ? 1 : 0); });
+}
+
+Cocoa spSlider(Cocoa parent, List frame) {
+  var v = Cocoa.cls("NSSlider").alloc().initWithFrame(frame);
+  v.setMinValue(0.0);
+  v.setMaxValue(255.0);
+  parent.addSubview(v);
+  gTargets.add(onAction(v, (s) { defer(spRgbFromSliders); }));
+  return v;
+}
+
+// --- painting ----------------------------------------------------------------
+
+double spCell() {
+  var m = gSpDoc.w > gSpDoc.h ? gSpDoc.w : gSpDoc.h;
+  var cell = (kSpGridPx / m).floorToDouble();
+  if (cell < 4.0) cell = 4.0;
+  if (cell > 27.0) cell = 27.0;
+  return cell;
+}
+
+/// One pointer event on the grid, click or drag. Drags paint with the pencil
+/// regardless of tool — a dragged fill or pick would fire dozens of times.
+void spPointer(double px, double py, bool dragging) {
+  if (gSpDoc == null) return;
+  var cell = spCell();
+  var x = (px / cell).floor(), y = (py / cell).floor();
+  if (x < 0 || x >= gSpDoc.w || y < 0 || y >= gSpDoc.h) return;
+  if (dragging || gSpTool == 'pencil') {
+    if (gSpDoc.setPx(gSpFrame, x, y, gSpColor)) spEdited();
+  } else if (gSpTool == 'fill') {
+    if (gSpDoc.floodFill(gSpFrame, x, y, gSpColor)) spEdited();
+  } else if (gSpTool == 'pick') {
+    spSelectColor(gSpDoc.getPx(gSpFrame, x, y));
+  }
+}
+
+void spShift(int dx, int dy) {
+  gSpDoc.shift(gSpFrame, dx, dy);
+  spEdited();
+}
+
+void spSelectColor(int i) {
+  if (i < 0 || i > 15) return;
+  gSpColor = i;
+  var p = gSpDoc.pal[i];
+  gSpRSlider.setDoubleValue(p[0].toDouble());
+  gSpGSlider.setDoubleValue(p[1].toDouble());
+  gSpBSlider.setDoubleValue(p[2].toDouble());
+  spRepaintPal();
+  spSyncFields();
+  spStatus(gSpTool + ", colour " + i.toString() +
+      (i == 0 ? " (transparent — the engine discards it)" : ""));
+}
+
+void spRgbFromSliders() {
+  gSpDoc.setPal(gSpColor, gSpRSlider.doubleValue().round(),
+      gSpGSlider.doubleValue().round(), gSpBSlider.doubleValue().round());
+  spEdited();
+}
+
+void spResizeFromFields() {
+  var nw = int.parse(gSpWField.stringValue().UTF8String().trim(),
+      onError: (_) => 0);
+  var nh = int.parse(gSpHField.stringValue().UTF8String().trim(),
+      onError: (_) => 0);
+  if (gSpDoc.resize(nw, nh)) {
+    spEdited();
+  } else {
+    spStatus("size is 1..64 x 1..64 (" + gSpDoc.w.toString() + "x" +
+        gSpDoc.h.toString() + " unchanged)");
+    spSyncFields();
+  }
+}
+
+void spGotoFrame(int f) {
+  if (f < 0 || f >= gSpDoc.frames.length) return;
+  gSpFrame = f;
+  spRepaintGrid();
+  spSyncFields();
+  spPreviewMark();   // a paused preview shows the frame under edit
+}
+
+/// Every mutation funnels here: repaint what shows the document, mark the
+/// preview. Called at pointer rate during a drag, so it stays cheap — one
+/// renderInto of the grid, no allocation beyond the op lists.
+void spEdited() {
+  spRepaintGrid();
+  spRepaintPal();
+  spSyncFields();
+  spPreviewMark();
+}
+
+void spRepaintAll() {
+  spRepaintGrid();
+  spRepaintPal();
+  spSyncFields();
+  spSyncTools();
+  spSelectColor(gSpColor);
+}
+
+void spSyncFields() {
+  if (gSpFrameLbl != null) {
+    gSpFrameLbl.setStringValue("Frame " + (gSpFrame + 1).toString() + "/" +
+        gSpDoc.frames.length.toString());
+  }
+  if (gSpWField != null) gSpWField.setStringValue(gSpDoc.w.toString());
+  if (gSpHField != null) gSpHField.setStringValue(gSpDoc.h.toString());
+  if (gSpRgbLbl != null) {
+    var p = gSpDoc.pal[gSpColor];
+    gSpRgbLbl.setStringValue(p[0].toString() + "," + p[1].toString() + "," +
+        p[2].toString());
+  }
+}
+
+// The draw-op colour contract is 0.0..1.0 (renderInto hands components
+// straight to colorWithCalibratedRed:, which clamps) — the model's palette is
+// 0..255, so every op converts HERE. Passing bytes draws white-on-white: the
+// first build of this window was a perfectly rendered blank.
+double _spC(num v) => v / 255.0;
+
+void spRepaintGrid() {
+  if (gSpGridImg == null) return;
+  var cell = spCell();
+  var ops = <List>[<dynamic>['clear', _spC(46), _spC(46), _spC(52)]];
+  var px = gSpDoc.frames[gSpFrame];
+  for (var y = 0; y < gSpDoc.h; y++) {
+    for (var x = 0; x < gSpDoc.w; x++) {
+      var cx = x * cell, cy = y * cell;
+      var v = px[y * gSpDoc.w + x];
+      if (v == 0) {
+        // Transparent: the checker every paint program means by "nothing".
+        var half = cell / 2;
+        ops.add(<dynamic>['rect', cx, cy, cell, cell, _spC(58), _spC(58), _spC(64), true]);
+        ops.add(<dynamic>['rect', cx, cy, half, half, _spC(74), _spC(74), _spC(80), true]);
+        ops.add(<dynamic>['rect', cx + half, cy + half, half, half, _spC(74), _spC(74), _spC(80), true]);
+      } else {
+        var p = gSpDoc.pal[v];
+        ops.add(<dynamic>['rect', cx, cy, cell, cell, _spC(p[0]), _spC(p[1]), _spC(p[2]), true]);
+      }
+      // The 1px seam that makes it a grid (skipped when cells get tiny).
+      if (cell >= 6.0) {
+        ops.add(<dynamic>['rect', cx, cy, cell, cell, _spC(30), _spC(30), _spC(34), false]);
+      }
+    }
+  }
+  renderInto(gSpGridImg, kSpGridPx, kSpGridPx, ops);
+  // Re-SET the image: NSImageView caches the drawn representation, and a
+  // lockFocus draw alone never reaches the glass (the app canvas learned the
+  // same lesson — see appApply).
+  gSpGridView.setImage(gSpGridImg);
+  gSpGridView.setNeedsDisplay(true);
+}
+
+void spRepaintPal() {
+  if (gSpPalImg == null) return;
+  var ops = <List>[<dynamic>['clear', _spC(46), _spC(46), _spC(52)]];
+  for (var i = 0; i < 16; i++) {
+    var cx = (i % 8) * 32.0, cy = (i ~/ 8) * 32.0;
+    var p = gSpDoc.pal[i];
+    ops.add(<dynamic>['rect', cx + 2, cy + 2, 28.0, 28.0, _spC(p[0]), _spC(p[1]), _spC(p[2]), true]);
+    if (i == 0) {
+      // Entry 0 carries a colour but the engine discards it — say so visually.
+      ops.add(<dynamic>['line', cx + 4, cy + 26, cx + 26, cy + 4, 1.0, 1.0, 1.0, 2.0]);
+    }
+    if (i == gSpColor) {
+      ops.add(<dynamic>['rect', cx + 1, cy + 1, 30.0, 30.0, 1.0, 1.0, 1.0, false]);
+      ops.add(<dynamic>['rect', cx, cy, 32.0, 32.0, 0.0, 0.0, 0.0, false]);
+    }
+  }
+  renderInto(gSpPalImg, kSpPalW, kSpPalH, ops);
+  gSpPalView.setImage(gSpPalImg);
+  gSpPalView.setNeedsDisplay(true);
+}
+
+// --- the pane preview --------------------------------------------------------
+
+void spAcquirePane() {
+  // A game on the demos tab holds the pane through the demo machinery — end
+  // that session properly (gpLeave restores the demos canvas) rather than
+  // yanking the view out from under it.
+  if (gGpMode) stopDemo("the sprite editor took the pane");
+  var v = gpOpen(256, 128, 256, 128, 0);
+  if (v == null) { spStatus("the engine would not open"); return; }
+  v.setFrame([0.0, 0.0, 512.0, 256.0]);
+  gSpPreviewBox.addSubview(v);
+  gSpOwnsPane = true;
+}
+
+/// Coalesce rebuilds: a drag edits at pointer rate, the pane needs ~10Hz.
+void spPreviewMark() {
+  if (gSpPreviewTimer != null) return;
+  gSpPreviewTimer = new Timer(const Duration(milliseconds: 100), () {
+    gSpPreviewTimer = null;
+    spRebuildPreview();
+  });
+}
+
+/// The whole preview scene, from scratch, in one atomic apply: reopen resets
+/// the engine (defs are append-only — rebuilding IS the edit path), then one
+/// batch carries background, def, frames, palette, placements and the
+/// present. Sprite instances at every power-of-two scale that fits, so the
+/// art is judged at game distance and up close in the same glance.
+void spRebuildPreview() {
+  if (!gSpOwnsPane || gSpDoc == null) return;
+  var v = gpOpen(256, 128, 256, 128, 0);   // open() closes first: full reset
+  if (v == null) return;
+  var cmds = <List>[];
+  // Screen palette 1..15 is the fixed per-scanline set — programmable
+  // entries start at 16 (the engine refuses lower; it told us so).
+  cmds.add(<dynamic>['gppal', 16, 26, 24, 38]);
+  cmds.add(<dynamic>['gpcls', 16]);
+  cmds.add(<dynamic>['gpsprite', 0, gSpDoc.rowsOf(0)]);
+  for (var f = 1; f < gSpDoc.frames.length; f++) {
+    cmds.add(<dynamic>['gpframe', 0, gSpDoc.rowsOf(f)]);
+  }
+  for (var i = 1; i < 16; i++) {
+    var p = gSpDoc.pal[i];
+    cmds.add(<dynamic>['gpspritepal', 0, i, p[0], p[1], p[2]]);
+  }
+  var playing = gSpPlayChk != null && gSpPlayChk.state() == 1 &&
+      gSpDoc.frames.length > 1;
+  var fps = gSpFpsSlider == null ? 8.0 : gSpFpsSlider.doubleValue();
+  var x = 10.0;
+  var inst = 0;
+  for (var scale in <double>[1.0, 2.0, 4.0]) {
+    var sw = gSpDoc.w * scale, sh = gSpDoc.h * scale;
+    if (x + sw > 250.0 || sh > 120.0) continue;
+    var y = (128.0 - sh) / 2;
+    cmds.add(<dynamic>['gpspawn', inst, 0, x, y]);
+    cmds.add(<dynamic>['gpplace', inst, x, y,
+        playing ? 0 : gSpFrame, scale, 0.0, 1.0]);
+    if (playing) cmds.add(<dynamic>['gpanim', inst, fps]);
+    inst++;
+    x += sw + 14.0;
+  }
+  var e = gpApply(cmds);
+  if (e != null) spStatus("preview: " + e.toString());
+}
+
+// --- save / load / export ----------------------------------------------------
+
+Future spSave() async {
+  var name = gSpNameField.stringValue().UTF8String().trim();
+  if (!SpriteDoc.validName(name)) {
+    spStatus("name must be a class name: capital letter, then letters/digits");
+    return;
+  }
+  gSpDoc.name = name;
+  // The STORE path, deliberately (live-reload contracts): parse-check, image
+  // write, one class made live — no world reload, nothing running disturbed.
+  var r = await ask('spstore', gSpDoc.sheetSource());
+  spStatus(r == null ? "save timed out" : r.toString());
+  spRefreshLoadList();
+}
+
+Future spRefreshLoadList() async {
+  if (gSpLoadPopup == null) return;
+  var r = await ask('splist', '');
+  gSpLoadPopup.removeAllItems();
+  gSpLoadPopup.addItemWithTitle("Load…");
+  if (r is List && r.isNotEmpty) {
+    for (var n in r) { gSpLoadPopup.addItemWithTitle(n.toString()); }
+  } else {
+    gSpLoadPopup.addItemWithTitle("(no sheets in the image)");
+  }
+}
+
+Future spLoadSheet(String name) async {
+  var r = await ask('spload', name);
+  if (r is! List || r.length < 3) {
+    spStatus("load " + name + ": " + r.toString());
+    return;
+  }
+  var rows = <String>[];
+  for (var s in (r[1] as List)) { rows.add(s.toString()); }
+  if (!gSpDoc.loadFrames(rows)) {
+    spStatus("load " + name + ": bad art rows in the image class");
+    return;
+  }
+  gSpDoc.name = r[0].toString();
+  var pl = r[2] as List;
+  for (var i = 0; i < 16 && i < pl.length; i++) {
+    var p = pl[i] as List;
+    gSpDoc.setPal(i, (p[0] as num).toInt(), (p[1] as num).toInt(),
+        (p[2] as num).toInt());
+  }
+  gSpFrame = 0;
+  if (gSpNameField != null) gSpNameField.setStringValue(gSpDoc.name);
+  spRepaintAll();
+  spPreviewMark();
+  spStatus("loaded " + gSpDoc.name + " — " +
+      gSpDoc.frames.length.toString() + " frame(s), " +
+      gSpDoc.w.toString() + "x" + gSpDoc.h.toString());
+}
+
+void spNew() {
+  gSpDoc = new SpriteDoc();
+  gSpFrame = 0;
+  gSpColor = 15;
+  gSpTool = 'pencil';
+  if (gSpNameField != null) gSpNameField.setStringValue(gSpDoc.name);
+  spRepaintAll();
+  spPreviewMark();
+  spStatus("new 16x16 document");
+}
+
+void spCopyCode() {
+  var code = gSpDoc.codeSnippet();
+  try {
+    var pb = Cocoa.cls("NSPasteboard").generalPasteboard();
+    pb.clearContents();
+    pb.setString(code, forType: "public.utf8-plain-text");
+    spStatus("defineSprite: code copied — paste it into a game's setup");
+  } catch (e) {
+    log(code);
+    spStatus("clipboard refused; the code went to the log instead");
+  }
+}
+
+// --- the scripted face (gui_smoke + the control plane) -----------------------
+
+Future<String> spriteEdVerb(String cmd, String arg) async {
+  if (cmd == 'sprited') { spriteEdShow(arg.trim()); await spRefreshLoadList(); return "ok"; }
+  if (gSpWindow == null) return "ERR: sprite editor not open (run sprited)";
+  switch (cmd) {
+    case 'spritedclose':
+      gSpWindow.orderOut(null);
+      return "ok";
+    case 'spedstat':
+      return (gSpOwnsPane ? "pane" : "nopane") + " " + gSpDoc.name + " " +
+          gSpDoc.w.toString() + "x" + gSpDoc.h.toString() +
+          " frame " + (gSpFrame + 1).toString() + "/" +
+          gSpDoc.frames.length.toString() +
+          " colour " + gSpColor.toString() + " tool " + gSpTool;
+    case 'spedrows':
+      return gSpDoc.rowsOf(gSpFrame);
+    case 'spednew':
+      spNew();
+      return "ok";
+    case 'speddump': {                        // debug: the two canvases to disk
+      try {
+        gSpGridImg.TIFFRepresentation().writeToFile("/tmp/sp_grid.tiff",
+            atomically: true);
+        gSpPalImg.TIFFRepresentation().writeToFile("/tmp/sp_pal.tiff",
+            atomically: true);
+        return "ok /tmp/sp_grid.tiff /tmp/sp_pal.tiff";
+      } catch (e) { return "ERR: " + e.toString(); }
+    }
+    case 'spedpaint': {                       // spedpaint <x> <y> — the tool, by hand
+      var p = arg.split(' ').where((s) => s.isNotEmpty).toList();
+      if (p.length < 2) return "ERR: spedpaint <x> <y>";
+      var cell = spCell();
+      spPointer((int.parse(p[0]) + 0.5) * cell, (int.parse(p[1]) + 0.5) * cell, false);
+      return gSpDoc.rowsOf(gSpFrame);
+    }
+    case 'spedcolor': {
+      spSelectColor(int.parse(arg.trim(), onError: (_) => -1));
+      return "colour " + gSpColor.toString();
+    }
+    case 'spedrgb': {
+      var p = arg.split(' ').where((s) => s.isNotEmpty).toList();
+      if (p.length < 3) return "ERR: spedrgb <r> <g> <b>";
+      gSpDoc.setPal(gSpColor, int.parse(p[0]), int.parse(p[1]), int.parse(p[2]));
+      spEdited();
+      return "ok";
+    }
+    case 'spedtool':
+      if (arg != 'pencil' && arg != 'fill' && arg != 'pick') return "ERR: pencil|fill|pick";
+      gSpTool = arg;
+      spSyncTools();
+      return "ok";
+    case 'spedframe': {
+      var a = arg.trim();
+      if (a == 'add') { gSpFrame = gSpDoc.addFrame(); spEdited(); }
+      else if (a == 'dup') { var ni = gSpDoc.dupFrame(gSpFrame); if (ni >= 0) { gSpFrame = ni; spEdited(); } }
+      else if (a == 'del') {
+        if (!gSpDoc.delFrame(gSpFrame)) return "ERR: the last frame stays";
+        if (gSpFrame >= gSpDoc.frames.length) gSpFrame = gSpDoc.frames.length - 1;
+        spEdited();
+      }
+      else if (a == 'next') { spGotoFrame(gSpFrame + 1); }
+      else if (a == 'prev') { spGotoFrame(gSpFrame - 1); }
+      else { return "ERR: add|dup|del|next|prev"; }
+      return "frame " + (gSpFrame + 1).toString() + "/" + gSpDoc.frames.length.toString();
+    }
+    case 'spedname':
+      if (arg.trim().isNotEmpty) {
+        gSpNameField.setStringValue(arg.trim());
+      }
+      return gSpNameField.stringValue().UTF8String();
+    case 'spedsave': {
+      if (arg.trim().isNotEmpty) gSpNameField.setStringValue(arg.trim());
+      await spSave();
+      return gSpStatusLbl.stringValue().UTF8String();
+    }
+    case 'spedload': {
+      await spLoadSheet(arg.trim());
+      return gSpStatusLbl.stringValue().UTF8String();
+    }
+    case 'spedlist': {
+      var r = await ask('splist', '');
+      if (r is List) return r.map((x) => x.toString()).join('\n');
+      return r.toString();
+    }
+  }
+  return "ERR: unknown " + cmd;
 }

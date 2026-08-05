@@ -1082,6 +1082,43 @@ String _hostAcceptWhole(String text, String what) {
 // only THIS class is made live, via a plain stLoad. Nothing else in the world is
 // touched, and a loop running underneath it keeps running.
 // Regression: st/test/galaxigans_reload_wire.dart.
+// --- sprite sheets (SPRITE_EDITOR_PLAN.md) -----------------------------------
+// A sheet is an ordinary st-class decl whose source carries the editor's
+// discovery marker. Listing greps the source; loading asks the LIVE class for
+// its literals (stInvokeStatic, so a sheet edited in the Browser answers its
+// edited art) and ships plain lists back over the port.
+
+List _spriteSheetList() {
+  var names = <String>[];
+  _decls.forEach((n, s) {
+    if (_kindOf(s) == 'st-class' && s.contains('isSpriteSheet [ ^true ]')) {
+      names.add(n);
+    }
+  });
+  names.sort();
+  return names;
+}
+
+dynamic _spriteSheetLoad(String name) {
+  if (!_decls.containsKey(name)) return 'ERR: no class ' + name;
+  try {
+    var fr = stInvokeStatic(name, 'frames', []);
+    var pl = stInvokeStatic(name, 'palette', []);
+    if (fr is! List || pl is! List) return 'ERR: ' + name + ' is not a sheet';
+    var rows = <String>[];
+    for (var r in (fr as List)) { rows.add(r.toString()); }
+    var pal = <List<int>>[];
+    for (var p in (pl as List)) {
+      var l = p as List;
+      pal.add(<int>[(l[0] as num).toInt(), (l[1] as num).toInt(),
+                    (l[2] as num).toInt()]);
+    }
+    return <dynamic>[name, rows, pal];
+  } catch (e) {
+    return 'ERR: ' + e.toString();
+  }
+}
+
 String _hostStoreClass(String text) {
   var s = text.trim();
   if (!_isStAny(s)) return 'ERR storeClass takes a Smalltalk class';
@@ -1374,6 +1411,12 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'gprun') out = _gpRun();
       else if (cmd == 'gpwhere') out = _gpWhere();
       else if (cmd == 'gpkeys') out = _gpKeysCmd(arg.toString());
+      // The sprite editor's persistence (SPRITE_EDITOR_PLAN.md). spstore is
+      // the STORE path — the same _hostStoreClass a program's own save uses:
+      // parse-check, image write, ONE class made live, no world reload.
+      else if (cmd == 'spstore') out = _hostStoreClass(arg.toString());
+      else if (cmd == 'splist') out = _spriteSheetList();
+      else if (cmd == 'spload') out = _spriteSheetLoad(arg.toString());
       else if (cmd == 'sthaltarm') out = stHaltArm(arg);
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();

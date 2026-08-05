@@ -118,6 +118,32 @@ s moveTo: 42 y: 24.
           wahSlot >= 0 && wahSlot < 64,
       ops.toString());
 
+  // --- custom effects: the full recipe over the wire (SOUND_EDITOR_PLAN.md) --
+  // Sound effect:slot: must ship the params VERBATIM after the slot (the flat
+  // contract order), define-once per slot+params (a game's playOn: in a frame
+  // loop must not re-render), and re-ship when the recipe changes.
+  stRun('Sound effect: #(0.3 0.01 0.1 0.6 0.2 220.0 110.0 0.05 0.0 '
+      '2 0.08 0.4 777 1 2 220.0 0.5 0.0 0.5) slot: 5. '
+      'Sound playSlot: 5. Sound playSlot: 5.');
+  ops = stGpTake();
+  check('effect ships slot + params verbatim, then plays twice',
+      ops.length == 3 && ops[0][0] == 'gpeffect' && ops[0][1] == 5 &&
+          ops[0][2] == 0.3 && ops[0][15] == 1 && ops[0][16] == 2 &&
+          ops[0].length == 21 &&
+          listEq(ops[1], ['gpplay', 5]) && listEq(ops[2], ['gpplay', 5]),
+      ops.toString());
+  stRun('Sound effect: #(0.3 0.01 0.1 0.6 0.2 220.0 110.0 0.05 0.0 '
+      '2 0.08 0.4 777 1 2 220.0 0.5 0.0 0.5) slot: 5. Sound playSlot: 5.');
+  ops = stGpTake();
+  check('an unchanged recipe is not re-shipped',
+      ops.length == 1 && listEq(ops[0], ['gpplay', 5]), ops.toString());
+  stRun('Sound effect: #(0.5 0.01 0.1 0.6 0.2 220.0 110.0 0.05 0.0 '
+      '2 0.08 0.4 777 1 2 220.0 0.5 0.0 0.5) slot: 5.');
+  ops = stGpTake();
+  check('a changed recipe re-ships',
+      ops.length == 1 && ops[0][0] == 'gpeffect' && ops[0][2] == 0.5,
+      ops.toString());
+
   // The LAST preset must land exactly on 63 — that is the invariant that says
   // the block is anchored to the top of the rack and nothing has fallen off it.
   stRun('Sound bossHum play.');

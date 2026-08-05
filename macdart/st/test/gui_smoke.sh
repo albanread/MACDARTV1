@@ -188,6 +188,34 @@ else
   skip "sprite editor" "no world in this image"
 fi
 
+# The sound editor (SOUND_EDITOR_PLAN.md): preset -> edit -> the params
+# contract holds -> the real synth plays it -> save -> the sheet is a live
+# class whose own play runs -> mutate -> load reverts.
+if [ "$world" = 1 ]; then
+  chk "sounded opens"   "ok"  "$(ctl sounded)"
+  ctl sndnew >/dev/null
+  ctl sndpreset coin >/dev/null
+  ctl sndset attack 0.2 >/dev/null
+  p1="$(ctl sndparams | cut -d' ' -f2)"
+  if [ "$p1" = "0.2" ]; then ok "snd params contract holds" "attack $p1"
+  else bad "snd params contract holds" "attack: $p1"; fi
+  case "$(ctl sndplay)" in played*) ok "snd plays through the synth" "$(ctl sndstat)";;
+    *) bad "snd plays through the synth" "$(ctl sndplay)";; esac
+  chk "snd saves via store" "OK stored SmokeSound" "$(ctl sndsave SmokeSound)"
+  case "$(ctl sndlist)" in *SmokeSound*) ok "snd sheet listed" "SmokeSound";;
+    *) bad "snd sheet listed" "$(ctl sndlist)";; esac
+  chk "sheet plays from Smalltalk" "24" \
+      "$(ctl doit "st> SmokeSound play. ^SmokeSound params size")"
+  ctl sndset attack 0.5 >/dev/null
+  ctl sndload SmokeSound >/dev/null
+  p2="$(ctl sndparams | cut -d' ' -f2)"
+  if [ "$p2" = "0.2" ]; then ok "snd load reverts the mutation" "attack $p2"
+  else bad "snd load reverts the mutation" "attack: $p2"; fi
+  chk "sounded closes"  "ok"  "$(ctl soundedclose)"
+else
+  skip "sound editor" "no world in this image"
+fi
+
 # scan the live log for anything that smells like a broken pane
 if [ -f "$LOG" ] && grep -qiE "NoSuchMethod|StSymbol|Cocoa: send to a released|Smalltalk browser: ERR|Unhandled exception" "$LOG"; then
   bad "log clean" "$(grep -iE 'NoSuchMethod|StSymbol|browser: ERR' "$LOG" | tail -1)"

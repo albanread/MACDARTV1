@@ -79,6 +79,18 @@ if [ -f "$HERE/spriteed_model_test.dart" ]; then
   fi
 else skip "tier2b sprite editor model (driver not present)"; fi
 
+# tier 2b-sounded — the sound editor's document model (pure Dart: the params
+# contract, clamps, preset transcriptions, sheet source). The window imports
+# the SAME file.
+if [ -f "$HERE/sounded_model_test.dart" ]; then
+  so="$("$DART" "$HERE/sounded_model_test.dart" 2>&1)"
+  if echo "$so" | grep -qE "SOUNDED-MODEL OK"; then
+    pass "tier2b sound editor model ($(echo "$so" | grep -cE '^  ok ') checks)"
+  else
+    fail "tier2b sound editor model"; echo "$so" | grep -iE "FAIL" | head -4 | sed 's/^/        /'
+  fi
+else skip "tier2b sound editor model (driver not present)"; fi
+
 # tier 2b-game — the ST game wire, asserted headless (GamePane primitives ->
 # gp* draw ops; Breakout/Worms boot and draw frames through it, no GUI needed).
 if [ -f "$HERE/gamepane_wire.dart" ]; then

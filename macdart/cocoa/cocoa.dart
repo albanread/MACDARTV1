@@ -2205,6 +2205,30 @@ stGpMoveSprite(p, id, x, y) {
   _stGpCmds.add(<dynamic>['gpplace', e, x, y, 0, 1.0, 0.0, 1.0]);
   return p;
 }
+// Custom synth effects (SOUND_EDITOR_PLAN.md): the FULL recipe over the wire.
+// `params` is the flat contract list starting at duration — the slot is
+// prepended here. Defining renders PCM natively, so a game calling playOn:
+// every frame must not re-ship an unchanged recipe: the cache skips the
+// gpeffect when this slot already holds these exact params.
+Map<int, String> _stGpEffectSig = <int, String>{};
+stGpEffect(cls, params, slot) {
+  if (slot is! int || slot < 0 || slot > 63 || params is! List) return cls;
+  var sig = params.join(',');
+  if (_stGpEffectSig[slot] != sig) {
+    _stGpEffectSig[slot] = sig;
+    var op = <dynamic>['gpeffect', slot];
+    for (var p in params) { op.add(p); }
+    _stGpCmds.add(op);
+  }
+  return cls;
+}
+stGpPlaySlot(cls, slot) {
+  if (slot is int && slot >= 0 && slot <= 63) {
+    _stGpCmds.add(<dynamic>['gpplay', slot]);
+  }
+  return cls;
+}
+
 stGpPlay(snd, preset) {
   if (preset is! int || preset < 0 || preset >= _stGpPresetNames.length) {
     return snd;
@@ -2275,6 +2299,7 @@ void stGpReset() {
   _stGpPane = null;
   _stGpStep = null;
   _stGpTeardown = null;
+  _stGpEffectSig = <int, String>{};  // engine slots reset with the pane
   _stGpSounds = <int, bool>{};
   _stGpTunes = <String, int>{};
   _stGpNextTune = 0;

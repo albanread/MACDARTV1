@@ -11,7 +11,10 @@ import 'dart:convert';
 import 'dart:async';
 import 'dart:developer';
 
+import 'dart:math' as math;
+
 import 'spriteed_model.dart';   // the sprite editor's document (pure, tested)
+import 'sounded_model.dart';    // the sound editor's document (pure, tested)
 
 Cocoa gWindow, gContent, gTabView, gEditor, gTranscript;
 SendPort gLang;
@@ -1429,6 +1432,7 @@ void buildMenu() {
   menuItem(games, "Smalltalk FFT", "", (s) => runStGame("FFT"));
   menuSep(games);
   menuItem(games, "Sprite Editor", "", (s) => spriteEdShow(''));
+  menuItem(games, "Sound Editor", "", (s) => soundEdShow(''));
   menuSep(games);
   menuItem(games, "Stop Game", "", (s) => stopDemo("stopped"));
 
@@ -2393,6 +2397,11 @@ Future<String> handle(String line) async {
     case 'spedframe': case 'spedname': case 'spedsave': case 'spedload':
     case 'spedlist': case 'speddump': case 'spednew':
       return await spriteEdVerb(cmd, arg.trim());
+    // The sound editor's scripted face — same handlers the sliders drive.
+    case 'sounded': case 'soundedclose': case 'sndnew': case 'sndstat':
+    case 'sndparams': case 'sndset': case 'sndosc': case 'sndpreset':
+    case 'sndplay': case 'sndsave': case 'sndload': case 'sndlist':
+      return await soundEdVerb(cmd, arg.trim());
     case 'kill': await respawnLanguage("manual kill"); return "ok";
     case 'quit':
       Cocoa.cls("NSApplication").sharedApplication().terminate(null); return "ok";
@@ -3975,6 +3984,7 @@ void gpEnter(List cmds) {
   // from wherever it was — including the sprite editor's preview box. Tell
   // the editor it lost the pane, so its rebuilds stop until it re-acquires.
   spriteEdPaneTaken();
+  soundEdPaneTaken();
   var o = cmds[0];
   int gi(int i, int dflt) =>
       (o.length > i && o[i] is num) ? (o[i] as num).toInt() : dflt;
@@ -7091,6 +7101,504 @@ Future<String> spriteEdVerb(String cmd, String arg) async {
     }
     case 'spedlist': {
       var r = await ask('splist', '');
+      if (r is List) return r.map((x) => x.toString()).join('\n');
+      return r.toString();
+    }
+  }
+  return "ERR: unknown " + cmd;
+}
+
+// === The Sound Editor (SOUND_EDITOR_PLAN.md) =================================
+// The sprite editor's sibling: the synth's FULL Effect recipe — the parameter
+// space the eleven presets are hand-tuned points in — edited with sliders,
+// auditioned through the real synth (gpeffect + gpplay on slot 0), and saved
+// as source in the image. The Metal pane draws the ENVELOPE and sweep (model
+// math — there is no sample readback); the AUDIO is the native truth via
+// Play. Same ownership etiquette as the sprite editor: the engine is a
+// singleton, the editor holds the pane, a launching game borrows it away.
+
+Cocoa gSndWindow;
+Cocoa gSndNameField, gSndSeedField, gSndStatusLbl;
+Cocoa gSndPresetPopup, gSndLoadPopup;
+Cocoa gSndPreviewBox;
+List gSndSliderDefs;                 // [label, min, max, get(), set(v)] rows
+List<Cocoa> gSndSliders = <Cocoa>[];
+List<Cocoa> gSndSliderVals = <Cocoa>[];
+List<Cocoa> gSndOscPopups = <Cocoa>[];
+List<Cocoa> gSndOscFreq = <Cocoa>[];
+List<Cocoa> gSndOscAmp = <Cocoa>[];
+List<Cocoa> gSndOscPw = <Cocoa>[];
+
+SoundDoc gSndDoc;
+bool gSndOwnsPane = false;
+Timer gSndPreviewTimer;
+math.Random gSndRng = new math.Random();
+
+void soundEdShow(String loadName) {
+  if (gSndDoc == null) gSndDoc = new SoundDoc();
+  if (gSndWindow == null) sndBuildWindow();
+  gSndWindow.makeKeyAndOrderFront(null);
+  Cocoa.cls("NSApplication").sharedApplication().activateIgnoringOtherApps(true);
+  if (!gSndOwnsPane && !gGpMode) sndAcquirePane();
+  if (loadName != null && loadName.isNotEmpty) sndLoadSheet(loadName);
+  sndSyncAll();
+}
+
+void soundEdPaneTaken() {
+  if (!gSndOwnsPane) return;
+  gSndOwnsPane = false;
+  sndStatus("a game took the pane — Play takes it back");
+}
+
+void sndStatus(String s) {
+  if (gSndStatusLbl != null) gSndStatusLbl.setStringValue(s);
+}
+
+void sndBuildWindow() {
+  gSndWindow = Cocoa.cls("NSWindow").alloc().initWithContentRect(
+      [0.0, 0.0, 980.0, 560.0], styleMask: 7, backing: 2, defer: false);
+  gSndWindow.setTitle("Sound Editor");
+  gSndWindow.setReleasedWhenClosed(false);
+  var c = gSndWindow.contentView();
+
+  // --- left: the pane (envelope view) + the oscillator rack ---
+  gSndPreviewBox = Cocoa.cls("NSView").alloc()
+      .initWithFrame([12.0, 288.0, 512.0, 256.0]);
+  c.addSubview(gSndPreviewBox);
+
+  for (var i = 0; i < 4; i++) {
+    var y = 252.0 - i * 32.0;
+    var lbl = label(c, [12.0, y + 3.0, 40.0, 18.0]);
+    lbl.setStringValue("Osc " + (i + 1).toString());
+    var pop = Cocoa.cls("NSPopUpButton").alloc()
+        .initWithFrame([54.0, y, 96.0, 24.0], pullsDown: false);
+    for (var w in kSndWaves) { pop.addItemWithTitle(w); }
+    c.addSubview(pop);
+    gSndOscPopups.add(pop);
+    var oi = i, opop = pop;
+    gTargets.add(onAction(pop, (s) { defer(() {
+      if (oi < gSndDoc.oscs.length) {
+        gSndDoc.oscs[oi].wave = opop.indexOfSelectedItem();
+        sndEdited();
+      }
+    }); }));
+    var fq = Cocoa.cls("NSTextField").alloc()
+        .initWithFrame([156.0, y, 66.0, 24.0]);
+    c.addSubview(fq);
+    gSndOscFreq.add(fq);
+    var ofq = fq;
+    gTargets.add(onAction(fq, (s) { defer(() {
+      if (oi < gSndDoc.oscs.length) {
+        gSndDoc.oscs[oi].freq = double.parse(
+            ofq.stringValue().UTF8String().trim(), (_) => 440.0);
+        sndEdited();
+      }
+    }); }));
+    var amp = Cocoa.cls("NSSlider").alloc()
+        .initWithFrame([228.0, y, 200.0, 22.0]);
+    amp.setMinValue(0.0);
+    amp.setMaxValue(1.0);
+    c.addSubview(amp);
+    gSndOscAmp.add(amp);
+    var oamp = amp;
+    gTargets.add(onAction(amp, (s) { defer(() {
+      if (oi < gSndDoc.oscs.length) {
+        gSndDoc.oscs[oi].amp = oamp.doubleValue();
+        sndEdited();
+      }
+    }); }));
+    var pw = Cocoa.cls("NSTextField").alloc()
+        .initWithFrame([434.0, y, 50.0, 24.0]);
+    c.addSubview(pw);
+    gSndOscPw.add(pw);
+    var opw = pw;
+    gTargets.add(onAction(pw, (s) { defer(() {
+      if (oi < gSndDoc.oscs.length) {
+        gSndDoc.oscs[oi].pw = double.parse(
+            opw.stringValue().UTF8String().trim(), (_) => 0.5);
+        sndEdited();
+      }
+    }); }));
+  }
+  button(c, "Add Osc", [12.0, 92.0, 76.0, 24.0], (s) {
+    if (gSndDoc.oscs.length < 4) {
+      gSndDoc.oscs.add(new SndOsc(0, 440.0, 0.5));
+      sndEdited();
+    }
+  });
+  button(c, "Del Osc", [94.0, 92.0, 76.0, 24.0], (s) {
+    if (gSndDoc.oscs.isNotEmpty) {
+      gSndDoc.oscs.removeLast();
+      sndEdited();
+    }
+  });
+  var oscNote = label(c, [180.0, 95.0, 340.0, 18.0]);
+  oscNote.setStringValue("no oscillators = the sweep + noise ARE the voice");
+
+  gSndStatusLbl = label(c, [12.0, 8.0, 956.0, 18.0]);
+  sndStatus("the eleven presets are starting points — pick one and pull sliders");
+
+  // --- right column: name, presets, the slider stack, files ---
+  var rx = 540.0;
+  var nameLbl = label(c, [rx, 528.0, 44.0, 18.0]);
+  nameLbl.setStringValue("Name");
+  gSndNameField = Cocoa.cls("NSTextField").alloc()
+      .initWithFrame([rx + 48.0, 524.0, 150.0, 24.0]);
+  gSndNameField.setStringValue("Sound");
+  c.addSubview(gSndNameField);
+  var seedLbl = label(c, [rx + 210.0, 528.0, 38.0, 18.0]);
+  seedLbl.setStringValue("Seed");
+  gSndSeedField = Cocoa.cls("NSTextField").alloc()
+      .initWithFrame([rx + 250.0, 524.0, 90.0, 24.0]);
+  c.addSubview(gSndSeedField);
+  gTargets.add(onAction(gSndSeedField, (s) { defer(() {
+    gSndDoc.seed = int.parse(gSndSeedField.stringValue().UTF8String().trim(),
+        onError: (_) => gSndDoc.seed);
+    sndEdited();
+  }); }));
+
+  gSndPresetPopup = Cocoa.cls("NSPopUpButton").alloc()
+      .initWithFrame([rx, 488.0, 130.0, 24.0], pullsDown: true);
+  gSndPresetPopup.addItemWithTitle("Preset…");
+  for (var nm in SoundDoc.kPresets) { gSndPresetPopup.addItemWithTitle(nm); }
+  c.addSubview(gSndPresetPopup);
+  gTargets.add(onAction(gSndPresetPopup, (s) { defer(() {
+    var t = gSndPresetPopup.titleOfSelectedItem().UTF8String();
+    if (t != null && t != "Preset…") {
+      var keep = gSndDoc.name;
+      gSndDoc = SoundDoc.preset(t);
+      gSndDoc.name = keep;
+      sndSyncAll();
+      sndStatus("preset " + t + " — now make it yours");
+    }
+  }); }));
+  button(c, "Play", [rx + 138.0, 488.0, 64.0, 24.0], (s) { sndPlay(); });
+  button(c, "Random", [rx + 208.0, 488.0, 70.0, 24.0], (s) {
+    gSndDoc.randomize(gSndRng);
+    sndSyncAll();
+    sndPlay();
+  });
+  button(c, "Mutate", [rx + 284.0, 488.0, 66.0, 24.0], (s) {
+    gSndDoc.mutate(gSndRng);
+    sndSyncAll();
+    sndPlay();
+  });
+
+  // The slider stack, data-driven: label, min, max, read, write.
+  gSndSliderDefs = <List>[
+    <dynamic>["duration", 0.01, 4.0, () => gSndDoc.duration, (v) { gSndDoc.duration = v; }],
+    <dynamic>["attack", 0.0, 1.0, () => gSndDoc.a, (v) { gSndDoc.a = v; }],
+    <dynamic>["decay", 0.0, 1.0, () => gSndDoc.d, (v) { gSndDoc.d = v; }],
+    <dynamic>["sustain", 0.0, 1.0, () => gSndDoc.s, (v) { gSndDoc.s = v; }],
+    <dynamic>["release", 0.0, 1.0, () => gSndDoc.r, (v) { gSndDoc.r = v; }],
+    <dynamic>["sweep from", 0.0, 3000.0, () => gSndDoc.sweepStart, (v) { gSndDoc.sweepStart = v; }],
+    <dynamic>["sweep to", 0.0, 3000.0, () => gSndDoc.sweepEnd, (v) { gSndDoc.sweepEnd = v; }],
+    <dynamic>["noise", 0.0, 1.0, () => gSndDoc.noiseMix, (v) { gSndDoc.noiseMix = v; }],
+    <dynamic>["distortion", 0.0, 1.0, () => gSndDoc.distortion, (v) { gSndDoc.distortion = v; }],
+    <dynamic>["echo taps", 0.0, 8.0, () => gSndDoc.echoCount.toDouble(), (v) { gSndDoc.echoCount = v.round(); }],
+    <dynamic>["echo delay", 0.0, 0.5, () => gSndDoc.echoDelay, (v) { gSndDoc.echoDelay = v; }],
+    <dynamic>["echo decay", 0.0, 0.95, () => gSndDoc.echoDecay, (v) { gSndDoc.echoDecay = v; }],
+  ];
+  for (var i = 0; i < gSndSliderDefs.length; i++) {
+    var def = gSndSliderDefs[i];
+    var y = 452.0 - i * 27.0;
+    var lbl = label(c, [rx, y + 2.0, 84.0, 18.0]);
+    lbl.setStringValue(def[0]);
+    var sl = Cocoa.cls("NSSlider").alloc()
+        .initWithFrame([rx + 88.0, y, 240.0, 22.0]);
+    sl.setMinValue(def[1]);
+    sl.setMaxValue(def[2]);
+    c.addSubview(sl);
+    gSndSliders.add(sl);
+    var vl = label(c, [rx + 334.0, y + 2.0, 86.0, 18.0]);
+    gSndSliderVals.add(vl);
+    var dslider = sl, ddef = def;
+    gTargets.add(onAction(sl, (s) { defer(() {
+      ddef[4](dslider.doubleValue());
+      sndEdited();
+    }); }));
+  }
+
+  button(c, "New", [rx, 56.0, 52.0, 24.0], (s) {
+    gSndDoc = new SoundDoc();
+    gSndNameField.setStringValue(gSndDoc.name);
+    sndSyncAll();
+    sndStatus("new sound");
+  });
+  button(c, "Save", [rx + 58.0, 56.0, 58.0, 24.0], (s) { sndSave(); });
+  gSndLoadPopup = Cocoa.cls("NSPopUpButton").alloc()
+      .initWithFrame([rx + 122.0, 56.0, 160.0, 24.0], pullsDown: true);
+  gSndLoadPopup.addItemWithTitle("Load…");
+  c.addSubview(gSndLoadPopup);
+  gTargets.add(onAction(gSndLoadPopup, (s) {
+    var t = gSndLoadPopup.titleOfSelectedItem().UTF8String();
+    if (t != null && t != "Load…" && !t.startsWith("(")) {
+      defer(() { sndLoadSheet(t); });
+    }
+  }));
+  button(c, "Copy Code", [rx + 288.0, 56.0, 88.0, 24.0], (s) {
+    try {
+      var pb = Cocoa.cls("NSPasteboard").generalPasteboard();
+      pb.clearContents();
+      pb.setString(gSndDoc.codeSnippet(), forType: "public.utf8-plain-text");
+      sndStatus("effect code copied — paste it into a game's setup");
+    } catch (e) {
+      log(gSndDoc.codeSnippet());
+      sndStatus("clipboard refused; the code went to the log instead");
+    }
+  });
+
+  gSndWindow.center();
+}
+
+// --- state <-> controls ------------------------------------------------------
+
+String _sndF(double v) => (v * 1000).round() / 1000.0 == v.roundToDouble()
+    ? v.toStringAsFixed(0) : v.toStringAsFixed(3);
+
+void sndSyncAll() {
+  gSndDoc.clamp();
+  for (var i = 0; i < gSndSliderDefs.length; i++) {
+    gSndSliders[i].setDoubleValue(gSndSliderDefs[i][3]());
+    gSndSliderVals[i].setStringValue(_sndF(gSndSliderDefs[i][3]()));
+  }
+  for (var i = 0; i < 4; i++) {
+    var have = i < gSndDoc.oscs.length;
+    gSndOscPopups[i].setEnabled(have);
+    gSndOscFreq[i].setEnabled(have);
+    gSndOscAmp[i].setEnabled(have);
+    gSndOscPw[i].setEnabled(have);
+    if (have) {
+      var o = gSndDoc.oscs[i];
+      gSndOscPopups[i].selectItemAtIndex(o.wave);
+      gSndOscFreq[i].setStringValue(o.freq.toStringAsFixed(1));
+      gSndOscAmp[i].setDoubleValue(o.amp);
+      gSndOscPw[i].setStringValue(o.pw.toStringAsFixed(2));
+    } else {
+      gSndOscFreq[i].setStringValue("");
+      gSndOscPw[i].setStringValue("");
+    }
+  }
+  if (gSndSeedField != null) gSndSeedField.setStringValue(gSndDoc.seed.toString());
+  sndPreviewMark();
+}
+
+void sndEdited() {
+  sndSyncAll();
+}
+
+// --- the pane: envelope + sweep, drawn by the engine -------------------------
+
+void sndAcquirePane() {
+  if (gGpMode) stopDemo("the sound editor took the pane");
+  var v = gpOpen(256, 128, 256, 128, 0);
+  if (v == null) { sndStatus("the engine would not open"); return; }
+  v.setFrame([0.0, 0.0, 512.0, 256.0]);
+  gSndPreviewBox.addSubview(v);
+  gSndOwnsPane = true;
+}
+
+void sndPreviewMark() {
+  if (gSndPreviewTimer != null) return;
+  gSndPreviewTimer = new Timer(const Duration(milliseconds: 100), () {
+    gSndPreviewTimer = null;
+    sndRebuildPreview();
+  });
+}
+
+/// The whole view, one atomic apply: the ADSR as a polyline over the full
+/// duration (attack up, decay to sustain, hold, release to zero — the
+/// engine's FIXED-DURATION rule, so what you see is exactly the length you
+/// hear), the sweep as a falling/rising line, osc stubs as labelled ticks.
+void sndRebuildPreview() {
+  if (!gSndOwnsPane || gSndDoc == null) return;
+  gSndDoc.clamp();
+  var v = gpOpen(256, 128, 256, 128, 0);
+  if (v == null) return;
+  var cmds = <List>[];
+  cmds.add(<dynamic>['gppal', 16, 24, 22, 34]);
+  cmds.add(<dynamic>['gppal', 17, 109, 194, 202]);  // envelope: DB16 cyan
+  cmds.add(<dynamic>['gppal', 18, 210, 125, 44]);   // sweep: DB16 orange
+  cmds.add(<dynamic>['gppal', 19, 78, 74, 78]);     // grid grey
+  cmds.add(<dynamic>['gpcls', 16]);
+  // baseline + envelope box
+  cmds.add(<dynamic>['gpline', 8, 100, 248, 100, 19]);
+  var dur = gSndDoc.duration;
+  var aX = 8 + (232 * (gSndDoc.a / dur)).clamp(0, 232);
+  var dX = aX + (232 * (gSndDoc.d / dur)).clamp(0, 232);
+  var rX = 240 - (232 * (gSndDoc.r / dur)).clamp(0, 232);
+  if (dX > 240) dX = 240;
+  if (rX < dX) rX = dX;
+  var sY = 100 - (80 * gSndDoc.s).round();
+  cmds.add(<dynamic>['gpline', 8, 100, aX.round(), 20, 17]);
+  cmds.add(<dynamic>['gpline', aX.round(), 20, dX.round(), sY, 17]);
+  cmds.add(<dynamic>['gpline', dX.round(), sY, rX.round(), sY, 17]);
+  cmds.add(<dynamic>['gpline', rX.round(), sY, 240, 100, 17]);
+  // the sweep, scaled into the same box against 3kHz
+  if (gSndDoc.sweepStart != gSndDoc.sweepEnd) {
+    var y0 = 100 - (80 * (gSndDoc.sweepStart / 3000.0)).clamp(0, 80).round();
+    var y1 = 100 - (80 * (gSndDoc.sweepEnd / 3000.0)).clamp(0, 80).round();
+    cmds.add(<dynamic>['gpline', 8, y0, 240, y1, 18]);
+  }
+  cmds.add(<dynamic>['gptextclear']);
+  cmds.add(<dynamic>['gptext', 8, 106, 'ADSR ' + gSndDoc.duration.toStringAsFixed(2) + 'S', 109, 194, 202, 1]);
+  var oscLbl = '';
+  for (var o in gSndDoc.oscs) {
+    oscLbl = oscLbl + kSndWaves[o.wave].substring(0, 2).toUpperCase() + ' ';
+  }
+  if (oscLbl.isNotEmpty) {
+    cmds.add(<dynamic>['gptext', 8, 116, oscLbl + (gSndDoc.noiseMix > 0 ? '+NOISE' : ''), 133, 149, 161, 1]);
+  } else {
+    cmds.add(<dynamic>['gptext', 8, 116, gSndDoc.noiseMix > 0 ? 'NOISE VOICE' : 'SWEEP VOICE', 133, 149, 161, 1]);
+  }
+  var e = gpApply(cmds);
+  if (e != null) sndStatus("preview: " + e.toString());
+}
+
+/// Audition on slot 0: define (render) + play, one atomic apply. Slot 0 is a
+/// game's low-rack slot, safe because the editor holds the pane — no game is
+/// live while it does.
+void sndPlay() {
+  if (!gSndOwnsPane) sndAcquirePane();
+  if (!gSndOwnsPane) return;
+  var op = <dynamic>['gpeffect', 0];
+  for (var p in gSndDoc.paramsList()) { op.add(p); }
+  var e = gpApply(<List>[op, <dynamic>['gpplay', 0]]);
+  sndStatus(e == null
+      ? "played — " + gSndDoc.duration.toStringAsFixed(2) + "s on slot 0"
+      : "play: " + e.toString());
+}
+
+// --- save / load -------------------------------------------------------------
+
+Future sndSave() async {
+  var name = gSndNameField.stringValue().UTF8String().trim();
+  if (!SoundDoc.validName(name)) {
+    sndStatus("name must be a class name: capital letter, then letters/digits");
+    return;
+  }
+  gSndDoc.name = name;
+  var r = await ask('sndstore', gSndDoc.sheetSource());
+  sndStatus(r == null ? "save timed out" : r.toString());
+  sndRefreshLoadList();
+}
+
+Future sndRefreshLoadList() async {
+  if (gSndLoadPopup == null) return;
+  var r = await ask('sndlist', '');
+  gSndLoadPopup.removeAllItems();
+  gSndLoadPopup.addItemWithTitle("Load…");
+  if (r is List && r.isNotEmpty) {
+    for (var n in r) { gSndLoadPopup.addItemWithTitle(n.toString()); }
+  } else {
+    gSndLoadPopup.addItemWithTitle("(no sounds in the image)");
+  }
+}
+
+Future sndLoadSheet(String name) async {
+  var r = await ask('sndload', name);
+  if (r is! List || r.length < 2) {
+    sndStatus("load " + name + ": " + r.toString());
+    return;
+  }
+  var params = <dynamic>[];
+  for (var x in (r[1] as List)) { params.add(x); }
+  if (!gSndDoc.fromParams(params)) {
+    sndStatus("load " + name + ": bad params in the image class");
+    return;
+  }
+  gSndDoc.name = r[0].toString();
+  if (gSndNameField != null) gSndNameField.setStringValue(gSndDoc.name);
+  sndSyncAll();
+  sndStatus("loaded " + gSndDoc.name + " — Play to hear it");
+}
+
+// --- the scripted face -------------------------------------------------------
+
+Future<String> soundEdVerb(String cmd, String arg) async {
+  if (cmd == 'sounded') {
+    soundEdShow(arg.trim());
+    await sndRefreshLoadList();
+    return "ok";
+  }
+  if (gSndWindow == null) return "ERR: sound editor not open (run sounded)";
+  switch (cmd) {
+    case 'soundedclose':
+      gSndWindow.orderOut(null);
+      return "ok";
+    case 'sndnew':
+      gSndDoc = new SoundDoc();
+      gSndNameField.setStringValue(gSndDoc.name);
+      sndSyncAll();
+      return "ok";
+    case 'sndstat':
+      return (gSndOwnsPane ? "pane " : "nopane ") + gSndDoc.name + " " +
+          gSndDoc.duration.toStringAsFixed(2) + "s osc " +
+          gSndDoc.oscs.length.toString() + " seed " + gSndDoc.seed.toString();
+    case 'sndparams':
+      return gSndDoc.paramsList().join(' ');
+    case 'sndset': {                       // sndset <field> <value>
+      var p = arg.split(' ').where((x) => x.isNotEmpty).toList();
+      if (p.length < 2) return "ERR: sndset <field> <value>";
+      var v = double.parse(p[1], (_) => 0.0);
+      var f = p[0];
+      if (f == 'duration') gSndDoc.duration = v;
+      else if (f == 'attack') gSndDoc.a = v;
+      else if (f == 'decay') gSndDoc.d = v;
+      else if (f == 'sustain') gSndDoc.s = v;
+      else if (f == 'release') gSndDoc.r = v;
+      else if (f == 'sweepstart') gSndDoc.sweepStart = v;
+      else if (f == 'sweepend') gSndDoc.sweepEnd = v;
+      else if (f == 'noise') gSndDoc.noiseMix = v;
+      else if (f == 'distortion') gSndDoc.distortion = v;
+      else if (f == 'echocount') gSndDoc.echoCount = v.round();
+      else if (f == 'echodelay') gSndDoc.echoDelay = v;
+      else if (f == 'echodecay') gSndDoc.echoDecay = v;
+      else if (f == 'seed') gSndDoc.seed = v.round();
+      else return "ERR: unknown field " + f;
+      sndSyncAll();
+      return "ok " + f;
+    }
+    case 'sndosc': {                       // sndosc <i> <wave|freq|amp|phase|pw> <v>
+      var p = arg.split(' ').where((x) => x.isNotEmpty).toList();
+      if (p.length < 3) return "ERR: sndosc <i> <prop> <v>";
+      var i = int.parse(p[0], onError: (_) => -1);
+      while (gSndDoc.oscs.length <= i && gSndDoc.oscs.length < 4) {
+        gSndDoc.oscs.add(new SndOsc(0, 440.0, 0.5));
+      }
+      if (i < 0 || i >= gSndDoc.oscs.length) return "ERR: osc 0..3";
+      var o = gSndDoc.oscs[i];
+      var v = double.parse(p[2], (_) => 0.0);
+      if (p[1] == 'wave') o.wave = v.round();
+      else if (p[1] == 'freq') o.freq = v;
+      else if (p[1] == 'amp') o.amp = v;
+      else if (p[1] == 'phase') o.phase = v;
+      else if (p[1] == 'pw') o.pw = v;
+      else return "ERR: wave|freq|amp|phase|pw";
+      sndSyncAll();
+      return "ok osc " + i.toString();
+    }
+    case 'sndpreset': {
+      var keep = gSndDoc.name;
+      gSndDoc = SoundDoc.preset(arg.trim());
+      gSndDoc.name = keep;
+      sndSyncAll();
+      return "ok " + arg.trim();
+    }
+    case 'sndplay':
+      sndPlay();
+      return gSndStatusLbl.stringValue().UTF8String();
+    case 'sndsave': {
+      if (arg.trim().isNotEmpty) gSndNameField.setStringValue(arg.trim());
+      await sndSave();
+      return gSndStatusLbl.stringValue().UTF8String();
+    }
+    case 'sndload': {
+      await sndLoadSheet(arg.trim());
+      return gSndStatusLbl.stringValue().UTF8String();
+    }
+    case 'sndlist': {
+      var r = await ask('sndlist', '');
       if (r is List) return r.map((x) => x.toString()).join('\n');
       return r.toString();
     }

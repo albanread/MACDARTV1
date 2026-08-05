@@ -1088,15 +1088,28 @@ String _hostAcceptWhole(String text, String what) {
 // its literals (stInvokeStatic, so a sheet edited in the Browser answers its
 // edited art) and ships plain lists back over the port.
 
-List _spriteSheetList() {
+List _sheetList(String marker) {
   var names = <String>[];
   _decls.forEach((n, s) {
-    if (_kindOf(s) == 'st-class' && s.contains('isSpriteSheet [ ^true ]')) {
-      names.add(n);
-    }
+    if (_kindOf(s) == 'st-class' && s.contains(marker)) names.add(n);
   });
   names.sort();
   return names;
+}
+
+List _spriteSheetList() => _sheetList('isSpriteSheet [ ^true ]');
+
+dynamic _soundSheetLoad(String name) {
+  if (!_decls.containsKey(name)) return 'ERR: no class ' + name;
+  try {
+    var pl = stInvokeStatic(name, 'params', []);
+    if (pl is! List) return 'ERR: ' + name + ' is not a sound sheet';
+    var params = <num>[];
+    for (var v in (pl as List)) { params.add(v as num); }
+    return <dynamic>[name, params];
+  } catch (e) {
+    return 'ERR: ' + e.toString();
+  }
 }
 
 dynamic _spriteSheetLoad(String name) {
@@ -1417,6 +1430,10 @@ main(List args, SendPort uiPort) {
       else if (cmd == 'spstore') out = _hostStoreClass(arg.toString());
       else if (cmd == 'splist') out = _spriteSheetList();
       else if (cmd == 'spload') out = _spriteSheetLoad(arg.toString());
+      // The sound editor's persistence — the same store path + markers.
+      else if (cmd == 'sndstore') out = _hostStoreClass(arg.toString());
+      else if (cmd == 'sndlist') out = _sheetList('isSoundSheet [ ^true ]');
+      else if (cmd == 'sndload') out = _soundSheetLoad(arg.toString());
       else if (cmd == 'sthaltarm') out = stHaltArm(arg);
       else if (cmd == 'ping') out = 'lang-pong';
       else out = 'ERR: unknown ' + cmd.toString();

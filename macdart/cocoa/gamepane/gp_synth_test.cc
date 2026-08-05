@@ -88,6 +88,40 @@ int main() {
   snprintf(buf, sizeof buf, "%d beats", plain);
   check(plain == 0, "a plain tone does not warble", buf);
 
+  // A CUSTOM Effect — the sound editor's path (gpeffect ships exactly these
+  // fields): two detuned saws + sweep + a pinch of noise and echo must render
+  // the asked-for length plus the release tail, audibly. Guards the recipe
+  // surface itself, not just the eleven presets.
+  {
+    Effect e(0.3);
+    e.add_osc(kSaw, 220.0, 0.5);
+    e.add_osc(kSaw, 223.0, 0.5);
+    e.set_env(0.02, 0.08, 0.6, 0.2);
+    e.sweep_start = 220.0; e.sweep_end = 110.0;
+    e.noise_mix = 0.05;
+    e.echo_count = 2; e.echo_delay = 0.08; e.echo_decay = 0.4;
+    Lcg erng(777);
+    Sound fx = render(e, erng);
+    double fsecs = (double)(fx.samples.size() / fx.channels) / fx.sample_rate;
+    snprintf(buf, sizeof buf, "%.2fs", fsecs);
+    // The ADSR is FIXED-DURATION: the envelope fits INSIDE `duration`
+    // (attack+decay+sustain+release shape the asked-for length; nothing
+    // renders past it, echo taps land in place). The editor documents the
+    // same rule.
+    check(fabs(fsecs - 0.3) < 0.05, "custom effect renders its duration", buf);
+    std::vector<double> fenv = envelope(fx);
+    double fpeak = 0.0;
+    for (double v : fenv) fpeak = fmax(fpeak, v);
+    snprintf(buf, sizeof buf, "peak %.2f", fpeak);
+    check(fpeak > 0.3, "custom effect is audible", buf);
+    // Same seed, same sound — the editor's reproducibility promise.
+    Lcg erng2(777);
+    Sound fx2 = render(e, erng2);
+    check(fx2.samples.size() == fx.samples.size() &&
+              fx2.samples[1000] == fx.samples[1000],
+          "same seed renders the same sound", "");
+  }
+
   printf("== %s ==\n", failures == 0 ? "SYNTH OK" : "SYNTH FAILED");
   return failures == 0 ? 0 : 1;
 }

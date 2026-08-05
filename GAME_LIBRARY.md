@@ -238,11 +238,38 @@ frame as exact hex rows), `spedname`, `spedsave [Name]`, `spedload <Name>`,
 `spedlist`, `spedstat`. The document model is pure Dart
 (`cocoa/workspace/spriteed_model.dart`), tested headless in the battery.
 
+## The sound editor
+
+**Games ▸ Sound Editor** is the sprite editor's sibling for the synth: the
+full `Effect` recipe — up to four oscillators (sine/square/saw/triangle/
+noise/pulse), a fixed-duration ADSR, frequency sweep, noise mix, tanh
+distortion, echo taps, and the LCG seed — on sliders, auditioned through the
+real synth (Play renders natively and plays on slot 0), with the Metal pane
+drawing the envelope and sweep. The eleven `Sound` presets are loadable
+starting points; Random and Mutate explore the space sfxr-style. Design in
+[`SOUND_EDITOR_PLAN.md`](SOUND_EDITOR_PLAN.md).
+
+Saving writes a **sound sheet** class through the store path:
+
+```smalltalk
+Laser playOn: 3.    "define (rendered once, cached) + play on slot 3"
+Laser play.         "the slot-0 convenience"
+```
+
+Under it sits one new wire op, `gpeffect`, which ships the whole recipe —
+`Sound effect: params slot: n` / `Sound playSlot: n` from Smalltalk — with
+define-once caching so a `playOn:` in a frame loop never re-renders. The
+seed crosses the wire too: a saved sound renders the same every time.
+Scripted face: `sounded`, `sndnew`, `sndpreset <name>`, `sndset <field> <v>`,
+`sndosc <i> <prop> <v>`, `sndparams` (the flat contract list), `sndplay`,
+`sndsave/sndload/sndlist`, `sndstat`.
+
 ## Testing
 
 | Tier | What it proves |
 |---|---|
 | `st/test/spriteed_model_test.dart` | the sprite editor's document — pixels/frames/palette ops, hex-row round-trip, sheet-class source — pure Dart, no world |
+| `st/test/sounded_model_test.dart` | the sound editor's document — params contract, clamps, preset transcriptions, sheet source — pure Dart |
 | `st/test/gamepane_wire.dart` | the exact `gp*` ops a game ships, headless — overlay, helpers, sound map, ABC compiler and step loop all agree, before any pixel exists |
 | `st/test/galaxigans_smoke.mst` | a real game played through: dive, fire, collisions, waves, the dance, the hall of fame, the attract timeout |
 | `st/test/galaxigans_reload_wire.dart` | the save path does not kill the frame loop, and a full world reload no longer can either |

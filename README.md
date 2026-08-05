@@ -216,7 +216,12 @@ Sprite Editor**, a utility window of Cocoa controls around the real Metal pane
 — paint the 16-colour sprites, edit the palette, flip through animation frames
 with the engine itself previewing at 1x/2x/4x — and Save writes the sheet as
 an ordinary class in the image whose `installOn: pane` hands a game the whole
-sprite in one send ([`SPRITE_EDITOR_PLAN.md`](SPRITE_EDITOR_PLAN.md)).
+sprite in one send ([`SPRITE_EDITOR_PLAN.md`](SPRITE_EDITOR_PLAN.md)). Its
+sibling **Games ▸ Sound Editor** does the same for the synth: the full ADSR/
+sweep/noise/echo recipe on sliders, auditioned through the real synth, the
+envelope drawn on the pane, presets and randomize to explore from — saved as a
+class whose `playOn: slot` is the whole consumption API
+([`SOUND_EDITOR_PLAN.md`](SOUND_EDITOR_PLAN.md)).
 
 Pong is the minimal worked example (← → or A/D, space to serve). Sprite
 Invaders and Brickout are the two full games: sprites, a destructible

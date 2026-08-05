@@ -73,6 +73,15 @@ GamePane >> primSpriteColor: id index: index r: r g: g b: b [ <stprim: stGpSprit
 GamePane >> primMoveSprite: id x: x y: y [ <stprim: stGpMoveSprite> ]
 
 Sound >> primPlay: n [ <stprim: stGpPlay> ]
+
+"Custom synth effects (SOUND_EDITOR_PLAN.md) — the full ADSR recipe the
+ eleven presets are hand-tuned points in, opened to Smalltalk. `params` is
+ the flat contract list (duration, a d s r, sweep x2, noise, distortion,
+ echo x3, seed, oscCount, then wave/freq/amp/phase/pw per oscillator);
+ effect:slot: renders and parks it in a slot (define-once cached), playSlot:
+ fires it. A saved sound sheet's playOn: is these two sends."
+Sound class >> effect: params slot: n [ <stprim: stGpEffect> ]
+Sound class >> playSlot: n [ <stprim: stGpPlaySlot> ]
 Tune >> primPlayTune: s [ <stprim: stGpPlayTune> ]
 
 "The HUD text overlay — NEW here, not part of MACVM's corpus (its pane had

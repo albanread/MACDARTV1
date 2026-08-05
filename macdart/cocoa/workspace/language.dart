@@ -873,6 +873,7 @@ String _hostCall(String verb, List args) {
   if (verb == 'removeMethod') return _hostRemoveMethod(args[0].toString(), args[1].toString(), args[2].toString());
   if (verb == 'newClass') return _hostAcceptWhole(args[0].toString(), 'created');
   if (verb == 'acceptClass') return _hostAcceptWhole(args[0].toString(), 'accepted');
+  if (verb == 'storeClass') return _hostStoreClass(args[0].toString());
   if (verb == 'setComment') return _hostSetComment(args[0].toString(), args[1].toString());
   if (verb == 'removeClass') {
     var r = _remove(args[0].toString());
@@ -954,6 +955,40 @@ String _hostAcceptWhole(String text, String what) {
   var err = _acceptOne(text.trim());
   if (err.isNotEmpty) return 'ERR ' + err;
   return 'OK ' + what + ' ' + name.toString();
+}
+
+// Persist a GENERATED class without hot-reloading the running world — the
+// accept path a program uses to save its own data, as opposed to the Browser's
+// accept, which a human drives between frames.
+//
+// _acceptMany reloads EVERY world class (stLoadFresh, so an edit always wins).
+// That is right for an editor and wrong for a program saving from inside a
+// callback: the reload re-inits class-side state, and the casualty is GamePane's
+// StepBlock — the class variable holding the per-frame closure. The GUI's frame
+// timer keeps calling GamePane stepWithKeys:, but with StepBlock nil every tick
+// is a no-op, so the game freezes on the frame that saved and never resumes
+// (galaxigans' hall of fame: "the high-score page never ends"). The game cannot
+// re-arm itself either — a running method's globals are already bound to the
+// pre-reload class, while the driver resolves GamePane by name and gets the new
+// one, so they write and read different variables.
+//
+// So: same parse-check and the same image write (it boots live next time), but
+// only THIS class is made live, via a plain stLoad. Nothing else in the world is
+// touched, and a loop running underneath it keeps running.
+// Regression: st/test/galaxigans_reload_wire.dart.
+String _hostStoreClass(String text) {
+  var s = text.trim();
+  if (!_isStAny(s)) return 'ERR storeClass takes a Smalltalk class';
+  var c = stCheck(s);                       // refused source never reaches the image
+  if (c.isNotEmpty) return 'ERR ' + c;
+  var name = _declName(s);
+  if (name == null) return 'ERR storeClass: no class name';
+  var r = stLoad(s);                        // live NOW, this class only
+  if (r.toString().startsWith('ERR')) return 'ERR ' + r.toString();
+  _decls[name] = s;
+  _recordVersion(name, 'store');
+  _imageUpsert(name, s);                    // and live at the next boot
+  return 'OK stored ' + name.toString();
 }
 
 String _hostSaveMethod(String cls, String side, String text) {

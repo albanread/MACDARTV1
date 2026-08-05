@@ -98,7 +98,14 @@ Transcript showCr: '  spread ', spread1 printString, ' then ', spread2 printStri
 check value: 'the dance hands off to the hall of fame' value:
     ([ 1 to: 320 do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #hiscore.
 check value: 'and the table times out into attract' value:
-    ([ 1 to: 370 do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #attract.
+    ([ 1 to: Galaxigans hiscoreLength + 10 do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #attract.
+"The attract cycle: left alone, the cabinet keeps turning over — the title hands
+ back to the hall of fame, the table hands back to the title, for as long as
+ nobody plays. Neither state may be a dead end."
+check value: 'the title hands back to the hall of fame' value:
+    ([ 1 to: Galaxigans attractLength do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #hiscore.
+check value: 'and round it goes again' value:
+    ([ 1 to: Galaxigans hiscoreLength do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #attract.
 
 "The hall of fame: a qualifying score slots in sorted, named YOU, and the
  sixth row drops off; a losing score changes nothing. Headless the persistence

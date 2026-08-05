@@ -462,7 +462,11 @@ Object subclass: Galaxigans [
     Galaxigans class >> danceAngleStep [ ^6 ]
     Galaxigans class >> danceRadStep [ ^10 ]
     Galaxigans class >> danceLength [ ^420 ]
-    Galaxigans class >> hiscoreLength [ ^360 ]
+    "The attract cycle, in frames at the ~33fps pull rate: the title holds for
+     ~18s, the hall of fame for ~30s, and then round again — the machine never
+     stops on its own, it just waits for a player."
+    Galaxigans class >> attractLength [ ^600 ]
+    Galaxigans class >> hiscoreLength [ ^1000 ]
 
     "--- the hall of fame: a CLASS IN THE IMAGE, written by the game ---------"
     "The original keeps six rows in .DATA — ACE 30000 down to WOW 4000 — and
@@ -519,11 +523,21 @@ Object subclass: Galaxigans [
     "Persist [rows] as GxHallOfFame. In the GUI this goes through the image
      host and answers 'OK ...'; headless there is no host and the reply is an
      ERR string — the game keeps its in-memory table and shrugs, which is why
-     the battery can drive the whole flow without a window."
+     the battery can drive the whole flow without a window.
+
+     STORE, not accept: we are saving from inside the frame callback. The
+     Browser's acceptEditorClass: hot-reloads the WHOLE world, which re-inits
+     every class's class-side state — including GamePane's StepBlock, the
+     per-frame closure that IS the frame loop. That froze the game on the very
+     frame it saved (the hall of fame came up and never timed out), and the
+     game could not rescue itself: this method's globals are already bound to
+     the pre-reload class, while the driver resolves GamePane by name and gets
+     the new one. storeEditorClass: parse-checks and persists identically, but
+     makes only GxHallOfFame live, so the loop underneath keeps running."
     Galaxigans class >> saveHall: rows [
         | reply |
         reply := STHostService new onMain
-                     acceptEditorClass: (self hallSourceFor: rows).
+                     storeEditorClass: (self hallSourceFor: rows).
         ^reply printString
     ]
 
@@ -694,7 +708,7 @@ Object subclass: Galaxigans [
         wave := 1.
         flap := 0.
         gameState := #attract.
-        stateTimer := 0.
+        stateTimer := self class attractLength.
         self startWave
     ]
 
@@ -865,13 +879,30 @@ Object subclass: Galaxigans [
     ]
 
     stepAttract [
-        "The title waits for fire, and the fleet sways behind it."
+        "The title, with the fleet swaying behind it. Fire starts a game — and
+         if nobody does, the title hands over to the hall of fame and the cabinet
+         keeps cycling title, table, title, ... for as long as it is left alone.
+         That loop is the whole point of an attract mode: the hall of fame is not
+         somewhere the machine ENDS up after a game, it is one of the two faces
+         the machine shows while it waits for a player."
         self swayFleet.
         fleet do: [ :a | a alive ifTrue: [ a followFormation: swayX ] ].
         (self firePressed) ifTrue: [
             gameState := #playing.
             self startWave.
-            (Tune fromAbc: self class tuneTitle) playOnce ]
+            (Tune fromAbc: self class tuneTitle) playOnce.
+            ^self ].
+        stateTimer := stateTimer - 1.
+        stateTimer <= 0 ifTrue: [ self showHiscores ]
+    ]
+
+    "Show the hall of fame with nothing highlighted — the attract cycle's turn
+     at the table, as opposed to enterHiscores, which arrives with a fresh score
+     to slot in and a row to flash."
+    showHiscores [
+        hiNewRow := 0.
+        gameState := #hiscore.
+        stateTimer := self class hiscoreLength
     ]
 
     stepCleared [
@@ -916,11 +947,11 @@ Object subclass: Galaxigans [
             [ fresh size > 6 ] whileTrue: [ fresh removeLast ].
             hiTable := fresh.
             Galaxigans saveHall: hiTable.
-            "The accept HOT-RELOADS the image, which replaces this game's own
-             class and resets its class variables — the instance survives by
-             morph (that is the workspace's contract), but the Current handle
-             comes back nil. Put ourselves back so the control plane, and the
-             next save, still find the running game."
+            "saveHall STORES rather than accepts (see it), so the world is no
+             longer hot-reloaded underneath the running frame loop and Current
+             survives. Re-register anyway: it costs nothing, and it keeps the
+             control plane and the next save pointed at the running game however
+             the save was made."
             Galaxigans register: self ].
         gameState := #hiscore.
         stateTimer := self class hiscoreLength

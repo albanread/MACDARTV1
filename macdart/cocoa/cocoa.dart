@@ -1665,6 +1665,12 @@ stHostRemoveMethod(svc, cls, side, sel) =>
     _stHost('removeMethod', [cls, side, sel]);
 stHostNewClass(svc, text) => _stHost('newClass', [text]);
 stHostAcceptClass(svc, text) => _stHost('acceptClass', [text]);
+/// Persist a class a PROGRAM generated, without hot-reloading the world: same
+/// parse-check and image write as the accept above, but only this class is made
+/// live. The accept's world reload re-inits class-side state, which kills a
+/// running game's frame loop (GamePane's StepBlock) — so anything saving from
+/// inside a callback, rather than from an editor between frames, wants this one.
+stHostStoreClass(svc, text) => _stHost('storeClass', [text]);
 stHostSetComment(svc, cls, text) => _stHost('setComment', [cls, text]);
 stHostRemoveClass(svc, cls) => _stHost('removeClass', [cls]);
 

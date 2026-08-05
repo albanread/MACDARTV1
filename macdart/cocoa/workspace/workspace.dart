@@ -4481,12 +4481,12 @@ Future runScannedDemo(String title, String path) {
 
 /// A standalone `.mst` file found by scanDemos (Demos menu), the same file
 /// shape apps/ already colocates with .dart via scanApps. There is no isolate
-/// to spawn — the class installs into the SAME running image (the
-/// editorDecls/acceptMany path _installApp uses) and then plays live through
+/// to spawn — the classes FILE IN to the same running isolate (editorDecls +
+/// acceptLive: live now, never written to the image) and then play live through
 /// the ST-game pull-tick loop (runStGame), so a demo dropped in demos/ needs
 /// no matching entry in language.dart's _kStGames table: _stGame() falls back
 /// there to an ad-hoc {cls: name, sel: 'launch'} for any class it finds
-/// already installed but not in its hardcoded list.
+/// live but not in its hardcoded list.
 Future runStFileDemo(String title, String path) async {
   var src;
   try { src = new File(path).readAsStringSync(); }
@@ -4514,8 +4514,19 @@ Future runStFileDemo(String title, String path) async {
   if (name == null) { log("✗ demo — no class in " + path); return; }
   var r = await checkDecls(decls);
   if (!r.ok) { log("✗ demo refused — " + r.message); return; }
-  var reply = await ask('acceptMany', decls);
-  log("✓ installed " + title + " — " + reply.toString());
+  // FILE IN, do not install: acceptLive makes the classes live in the running
+  // isolate without writing them to the image. A game belongs to its FILE — the
+  // Demos/Games menu IS the folder, Save writes back to disk (gDemoEditPath
+  // below), and every launch re-reads the file, so what runs is always what is
+  // on disk. Committing them with acceptMany instead left a stale copy in the
+  // image that silently won on the next launch: edit the file, run it, and the
+  // OLD code played — hours of "but I fixed that" (galaxigans' hall of fame).
+  // Apps are different and still install: an app is meant to live in the image
+  // and be edited there (see _installApp). Data a game persists is different
+  // again — the hall of fame is a class the GAME writes, and it goes through the
+  // host's store verb, so scores survive while code never does.
+  var reply = await ask('acceptLive', decls);
+  log("✓ filed in " + title + " — " + reply.toString() + " (file, not image)");
   await runStGame(name);
   // runStGame points Edit at the launched CLASS; for a filed-in game the file
   // is the truth (it holds every class, and Save writes back to disk), so it

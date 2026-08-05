@@ -41,6 +41,13 @@ Object subclass: STHostService [
     newClassFrom: text [ <stprim: stHostNewClass> ]
     setCommentFor: cls comment: text [ <stprim: stHostSetComment> ]
     acceptEditorClass: text [ <stprim: stHostAcceptClass> ]
+    "Persist a class the PROGRAM generated (a saved table, a preferences
+     holder), parse-checked and stored exactly like the accept above — but
+     WITHOUT hot-reloading the world. The accept's reload re-inits every class's
+     class-side state, which nils the frame loop's step block and freezes a
+     running game on the frame that saved; this makes only the saved class live.
+     Save from inside a running callback through here, not acceptEditorClass:."
+    storeEditorClass: text [ <stprim: stHostStoreClass> ]
     removeClassNamed: cls [ <stprim: stHostRemoveClass> ]
     removeMethodFor: cls side: side selector: sel [ <stprim: stHostRemoveMethod> ]
 ]

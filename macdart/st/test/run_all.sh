@@ -150,6 +150,20 @@ if [ -f "$HERE/galaxigans_smoke.mst" ] && [ -f "$GAME" ]; then
   fi
 else skip "tier5b galaxigans (missing)"; fi
 
+# tier 5c — the hall-of-fame save must not kill the frame loop. The smoke above
+# runs with NO image host, so its save answers ERR and never persists; this one
+# installs a host, so the save path runs for real. Asserts the shipped store path
+# leaves the loop running (the table times out into attract) AND that the old
+# world-reloading accept still freezes it — the bug, kept reproducible.
+if [ -f "$HERE/galaxigans_reload_wire.dart" ] && [ -f "$GAME" ]; then
+  rw="$("$DART" --with-st "$HERE/galaxigans_reload_wire.dart" "$GAME" "$MACDART/st/world/43_gamepane.mst" 2>&1)"
+  if echo "$rw" | grep -q "RELOAD-WIRE OK"; then
+    pass "tier5c galaxigans hall save ($(echo "$rw" | grep -cE '^  ok ') checks)"
+  else
+    fail "tier5c galaxigans hall save"; echo "$rw" | grep -E "FAIL|ERR" | head -3 | sed 's/^/        /'
+  fi
+else skip "tier5c galaxigans hall save (missing)"; fi
+
 # tier 6 — GUI smoke (opt-in; needs a window server)
 if [ "$WANT_GUI" = 1 ]; then
   if [ -x "$HERE/gui_smoke.sh" ]; then

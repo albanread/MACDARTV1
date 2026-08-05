@@ -7,7 +7,13 @@
 // @encode. See MACDART/COCOA_PLAN.md.
 library dart.cocoa;
 
+import 'dart:_internal' as internal show VMLibraryHooks;
+import 'dart:math' as math
+    show sqrt, log, exp, sin, cos, tan, atan, asin, acos, pow;
 import 'dart:mirrors' show MirrorSystem;
+import 'dart:developer' as developer show debugger;
+import 'dart:typed_data' show Uint8List;
+import 'dart:convert' show BASE64;
 
 /// The process id — a POSIX FFI smoke test (getpid()).
 int processId() native "Cocoa_getpid";
@@ -51,6 +57,1478 @@ String wsUiReloadStatus() native "Workspace_uiReloadStatus";
 /// a running process with no window and no control socket.
 String wsUiReady() native "Workspace_uiReady";
 
+/// Load MACVM Smalltalk source [src] (a `.mst` string) into the live VM object
+/// model: its classes/methods/fields are REGISTERED in the class table (method
+/// bodies are not compiled yet — that is ST_PLAN.md Sprint 3). Returns a
+/// human-readable summary of what was registered, or an `"ERR: ..."` string on
+/// a lex/parse/finalize failure (never throws). Verification surface only:
+/// registered ST methods must not be invoked until the Sprint 3 compiler hook.
+String _stLoadRaw(String src) native "ST_load";
+String _stRunRaw(String src) native "ST_run";
+String _stLoadFreshRaw(String src) native "ST_loadFresh";
+
+String stLoad(String src) { _stEnsureHooks(); return _stLoadRaw(src); }
+
+/// Load AND run: like [stLoad], then execute the file's bare top-level
+/// statements (MACVM do-it semantics — a corpus file's own driver lines).
+String stRun(String src) { _stEnsureHooks(); return _stRunRaw(src); }
+
+/// The workspace image reload: a FRESH layer — same-name classes fully
+/// shadow earlier loads instead of being reopened in place, so a
+/// re-Accepted class's edits always win (and no stale inline caches).
+String stLoadFresh(String src) { _stEnsureHooks(); return _stLoadFreshRaw(src); }
+
+/// Parse-only outline for the import slicer: List of [type, name, startLine]
+/// per top-level item ('class'/'extend'/'extmethod'/'vardecl'/'stmt'), or an
+/// "ERR: ..." String on a parse failure.
+stOutline(String src) native "ST_outline";
+
+/// Probe-mode class-side dispatch: answers [result] on a hit (even a nil
+/// result), or null when the class has no such class-side method — WITHOUT
+/// masking ST exceptions raised inside a found method (they propagate).
+_stClassSendTry(type, String sel, List args) native "ST_classSendTry";
+
+/// Probe-mode EXTENSION dispatch (Sprint 11c): the world image's core-class
+/// extensions, tried by Object.noSuchMethod on any genuine miss.
+_stExtSendTry(recv, String sel, List args) native "ST_extSendTry";
+
+/// `x class` — the receiver's class VALUE (canonical Type; natives answer
+/// their extension holder's Type when the world image is loaded).
+stClassOf(r) native "ST_classOf";
+
+/// Probe-mode instance dispatch: [result] on a hit, null on a MISS — never an
+/// ApiError (an ApiError is not catchable by Dart try/catch; the print
+/// protocol's printOn: fallback must degrade, not crash the Release GUI).
+_stSendTry(recv, String sel, List args) native "ST_sendTry";
+
+/// Lookup-only probe: does the receiver's class chain define the selector?
+/// (No invoke, no prelude requirement — safe before any ST has loaded.)
+bool _stHasMethod(recv, String sel) native "ST_hasMethod";
+
+/// `respondsTo:` — does [recv] understand [sel] via its own class chain OR the
+/// native extension holders? The 76_reflection overlay routes Object>>respondsTo:
+/// here; [sel] arrives as a Symbol (or String), so name it before the probe.
+bool stRespondsTo(recv, sel) {
+  var s = _stStr(sel);
+  return s == null ? false : _stRespondsToImpl(recv, s);
+}
+bool _stRespondsToImpl(recv, String sel) native "ST_respondsTo";
+
+/// Public alias for the --with-st boot path (C++ enters via Dart_Invoke,
+/// which cannot reach the private installer).
+void stEnsureHooks() { _stEnsureHooks(); }
+
+bool _stHooked = false;
+
+/// Installed once, before the first ST load: lets _Type.noSuchMethod route a
+/// send to a CLASS VALUE held in a variable into ST class-side dispatch, and
+/// Object.noSuchMethod route misses on native receivers into the world
+/// image's extension holders (Integer>>fib, ...).
+/// Forward a String-protocol send from a native Symbol / mutable String to the
+/// Dart String [s] the way a plain String receiver is handled: the "String ext"
+/// holder chain FIRST (tokenize:, substrings:, asUppercase, replaceAll:, …),
+/// then stSend as a last resort. Answers the [result] box the hook contract
+/// wants. (stSend alone does not walk the extension holders, so symbols and
+/// mutable strings used to miss the whole String extension protocol.)
+List _stStrForward(String s, String sel, List args) {
+  var hit = _stExtSendTry(s, sel, args);      // already a [result] box, or null
+  if (hit != null) return hit;
+  return [stSend(s, sel, args)];
+}
+
+void _stEnsureHooks() {
+  if (_stHooked) return;
+  _stHooked = true;
+  // A class value first tries class-side dispatch; a miss then tries the
+  // Behavior/Object extension holders (the world's reflective protocol)
+  // with the Type itself as receiver.
+  internal.VMLibraryHooks.stTypeNSM = (t, String sel, List args) {
+    var r = _stClassSendTry(t, sel, args);
+    if (r != null) return r;
+    return _stExtSendTry(t, sel, args);
+  };
+  internal.VMLibraryHooks.stObjNSM = (r, String sel, List args) {
+    // A Symbol IS a String (subclass): its own protocol is a short list; every
+    // other message forwards to the spelling, so all String protocol answers.
+    // The hook contract: return a 1-element LIST [result] on a hit (noSuchMethod
+    // unboxes r[0]), null to fall through. A bare value would be `[0]`-indexed.
+    if (r is StSymbol) {
+      if (sel == 'isSymbol') return const [true];
+      if (sel == 'asSymbol' || sel == 'yourself') return [r];
+      // A Symbol is unique: copying answers the receiver (else `#foo copy ==
+      // #foo` fails). Without this, copy's `postCopy` step forwarded to the
+      // spelling and demoted #foo to the String 'foo'.
+      if (sel == 'copy' || sel == 'shallowCopy' || sel == 'postCopy') return [r];
+      if (sel == 'hash' || sel == 'identityHash') return [r.hashCode];
+      if (sel == '=' || sel == '==') return [identical(r, args[0])];
+      // isKindOf:/class must see the SYMBOL, not its spelling — a Symbol is-a
+      // Symbol (and a String), which forwarding to r.name would answer as a bare
+      // String. (class already routes through the stClassOf helper, not here.)
+      if (sel == 'isKindOf_') return [stIsKindOf(r, args[0])];
+      return _stStrForward(r.name, sel, args);    // full String protocol
+    }
+    if (r is StMutableString) {
+      var v = _stMutProtocol(r, sel, args);
+      if (!identical(v, _noStMut)) return [v];
+      return _stStrForward(r.toString(), sel, args);  // full String protocol
+    }
+    if (r is StChar) {
+      var v = _stCharProtocol(r, sel, args);
+      if (!identical(v, _noStChar)) return [v];
+      // not Character protocol — a Character IS NOT a String, so anything else
+      // is a genuine doesNotUnderstand (fall through to the reify path).
+    }
+    // Dart's num operators COERCE an unknown right operand by delegating to a
+    // private on it — `2 + (1/3)` compiles to int.+ which calls
+    // `other._addFromInteger(2)`. An ST numeric (Fraction, ScaledDecimal) has
+    // no such private, so mixed int-op-Fraction arithmetic died as a dNU.
+    // Translate each coercion private to the receiver's own ST protocol (the
+    // int is the LEFT operand: _subFromInteger(n) means n - recv). Division
+    // builds the result from numerator/denominator directly — `reciprocal` is
+    // `1 / self`, which would loop straight back through this hook.
+    {
+      var at = sel.indexOf('@');                 // privates carry @libraryKey
+      var bare = at > 0 ? sel.substring(0, at) : sel;
+      if (bare == '_addFromInteger') return [stSend(r, '+', [args[0]])];
+      if (bare == '_mulFromInteger') return [stSend(r, '*', [args[0]])];
+      if (bare == '_subFromInteger') {
+        return [stSend(stSend(r, 'negated', []), '+', [args[0]])];
+      }
+      if (bare == '_greaterThanFromInteger') {
+        return [stSend(r, '<', [args[0]])];      // n > recv  ==  recv < n
+      }
+      if (bare == '_equalToInteger') return [stSend(r, '=', [args[0]])];
+      if (bare == 'toDouble') return [stSend(r, 'asDouble', [])];
+      if (bare == '_divFromInteger' || bare == '_truncDivFromInteger' ||
+          bare == '_moduloFromInteger') {
+        var num = _stSendTry(r, 'numerator', const []);
+        var den = _stSendTry(r, 'denominator', const []);
+        if (num != null && den != null) {
+          // n / (p/q) = n*q/p — exact, through the world's own constructor.
+          var q = stInvokeStatic('Fraction', 'numerator:denominator:',
+              [args[0] * den[0], num[0]]);
+          if (bare == '_divFromInteger') return [q];
+          var fl = stSend(q, 'floor', []);       // n // recv
+          if (bare == '_truncDivFromInteger') return [fl];
+          // n \\ recv = n - (n // recv) * recv
+          return [stSend(stSend(stSend(r, '*', [fl]), 'negated', []),
+              '+', [args[0]])];
+        }
+      }
+    }
+    var hit = _stExtSendTry(r, sel, args);
+    if (hit != null) return hit;
+    // Sprint 13: real doesNotUnderstand: — after the inherited protocol
+    // (the extension holders) misses, a receiver whose chain defines
+    // doesNotUnderstand: gets the send REIFIED as an STMessage (selector
+    // un-mangled back to its keyword spelling). This is what the world's
+    // ObjcRef passthrough and ObjcMainProxy are built on.
+    if (_stHasMethod(r, 'doesNotUnderstand:')) {
+      var stSel = sel.endsWith('_') ? sel.replaceAll('_', ':') : sel;
+      var msg = stNew('STMessage');
+      stSend(msg, 'setSelector:arguments:', [stSel, args]);
+      return _stSendTry(r, 'doesNotUnderstand:', [msg]);
+    }
+    return null;
+  };
+}
+
+// --- native Symbol (representation fix, phase 1) ----------------------------
+// A Smalltalk Symbol is `String subclass: Symbol` — it answers all String
+// protocol but its `=` is IDENTITY (the interned-string contract). Dart's
+// String cannot be subclassed, so Symbol is a DISTINCT class that carries the
+// spelling and FORWARDS String protocol to it (via the stObjNSM hook below),
+// while `==`/`=`/hash are its own. Distinct class identity is what lets `=`
+// tell a Symbol from a String — the whole point.
+class StSymbol {
+  final String name;
+  StSymbol._(this.name);
+  bool operator ==(o) => identical(this, o);   // interned -> identity is `=`
+  int get hashCode => name.hashCode;            // hashes with its spelling
+  toString() => name;                           // join/marshal see the chars
+}
+
+final Map<String, StSymbol> _stSymbolTable = <String, StSymbol>{};
+
+/// The canonical Symbol for [name] — interned, so `#foo == #foo` by identity.
+///
+/// The AUTHORITY is the native intern table (ST_symbolFor / st::InternStSymbol),
+/// which the flow-graph builder also uses to bake a `#foo` literal as a
+/// compile-time Constant — so a compiled literal and a runtime `'foo' asSymbol`
+/// are the SAME object. This Dart map is a per-isolate FAST CACHE over that
+/// authority (one map read on the hit path, no allocation); on a miss it asks
+/// the native for the canonical (old-space, rooted) StSymbol and records it.
+StSymbol stSymbol(String name) {
+  var s = _stSymbolTable[name];
+  if (s != null) return s;
+  s = _stSymbolFor(name);      // native: the one canonical StSymbol
+  _stSymbolTable[name] = s;
+  return s;
+}
+
+StSymbol _stSymbolFor(String name) native "ST_symbolFor";
+
+bool stIsSymbol(x) => x is StSymbol;
+
+// --- native Character (representation fix, phase 2) -------------------------
+// A Smalltalk Character is a distinct class ordered by code point, NOT a
+// 1-char string. Latin-1 (0..255) is a shared FLYWEIGHT so `$a == $a` holds by
+// identity (09_character.mst's documented promise), and being its own class is
+// what makes `$a = 'a'` false. Its `toString` is the character, so it drops
+// into a WriteStream / join / marshal as the glyph.
+class StChar {
+  final int code;
+  const StChar._(this.code);
+  bool operator ==(o) => o is StChar && o.code == code;  // value = by code point
+  int get hashCode => code;
+  toString() => new String.fromCharCode(code);
+}
+
+final List<StChar> _stCharTable =
+    new List<StChar>.generate(256, (i) => new StChar._(i));
+
+/// The Character for [code] — the shared flyweight for Latin-1, else a fresh
+/// instance (so `$a == $a` but `$λ == $λ` need not, exactly as documented).
+StChar stChar(int code) =>
+    (code >= 0 && code < 256) ? _stCharTable[code] : new StChar._(code);
+
+bool stIsChar(x) => x is StChar;
+
+// --- mutable String (representation fix, phase 3) ---------------------------
+// Smalltalk strings are MUTABLE; Dart strings are not. The hybrid: an immutable
+// literal stays a fast Dart String, but `String new:` / at:put: / WriteStream's
+// backing use StMutableString — a real growable code-unit buffer whose
+// `toString` is the string, so it reads and marshals as one. (Was a bare Dart
+// List, so `contents` answered a char-list — the "bad canvas JSON" bug.)
+class StMutableString {
+  List<int> units;
+  StMutableString(this.units);
+  int get length => units.length;
+  toString() => new String.fromCharCodes(units);
+  bool operator ==(o) {
+    if (o is StMutableString) {
+      if (o.units.length != units.length) return false;
+      for (var i = 0; i < units.length; i++) if (o.units[i] != units[i]) return false;
+      return true;
+    }
+    if (o is String) return toString() == o;
+    return false;
+  }
+  int get hashCode => toString().hashCode;
+}
+
+bool stIsMutStr(x) => x is StMutableString;
+
+/// The code unit for a value written INTO a string: a Character, an int code,
+/// or a 1-char string (legacy). Anything else is a bug the caller surfaces.
+int _stCode(v) {
+  if (v is StChar) return v.code;
+  if (v is int) return v;
+  if (v is String && v.length >= 1) return v.codeUnitAt(0);
+  if (v is StMutableString && v.units.isNotEmpty) return v.units[0];
+  // A non-flyweight ST Character (e.g. one the corpus Table minted via
+  // `basicNew setValue:`) still knows its code — read it rather than
+  // defaulting to a space, so any Character interops in string building.
+  if (v != null) {
+    var iv = _stSendTry(v, 'value', const []);
+    if (iv != null && iv[0] is int) return iv[0];
+  }
+  return 32;
+}
+
+/// The Character/String-building protocol on a mutable string (replaceFrom:to:
+/// with:, asString/contents, concatenation, do:); the reads a Symbol-style
+/// forward would miss because it is a distinct class. Returns _noStMut to fall
+/// through. (Reads like size/at: go through the universal helpers below.)
+const _noStMut = const Object();
+_stMutProtocol(StMutableString r, String sel, List args) {
+  switch (sel) {
+    case 'asString': case 'yourself': case 'contents': return r;
+    case 'isString': return true;
+    // A mutable string stays MUTABLE and INDEPENDENT across a copy — else the
+    // `postCopy` step of `copy` forwarded to the immutable spelling and handed
+    // back a read-only String that at:put: silently ignored.
+    case 'copy': case 'shallowCopy':
+      return new StMutableString(r.units.toList(growable: true));
+    case 'postCopy': return r;
+    // In-place mutators must run on the buffer, not the immutable spelling a
+    // forward would hand them (that copy silently absorbed the writes).
+    case 'replaceAll_with_': {           // every elem = old -> new, in place
+      var oldC = _stCode(args[0]), newC = _stCode(args[1]);
+      for (var i = 0; i < r.units.length; i++) {
+        if (r.units[i] == oldC) r.units[i] = newC;
+      }
+      return r;
+    }
+    case 'atAllPut_': {                   // fill with one Character
+      var c = _stCode(args[0]);
+      for (var i = 0; i < r.units.length; i++) r.units[i] = c;
+      return r;
+    }
+    case 'asSymbol': return stSymbol(r.toString());
+    case 'printString': return "'" + r.toString() + "'";
+    case 'displayString': return r.toString();
+    case 'hash': return r.hashCode;
+    case 'reversed': case 'reverse':
+      return new StMutableString(r.units.reversed.toList());
+    // NB: selectors arrive MANGLED (noSuchMethod hands us the Dart method
+    // name, `:` -> `_`), so keyword cases match the underscore form.
+    case 'replaceFrom_to_with_': {          // memcpy: dst[a..b] := src[1..]
+      var a = args[0], b = args[1], src = args[2];
+      for (var i = a; i <= b; i++) r.units[i - 1] = _stCode(stAt1(src, i - a + 1));
+      return r;
+    }
+    case 'replaceFrom_to_with_startingAt_': {
+      var a = args[0], b = args[1], src = args[2], s = args[3];
+      for (var i = a; i <= b; i++) r.units[i - 1] = _stCode(stAt1(src, s + i - a));
+      return r;
+    }
+  }
+  return _noStMut;
+}
+
+/// `\$a` literal -> the flyweight Character (the code from the parser's glyph).
+StChar stCharLit(String glyph) => stChar(glyph.codeUnitAt(0));
+
+/// The Character protocol answered directly (the receiver is an StChar, not a
+/// String, so String forwarding would be wrong). Returns a sentinel _noStChar
+/// when the selector isn't Character protocol, so the caller falls through.
+const _noStChar = const Object();
+_stCharProtocol(StChar r, String sel, List args) {
+  var c = r.code;
+  switch (sel) {
+    case 'asInteger': case 'value': case 'codePoint': case 'asciiValue':
+      return c;
+    case 'asCharacter': case 'yourself': return r;
+    case 'isCharacter': return true;
+    case 'asString': case 'printString': return r.toString();  // printString handled in stPrintOf too
+    case 'asSymbol': return stSymbol(r.toString());
+    case 'hash': case 'identityHash': return c;
+    case 'asUppercase':
+      return stChar(new String.fromCharCode(c).toUpperCase().codeUnitAt(0));
+    case 'asLowercase':
+      return stChar(new String.fromCharCode(c).toLowerCase().codeUnitAt(0));
+    case 'isDigit': return c >= 48 && c <= 57;
+    case 'isLetter':
+      return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+    case 'isUppercase': return c >= 65 && c <= 90;
+    case 'isLowercase': return c >= 97 && c <= 122;
+    case 'isVowel':
+      return c==97||c==101||c==105||c==111||c==117||c==65||c==69||c==73||c==79||c==85;
+    case 'isSpace': case 'isSeparator':
+      return c == 32 || c == 9 || c == 10 || c == 13 || c == 12;
+    case 'isLetterOrDigit': case 'isAlphaNumeric':
+      return (c>=48&&c<=57)||(c>=65&&c<=90)||(c>=97&&c<=122);
+    case 'digitValue':
+      if (c >= 48 && c <= 57) return c - 48;
+      if (c >= 65 && c <= 90) return c - 55;   // A..Z -> 10..35
+      if (c >= 97 && c <= 122) return c - 87;
+      return -1;
+    case '<': return args[0] is StChar ? c < args[0].code : stSend(r, '<', args);
+    case '<=': return args[0] is StChar ? c <= args[0].code : stSend(r, '<=', args);
+    case '>': return args[0] is StChar ? c > args[0].code : stSend(r, '>', args);
+    case '>=': return args[0] is StChar ? c >= args[0].code : stSend(r, '>=', args);
+    case '=': return stEquals(r, args[0]);
+    case '==': return identical(r, args[0]);
+  }
+  return _noStChar;
+}
+
+/// ST `=` with recovered class identity — the representation fix. `==` stays a
+/// StrictCompare (identity) in the builder; this is `=` (value). Fast path:
+/// identical objects (incl. interned Symbols and equal Smis) and numbers.
+/// Slow path: a Symbol's `=` is identity (so `#foo = 'foo'` is false); a String
+/// compares elements, treating a Symbol as its spelling (so `'foo' = #foo` is
+/// true); any real ST object dispatches to its OWN `=` method — which is what
+/// finally makes Fraction and every user-defined `=` work.
+/// A string-ish value (Dart String, native mutable String, Symbol, Character)
+/// as a real Dart String; null for anything that is not string-ish.
+String _stStr(x) {
+  if (x is String) return x;
+  if (x is StMutableString) return x.toString();
+  if (x is StSymbol) return x.name;
+  if (x is StChar) return x.toString();
+  return null;
+}
+
+stEquals(a, b) {
+  if (identical(a, b)) return true;
+  if (a is num) return a == b;
+  // Booleans are Dart bools here, and they have no ST `=` method — so anything
+  // that reached the native dispatch below threw. `true = true` hid it by
+  // taking the identical() fast path; `false = true`, `true = false` and every
+  // comparison of a computed Boolean did not. Found by a test asserting
+  // `g lives < livesBefore` and getting "Class 'bool' has no method '='"
+  // instead of `false`.
+  if (a is bool || b is bool) return identical(a, b);
+  return _stEqualsSlow(a, b);
+}
+_stEqualsSlow(a, b) {
+  if (a == null) return false;                  // nil = x (nil=nil took identical)
+  if (a is StSymbol) return false;              // identity already failed
+  if (a is StChar) return b is StChar && a.code == b.code;  // $a = 'a' -> false
+  if (a is StMutableString) {                   // (String new:..) = 'abc'
+    var s = _stStr(b); return s != null && s is String && a.toString() == s;
+  }
+  if (a is String) {
+    if (b is StSymbol) return a == b.name;      // 'foo' = #foo  -> true
+    if (b is StMutableString) return a == b.toString();
+    if (b is String) return a == b;
+    return false;                               // 'a' = $a  -> false
+  }
+  if (a is List) {                              // a literal #(...) is a Dart
+    if (b is! List || a.length != b.length) return false;  // List, with no ST
+    for (var i = 0; i < a.length; i++) {        // `=` — compare element-wise
+      if (!stEquals(a[i], b[i])) return false;  // (Array>>= semantics),
+    }                                           // recursively so nested arrays
+    return true;                                // and ST elements compare too.
+  }
+  return _stEqNative(a, b);                     // Fraction / user classes —
+}                                               // cached dispatch, no args List
+
+/// The `=` dispatch native: (isolate, cid)-cached lookup + direct invoke —
+/// stSend(a, '=', [b]) here cost ~158ns per ST-object comparison (fresh args
+/// List + uncached C++ super-walk + old-space args Array).
+_stEqNative(a, b) native "ST_eq";
+
+/// `,` concatenation. String+String is the hot path (plain Dart `+`). Any pair
+/// of string-ish operands (mutable String / Symbol / Character mixed with a
+/// literal) coerces to a Dart String; List,List concatenates; anything else is
+/// sent on as a real ST `,` message so world collections keep their own method.
+stConcat(a, b) {
+  if (a is String && b is String) return a + b;
+  var sa = _stStr(a);
+  if (sa != null) {
+    var sb = _stStr(b);
+    if (sb != null) return sa + sb;
+  }
+  if (a is List) {
+    var r = new List.from(a);
+    if (b is List) r.addAll(b); else r.add(b);
+    return r;
+  }
+  return stSend(a, ',', [b]);
+}
+
+/// Invoke a class-side (static) method [selector] on a loaded ST class
+/// [className], passing [args], and return the result. The first call JIT-
+/// compiles the ST method body through the Sprint 3 IL builder
+/// (`st::BuildGraph`). E.g. `stInvokeStatic("Calc", "double:", [21])` → 42.
+dynamic stInvokeStatic(String className, String selector, List args)
+    native "ST_invokeStatic";
+
+/// Allocate an instance of a loaded ST class [className] (ST_PLAN.md Sprint 5).
+/// The class is member-finalized on demand; returns the new ST instance.
+dynamic stNew(String className) native "ST_new";
+
+/// Send instance method [selector] with [args] to an ST [receiver] (Sprint 5);
+/// the first call lazily compiles the method body. Returns the result.
+dynamic stSend(receiver, String selector, List args) native "ST_send";
+
+dynamic _stGetField(receiver, String name) native "ST_getField";
+
+/// Universal ST send for selectors that collide with a dart:core GETTER (`7
+/// sign`, `#(1 2 3) first`, `aList reversed`). A plain InstanceCall would let
+/// Dart resolve the getter and getter-CALL its result — `(7.sign).call()` — and
+/// crash. Dispatch in Smalltalk-correct order: (1) the native ext-chain
+/// (Integer ext, Array ext, ... — an ST override wins), (2) the receiver's own
+/// ST class chain (an ST object: Fraction>>sign, OrderedCollection>>first), (3)
+/// only for a NATIVE receiver, the dart:core getter itself, read as a plain
+/// field so it is NOT invoked — there the getter is the intended ST value
+/// (List.first, num.sign). Non-native misses fall to stSend for an honest DNU.
+stSendExt(receiver, String selector, List args) {
+  var hit = _stExtSendTry(receiver, selector, args); // [result] box, or null
+  if (hit != null) return hit[0];
+  var box = _stSendTry(receiver, selector, args); // ST class chain, no throw
+  if (box != null) return box[0];
+  if (args.isEmpty &&
+      (receiver is num ||
+          receiver is String ||
+          receiver is List ||
+          receiver is bool)) {
+    return _stGetField(receiver, selector);
+  }
+  return stSend(receiver, selector, args); // throws the proper doesNotUnderstand
+}
+
+// The unary form with NO argument list allocated — the getter-collision path
+// (`7 sign`, `#(1 2) first`) used to build a fresh empty List per send.
+final List _stNoArgs = const [];
+stSendExt0(receiver, String selector) => stSendExt(receiver, selector, _stNoArgs);
+
+/// Like stSendExt but GRACEFUL on a total miss: answers nil instead of throwing.
+/// The compiled CLASS-SEND fallback: resolve a selector against a class VALUE
+/// (a Type) — ext holders (Behavior/ClassDescription/Class, the reflective
+/// protocol), then the ST class chain — and when nothing answers, raise a
+/// proper Smalltalk Error ("Set class does not understand bogusWith:"),
+/// catchable by on:do: exactly like an instance-side doesNotUnderstand.
+///
+/// This fallback answered nil for months ("no surprise dNU where there used
+/// to be none"), and the silence hid five never-written methods. The first
+/// attempt to make it raise appeared to corrupt unrelated String code whole
+/// suites later — that was NOT the raise: core-snapshot classes finalize
+/// members lazily, and an ST ext-chain walk could mark _Type finalized with
+/// its members never parsed, killing the patched _Type.noSuchMethod for the
+/// whole process (see the LAZY-PARSE GUARD in st_loader.cc, which fixes it at
+/// the root). With the guard in place the raise is safe.
+///
+/// Deliberately its own function rather than stSendExt: stSendExt is the hot
+/// instance-send helper, and mixing class VALUES into its call-site type
+/// feedback costs the optimizer; it also skips stSendExt's getter-collision
+/// branch, which exists for native receivers a class value can never be.
+stSendClass(receiver, String selector, List args) {
+  var hit = _stExtSendTry(receiver, selector, args);
+  if (hit != null) return hit[0];
+  var box = _stSendTry(receiver, selector, args);
+  if (box != null) return box[0];
+  return stError(receiver, stClassSendMissText(receiver, selector));
+}
+
+/// "Set class does not understand bogusWith:" — the class-side miss named the
+/// way a Smalltalk programmer thinks about it. Class values print as Dart
+/// Types (`_Type@0150898`), and the bridge's holders carry an " ext" suffix
+/// (an artifact of Dart's sealed String/int); neither belongs in an error
+/// anyone reads.
+String stClassSendMissText(receiver, String selector) {
+  var name = stClassNameOf(receiver);
+  if (name == null) name = receiver.toString();
+  if (name.endsWith(' ext')) name = name.substring(0, name.length - 4);
+  var sel = selector.endsWith('_') ? selector.replaceAll('_', ':') : selector;
+  return name + ' class does not understand ' + sel;
+}
+
+/// The SOFT send: "invoke this if it exists". For genuinely optional protocol
+/// — the app runner asking a user class for a `stop` it need not define — where
+/// absence is an expected answer, not an error.
+///
+/// It is NOT the class-send fallback (that is stSendClass above, which
+/// raises): reach for this one only when you can name why a miss is a
+/// legitimate answer rather than an error.
+stSendExtOrNil(receiver, String selector, List args) {
+  var hit = _stExtSendTry(receiver, selector, args);
+  if (hit != null) return hit[0];
+  var box = _stSendTry(receiver, selector, args);
+  if (box != null) return box[0];
+  return null;
+}
+
+// --- Smalltalk non-local return (ST_PLAN.md closures Stage C) ---------------
+// A `^expr` inside a FIRST-CLASS closure returns from the closure's HOME
+// method activation. The ST IL builder desugars it to stNlrThrow(home, value)
+// where `home` is the home activation's Context object (unique per
+// activation); the home method's body is wrapped in a catch that returns
+// `value` when the carrier's home is ITS context, and rethrows otherwise. A
+// carrier that reaches the top means the home frame already returned — the
+// classic "block cannot return" error, reported as an unhandled _STNlr.
+class _STNlr {
+  var home;
+  var value;
+  _STNlr(this.home, this.value);
+  String toString() => "Smalltalk non-local return: the block's home method"
+      " has already returned (BlockContext>>cannotReturn)";
+}
+
+stNlrThrow(home, value) {
+  throw new _STNlr(home, value);
+}
+
+stNlrHome(e) {
+  if (e is _STNlr) return e.home;
+  return false; // never identical to a Context: forces a rethrow
+}
+
+stNlrValue(e) {
+  return e.value;
+}
+
+// --- Smalltalk exceptions (ST_PLAN.md Sprint 9) -----------------------------
+// ST `signal` throws the exception INSTANCE inside an _STException carrier;
+// `[..] on: Cls do: [:e | ..]` lowers to stOnDo(protected, type, handler) —
+// ST closures are directly callable as Dart closures, so the whole protocol
+// is ordinary Dart try/catch/finally. ensure: therefore runs during a
+// non-local return (the _STNlr carrier passes through `finally`) — exact
+// Smalltalk unwind semantics for free. _STNlr always rethrows: a `^` is not
+// a Smalltalk exception and must never be caught by on:do:.
+class _STException {
+  var instance; // the ST exception object (an Exception subclass instance)
+  _STException(this.instance);
+  String toString() {
+    var t = null;
+    try {
+      t = stSend(instance, 'messageText', []);
+    } catch (_) {}
+    return "Smalltalk exception: " + (t == null ? "(no message)" : t.toString());
+  }
+}
+
+stSignal(instance) {
+  throw new _STException(instance);
+}
+
+// A handler action (`e return:`/`retry`/`pass`/`return`). Thrown from inside a
+// running handler, it unwinds to the stOnDo that established THAT handler,
+// identified by `token`. An Expando maps each in-flight exception instance to
+// its handler's token so the instance's own method can find its stOnDo.
+class _STHandlerAction {
+  final token;
+  final String kind; // 'return' | 'retry' | 'pass'
+  final value;
+  _STHandlerAction(this.token, this.kind, this.value);
+}
+final Expando _stExcTokens = new Expando('stExcTokens');
+
+// A native Dart error caught by `on: Error do:` is reified as an ST exception so
+// the handler sees a real object (`e messageText`): ZeroDivide for a division by
+// zero, a plain Error otherwise. A narrower handler class simply won't match.
+_stWrapNativeError(e) {
+  var name = (e is IntegerDivisionByZeroException) ? 'ZeroDivide' : 'Error';
+  var err = stNew(name);
+  try {
+    stSend(err, 'messageText:', [e.toString()]);
+  } catch (_) {}
+  return err;
+}
+
+stOnDo(protected, type, handler) {
+  var token = new Object(); // identifies THIS handler activation (for retry etc.)
+  while (true) {
+    var exc;
+    try {
+      return protected();
+    } catch (e) {
+      if (e is _STNlr) rethrow; // non-local ^ is not an exception
+      if (e is _STHandlerAction) rethrow; // belongs to an ancestor handler
+      if (e is _STException) {
+        exc = e.instance;
+        if (!stIsKindOf(exc, type)) rethrow;
+      } else {
+        exc = _stWrapNativeError(e); // a native Dart error, if Error-catchable
+        if (!stIsKindOf(exc, type)) rethrow;
+      }
+      var saved = _stExcTokens[exc];
+      _stExcTokens[exc] = token;
+      var action;
+      try {
+        return handler(exc); // handler falls off its end -> its value wins
+      } on _STHandlerAction catch (a) {
+        if (a.token != token) rethrow; // an enclosing handler's action
+        action = a;
+      } finally {
+        _stExcTokens[exc] = saved;
+      }
+      if (action.kind == 'return') return action.value;
+      if (action.kind == 'pass') { // resignal to the next enclosing handler
+        if (e is _STException) rethrow;
+        throw e;
+      }
+      // 'retry' -> loop and re-run the protected block from the top.
+    }
+  }
+}
+
+// `e return: v` / `return` / `retry` / `pass`, sent to the exception INSIDE a
+// handler: throw the carrier keyed to the handler's stOnDo (found via the
+// Expando). Outside a handler the token is null and no stOnDo matches -> the
+// action surfaces as an ordinary unhandled error.
+stExcReturn(exc, v) { throw new _STHandlerAction(_stExcTokens[exc], 'return', v); }
+stExcReturnNil(exc) { throw new _STHandlerAction(_stExcTokens[exc], 'return', null); }
+stExcRetry(exc) { throw new _STHandlerAction(_stExcTokens[exc], 'retry', null); }
+stExcPass(exc) { throw new _STHandlerAction(_stExcTokens[exc], 'pass', null); }
+
+stEnsure(protected, cleanup) {
+  try {
+    return protected();
+  } finally {
+    cleanup();
+  }
+}
+
+stIfCurtailed(protected, cleanup) {
+  try {
+    return protected();
+  } catch (e) {
+    cleanup();
+    rethrow;
+  }
+}
+
+/// Is [obj]'s class the [type]'s class or one of its subclasses?
+bool stIsKindOf(obj, type) native "ST_isKindOf";
+
+// --- corpus-breadth helpers (ST_PLAN Sprint 11) -----------------------------
+/// Class-side `self <sel>`: dispatch on the RECEIVING class (a Type value)
+/// at runtime — walks the metaclass shadow chain; falls back to allocation
+/// for new/basicNew and to create-and-signal for signal/signal:.
+_stClassSend(type, String sel, List args) native "ST_classSend";
+stBasicNew(type) native "ST_basicNewFromType";
+
+/// `self new` / `self basicNew` reached from an INHERITED class factory, where
+/// the runtime class is a SUBCLASS of the method's owner (`OrderedCollection
+/// withAll:` runs `Collection class>>withAll:`, whose `self new` must build an
+/// OrderedCollection). The old slow path called stBasicNew — a bare allocation
+/// that SKIPPED the subclass's `new` (OrderedCollection/Set/Dictionary/Bag all
+/// do `basicNew init`), so `array` stayed nil and withAll:/asSet/... died on
+/// `size` of null. Dispatch the selector on the actual class so the override
+/// (with its init) runs; only a class with no such class-method falls back to
+/// the raw allocation.
+stClassNewDispatch(type, sel) {
+  var r = _stClassSendTry(type, sel is String ? sel : sel.toString(), const []);
+  if (r != null) return r[0];
+  return stBasicNew(type);
+}
+
+/// `k -> v` — an Association. A method (Object>>->), so on a Symbol receiver it
+/// forwarded to the spelling and the key came back as the String 'k' (breaking
+/// `(#a -> 1) key == #a`). Building it here keeps the key exactly as given.
+stArrow(k, v) => stInvokeStatic('Association', 'key:value:', [k, v]);
+
+stClassSend0(t, sel) => _stClassSend(t, sel, []);
+stClassSend1(t, sel, a) => _stClassSend(t, sel, [a]);
+stClassSend2(t, sel, a, b) => _stClassSend(t, sel, [a, b]);
+stClassSend3(t, sel, a, b, c) => _stClassSend(t, sel, [a, b, c]);
+stClassSend4(t, sel, a, b, c, d) => _stClassSend(t, sel, [a, b, c, d]);
+stClassSend5(t, sel, a, b, c, d, e) => _stClassSend(t, sel, [a, b, c, d, e]);
+
+// Universal ST-protocol shims: bridged Dart receivers (List/Map/String) get
+// direct semantics — including Smalltalk's 1-BASED indexing — and any other
+// receiver falls back to real ST dispatch via stSend, so an ST class defining
+// its own at:/size keeps working through the same selectors.
+stNot(b) => b == true ? false : true;
+// `between:and:` — the #1 remaining ext-send by the profiler (OrderedCollection
+// at:/at:put: bounds checks send it to a Smi ~330x per deltablue iteration, and
+// each ride was a full native round-trip: NSM -> stSendExt -> ST_extSendTry).
+// Tiny fast/rare split so the num case inlines to two compares; the rare tail
+// is EXACTLY the dynamic send the builder used to emit, so ST receivers
+// (Character, Fraction, Date) keep today's dispatch order unchanged.
+stBetween(a, lo, hi) {
+  if (a is num && lo is num && hi is num) return lo <= a && a <= hi;
+  return _stBetweenRare(a, lo, hi);
+}
+_stBetweenRare(a, lo, hi) => a.between_and_(lo, hi);
+// `~=` in ONE call (the builder used to emit stEquals + stNot — two static
+// calls per send); same truth table as stNot(stEquals(a, b)).
+stNotEquals(a, b) => stEquals(a, b) == true ? false : true;
+
+/// value-family sends: a real closure invokes directly (the optimizer inlines
+/// these helpers, restoring per-site monomorphic ICs); anything else — e.g. a
+/// DeltaBlue Variable with its own `value` method — goes to ST dispatch.
+stValue0(r) { if (r is Function) return r(); return _stValue0Slow(r); }
+_stValue0Slow(r) => r.value();
+stValue1(r, a) { if (r is Function) return r(a); return _stValue1Slow(r, a); }
+_stValue1Slow(r, a) => r.value_(a);
+stValue2(r, a, b) { if (r is Function) return r(a, b); return _stValue2Slow(r, a, b); }
+_stValue2Slow(r, a, b) => r.value_value_(a, b);
+stValue3(r, a, b, c) { if (r is Function) return r(a, b, c); return _stValue3Slow(r, a, b, c); }
+_stValue3Slow(r, a, b, c) => r.value_value_value_(a, b, c);
+stValue4(r, a, b, c, d) { if (r is Function) return r(a, b, c, d); return _stValue4Slow(r, a, b, c, d); }
+_stValue4Slow(r, a, b, c, d) => r.value_value_value_value_(a, b, c, d);
+
+/// ST `&`/`|`: Boolean non-short-circuit and/or (Dart 1.24 bool has no
+/// operator&). Ints keep bitwise semantics; anything else -> ST dispatch.
+stBoolAnd(a, b) {
+  if (a is bool && b is bool) return a && b;
+  if (a is int && b is int) return a & b;
+  return _stAmpSlow(a, b);
+}
+_stAmpSlow(a, b) => a & b;
+
+stBoolOr(a, b) {
+  if (a is bool && b is bool) return a || b;
+  if (a is int && b is int) return a | b;
+  return _stPipeSlow(a, b);
+}
+_stPipeSlow(a, b) => a | b;
+
+stAt1(c, k) {
+  // Tiny on purpose (one test + rare tail) so every hot site inlines the
+  // List fast path; Smalltalk indexes from 1.
+  if (c is List) return c[k - 1];
+  return _stAt1Rare(c, k);
+}
+_stAt1Rare(c, k) {
+  if (c is Map) return c[k];
+  if (c is StMutableString) return stChar(c.units[k - 1]);
+  if (c is StSymbol) return stChar(c.name.codeUnitAt(k - 1));
+  if (c is String) return stChar(c.codeUnitAt(k - 1));  // a Character, not a 1-char string
+  return _stAtSlow(c, k);
+}
+_stAtSlow(c, k) => c.at_(k);
+
+stAtPut1(c, k, v) {
+  if (c is List) { c[k - 1] = v; return v; }   // tiny: inlines at every hot site
+  return _stAtPut1Rare(c, k, v);
+}
+_stAtPut1Rare(c, k, v) {
+  if (c is Map) { c[k] = v; return v; }
+  if (c is StMutableString) { c.units[k - 1] = _stCode(v); return v; }
+  return _stAtPutSlow(c, k, v);
+}
+_stAtPutSlow(c, k, v) => c.at_put_(k, v);
+
+/// `basicByteAt: i put: v` — the raw 1-based byte store the world's
+/// String>>at:put: delegates to. at:put: has its own fast path (stAtPut1), so
+/// this only mattered on a DIRECT call — where it used to throw, because a
+/// mutable string forwards unknown selectors to its immutable copy. Same
+/// receiver handling as stAtPut1; the world returns the stored value (`^v`).
+stBasicBytePut(r, i, v) {
+  var code = _stCode(v);
+  if (r is StMutableString) { r.units[i - 1] = code; return code; }
+  if (r is List) { r[i - 1] = v; return v; }
+  return _stBasicBytePutSlow(r, i, v);
+}
+_stBasicBytePutSlow(r, i, v) => r.basicByteAt_put_(i, v);
+
+/// `self halt` — the programmer's breakpoint. The world's contract is precise:
+/// "open the debugger WHEN ONE IS ARMED, otherwise a no-op, answer self".
+///
+/// The arming is not optional bookkeeping — it is a safety requirement.
+/// dart:developer's debugger() pauses the isolate and BLOCKS until a service
+/// client resumes it; with no client (every headless run, every plain `dart`)
+/// it hangs forever. So halt pauses ONLY when the workspace has told this
+/// isolate a debugger is attached to catch it (stHaltArm below, set from
+/// dbgAttach). Unarmed, it is the no-op the world promises. Answers self both
+/// ways.
+bool stHaltArmed = false;
+stHalt(recv) {
+  if (stHaltArmed) developer.debugger(message: 'Smalltalk halt');
+  return recv;
+}
+
+/// The workspace arms halt while its Debugger tab is attached to this isolate,
+/// and disarms it otherwise — so a halt only pauses when something will resume.
+stHaltArm(on) { stHaltArmed = (on == true || on == 'on'); return stHaltArmed; }
+
+stSizeOf(c) {
+  if (c is StMutableString) return c.units.length;
+  if (c is StSymbol) return c.name.length;
+  if (c is List || c is Map || c is String) return c.length;
+  if (c is int) return stIntByteSize(c);   // Integer>>size = magnitude byte count
+  return _stSizeSlow(c);
+}
+
+/// LargeInteger byte protocol (little-endian, 1-based, index 1 = least
+/// significant — the corpus's own convention). A Dart int (Mint/Bigint) is
+/// immutable, so these are the READS; byteAt:put: (construction) is unused
+/// because MACDART does bignum arithmetic natively. The 07a overlay <stprim:>s
+/// LargeInteger>>byteAt:/hash onto these; size rides the stSizeOf helper above.
+int stIntByteSize(n) { n = n.abs(); return n == 0 ? 0 : (n.bitLength + 7) ~/ 8; }
+int stIntByteAt(n, i) => (n.abs() >> (8 * (i - 1))) & 0xFF;
+_stSizeSlow(c) => c.size();
+
+stAddU(c, x) {
+  if (c is List) { c.add(x); return x; }   // ST add: answers the argument
+  return _stAddSlow(c, x);
+}
+_stAddSlow(c, x) => c.add_(x);
+
+stDo(c, f) {
+  if (c is List) { for (var e in c) f(e); return c; }   // the hot case, first
+  if (c is Map) { for (var v in c.values) f(v); return c; }
+  if (c is StMutableString) { for (var i = 0; i < c.units.length; i++) f(stChar(c.units[i])); return c; }
+  if (c is StSymbol) { for (var i = 0; i < c.name.length; i++) f(stChar(c.name.codeUnitAt(i))); return c; }
+  if (c is String) { for (var i = 0; i < c.length; i++) f(stChar(c.codeUnitAt(i))); return c; }
+  return _stDoSlow(c, f);
+}
+_stDoSlow(c, f) => c.do_(f);
+
+stIsEmptyU(c) {
+  if (c is StMutableString) return c.units.isEmpty;
+  if (c is StSymbol) return c.name.isEmpty;
+  if (c is List || c is Map || c is String) return c.isEmpty;
+  return _stIsEmptySlow(c);
+}
+_stIsEmptySlow(c) => c.isEmpty();
+
+/// `self error: 'msg'` — construct and signal a prelude Error.
+stError(recv, msg) {
+  var e = stNew('Error');
+  stSend(e, 'messageText:', [msg]);
+  return stSignal(e);
+}
+
+/// `Smalltalk millisecondClock` — the corpus benchmark clock.
+stMillisecondClock() => new DateTime.now().millisecondsSinceEpoch;
+// Monotonic microsecond clock for benchmarking: one process-lifetime Stopwatch
+// (mach_absolute_time underneath), so t1-t0 is immune to wall-clock / NTP jumps.
+// Mirrors MACVM's `Smalltalk microsecondClock` (prim 252) and Cog's
+// `Time microsecondClockValue` so one harness times identically on all three.
+final Stopwatch _stMicroClock = new Stopwatch()..start();
+stMicrosecondClock() => _stMicroClock.elapsedMicroseconds;
+
+/// ST `/` is EXACT: int/int divides evenly to an int, else answers a world
+/// Fraction (when 23_fraction is loaded; a plain double otherwise). The
+/// world-presence probe is cached — no per-divide exception cost.
+bool _stFractionKnown = false;
+bool _stFractionPresent = false;
+stDivide(a, b) {
+  if (a is int && b is int && b != 0) {
+    if (a % b == 0) return a ~/ b;
+    if (!_stFractionKnown) {
+      _stFractionKnown = true;
+      try {
+        stInvokeStatic('Fraction', 'numerator:denominator:', [1, 2]);
+        _stFractionPresent = true;
+      } catch (_) {
+        _stFractionPresent = false;
+      }
+    }
+    if (_stFractionPresent) {
+      return stInvokeStatic('Fraction', 'numerator:denominator:', [a, b]);
+    }
+    return a / b;
+  }
+  if (a is num && b is num) return a / b;
+  return _stDivSlow(a, b);
+}
+_stDivSlow(a, b) {
+  // A native number over an ST numeric: Dart's `int./` is DOUBLE division and
+  // would call toDouble on the Fraction — but Smalltalk `2 / (1/3)` is EXACT
+  // (6). Build n / (p/q) = n*q/p through the world's own constructor; a
+  // double (or a fraction-less ST numeric) falls back to double division.
+  if (a is num && b is! num) {
+    var p = _stSendTry(b, 'numerator', const []);
+    var q = _stSendTry(b, 'denominator', const []);
+    if (a is int && p != null && q != null) {
+      return stInvokeStatic('Fraction', 'numerator:denominator:',
+          [a * q[0], p[0]]);
+    }
+    return (a as num) / (stSend(b, 'asDouble', []) as num);
+  }
+  return a / b;
+}
+
+// Smalltalk `//` and `\\` are FLOORED, not truncated — the whole family of
+// bugs the number sweep found lived in the builder mapping `//`->`~/` and
+// `\\`->`%`: Dart's `~/` truncates toward zero (`-7 // 2` gave -3, must be -4)
+// and Dart's `%` is Euclidean/non-negative (`7 \\ -2` gave 1, must be -1 —
+// `\\` follows the sign of the DIVISOR). Fraction had no `//` at all (a raw
+// DNU on `~/`). These helpers implement the real thing for every numeric type
+// and are the rewrite-table targets, so the dead <primitive:4/5> bodies never
+// matter. (Dart 1.x ints are arbitrary-precision, so SmallInteger and big
+// powers are both `is int` — one fast path covers them; a genuine ST
+// LargeInteger/Fraction is the exact-quotient fallback, which floors without
+// re-entering `//`.)
+int _floorDivInt(int a, int b) {
+  var q = a ~/ b;
+  var r = a - q * b;               // truncated remainder — sign of a
+  if (r != 0 && ((r < 0) != (b < 0))) q -= 1;   // opposite signs -> round down
+  return q;
+}
+stFloorDiv(a, b) {
+  if (a is int && b is int) return _floorDivInt(a, b);
+  if (a is num && b is num) return (a / b).floor();   // `//` answers an Integer
+  var q = stDivide(a, b);          // exact quotient: int / Fraction (no loop)
+  if (q is int) return q;
+  if (q is num) return q.floor();
+  var p = _stSendTry(q, 'numerator', const []);
+  var d = _stSendTry(q, 'denominator', const []);
+  if (p != null && d != null && p[0] is int && d[0] is int) {
+    return _floorDivInt(p[0], d[0]);
+  }
+  return stSend(q, 'floor', []);
+}
+stFloorMod(a, b) {
+  // a \\ b = a - (a // b) * b — always the sign of b (or zero).
+  if (a is int && b is int) return a - _floorDivInt(a, b) * b;
+  if (a is num && b is num) return a - (a / b).floor() * b;
+  var q = stFloorDiv(a, b);
+  return (a - q * b);              // mixed num/ST resolves via the NSM hook
+}
+
+// Numeric conversions/negation: Dart-num fast paths (the world kernel's
+// versions are <primitive:>-backed and must never be reached via the NSM
+// hook, whose ignored-pragma bodies would answer self).
+stAsDouble(r) => r is num ? r.toDouble() : _stAsDoubleSlow(r);
+_stAsDoubleSlow(r) => r.asDouble();
+// `asInteger` (aliased here): a number truncates, a Character answers its code,
+// a String PARSES (leading optional-sign digits, nil if none) — Smalltalk's
+// String>>asInteger, which the helper alias would otherwise route to .truncated.
+stTruncated(r) {
+  if (r is num) return r.truncate();
+  if (r is StChar) return r.code;
+  var s = _stStr(r);                       // String / mutable String
+  if (s != null) {
+    var m = new RegExp(r'-?[0-9]+').firstMatch(s);
+    return m == null ? null : int.parse(m.group(0));
+  }
+  return _stTruncSlow(r);
+}
+_stTruncSlow(r) => r.truncated();
+stRounded(r) => r is num ? r.round() : _stRoundSlow(r);
+_stRoundSlow(r) => r.rounded();
+stFloorU(r) => r is num ? r.floor() : _stFloorSlow(r);
+_stFloorSlow(r) => r.floor();
+stCeilingU(r) => r is num ? r.ceil() : _stCeilSlow(r);
+_stCeilSlow(r) => r.ceiling();
+stNegated(r) => r is num ? -r : _stNegSlow(r);
+_stNegSlow(r) => r.negated();
+stSqrt(r) => r is num ? math.sqrt(r) : _stSqrtSlow(r);
+_stSqrtSlow(r) => r.sqrt();
+
+// The transcendentals and bitShift:, added because st/test/primitive_coverage
+// caught them ANSWERING THE RECEIVER. The world declares them on Double and
+// SmallInteger as bare <primitive: N> bodies; MACDART ignores numbered
+// primitives, so with no fast path the method compiled to an empty body — and
+// an empty Smalltalk body returns self. `2 sin` was 2, silently.
+stLn(r) => r is num ? math.log(r) : _stLnSlow(r);
+_stLnSlow(r) => r.ln();
+stExp(r) => r is num ? math.exp(r) : _stExpSlow(r);
+_stExpSlow(r) => r.exp();
+stSin(r) => r is num ? math.sin(r) : _stSinSlow(r);
+_stSinSlow(r) => r.sin();
+stCos(r) => r is num ? math.cos(r) : _stCosSlow(r);
+_stCosSlow(r) => r.cos();
+stTan(r) => r is num ? math.tan(r) : _stTanSlow(r);
+_stTanSlow(r) => r.tan();
+stAtan(r) => r is num ? math.atan(r) : _stAtanSlow(r);
+_stAtanSlow(r) => r.atan();
+// The Smalltalk spellings (arcTan/arcSin/arcCos) — the corpus only ever
+// declared `atan`, so `1.5 arcTan` was a raw DNU on a native double.
+stArcSin(r) => r is num ? math.asin(r) : math.asin(stSend(r, 'asDouble', []));
+stArcCos(r) => r is num ? math.acos(r) : math.acos(stSend(r, 'asDouble', []));
+
+/// `raisedTo:` for EVERY exponent (the corpus's 51_number_ext version errors on
+/// a non-integer). Integer exponents stay EXACT — an int base promotes through
+/// the bignum tower, an ST numeric (Fraction) accumulates via its own `*`, and
+/// a negative exponent answers the exact reciprocal (a Fraction for an int
+/// base, built directly — `reciprocal` is 1/self, which routes through the
+/// int-coercion path). A fractional exponent goes through doubles (math.pow).
+stRaisedTo(r, n) {
+  if (n is int) {
+    var m = n < 0 ? -n : n;
+    var acc;
+    if (r is num) {
+      acc = r is int ? 1 : 1.0;
+      for (var i = 0; i < m; i++) acc = acc * r;
+    } else {
+      acc = 1;
+      for (var i = 0; i < m; i++) {
+        acc = stSend(r, '*', [acc]);   // exact for Fraction/ScaledDecimal
+      }
+    }
+    if (n >= 0) return acc;
+    if (acc is int) {
+      return stInvokeStatic('Fraction', 'numerator:denominator:', [1, acc]);
+    }
+    if (acc is double) return 1.0 / acc;
+    return stSend(acc, 'reciprocal', []);
+  }
+  var base = r is num ? r : stSend(r, 'asDouble', []);
+  var e = n is num ? n : stSend(n, 'asDouble', []);
+  return math.pow((base as num).toDouble(), (e as num).toDouble());
+}
+
+/// Smalltalk `bitShift:` is signed: positive shifts left, negative right.
+stBitShift(r, n) {
+  if (r is int && n is int) return n >= 0 ? (r << n) : (r >> -n);
+  return _stBitShiftSlow(r, n);
+}
+_stBitShiftSlow(r, n) => r.bitShift(n);
+
+/// `compare:` answers an Integer the world tests against 0 (String>>= is
+/// `(self compare: other) = 0`, `<` is `< 0`), so compareTo's
+/// negative/zero/positive contract is exactly right.
+stCompare(a, b) {
+  if (a is StSymbol) a = a.name;
+  if (b is StSymbol) b = b.name;
+  if (a is String && b is String) return a.compareTo(b);
+  return _stCompareSlow(a, b);
+}
+_stCompareSlow(a, b) {
+  // A ByteArray is a Dart List, which has no compare — element-wise, same
+  // negative/zero/positive contract. Adding stCompare for Strings alone just
+  // moved the bug: `#[1 2 3] compare:` went from silently answering self to
+  // throwing "List has no method compare".
+  if (a is List && b is List) {
+    var n = a.length < b.length ? a.length : b.length;
+    for (var i = 0; i < n; i++) {
+      var d = (a[i] as Comparable).compareTo(b[i]);
+      if (d != 0) return d < 0 ? -1 : 1;
+    }
+    return a.length == b.length ? 0 : (a.length < b.length ? -1 : 1);
+  }
+  return a.compare(b);
+}
+
+/// `basicByteAt:` is the raw byte behind a String, 1-BASED.
+stBasicByteAt(r, i) {
+  if (r is StSymbol) r = r.name;
+  if (r is StMutableString && i is int) return r.units[i - 1];  // String new:..
+  if (r is String && i is int) return r.codeUnitAt(i - 1);
+  if (r is List && i is int) return r[i - 1];
+  return _stBasicByteAtSlow(r, i);
+}
+_stBasicByteAtSlow(r, i) => r.basicByteAt(i);
+
+/// `valueWithArguments:` — a closure applied to a list of arguments.
+stValueWithArgs(r, a) {
+  if (r is Function && a is List) return Function.apply(r, a);
+  return _stValueWithArgsSlow(r, a);
+}
+_stValueWithArgsSlow(r, a) => r.valueWithArguments(a);
+
+/// Double>>printDigits answers the digits as a String — the world uses it as
+/// `s nextPutAll: self printDigits` (19_printing.mst).
+stPrintDigits(r) => r is num ? r.toString() : _stPrintDigitsSlow(r);
+_stPrintDigitsSlow(r) => r.printDigits();
+
+// Ordering (Sprint 14): Dart Strings have no operator< — a miss walked
+// into the world's Magnitude circularity (whose primitive stubs answer
+// self) and overflowed the stack. Nums stay fast, Strings compare
+// lexically, everything else is real ST dispatch.
+stLess(a, b) {
+  // Tiny on purpose: one test + a rare-tail call, so the optimizer ALWAYS
+  // inlines this at hot sites (a bigger body fell out of the inline budget
+  // and cost fib 2.7x in out-of-line compare calls).
+  if (a is num && b is num) return a < b;
+  return _stLessRare(a, b);
+}
+_stLessRare(a, b) {
+  if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
+  if (a is StChar) a = a.code; if (b is StChar) b = b.code;
+  if (a is num && b is num) return a < b;   // $a < $b
+  if (a is String && b is String) return a.compareTo(b) < 0;
+  return _stLtSlow(a, b);
+}
+// A native number vs an ST numeric object (a Fraction, a ScaledDecimal) can't
+// go through Dart's own operator: `int.<` is `other > this`, and the corpus's
+// `Fraction>>` is `^aNumber < self` — two reversals that form an infinite
+// 2-cycle (`0 < (3/4)` → `(3/4) > 0` → `0 < (3/4)` → stack overflow). Only the
+// ST object's FORWARD `<` does real work (cross-multiplication), so derive all
+// four from it: with lt = (b < a) and eq = (a = b) — both computed on the ST
+// side, which terminates — a<b ⟺ ¬lt∧¬eq, a≤b ⟺ ¬lt, a>b ⟺ lt, a≥b ⟺ lt∨eq.
+_stLtSlow(a, b) {
+  if (a is num && b is! num) return !stLess(b, a) && !stEquals(a, b);
+  return a < b;
+}
+stLessEq(a, b) {
+  // Tiny on purpose: one test + a rare-tail call, so the optimizer ALWAYS
+  // inlines this at hot sites (a bigger body fell out of the inline budget
+  // and cost fib 2.7x in out-of-line compare calls).
+  if (a is num && b is num) return a <= b;
+  return _stLessEqRare(a, b);
+}
+_stLessEqRare(a, b) {
+  if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
+  if (a is StChar) a = a.code; if (b is StChar) b = b.code;
+  if (a is num && b is num) return a <= b;   // $a <= $b
+  if (a is String && b is String) return a.compareTo(b) <= 0;
+  return _stLeSlow(a, b);
+}
+_stLeSlow(a, b) {
+  if (a is num && b is! num) return !stLess(b, a);
+  return a <= b;
+}
+stGreater(a, b) {
+  // Tiny on purpose: one test + a rare-tail call, so the optimizer ALWAYS
+  // inlines this at hot sites (a bigger body fell out of the inline budget
+  // and cost fib 2.7x in out-of-line compare calls).
+  if (a is num && b is num) return a > b;
+  return _stGreaterRare(a, b);
+}
+_stGreaterRare(a, b) {
+  if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
+  if (a is StChar) a = a.code; if (b is StChar) b = b.code;
+  if (a is num && b is num) return a > b;   // $a > $b
+  if (a is String && b is String) return a.compareTo(b) > 0;
+  return _stGtSlow(a, b);
+}
+_stGtSlow(a, b) {
+  if (a is num && b is! num) return stLess(b, a);
+  return a > b;
+}
+stGreaterEq(a, b) {
+  // Tiny on purpose: one test + a rare-tail call, so the optimizer ALWAYS
+  // inlines this at hot sites (a bigger body fell out of the inline budget
+  // and cost fib 2.7x in out-of-line compare calls).
+  if (a is num && b is num) return a >= b;
+  return _stGreaterEqRare(a, b);
+}
+_stGreaterEqRare(a, b) {
+  if (a is StSymbol) a = a.name; if (b is StSymbol) b = b.name;
+  if (a is StChar) a = a.code; if (b is StChar) b = b.code;
+  if (a is num && b is num) return a >= b;   // $a >= $b
+  if (a is String && b is String) return a.compareTo(b) >= 0;
+  return _stGeSlow(a, b);
+}
+_stGeSlow(a, b) {
+  if (a is num && b is! num) return stLess(b, a) || stEquals(a, b);
+  return a >= b;
+}
+
+stMax(a, b) {
+  if (a is num && b is num) return a > b ? a : b;
+  return _stMaxSlow(a, b);
+}
+_stMaxSlow(a, b) => a.max_(b);
+
+stMin(a, b) {
+  if (a is num && b is num) return a < b ? a : b;
+  return _stMinSlow(a, b);
+}
+_stMinSlow(a, b) => a.min_(b);
+
+/// `'foo' asSymbol` — the CANONICAL interned Symbol, IDENTICAL to the `#foo`
+/// literal. Both must go through stSymbol / the _stSymbolTable: Phase 1 made
+/// Symbol its own class, so the old VM-Symbols-table native answered a
+/// different object and `'foo' asSymbol == #foo` was false.
+stAsSymbol(s) {
+  if (s is StSymbol) return s;               // already canonical
+  var str = _stStr(s);                       // String / mutable String / Char
+  if (str != null) return stSymbol(str);
+  return _stAsSymSlow(s);
+}
+_stAsSymSlow(s) => s.asSymbol();
+
+/// The FFI floor (ST_PORTING_PLAN §3a): call a C function by name. The builder
+/// lowers a `<primitive: FFI function: #name ret: #r args: #(c c)>` method to
+/// stFfiCall([params], "name|ret|codes"). Word args/return for now (Posix +
+/// Time); doubles (Accel) arrive with the FPR trampoline.
+stFfiCall(List args, String desc) native "ST_ffiCall";
+
+/// Alien peek/poke (stage b): raw read/write at an ABSOLUTE address (an int).
+/// The prelude's Alien bounds-checks against its span before calling these.
+stPeekByte(a) native "ST_peekByte";
+stPokeByte(a, v) native "ST_pokeByte";
+stPeekF64(a) native "ST_peekF64";
+stPokeF64(a, v) native "ST_pokeF64";
+stPeekI64(a) native "ST_peekI64";
+stPokeI64(a, v) native "ST_pokeI64";
+
+/// Class reflection (M5): a class VALUE's name/super and, class-side, the whole
+/// ST class list + a behavior's own selectors/ivars/classvars — answered from
+/// the VM's real Class API (MACVM read these off the class object's layout).
+/// The 76_reflection.mst overlay <stprim:>s ClassMirror/Behavior onto these.
+stClassNameOf(c) native "ST_classNameOf";
+stSuperclassOf(c) native "ST_superclassOf";
+stAllClasses() native "ST_allClasses";
+stSelectorsOf(c) native "ST_selectorsOf";
+stInstVarNamesOf(c) native "ST_instVarNamesOf";
+stClassVarNamesOf(c) native "ST_classVarNamesOf";
+
+/// Sorted copy of a Dart list (prelude asSortedCollection plumbing).
+stSortedOf(l) { var c = new List.from(l); c.sort(); return c; }
+
+stJoinList(l) => l.join('');
+
+/// A Dart-side stream for the print protocol: its method names ARE the
+/// mangled ST selectors, so an ST `printOn:` body drives it directly via
+/// ordinary dispatch (`nextPutAll:` -> nextPutAll_, `<<` -> operator<<) —
+/// independent of whichever WriteStream class (prelude or world) is loaded.
+class STWriteBuffer {
+  final StringBuffer _b = new StringBuffer();
+  nextPutAll_(s) { _b.write(s is String ? s : stDisplayOf(s)); return s; }
+  nextPut_(c) { _b.write(c is String ? c : c.toString()); return c; }
+  space() { _b.write(' '); return this; }
+  tab() { _b.write('\t'); return this; }
+  cr() { _b.write('\n'); return this; }
+  show_(x) { _b.write(stDisplayOf(x)); return this; }
+  print_(x) { _b.write(stPrintOf(x)); return x; }
+  operator <<(x) { _b.write(stDisplayOf(x)); return this; }
+  contents() => _b.toString();
+}
+
+/// The print protocol. printString of a string is QUOTED (ST convention);
+/// displayString is the bare text. An ST object prints via its printOn:
+/// into an STWriteBuffer; one without printOn: falls back to the VM default
+/// text. (The catch intentionally narrows only the no-method case in
+/// spirit — a printOn: that itself signals is pathological.)
+stPrintOf(x) {
+  if (x is StMutableString) return "'" + x.toString() + "'";
+  if (x is StChar) return r"$" + x.toString();     // Smalltalk prints a char as $a
+  if (x is StSymbol) return "#" + x.name;        // Smalltalk prints symbols as #foo
+  if (x is String) return "'" + x + "'";
+  if (x == null) return 'nil';                   // Smalltalk nil, not Dart null
+  if (x is List) {
+    // An ST Array IS a Dart List (a literal #(...), Array new:, a collect:
+    // result). Print it Smalltalk-style — `(e1 e2 e3 )` — instead of Dart's
+    // `[e1, e2, e3]`; elements recurse through printString (strings quote,
+    // nested arrays parenthesize). (GNU-Smalltalk Array form; Set/Bag add the
+    // class-name prefix in their own printOn:.)
+    var sb = new StringBuffer('(');
+    for (var e in x) {
+      sb.write(stPrintOf(e));
+      sb.write(' ');
+    }
+    sb.write(')');
+    return sb.toString();
+  }
+  if (x is num || x is bool || x is Map) {
+    return x.toString();
+  }
+  if (x is Function) return 'a Block';
+  // A class VALUE (a Type) prints as its ST name — `Number`, not `Number ext`
+  // and not the generic Object>>printOn: text. stClassNameOf answers non-null
+  // ONLY for a Type (it strips the bridged-holder suffix), so it doubles as the
+  // is-a-class test. (Behavior>>printOn: lives in an ext holder that stPrintOf's
+  // own-class-chain printOn: probe below can't reach for a Type receiver.)
+  var cn = stClassNameOf(x);
+  if (cn != null) return cn;
+  var ws = new STWriteBuffer();
+  var r = _stSendTry(x, 'printOn:', [ws]);
+  if (r == null) return x.toString();   // no printOn: — the VM default text
+  return ws.contents();
+}
+
+stDisplayOf(x) => x is String ? x : (x is StMutableString ? x.toString() : (x is StSymbol ? x.name : (x is StChar ? x.toString() : stPrintOf(x))));
+
+/// `x printOn: aStream` with a bridged x: write its text into the stream.
+stPrintOn(r, s) {
+  // The native value types print through stPrintOf too — else `key printOn: s`
+  // (Association/Dictionary) forwarded a Symbol/Character to its spelling and
+  // dropped the #/$ (`#a->1` printed as `a->1`).
+  if (r is num || r is String || r is bool || r == null || r is List ||
+      r is Map || r is Function ||
+      r is StSymbol || r is StChar || r is StMutableString) {
+    return _stNPASlow(s, stPrintOf(r));
+  }
+  var v = _stSendTry(r, 'printOn:', [s]);
+  if (v == null) return _stNPASlow(s, r.toString());
+  return v[0];
+}
+
+stGcFull() native "ST_gcFull";
+
+// Bridged String/Character constructors: a "new" ST String is a MUTABLE char
+// buffer (Dart strings are immutable) — an StMutableString speaking at:put:/
+// size/replaceFrom: (its `toString` IS the string, so it reads and marshals as
+// one); a Character value: answers the flyweight Character.
+stStringNew(n) => new StMutableString(new List<int>.filled(n, 32, growable: true));  // n spaces, mutable
+stStringNew0() => new StMutableString(<int>[]);
+/// `String new: n withAll: aChar` — a mutable String of n copies of the char.
+stStringNewWithAll(n, c) {
+  var code = (c is StChar)
+      ? c.code
+      : (c is String && c.length == 1 ? c.codeUnitAt(0) : 32);
+  return new StMutableString(new List<int>.filled(n, code, growable: true));
+}
+/// `[:a :b | ...] numArgs` — the block's declared argument count.
+int stBlockNumArgs(block) native "ST_blockNumArgs";
+stCharValue(c) => stChar(c);   // Character value: n -> the flyweight Character
+
+/// A plain ST instance clone (fresh object, fields copied) — the native the
+/// world's `shallowCopy` <primitive: 247> body only faked.
+_stShallowCopyNative(r) native "ST_shallowCopy";
+
+/// `shallowCopy` — a REAL shallow copy, the thing `copy` (shallowCopy postCopy)
+/// depends on. The world's primitive was ignored, so `x copy` answered x and
+/// mutating the "copy" hit the original (an OrderedCollection copy shared its
+/// original's elements; a String copy could not be at:put:'d — it was still the
+/// read-only literal). Immutable/value receivers answer self (matching the
+/// world's Symbol/Boolean/nil/Character overrides); a native String copies into
+/// a MUTABLE StMutableString so it can be modified; List/Map get a fresh
+/// container (which is what a collection's postCopy deep-copies through); a
+/// plain ST instance goes to the native clone.
+stShallowCopy(r) {
+  if (r == null || r is num || r is bool) return r;
+  if (r is StSymbol || r is StChar) return r;
+  if (r is String) {
+    return new StMutableString(r.codeUnits.toList(growable: true));
+  }
+  if (r is StMutableString) {
+    return new StMutableString(r.units.toList(growable: true));
+  }
+  if (r is List) return r.toList(growable: true);
+  if (r is Map) return new Map.from(r);
+  return _stShallowCopyNative(r);
+}
+
+// Array with:* constructors.
+stList1(a) => [a];
+stList2(a, b) => [a, b];
+stList3(a, b, c) => [a, b, c];
+stList4(a, b, c, d) => [a, b, c, d];
+
+// GC introspection (`Smalltalk gcScavenge` / `gcStats` — the MACVM SPEC
+// 8-element order; counters the Dart heap doesn't expose stay 0).
+stGcScavenge() native "ST_gcScavenge";
+stGcStats() native "ST_gcStats";
+
+// List plumbing for the prelude's OrderedCollection/Array (via <stprim:>).
+stNewList() => new List();
+stNewListSized(n) => new List(n);
+stNewByteArray(n) => new List<int>.filled(n, 0);  // ByteArray new: n (0-filled)
+stNewMap() => new Map();
+stListRemoveFirst(l) => l.removeAt(0);
+stListInsertFirst(l, x) { l.insert(0, x); return x; }
+stListRemove(l, x) { l.remove(x); return x; }
+stListIncludes(l, x) => l.contains(x);
+stListAppend(l, x) { l.add(x); return l; }  // literal-array build chain
+stSplitByChar(s, code) => s.toString().split(new String.fromCharCode(code));
+stStringWith(c) => c.toString();  // a Character IS a 1-char string here
+stNewArray0() => <dynamic>[];    // `Array new` — an empty growable Array (List)
+stStrLf() => '\n';
+stStrTab() => '\t';
+stStrCr() => '\r';
+stStrSpace() => ' ';
+
+/// One-hop table snapshot: rows joined on US (char 31) for setRowsJoined:.
+stJoinRows(l) {
+  if (l == null) return '';
+  var out = new StringBuffer();
+  var first = true;
+  for (var e in (l as List)) {
+    if (!first) out.write(new String.fromCharCode(31));
+    out.write(e == null ? '' : e.toString());
+    first = false;
+  }
+  return out.toString();
+}
+
+/// 1-based copyFrom:to: — Dart Strings slice as STRINGS (the world's
+/// species-based fallback rebuilt them as char Lists, so 'OK'-prefix reply
+/// checks never matched).
+stCopyFromTo(c, a, b) {
+  if (c is StSymbol) c = c.name;
+  if (c is String) return c.substring(a - 1, b);
+  if (c is List) return c.sublist(a - 1, b);
+  return _stCopySlow(c, a, b);
+}
+_stCopySlow(c, a, b) => c.copyFrom_to_(a, b);
+
+/// Parse-check `.mst` source WITHOUT loading it: returns '' when it parses,
+/// else "ERR: line:col: message" — the editor's cheap pre-Accept validation.
+String stCheck(String src) native "ST_check";
+
+// --- the Smalltalk Transcript (ST_PLAN.md Sprint 10) ------------------------
+// The prelude's `Transcript show:`/`cr` land here (via <stprim:>). show:
+// buffers; cr emits one whole line — to [stTranscriptSink] when a host (the
+// workspace's language isolate) installed one, else to stdout. Each isolate
+// has its own copy of these globals, so demo/game isolates print to stdout
+// while the workspace's language isolate feeds the GUI Transcript.
+var stTranscriptSink; // void Function(String line), or null
+String _stTrBuf = '';
+
+stTrShow(s) {
+  _stTrBuf = _stTrBuf + (s == null ? 'nil' : s.toString());
+  return null;
+}
+
+stTrCr() {
+  var line = _stTrBuf;
+  _stTrBuf = '';
+  if (stTranscriptSink != null) {
+    stTranscriptSink(line);
+  } else {
+    print(line);
+  }
+  return null;
+}
+
+// --- Smalltalk become (Sprint 9) --------------------------------------------
+/// One-way: every reference to [a] becomes a reference to [b] (the VM's
+/// reload-morphing primitive). Returns [b].
+stBecomeForward(a, b) native "ST_becomeForward";
+
+/// Two-way identity swap via shallow copies (identity hashes are the copies').
+stBecome(a, b) native "ST_become";
+
+/// The world's Object>>instVarAt: — 1-based, super-chain-first. Declared as a
+/// bare <primitive: 25> with nothing behind it, so it used to answer the
+/// receiver.
+stInstVarAt(r, i) native "ST_instVarAt";
+stInstVarAtPut(r, i, v) native "ST_instVarAtPut";
+
 // --- Low-level natives ------------------------------------------------------
 int _nsStringFromCString(String s) native "Cocoa_nsStringFromCString";
 int _nsStringLength(int handle) native "Cocoa_nsStringLength";
@@ -81,6 +1559,214 @@ List cocoaNearestSelectors(String cls, String typo) =>
 /// object result — retained, released on GC), a String (char*), an int
 /// (integer id), a double, a List of numbers (struct), or null (void).
 dynamic _send(Cocoa receiver, String selector, List args) native "Cocoa_send";
+dynamic _sendMain(Cocoa receiver, String selector, List args)
+    native "Cocoa_sendMain";
+
+// --- Sprint 13: the ST face of the ONE Cocoa bridge -------------------------
+// The world's Cocoa/ObjcRef API (49_cocoa.mst) binds its former MACVM
+// primitives to these helpers; the handle an ObjcRef carries in its ivar IS
+// the Dart Cocoa wrapper, so retain/release/GC policy stays in one place.
+stObjcClassNamed(String name) {
+  var c = Cocoa.cls(name);
+  return c.isNil ? null : c;             // ST nil for an unknown class
+}
+
+/// Map an ST-side argument onto the bridge: Cocoa wrappers and scalars pass
+/// through; an ST ObjcRef contributes its wrapped handle (via its
+/// `objcHandle` accessor); anything else passes as-is.
+_stObjcArg(a) {
+  if (a is Cocoa || a == null || a is num || a is String || a is bool) {
+    return a;
+  }
+  var r = _stSendTry(a, 'objcHandle', []);
+  if (r != null && r[0] is Cocoa) return r[0];
+  return a;
+}
+
+List _stObjcArgs(args) {
+  var out = <dynamic>[];
+  if (args is List) {
+    for (var a in args) out.add(_stObjcArg(a));
+  }
+  return out;
+}
+
+/// Auto-shaped send on the isolate thread (headless-safe work).
+stObjcSend(h, String sel, args) {
+  if (h == null) {
+    throw 'Cocoa: send to a released or nil reference (' + sel + ')';
+  }
+  return (h as Cocoa).send(sel, _stObjcArgs(args));
+}
+
+/// The C3 hop: the same send with objc_msgSend on the MAIN thread (AppKit).
+stObjcSendMain(h, String sel, args) {
+  if (h == null) {
+    throw 'Cocoa: send to a released or nil reference (' + sel + ')';
+  }
+  return (h as Cocoa).sendMain(sel, _stObjcArgs(args));
+}
+
+stObjcIsRef(x) => x is Cocoa;
+
+/// Sprint 13b: the action trampoline. The mint needs a live action HOST —
+/// the workspace language isolate installs its port (it owns dart:isolate);
+/// posts arrive there as [ticket, selector] and dispatch through the world's
+/// own MacvmDelegate registry (ticket -> receiver, pure Smalltalk).
+_stMakeActionTarget(port, int ticket) native "ST_makeActionTarget";
+_stMakeTableSource(port, int ticket) native "ST_makeTableSource";
+var stActionPort;
+stObjcActionTarget(int ticket) {
+  if (stActionPort == null) {
+    throw 'Cocoa: no action host — the workspace language isolate installs '
+        'the action port (buttons need the GUI, not a headless CLI)';
+  }
+  return _stMakeActionTarget(stActionPort, ticket);
+}
+
+/// Sprint 13c: the SNAPSHOT table source — rows live ObjC-side (AppKit's
+/// synchronous questions never enter a VM); selection changes come back
+/// through the same async post as actions, carrying the row index.
+stObjcTableSource(int ticket) {
+  if (stActionPort == null) {
+    throw 'Cocoa: no action host — the workspace language isolate installs '
+        'the action port (tables need the GUI, not a headless CLI)';
+  }
+  return _stMakeTableSource(stActionPort, ticket);
+}
+
+/// One posted action, dispatched: MacvmDelegate looks the ticket up and
+/// performs the selector on the registered receiver (sender crosses as nil —
+/// wrap-on-post would root an ObjC object against a maybe-dead isolate).
+stActionDispatch(ticket, String sel, arg) {
+  return stInvokeStatic('MacvmDelegate', 'dispatchTicket:selector:arguments:',
+      [ticket, sel, [arg]]);
+}
+
+/// Sprint 14: the browser HOST hook — the workspace language isolate
+/// installs a closure (verb, args) -> String over its image decls; the
+/// STHostService prims below route through it. Null hook = clear ERR.
+var stHostHook;
+_stHost(String verb, List args) {
+  if (stHostHook == null) return 'ERR no image host in this isolate';
+  var r = stHostHook(verb, args);
+  return r == null ? '' : r.toString();
+}
+
+stHostPackageTree(svc) => _stHost('packageTree', const []);
+stHostBrowseRecords(svc) => _stHost('browseRecords', const []);
+stHostComment(svc, cls) => _stHost('comment', [cls]);
+stHostClassSource(svc, cls) => _stHost('classSource', [cls]);
+stHostMethodSource(svc, cls, side, sel) =>
+    _stHost('methodSource', [cls, side, sel]);
+stHostSaveMethod(svc, cls, side, text) =>
+    _stHost('saveMethod', [cls, side, text]);
+stHostRemoveMethod(svc, cls, side, sel) =>
+    _stHost('removeMethod', [cls, side, sel]);
+stHostNewClass(svc, text) => _stHost('newClass', [text]);
+stHostAcceptClass(svc, text) => _stHost('acceptClass', [text]);
+/// Persist a class a PROGRAM generated, without hot-reloading the world: same
+/// parse-check and image write as the accept above, but only this class is made
+/// live. The accept's world reload re-inits class-side state, which kills a
+/// running game's frame loop (GamePane's StepBlock) — so anything saving from
+/// inside a callback, rather than from an editor between frames, wants this one.
+stHostStoreClass(svc, text) => _stHost('storeClass', [text]);
+stHostSetComment(svc, cls, text) => _stHost('setComment', [cls, text]);
+stHostRemoveClass(svc, cls) => _stHost('removeClass', [cls]);
+
+/// The Apps-player surface hook — the workspace language isolate installs a
+/// closure (verb, args) routing onto the LIVE AppSurface while an ST app runs
+/// (the STHostService pattern, applied to widgets). The world's AppUI class
+/// (81_appui.mst) is the ST face: each widget method is one stAppUi* prim
+/// below. ST blocks pass through UNTOUCHED into the surface's handler map —
+/// they are directly callable as Dart closures, so 'appevent' dispatch needs
+/// no ST-specific path at all. No hook (headless, or outside the player) is a
+/// programmer error and throws — catchable ST-side as an Error.
+var stAppUiHook;
+_stAppUi(String verb, List args) {
+  if (stAppUiHook == null) {
+    throw 'ERR no app surface in this isolate (run me from the Apps player)';
+  }
+  return stAppUiHook(verb, args);
+}
+
+stAppUiTitle(u, t) => _stAppUi('title', [t]);
+stAppUiClear(u) => _stAppUi('clear', const []);
+stAppUiLabel(u, id, t, f, align) => _stAppUi('label', [id, t, f, align]);
+stAppUiField(u, id, t, f, onText, onEnter) =>
+    _stAppUi('field', [id, t, f, onText, onEnter]);
+stAppUiButton(u, id, t, f, onClick) => _stAppUi('button', [id, t, f, onClick]);
+stAppUiCheckbox(u, id, label, f, value, onToggle) =>
+    _stAppUi('checkbox', [id, label, f, value, onToggle]);
+stAppUiSlider(u, id, f, min, max, value, onSlide) =>
+    _stAppUi('slider', [id, f, min, max, value, onSlide]);
+stAppUiPopup(u, id, items, f, selected, onSelect) =>
+    _stAppUi('popup', [id, items, f, selected, onSelect]);
+stAppUiSecure(u, id, t, f, onText, onEnter) =>
+    _stAppUi('secure', [id, t, f, onText, onEnter]);
+stAppUiProgress(u, id, f, min, max, value) =>
+    _stAppUi('progress', [id, f, min, max, value]);
+stAppUiBox(u, id, t, f) => _stAppUi('box', [id, t, f]);
+stAppUiList(u, id, items, f, onSelect) =>
+    _stAppUi('list', [id, items, f, onSelect]);
+stAppUiTabs(u, id, items, f) => _stAppUi('tabs', [id, items, f]);
+stAppUiTab(u, id, index) => _stAppUi('tab', [id, index]);
+stAppUiScroll(u, id, f, w, h) => _stAppUi('scroll', [id, f, w, h]);
+stAppUiInto(u, id) => _stAppUi('into', [id]);
+stAppUiPane(u) => _stAppUi('pane', const []);
+stAppUiCanvas(u, id, f, bg, onClick) =>
+    _stAppUi('canvas', [id, f, bg, onClick]);
+stAppUiDraw(u, id, ops) => _stAppUi('draw', [id, ops]);
+stAppUiSet(u, id, key, value) => _stAppUi('set', [id, key, value]);
+stAppUiRemove(u, id) => _stAppUi('remove', [id]);
+stAppUiFocus(u, id) => _stAppUi('focus', [id]);
+stAppUiWidth(u) => _stAppUi('width', const []);
+stAppUiHeight(u) => _stAppUi('height', const []);
+
+/// `Worker classNamed:` — the engine's class lookup (a class VALUE or nil).
+_stClassNamedRaw(name) native "ST_classNamed";
+/// `Worker classNamed: name` — the browser passes a Symbol (`#CocoaTableFace`),
+/// and since Symbol became its own class the native's string lookup no longer
+/// sees a Dart String. Coerce any string-ish name to its spelling first.
+stClassNamed(name) => _stClassNamedRaw(name is String ? name : name.toString());
+
+/// ST `perform:` — dynamic dispatch by selector string.
+// `perform:` is a normal send by another name — and must dispatch in the SAME
+// order a compiled send does, or it diverges both ways: the bare stSend misses
+// the extension holders (`42 perform: #printString` / `#between:and:` raised),
+// while an ext-FIRST dispatch mis-routes a native operator (`perform: #+` found
+// LargeInteger's byte-based `+` and ran it on the wrong receiver). So:
+//   1. the pure rewrite-table helpers (printString/class/...) that are real
+//      methods nowhere — a runtime send can't reach them;
+//   2. the native + ST class chain (operators, user methods) — stSendTry;
+//   3. the extension holders (Magnitude>>between:and: on a Smi, ...);
+//   4. stSend, which raises the honest doesNotUnderstand.
+stPerform(r, String sel, List args) {
+  if (args.isEmpty) {
+    if (sel == 'printString') return stPrintOf(r);
+    if (sel == 'displayString' || sel == 'asString') return stDisplayOf(r);
+    if (sel == 'class') return stClassOf(r);
+  }
+  var box = _stSendTry(r, sel, args);
+  if (box != null) return box[0];
+  var hit = _stExtSendTry(r, sel, args);
+  if (hit != null) return hit[0];
+  return stSend(r, sel, args);
+}
+stPerform1(r, sel) => stPerform(r, stDisplayOf(sel), const []);
+stPerform2(r, sel, args) =>
+    stPerform(r, stDisplayOf(sel), args is List ? args : [args]);
+int stObjcPoolPush() native "Cocoa_poolPush";
+stObjcPoolPop(p) native "Cocoa_poolPop";
+
+/// An ST String from a send result: NSString wrappers via UTF8String,
+/// Dart strings as-is.
+stObjcUTF8(x) {
+  if (x is String) return x;
+  var c = _stObjcArg(x);              // an ST ObjcRef unwraps to its Cocoa
+  if (c is Cocoa) return c.isNil ? null : c.send('UTF8String', const []);
+  return x == null ? null : x.toString();
+}
 int _retain(int handle) native "Cocoa_retain";
 void _release(int handle) native "Cocoa_release";
 int _poolPush() native "Cocoa_poolPush";
@@ -111,6 +1797,7 @@ typedef void CocoaAction(Cocoa sender);
 typedef int RowCountFn();
 typedef String CellFn(int row);
 typedef void SelectFn(int row);
+typedef void GutterClickFn(int line);   // debugger gutter click -> 1-based line
 
 class _TableSource {
   final RowCountFn rowCount;
@@ -126,6 +1813,9 @@ bool _cbDispatchRegistered = false;
 void _registerCallbackDispatch(Function f) native "Cocoa_registerCallbackDispatch";
 int _makeActionTarget(int ticket) native "Cocoa_makeActionTarget";
 void _wireAction(int control, int target) native "Cocoa_wireAction";
+int _attachGutter(int scrollView, int ticket) native "Cocoa_attachGutter";
+void _gutterSetLines(int gutter, String breaksCsv, int paused)
+    native "Cocoa_gutterSetLines";
 
 // The single entry every native callback funnels through (see cocoa_callbacks.mm).
 // kind: 0 action, 1 textDidChange, 2 tableRowCount, 3 tableValue(arg=row),
@@ -134,6 +1824,7 @@ dynamic _cocoaDispatch(int ticket, int kind, int arg) {
   var h = _cbHandlers[ticket];
   if (h == null) return null;
   if (kind <= 1) { if (h is CocoaAction) h(new Cocoa._adopt(arg)); return null; }
+  if (kind == 5) { if (h is GutterClickFn) h(arg); return null; }  // gutter click
   if (h is _TableSource) {
     if (kind == 2) return h.rowCount();
     if (kind == 3) return h.cellAt(arg);
@@ -166,6 +1857,29 @@ Cocoa onAction(Cocoa control, CocoaAction fn) {
   var target = new Cocoa._adopt(_makeActionTarget(ticket));
   _wireAction(control.handle, target.handle);
   return target;
+}
+
+/// Attach a debugger-style breakpoint gutter (a vertical NSRulerView) to
+/// [scrollView] (the enclosing scroll view of a source text view). A click in
+/// the gutter calls [onLineClick] with the 1-based source line. Returns the
+/// gutter handle — pass it to [gutterSetLines] to paint the dots. Keep it alive.
+Cocoa attachGutter(Cocoa scrollView, GutterClickFn onLineClick) {
+  _ensureDispatch();
+  var ticket = _cbNext++;
+  _cbHandlers[ticket] = onLineClick;
+  return new Cocoa._adopt(_attachGutter(scrollView.handle, ticket));
+}
+
+/// Repaint [gutter]: a red dot on each line in [breakLines], a caret on
+/// [pausedLine] (0 for none).
+void gutterSetLines(Cocoa gutter, List<int> breakLines, int pausedLine) {
+  if (gutter == null) return;
+  var csv = new StringBuffer();
+  for (var i = 0; i < breakLines.length; i++) {
+    if (i > 0) csv.write(',');
+    csv.write(breakLines[i]);
+  }
+  _gutterSetLines(gutter.handle, csv.toString(), pausedLine);
 }
 
 /// Wire [textView]'s text-change notification (`textDidChange:`) to [fn] — e.g.
@@ -264,6 +1978,591 @@ void _gpFullscreen(int on) native "Cocoa_gpFullscreen";
 /// unchanged, upscaled crisp. No-op when the pane is closed.
 void gpFullscreen(bool on) => _gpFullscreen(on ? 1 : 0);
 
+// --- the ST game wire (GAMEPANE_PLAN.md §8: the language-isolate driver) -----
+// The world's GamePane/Sound/Tune speak MACVM's numbered game primitives
+// (200..215), which this VM never had. The overlay 80_gamepane_wiring.mst
+// reopens those methods onto the stGp* helpers below, which APPEND the exact
+// gp* wire ops a Dart game ships (workspace/demos/gamepane.dart) into a
+// per-isolate command buffer. A driver (language.dart's `stgame`) drains the
+// buffer once per tick with [stGpTake] and pushes `['draw', cmds]` to the UI —
+// so an ST game rides the same pane/pacing/teardown machinery as a Dart one.
+// Headless (no driver) the buffer just fills and is never shipped, preserving
+// the corpus's documented "silently a no-op" behaviour, and making the wiring
+// testable without a GUI (st/test/gamepane_wire.dart).
+List _stGpCmds = <List>[];
+bool _stGpRunning = false;
+var _stGpPane; // the GamePane instance `run` was sent to (the driver's handle)
+// The frame loop's two blocks. These live HERE, not in GamePane's class
+// variables, because an image accept RELOADS THE WHOLE ST WORLD: every class
+// is rebuilt and its class-side state comes back nil. A running game whose
+// StepBlock was nilled that way is not slowed or interrupted — it is over. The
+// UI timer keeps inviting frames and every one finds nothing to run, so the
+// game freezes on whatever frame it was showing, alive and responsive and
+// permanently still. That is not a hypothetical: Galaxigans persists its high
+// scores BY accepting a class, so finishing a qualifying game froze the hall of
+// fame forever, and editing any class in the Browser froze whatever was
+// playing. Dart-side state has none of that fragility — it survives the reload
+// the same way _stGpRunning and the sprite maps below already do, so a game
+// plays straight through an accept and the world stays reloadable.
+var _stGpStep;      // the per-frame block registered by GamePane>>onStep:
+var _stGpTeardown;  // the one-shot cleanup block registered by onReset:
+Map<int, bool> _stGpSounds = <int, bool>{}; // preset -> gpsound already shipped
+Map<String, int> _stGpTunes = <String, int>{}; // abc source -> tune slot
+Map<int, int> _stGpSpriteIds = <int, int>{};  // ST's monotonic id -> engine id
+int _stGpNextSprite = 0;
+int _stGpNextTune = 0;
+bool _stGpBlitWarned = false;
+
+// 43_gamepane.mst's Sound preset numbers, in declaration order, to the synth's
+// preset names (gp_synth.cc preset_* — verified 1:1).
+// Preset 10 (wah) is NOT one of MACVM's ten: it is the arcade UFO warble —
+// two sines a few Hz apart beating against each other — which world/49's bonus
+// saucer loops while it crosses. The engine renders it from the same recipe the
+// assembler original uses (280 Hz, 5 Hz detune).
+const List<String> _stGpPresetNames = const <String>[
+  'coin', 'jump', 'zap', 'shoot', 'explode',
+  'powerup', 'hurt', 'click', 'bang', 'blip', 'wah', 'hum'
+];
+
+// Instance <stprim:> passes the RECEIVER first; every helper answers it so the
+// reopened method keeps 43's `^self` convention.
+stGpClearRGB(p, r, g, b) {
+  // The wire clears to a PALETTE index; entry 1 is reserved as the clear
+  // colour (user entries start at 16 per the pane's contract).
+  _stGpCmds.add(<dynamic>['gppal', 1, r, g, b]);
+  _stGpCmds.add(<dynamic>['gpcls', 1]);
+  return p;
+}
+stGpPal(p, i, r, g, b) { _stGpCmds.add(<dynamic>['gppal', i, r, g, b]); return p; }
+stGpCls(p, i) { _stGpCmds.add(<dynamic>['gpcls', i]); return p; }
+// The PER-SCANLINE palette (indices 1..15): the copper-bar mechanism. A shape
+// drawn once in index 1 changes colour down the screen and animates by
+// rewriting the line colours, with no pixel touched per frame — which is how
+// the original's tractor beam flows (world/49's boss) and how its copper bars
+// work. The engine has always had it; Smalltalk could not reach it.
+stGpLinePal(p, line, i, r, g, b) {
+  _stGpCmds.add(<dynamic>['gplinepal', line, i, r, g, b]);
+  return p;
+}
+stGpPset(p, x, y, c) { _stGpCmds.add(<dynamic>['gppset', x, y, c]); return p; }
+stGpLine(p, x0, y0, x1, y1, c) {
+  _stGpCmds.add(<dynamic>['gpline', x0, y0, x1, y1, c]);
+  return p;
+}
+stGpFill(p, x, y, w, h, c) {
+  _stGpCmds.add(<dynamic>['gpfill', x, y, w, h, c]);
+  return p;
+}
+stGpDisc(p, cx, cy, r, c) {
+  _stGpCmds.add(<dynamic>['gpdisc', cx, cy, r, c]);
+  return p;
+}
+
+// --- buffer slots (GAMEPANE_PLAN.md §5 / world/84_gamepane_buffers.mst) -----
+// The indexed pane's 8 buffer slots (0 front, 1 back, 2..7 asset/scratch —
+// gp_engine.h's kNumBuffers) and the GPU compute blitter between them, for
+// tile-atlas reuse and scrolling multi-layer scenes: pre-render a tile/layer
+// once into an asset slot, then cheaply blitMode:...: copies of it into the
+// front buffer instead of redrawing it every frame. These are plain wire ops
+// (like every stGp* above), applied by the SAME gpApply pass that draws —
+// unlike direct mode, there is no separate native buffer to reach into, so
+// load's bytes travel base64-encoded exactly as a Dart game's loadBuffer
+// would ship them. This SDK predates the Dart 2 lowercase rename — the
+// constant is `BASE64`, not `base64` (dart:convert's own base64.dart:
+// `const Base64Codec BASE64 = const Base64Codec();`); importing the
+// (nonexistent here) lowercase name compiled clean but threw a
+// NoSuchMethodError the first time an ST game actually called
+// loadBuffer:bytes:, which is what caught it.
+stGpScroll(p, x, y) { _stGpCmds.add(<dynamic>['gpscroll', x, y]); return p; }
+stGpActive(p, slot) { _stGpCmds.add(<dynamic>['gpactive', slot]); return p; }
+stGpSwap(p) { _stGpCmds.add(<dynamic>['gpswap']); return p; }
+stGpLoad(p, slot, bytes) {
+  _stGpCmds.add(<dynamic>['gpload', slot, BASE64.encode(bytes)]);
+  return p;
+}
+stGpBlitSlots(p, mode, src, dst, sx, sy, dx, dy, w, h, value) {
+  _stGpCmds.add(<dynamic>['gpblit', mode, src, dst, sx, sy, dx, dy, w, h, value]);
+  return p;
+}
+
+// --- the HUD text overlay (layer 3) ------------------------------------------
+// The pane's own 5x7 atlas, drawn OVER the indexed layer and the sprites, in
+// RGB rather than palette indices (it is a separate texture, not part of the
+// buffer). Retained between frames like everything else here, so a changing
+// score wants textClear first — otherwise each frame prints over the last and
+// the digits silt up into blocks.
+stGpTextClear(p) { _stGpCmds.add(<dynamic>['gptextclear']); return p; }
+// The parameters arrive in the SMALLTALK selector's order — the stprim lowering
+// pushes self then the method's arguments left to right, so
+// `text: aString x: x y: y …` hands over (pane, string, x, y, …). Declaring
+// them in the wire's order instead drew the y-coordinate as the label.
+stGpText(p, s, x, y, r, g, b, scale) {
+  _stGpCmds.add(<dynamic>['gptext', x, y, s.toString(), r, g, b, scale]);
+  return p;
+}
+
+// --- layer 0: the shader background, and sprite animation ------------------
+// The pane's bottom layer is a fragment shader compiled at runtime from the
+// game's own MSL (the header supplies VOut and Uniforms{time, aspect, p[8]});
+// a compile error comes back as a logged string, never an abort. Dart games
+// have had this since M4 — these two verbs give Smalltalk the same layer.
+stGpShader(p, src) {
+  _stGpCmds.add(<dynamic>['gpshader', src.toString()]);
+  return p;
+}
+stGpShaderParam(p, i, v) {
+  _stGpCmds.add(<dynamic>['gpparam', i, v]);
+  return p;
+}
+
+// A sprite DEF can carry several frames of the same size; an instance picks one
+// per place. That is how a fleet flaps its wings without a second sprite each.
+stGpAddFrame(p, id, rows) {
+  var e = _stGpSpriteIds[id];
+  if (e == null) return p;
+  _stGpCmds.add(<dynamic>['gpframe', e, rows.toString()]);
+  return p;
+}
+stGpPlaceFrame(p, id, x, y, frame) {
+  var e = _stGpSpriteIds[id];
+  if (e == null) return p;
+  _stGpCmds.add(<dynamic>['gpplace', e, x, y, frame, 1.0, 0.0, 1.0]);
+  return p;
+}
+// Honest hiding: the engine's own visible flag, rather than parking a sprite
+// off-screen and hoping the viewport never grows to meet it.
+stGpHide(p, id) {
+  var e = _stGpSpriteIds[id];
+  if (e == null) return p;
+  _stGpCmds.add(<dynamic>['gphide', e]);
+  return p;
+}
+
+stGpPresent(p) => p; // the driver's tick drain IS the frame boundary
+stGpBlit(p, bytes) {
+  if (!_stGpBlitWarned) {
+    _stGpBlitWarned = true;
+    print('st: GamePane>>blit: is not wired on this VM yet (draw ops and '
+        'sprites are) — the frame was skipped');
+  }
+  return p;
+}
+
+// --- direct-mode bridge (GAMEPANE_PLAN.md §6b), for the world's whole-frame
+// CPU renderers (MandelZoom/MandelVM — see 83_gamepane_direct.mst) — the same
+// shape as demos/14_julia.dart at the Dart level: skip the indexed pane's
+// per-isolate command buffer for the pixel data entirely and write straight
+// into the shared GPU memory gpBackbuffer() exposes. Only meaningful when
+// _stGame opened the pane in direct mode (language.dart's _kStGames entry
+// has 'direct': true); otherwise gpBackbuffer() answers null and this is
+// silently a no-op, matching every other stGp* helper's headless contract.
+stGpDirectPal(p, i, r, g, b) { _stGpCmds.add(<dynamic>['gpdpal', i, r, g, b]); return p; }
+stGpDirectBlit(p, bytes) {
+  var fb = gpBackbuffer();
+  if (fb is! Uint8List) return p;             // not open/ready yet — no-op
+  var st = gpStat();
+  if (st is! List || st.length <= 6) return p;
+  int w = st[2], h = st[3], stride = st[6];
+  if (w <= 0 || h <= 0) return p;
+  var n = bytes.length < w * h ? bytes.length : w * h;
+  if (stride == w) {
+    for (var i = 0; i < n; i++) fb[i] = bytes[i];
+  } else {
+    for (var y = 0; y < h; y++) {
+      var srcRow = y * w, dstRow = y * stride;
+      for (var x = 0; x < w && srcRow + x < n; x++) fb[dstRow + x] = bytes[srcRow + x];
+    }
+  }
+  return p;
+}
+// ST merges define+place ("defines the pixel art and places me"): one ST id
+// serves as both the definition and the instance (separate namespaces
+// engine-side); park it offscreen until the game's first moveTo:.
+//
+// The ENGINE numbers its defs and instances from 0 on every gpopen and rejects
+// anything out of sequence, while Smalltalk's GamePane hands out a monotonic
+// NextId that keeps climbing for the life of the isolate. Relaunch a game and
+// those two disagree — the second run's sprites were refused ("id out of
+// sequence") and every move after them was "gpplace: bad instance", i.e. an
+// invisible fleet. So the wire owns the engine's id space and maps ST's ids
+// onto it; the map is per-run state, cleared by stGpReset with everything else.
+stGpDefineSprite(p, id, rows) {
+  var e = _stGpNextSprite++;
+  _stGpSpriteIds[id] = e;
+  _stGpCmds.add(<dynamic>['gpsprite', e, rows.toString()]);
+  _stGpCmds.add(<dynamic>['gpspawn', e, e, -100, -100]);
+  return p;
+}
+stGpSpriteColor(p, id, i, r, g, b) {
+  var e = _stGpSpriteIds[id];
+  if (e == null) return p;                 // a handle from a previous run
+  _stGpCmds.add(<dynamic>['gpspritepal', e, i, r, g, b]);
+  return p;
+}
+stGpMoveSprite(p, id, x, y) {
+  var e = _stGpSpriteIds[id];
+  if (e == null) return p;
+  _stGpCmds.add(<dynamic>['gpplace', e, x, y, 0, 1.0, 0.0, 1.0]);
+  return p;
+}
+// Custom synth effects (SOUND_EDITOR_PLAN.md): the FULL recipe over the wire.
+// `params` is the flat contract list starting at duration — the slot is
+// prepended here. Defining renders PCM natively, so a game calling playOn:
+// every frame must not re-ship an unchanged recipe: the cache skips the
+// gpeffect when this slot already holds these exact params.
+Map<int, String> _stGpEffectSig = <int, String>{};
+stGpEffect(cls, params, slot) {
+  if (slot is! int || slot < 0 || slot > 63 || params is! List) return cls;
+  var sig = params.join(',');
+  if (_stGpEffectSig[slot] != sig) {
+    _stGpEffectSig[slot] = sig;
+    var op = <dynamic>['gpeffect', slot];
+    for (var p in params) { op.add(p); }
+    _stGpCmds.add(op);
+  }
+  return cls;
+}
+stGpPlaySlot(cls, slot) {
+  if (slot is int && slot >= 0 && slot <= 63) {
+    _stGpCmds.add(<dynamic>['gpplay', slot]);
+  }
+  return cls;
+}
+
+stGpPlay(snd, preset) {
+  if (preset is! int || preset < 0 || preset >= _stGpPresetNames.length) {
+    return snd;
+  }
+  // The engine's sound slots are 0..63; park the ST presets at the TOP of that
+  // range, clear of a Dart game's low slots. The base is derived from the list
+  // rather than written down — adding the eleventh preset (wah) with a hardcoded
+  // 54 put it at slot 64, one past the end of the rack, where the engine
+  // rejects it with "gpsound: slot 0..63" and the sound simply never plays.
+  var slot = 64 - _stGpPresetNames.length + preset;
+  if (_stGpSounds[preset] != true) {
+    _stGpSounds[preset] = true;
+    _stGpCmds.add(<dynamic>['gpsound', slot, _stGpPresetNames[preset], 0, 0]);
+  }
+  _stGpCmds.add(<dynamic>['gpplay', slot]);
+  return snd;
+}
+stGpPlayTune(tn, abc) {
+  var src = abc.toString();
+  var slot = _stGpTunes[src];
+  if (slot == null) {
+    var t;
+    try { t = _stAbcParse(src); } catch (e) {
+      print('st: Tune fromAbc: did not compile - ' + e.toString());
+      return tn;
+    }
+    slot = _stGpNextTune++;
+    _stGpTunes[src] = slot;
+    _stGpCmds.add(<dynamic>['gptune', slot, t.bpm, t.events]);
+  }
+  _stGpCmds.add(<dynamic>['gpmusic', slot, 1]); // play once (43's contract)
+  return tn;
+}
+stGpRun(p) { _stGpRunning = true; _stGpPane = p; return p; }
+stGpStop(p) { _stGpRunning = false; return p; }
+
+// The frame-loop blocks (see _stGpStep above for WHY they are Dart-side).
+// Instance-side helpers take the receiver first and answer it, so `onStep:`
+// still chains — `pane onStep: [...]; run` is how every game starts.
+stGpOnStep(p, blk) { _stGpStep = blk; return p; }
+stGpOnReset(p, blk) { _stGpTeardown = blk; return p; }
+// Class-side helpers take no receiver (the builder pushes one only for
+// instance methods), which is why these read as bare getters.
+stGpStepBlock() => _stGpStep;
+stGpResetBlock() => _stGpTeardown;
+stGpClearBlocks() { _stGpStep = null; _stGpTeardown = null; return null; }
+
+/// Drain and return the command buffer (the driver ships it as one
+/// `['draw', cmds]`). Answers a fresh list; the buffer restarts empty.
+List stGpTake() {
+  var out = _stGpCmds;
+  _stGpCmds = <List>[];
+  return out;
+}
+
+/// Did an ST `GamePane>>run` arrive (and no `stop` since)?
+bool stGpIsRunning() => _stGpRunning;
+
+/// The pane instance `run` was sent to (for the driver's bookkeeping).
+dynamic stGpPane() => _stGpPane;
+
+/// Reset the whole wire between games: buffer, run flag, blocks, sound/tune
+/// caches. Surviving a world reload is the point of holding the blocks here —
+/// surviving the NEXT GAME is not, so they are dropped with everything else.
+void stGpReset() {
+  _stGpCmds = <List>[];
+  _stGpRunning = false;
+  _stGpPane = null;
+  _stGpStep = null;
+  _stGpTeardown = null;
+  _stGpEffectSig = <int, String>{};  // engine slots reset with the pane
+  _stGpSounds = <int, bool>{};
+  _stGpTunes = <String, int>{};
+  _stGpNextTune = 0;
+  _stGpSpriteIds = <int, int>{};
+  _stGpNextSprite = 0;
+}
+
+// --- ABC notation -> flat MIDI events (the ST game wire's music half) --------
+// A TWIN of workspace/demos/abc.dart (same frozen subset, same logic —
+// identifiers renamed with the _stAbc prefix): that copy deliberately lives
+// game-isolate-side for hot reload, while the ST driver runs in the language
+// isolate whose scratch source can only import dart: libraries — so the
+// compiler must live here in dart:cocoa. KEEP THE TWO IN SYNC.
+class _StAbcTune {
+  final List<int> events; // flat [timeMs, status, data1, data2, ...]
+  final int bpm;
+  final int endMs;
+  _StAbcTune(this.events, this.bpm, this.endMs);
+}
+
+Map<String, int> _stAbcKeySig(String k) {
+  k = k.trim();
+  var minor = false;
+  var m = k.toLowerCase();
+  if (m.endsWith('min')) { k = k.substring(0, k.length - 3); minor = true; }
+  else if (m.endsWith('m') && k.length > 1) { k = k.substring(0, k.length - 1); minor = true; }
+  else if (m.endsWith('maj')) { k = k.substring(0, k.length - 3); }
+  k = k.trim();
+  const order = 'FCGDAEB';
+  const majors = const <String, int>{
+    'C': 0, 'G': 1, 'D': 2, 'A': 3, 'E': 4, 'B': 5, 'F#': 6, 'C#': 7,
+    'F': -1, 'BB': -2, 'EB': -3, 'AB': -4, 'DB': -5, 'GB': -6, 'CB': -7,
+  };
+  const relMajorOfMinor = const <String, String>{
+    'A': 'C', 'E': 'G', 'B': 'D', 'F#': 'A', 'C#': 'E', 'G#': 'B',
+    'D': 'F', 'G': 'BB', 'C': 'EB', 'F': 'AB', 'BB': 'DB', 'EB': 'GB',
+  };
+  var name = k.toUpperCase().replaceAll('♭', 'B');
+  if (minor && relMajorOfMinor.containsKey(name)) name = relMajorOfMinor[name];
+  var n = majors.containsKey(name) ? majors[name] : 0;
+  var sig = <String, int>{};
+  if (n > 0) for (var i = 0; i < n; i++) sig[order[i]] = 1;
+  if (n < 0) for (var i = 0; i < -n; i++) sig[order[6 - i]] = -1;
+  return sig;
+}
+
+const Map<String, int> _stAbcLetterSemi = const {
+  'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11,
+};
+
+_StAbcTune _stAbcParse(String src) {
+  var bpm = 120;
+  var unitNum = 1, unitDen = 8;
+  var meterDecimal = 1.0;
+  var sawL = false;
+  var program = -1;
+  var sig = <String, int>{};
+  var body = new StringBuffer();
+
+  var lines = src.split('\n');
+  var inBody = false;
+  for (var line in lines) {
+    var t = line.trim();
+    if (t.isEmpty || t.startsWith('%')) {
+      if (t.startsWith('%%MIDI')) {
+        var parts = t.split(new RegExp(r'\s+'));
+        if (parts.length >= 3 && parts[1] == 'program') {
+          program = int.parse(parts[2], onError: (_) => -1);
+        }
+      }
+      continue;
+    }
+    if (!inBody && t.length > 1 && t[1] == ':' && 'XTMLQKVRZNOHW'.contains(t[0])) {
+      var field = t[0];
+      var val = t.substring(2).trim();
+      if (field == 'M') {
+        var mm = val.split('/');
+        if (mm.length == 2) {
+          var a = int.parse(mm[0], onError: (_) => 4);
+          var b = int.parse(mm[1], onError: (_) => 4);
+          if (b != 0) meterDecimal = a / b;
+        }
+      } else if (field == 'L') {
+        var ll = val.split('/');
+        if (ll.length == 2) {
+          unitNum = int.parse(ll[0], onError: (_) => 1);
+          unitDen = int.parse(ll[1], onError: (_) => 8);
+          sawL = true;
+        }
+      } else if (field == 'Q') {
+        var eq = val.indexOf('=');
+        var beat = eq >= 0 ? val.substring(eq + 1) : val;
+        bpm = int.parse(beat.trim(), onError: (_) => 120);
+        if (bpm <= 0) bpm = 120;
+      } else if (field == 'K') {
+        sig = _stAbcKeySig(val);
+        inBody = true;
+      }
+      continue;
+    }
+    if (inBody) body.write(t + ' ');
+    if (!inBody && !(t.length > 1 && t[1] == ':')) { body.write(t + ' '); inBody = true; }
+  }
+  if (!sawL) { unitNum = 1; unitDen = meterDecimal < 0.75 ? 16 : 8; }
+
+  var text = body.toString();
+  var open = text.indexOf('|:');
+  var close = text.indexOf(':|');
+  if (close >= 0) {
+    var start = open >= 0 && open < close ? open + 2 : 0;
+    var section = text.substring(start, close);
+    text = text.substring(0, start) + section + ' | ' + section +
+        text.substring(close + 2);
+  }
+
+  var events = <int>[];
+  var wholeMs = 4.0 * 60000.0 / bpm;
+  var unit = unitNum / unitDen;
+  var t = 0.0;
+  var barAcc = <String, int>{};
+  var tupletLeft = 0;
+  var tupletFactor = 1.0;
+  var pendingBroken = 0;
+
+  if (program >= 0 && program <= 127) {
+    events.add(0); events.add(0xC0); events.add(program); events.add(0);
+  }
+
+  void emit(int midi, double durWhole) {
+    var startMs = t.round();
+    var offMs = (t + durWhole * wholeMs * 0.92).round();
+    if (offMs <= startMs) offMs = startMs + 10;
+    events.add(startMs); events.add(0x90); events.add(midi); events.add(80);
+    events.add(offMs); events.add(0x80); events.add(midi); events.add(0);
+  }
+
+  var i = 0;
+  double readDur() {
+    var num = 0, den = 0, slashes = 0;
+    while (i < text.length && text[i].compareTo('0') >= 0 &&
+           text[i].compareTo('9') <= 0) {
+      num = num * 10 + (text.codeUnitAt(i) - 48); i++;
+    }
+    while (i < text.length && text[i] == '/') { slashes++; i++; }
+    if (slashes > 0) {
+      while (i < text.length && text[i].compareTo('0') >= 0 &&
+             text[i].compareTo('9') <= 0) {
+        den = den * 10 + (text.codeUnitAt(i) - 48); i++;
+      }
+    }
+    var mult = num == 0 ? 1.0 : num.toDouble();
+    if (slashes > 0) {
+      mult /= den != 0 ? den : (1 << slashes);
+    }
+    return mult;
+  }
+
+  double applyMods(double d) {
+    if (tupletLeft > 0) { d *= tupletFactor; tupletLeft--; }
+    if (pendingBroken != 0) {
+      d *= pendingBroken > 0 ? 0.5 : 1.5;
+      pendingBroken = 0;
+    }
+    if (i < text.length && (text[i] == '>' || text[i] == '<')) {
+      var c = text[i]; i++;
+      d *= c == '>' ? 1.5 : 0.5;
+      pendingBroken = c == '>' ? 1 : -1;
+    }
+    return d;
+  }
+
+  int readPitch(int accOverride, bool haveAcc) {
+    var c = text[i];
+    var upper = c.toUpperCase();
+    var octave = c == upper ? 4 : 5;
+    i++;
+    while (i < text.length && (text[i] == "'" || text[i] == ',')) {
+      if (text[i] == "'") octave++; else octave--;
+      i++;
+    }
+    var key = upper + octave.toString();
+    var acc;
+    if (haveAcc) { acc = accOverride; barAcc[key] = accOverride; }
+    else if (barAcc.containsKey(key)) { acc = barAcc[key]; }
+    else { acc = sig.containsKey(upper) ? sig[upper] : 0; }
+    return 12 * (octave + 1) + _stAbcLetterSemi[upper] + acc;
+  }
+
+  while (i < text.length) {
+    var c = text[i];
+    if (c == ' ' || c == '\t') { i++; continue; }
+    if (c == '|' || c == ':') {
+      barAcc.clear(); i++; continue;
+    }
+    if (c == '(') {
+      i++;
+      if (i < text.length && text[i] == '3') {
+        tupletLeft = 3; tupletFactor = 2.0 / 3.0; i++;
+      }
+      continue;
+    }
+    if (c == 'z' || c == 'x' || c == 'Z') {
+      i++;
+      var d = applyMods(unit * readDur());
+      t += d * wholeMs;
+      continue;
+    }
+    if (c == '[') {
+      i++;
+      var durs = <double>[];
+      while (i < text.length && text[i] != ']') {
+        var acc = 0; var haveAcc = false;
+        while (i < text.length && (text[i] == '^' || text[i] == '_' || text[i] == '=')) {
+          haveAcc = true;
+          if (text[i] == '^') acc++;
+          if (text[i] == '_') acc--;
+          i++;
+        }
+        if (i < text.length && _stAbcLetterSemi.containsKey(text[i].toUpperCase())) {
+          var midi = readPitch(acc, haveAcc);
+          var d = unit * readDur();
+          durs.add(d);
+          emit(midi, d);
+        } else { i++; }
+      }
+      if (i < text.length) i++;
+      var chordDur = 0.0;
+      for (var d in durs) if (d > chordDur) chordDur = d;
+      chordDur = applyMods(chordDur == 0.0 ? unit : chordDur);
+      t += chordDur * wholeMs;
+      continue;
+    }
+    var acc = 0; var haveAcc = false;
+    while (i < text.length && (text[i] == '^' || text[i] == '_' || text[i] == '=')) {
+      haveAcc = true;
+      if (text[i] == '^') acc++;
+      if (text[i] == '_') acc--;
+      i++;
+    }
+    if (i < text.length && _stAbcLetterSemi.containsKey(text[i].toUpperCase())) {
+      var midi = readPitch(acc, haveAcc);
+      var d = applyMods(unit * readDur());
+      emit(midi, d);
+      t += d * wholeMs;
+      continue;
+    }
+    i++;
+  }
+
+  var idx = new List<int>.generate(events.length ~/ 4, (k) => k);
+  idx.sort((a, b) => events[a * 4] - events[b * 4]);
+  var sorted = <int>[];
+  for (var k in idx) {
+    sorted.add(events[k * 4]); sorted.add(events[k * 4 + 1]);
+    sorted.add(events[k * 4 + 2]); sorted.add(events[k * 4 + 3]);
+  }
+  var end = 0;
+  for (var k = 0; k < sorted.length; k += 4) {
+    if (sorted[k] > end) end = sorted[k];
+  }
+  return new _StAbcTune(sorted, bpm, end + 200);
+}
+
 void _setSplitMinSize(int splitView, double minSize) native "Cocoa_setSplitMinSize";
 
 /// Stop the user dragging any pane of [splitView] below [minSize] points.
@@ -274,6 +2573,15 @@ void setSplitMinSize(Cocoa splitView, double minSize) {
 }
 
 void _applySpans(int textStorage, List spans) native "Cocoa_applySpans";
+void _quitOnClose(int window) native "Cocoa_quitOnClose";
+
+/// Closing [window] terminates the app — for a window that IS the app (the
+/// workspace, a standalone game). Without it the red close button leaves the
+/// process alive and headless, holding the vm-service port. Windows a program
+/// merely OPENS (the ST world's own NSWindows) must not use this.
+void quitOnClose(Cocoa window) {
+  _quitOnClose(window.handle);
+}
 
 /// Colour [textView] with syntax-highlight runs: a flat `[start, len, kind, …]`
 /// list (kind: 1 keyword, 2 string, 3 comment, 4 number, 5 type, else default).
@@ -336,6 +2644,12 @@ class Cocoa {
   /// Look up a class by name — the receiver for class methods (not finalized).
   static Cocoa cls(String name) => new Cocoa._adopt(_getClass(name));
 
+  /// Wrap a raw ObjC handle WITHOUT taking ownership (no retain, no
+  /// finalizer). Sprint 15: how a view built by one isolate (the language
+  /// isolate's ST browser) is parented by another (the UI isolate's tab) —
+  /// the view hierarchy retains it; the builder keeps ownership.
+  static Cocoa adoptHandle(int h) => new Cocoa._adopt(h);
+
   /// The raw ObjC id (0 if nil / released).
   int get handle => _handle;
   bool get isNil => _handle == 0;
@@ -344,12 +2658,28 @@ class Cocoa {
   dynamic send(String selector, [List args = const []]) =>
       _send(this, selector, _unwrap(args));
 
+  /// Same send, but the objc_msgSend runs ON THE MAIN THREAD (synchronously,
+  /// via dispatch_sync) — AppKit's window/view work is main-thread-only.
+  /// Sprint 13: the substance behind the ST world's `onMain` proxy.
+  dynamic sendMain(String selector, [List args = const []]) =>
+      _sendMain(this, selector, _unwrap(args));
+
   dynamic noSuchMethod(Invocation inv) {
     var name = MirrorSystem.getName(inv.memberName);
     var pos = inv.positionalArguments;
     var named = inv.namedArguments;
     String selector;
     var args = <dynamic>[];
+
+    // Sprint 13: an ST send arrives with its keyword selector MANGLED
+    // (':' -> '_' — `w setTitle: t` => setTitle_, `p colorWithRed: r green: g`
+    // => colorWithRed_green_) and every argument positional. A '_' in the
+    // member name never comes from dartui's own camelCase call sites, so it
+    // marks the ST road: un-mangle and send. (Rare underscore-bearing ObjC
+    // selectors remain reachable via send('the_sel:', [...]).)
+    if (name.contains('_') && named.isEmpty) {
+      return _send(this, name.replaceAll('_', ':'), _unwrap(pos));
+    }
 
     if (inv.isGetter || (pos.isEmpty && named.isEmpty)) {
       // A getter or a 0-argument method: bare selector, no colon.
@@ -385,3 +2715,5 @@ class Cocoa {
 
   String toString() => 'Cocoa(0x${handle.toRadixString(16)})';
 }
+
+_stNPASlow(s, t) => s.nextPutAll_(t);

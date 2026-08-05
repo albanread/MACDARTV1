@@ -1,7 +1,10 @@
 # MACDART build
 
 Darwin-arm64 JIT build of the Dart 1.24.3 VM. Owns its build (CMake + Ninja);
-no gyp/GN/gclient. The reference tree `../sdk` is read-only.
+no gyp/GN/gclient. The reference tree `../sdk` is read-only, and comes from our
+**owned** mirror `albanread/dart-v1-sdk` (a byte-verbatim snapshot of
+`dart-lang/sdk` @ 1.24.3) — Dart V1 is EOL, so we do not depend on upstream
+staying online. `port/get-sdk.sh` clones it; the build is offline thereafter.
 
 ## Layout
 
@@ -22,7 +25,8 @@ macdart/
 ## Build
 
 ```bash
-./port/extract.sh                       # only needed once, or to re-sync from ../sdk
+./port/get-sdk.sh                       # clone the owned Dart 1.24.3 mirror -> ../sdk (once)
+./port/extract.sh                       # copy the subset + apply the patch (auto-bootstraps ../sdk)
 cmake -G Ninja -B build -S .
 ninja -C build dart_engine
 ```

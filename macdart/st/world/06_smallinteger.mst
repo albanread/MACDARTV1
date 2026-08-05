@@ -1,0 +1,163 @@
+"06_smallinteger.mst — Integer (shared) + SmallInteger
+ (sprint_s06_detail.md #06). Every arithmetic/comparison selector binds its
+ primitive with a Large/Double-coercing fallback."
+
+"I am the abstract superclass of the integers; SmallInteger and
+ LargeInteger are my concrete representations, and arithmetic moves
+ between them automatically. I supply the shared whole-number protocol:
+ even, odd, gcd:, lcm:, factorial, isPrime, timesRepeat:, radix
+ printing with printString:, and conversions (asFloat, asCharacter).
+ The division selectors differ: // and \\ are floored quotient and
+ remainder, while / answers an exact Fraction when the division is not
+ whole."
+
+Number subclass: Integer [
+    isInteger ^ <Boolean> [
+        ^true
+    ]
+    asInteger ^ <Integer> [
+        ^self
+    ]
+    hash ^ <Integer> [
+        ^self
+    ]
+    even ^ <Boolean> [
+        ^self \\ 2 = 0
+    ]
+    odd ^ <Boolean> [
+        ^self even not
+    ]
+    timesRepeat: aBlock <[]> ^ <Object> [
+        | i |
+        i := 0.
+        [ i < self ] whileTrue: [ aBlock value. i := i + 1 ]
+    ]
+    gcd: anInteger <Integer> ^ <Integer> [
+        | a b t |
+        a := self abs.
+        b := anInteger abs.
+        [ b = 0 ] whileFalse: [ t := b. b := a \\ b. a := t ].
+        ^a
+    ]
+]
+
+"I am the immediate fixed-size integer: a tagged machine word holding
+ values from minVal to maxVal (a little under 62 signed bits). Literals
+ like 42 are my instances. Arithmetic, comparison and the bit
+ operations (bitAnd:, bitOr:, bitXor:, bitShift:) are single VM
+ primitives, which makes me the fastest number in the system. On
+ overflow, or when the other operand is a LargeInteger, Double or
+ Fraction, my fallback code coerces and answers the right class — you
+ never request the promotion yourself."
+
+Integer subclass: SmallInteger [
+    SmallInteger class >> maxVal ^ <Integer> [
+        ^2305843009213693951
+    ]
+    SmallInteger class >> minVal ^ <Integer> [
+        ^-2305843009213693952
+    ]
+    asDouble ^ <Double> [
+        <primitive: 108>
+    ]
+    asCharacter ^ <Character> [
+        ^Character value: self
+    ]
+    asLargeInteger ^ <LargeInteger> [
+        ^LargeInteger fromSmallInteger: self
+    ]
+    identityHash ^ <Integer> [
+        ^self
+    ]
+    hash ^ <Integer> [
+        ^self
+    ]
+    "The Fraction arms below: the primitive only handles SmallInteger args, so
+     every other type lands in the fallback — which previously assumed Double
+     or Integer and sent `asLargeInteger` to whatever arrived, so `2 + (1/2)`
+     was a doesNotUnderstand. They DELEGATE to the Fraction (whose ops already
+     coerce an Integer arg) rather than wrapping self in a `self/1` Fraction:
+     `numerator:denominator:` collapses a denominator of 1 back to a plain
+     Integer, so a self/1 wrapper would re-dispatch to this same method with
+     the same argument — the infinite recursion 23_fraction.mst's own `/`
+     comment documents."
+    + aNumber <Number> ^ <Number> [
+        <primitive: 1>
+        aNumber isDouble ifTrue: [ ^self asDouble + aNumber ].
+        aNumber isFraction ifTrue: [ ^aNumber + self ].          "+ commutes"
+        ^self asLargeInteger + aNumber asLargeInteger
+    ]
+    - aNumber <Number> ^ <Number> [
+        <primitive: 2>
+        aNumber isDouble ifTrue: [ ^self asDouble - aNumber ].
+        aNumber isFraction ifTrue: [ ^aNumber negated + self ].  "a-b = (-b)+a"
+        ^self asLargeInteger - aNumber asLargeInteger
+    ]
+    * aNumber <Number> ^ <Number> [
+        <primitive: 3>
+        aNumber isDouble ifTrue: [ ^self asDouble * aNumber ].
+        aNumber isFraction ifTrue: [ ^aNumber * self ].          "* commutes"
+        ^self asLargeInteger * aNumber asLargeInteger
+    ]
+    // aNumber <Number> ^ <Integer> [
+        <primitive: 4>
+        aNumber isDouble ifTrue: [ ^(self asDouble / aNumber) floor ].
+        ^self error: 'large division unimplemented'
+    ]
+    \\ aNumber <Number> ^ <Number> [
+        <primitive: 5>
+        aNumber isDouble ifTrue: [ ^self error: 'not implemented' ].
+        ^self error: 'large division unimplemented'
+    ]
+    bitAnd: aNumber <Integer> ^ <Integer> [
+        <primitive: 6>
+    ]
+    bitOr: aNumber <Integer> ^ <Integer> [
+        <primitive: 7>
+    ]
+    bitXor: aNumber <Integer> ^ <Integer> [
+        <primitive: 8>
+    ]
+    bitShift: aNumber <Integer> ^ <Integer> [
+        <primitive: 9>
+    ]
+    "`<` cross-multiplies against the Fraction directly (denominator is always
+     positive — Fraction's own reduce invariant — so the inequality direction
+     is preserved). NOT `^aNumber > self`: Fraction>>> is itself `^aNumber <
+     self`, which would bounce straight back here forever. `<=` needs no arm of
+     its own — it delegates to this `<` and to `=` (which correctly answers
+     false: a reduced Fraction is never a whole number). `>`/`>=` already work
+     via `^aNumber < self` into Fraction>><."
+    < aNumber <Number> ^ <Boolean> [
+        <primitive: 10>
+        aNumber isDouble ifTrue: [ ^self asDouble < aNumber ].
+        aNumber isFraction ifTrue: [ ^(self * aNumber denominator) < aNumber numerator ].
+        ^(self asLargeInteger < aNumber asLargeInteger)
+    ]
+    <= aNumber <Number> ^ <Boolean> [
+        <primitive: 11>
+        aNumber isDouble ifTrue: [ ^self asDouble <= aNumber ].
+        ^(self < aNumber) or: [ self = aNumber ]
+    ]
+    > aNumber <Number> ^ <Boolean> [
+        <primitive: 12>
+        aNumber isDouble ifTrue: [ ^self asDouble > aNumber ].
+        ^aNumber < self
+    ]
+    >= aNumber <Number> ^ <Boolean> [
+        <primitive: 13>
+        aNumber isDouble ifTrue: [ ^self asDouble >= aNumber ].
+        ^(self > aNumber) or: [ self = aNumber ]
+    ]
+    = aNumber <Object> ^ <Boolean> [
+        <primitive: 14>
+        "primitive 14 only fails when aNumber is not itself a SmallInteger."
+        aNumber isDouble ifTrue: [ ^self asDouble = aNumber ].
+        (aNumber isKindOf: LargeInteger) ifTrue: [ ^self asLargeInteger = aNumber ].
+        ^false
+    ]
+    ~= aNumber <Object> ^ <Boolean> [
+        <primitive: 15>
+        ^(self = aNumber) not
+    ]
+]

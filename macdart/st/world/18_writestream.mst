@@ -1,0 +1,100 @@
+"18_writestream.mst — WriteStream (sprint_s06_detail.md #18). NEW class.
+ `on:` works over both String and Array collections — every write goes
+ through the receiver's own at:put:, so bytes vs. oops dispatch naturally.
+ `<<` on non-String/Character objects needs printString (19) to be useful;
+ it compiles fine now (just a runtime send) but only works after 19 loads."
+
+"I am a sequential output stream that appends elements to a growable
+ collection, usually a String. Create me with WriteStream on: String new,
+ then send nextPut:, nextPutAll:, or << to append; contents answers a copy
+ of everything written so far. << accepts a String or Character directly
+ and appends any other object via its printString; print: does the same
+ explicitly. cr, nl, tab, and space append the corresponding characters.
+ My backing collection grows automatically by doubling, so building large
+ strings stays cheap. String streamContents: is a convenient way to build
+ a string through me."
+Object subclass: WriteStream [
+    | collection <SequenceableCollection> position <Integer> |
+
+    WriteStream class >> on: aCollection <SequenceableCollection> ^ <WriteStream> [
+        | s |
+        s := self basicNew.
+        s setOn: aCollection.
+        ^s
+    ]
+    "`with:` is `on:`'s appending twin: the stream starts at the END of what
+     it is given, so writes extend the existing contents instead of
+     overwriting them from zero. Standard protocol, and it was missing —
+     `WriteStream with: 'abc'` answered nil in silence until class-side
+     doesNotUnderstand started speaking up."
+    WriteStream class >> with: aCollection <SequenceableCollection> ^ <WriteStream> [
+        | s |
+        s := self basicNew.
+        s setOn: aCollection.
+        s setToEnd.
+        ^s
+    ]
+    setOn: aCollection <SequenceableCollection> [
+        collection := aCollection.
+        position := 0.
+    ]
+    setToEnd [
+        position := collection size.
+    ]
+    grow [
+        self growTo: (collection size max: 4) * 2.
+    ]
+    "Grow the backing collection to at least `minSize`, moving the live
+     prefix with the bulk `replaceFrom:to:with:` primitive (a memcpy for
+     byte collections) rather than element-by-element — the char-by-char
+     copy here was a big part of why building large strings was slow."
+    growTo: minSize <Integer> [
+        | newSize newColl |
+        newSize := collection size max: 4.
+        [ newSize < minSize ] whileTrue: [ newSize := newSize * 2 ].
+        newColl := collection class new: newSize.
+        position > 0 ifTrue: [ newColl replaceFrom: 1 to: position with: collection ].
+        collection := newColl.
+    ]
+    nextPut: e <Object> ^ <Object> [
+        position = collection size ifTrue: [ self grow ].
+        position := position + 1.
+        collection at: position put: e.
+        ^e
+    ]
+    "Bulk append via one `replaceFrom:to:with:` (a memcpy for byte
+     collections) instead of a per-element `nextPut:` loop."
+    nextPutAll: aColl <SequenceableCollection> ^ <SequenceableCollection> [
+        | n |
+        n := aColl size.
+        n = 0 ifTrue: [ ^aColl ].
+        (position + n) > collection size ifTrue: [ self growTo: position + n ].
+        collection replaceFrom: position + 1 to: position + n with: aColl.
+        position := position + n.
+        ^aColl
+    ]
+    contents ^ <SequenceableCollection> [
+        | r |
+        r := collection class new: position.
+        position > 0 ifTrue: [ r replaceFrom: 1 to: position with: collection ].
+        ^r
+    ]
+    << anObject <Object> ^ <Self> [
+        anObject isString ifTrue: [ self nextPutAll: anObject. ^self ].
+        anObject isCharacter ifTrue: [ self nextPut: anObject. ^self ].
+        self nextPutAll: anObject printString.
+        ^self
+    ]
+    cr [
+        self nextPut: Character cr
+    ]
+    nl [
+        self nextPut: Character nl
+    ]
+    tab [
+        self nextPut: Character tab
+    ]
+    space [
+        self nextPut: Character space
+    ]
+]

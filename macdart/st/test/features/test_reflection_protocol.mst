@@ -1,0 +1,100 @@
+"Feature test: the full reflection / metaprogramming protocol — perform:,
+ instVarAt:[put:], class introspection (name/superclass/instVarNames), membership
+ (isKindOf:/isMemberOf:/inheritsFrom:/respondsTo:), identity, and the ClassMirror
+ — one assertion per method with human-verified values (the test IS the spec).
+ Born from a live sweep of every reflection method; it pins the bugs that sweep
+ found and fixed:
+   * perform: routed through the bare stSend (native methods only), so
+     `42 perform: #printString` / `#between:and:` (extension methods on a native
+     receiver) raised where the same message sent directly works — now the FULL
+     protocol (stSendExt);
+   * instVarAt:put: did not exist (reflective mutation had no path);
+   * instVarNames read MACVM's Rust KLASS layout (garbage on a Dart Type) — now
+     the class's real declared fields.
+ Uses a local test class so the shape is known and stable."
+Object subclass: ReflTarget [
+    | alpha beta gamma |
+    a: x b: y c: z [ alpha := x. beta := y. gamma := z ]
+    alpha [ ^alpha ]
+    sum [ ^alpha + beta + gamma ]
+    add: n [ ^alpha + n ]
+]
+STestCase subclass: TestReflectionProtocol [
+    tests [
+        "── class / membership ──"
+        self check: 42 class name is: 'SmallInteger' label: 'class name (native)'.
+        self check: (ReflTarget new) class name is: 'ReflTarget' label: 'class name (user)'.
+        self assert: (42 isKindOf: Integer) label: 'isKindOf: direct'.
+        self assert: (42 isKindOf: Number) label: 'isKindOf: inherited'.
+        self deny: (42 isKindOf: String) label: 'isKindOf: false'.
+        self assert: ((ReflTarget new) isMemberOf: ReflTarget) label: 'isMemberOf: true'.
+        self deny: (42 isMemberOf: Number) label: 'isMemberOf: false (not exact class)'.
+        self assert: (SmallInteger inheritsFrom: Number) label: 'inheritsFrom: true'.
+        self deny: (SmallInteger inheritsFrom: String) label: 'inheritsFrom: false'.
+
+        "── respondsTo: (native ext AND user) ──"
+        self assert: (42 respondsTo: #printString) label: 'respondsTo: ext method'.
+        self assert: (42 respondsTo: #+) label: 'respondsTo: native op'.
+        self deny: (42 respondsTo: #fooBarBaz) label: 'respondsTo: unknown false'.
+        self assert: ((ReflTarget new) respondsTo: #sum) label: 'respondsTo: user method'.
+
+        "── perform: (the stSend->stSendExt fix) ──"
+        self check: (42 perform: #printString) is: '42' label: 'perform: ext method (was a raw miss)'.
+        self check: (5 perform: #+ with: 3) is: 8 label: 'perform:with: native op'.
+        self assert: (5 perform: #between:and: with: 1 with: 10) label: 'perform:with:with: ext method'.
+        self assert: (5 perform: #between:and: withArguments: #(1 10)) label: 'perform:withArguments:'.
+        self check: (self performSumOn123) is: 6 label: 'perform: user method'.
+        self check: (self performAddOn: 5) is: 15 label: 'perform:with: user method'.
+        self check: (self performDnuCaught) is: 'caught' label: 'perform: unknown selector raises (catchable)'.
+
+        "── instance variables (get, set, names) ──"
+        self check: (self ivarAt1) is: 7 label: 'instVarAt:'.
+        self check: (self ivarAt2) is: 8 label: 'instVarAt: 2'.
+        self check: (self ivarAtPut) is: 99 label: 'instVarAt:put: (was a DNU)'.
+        self check: ReflTarget instVarNames is: #('alpha' 'beta' 'gamma') label: 'instVarNames (real fields)'.
+
+        "── class introspection ──"
+        self check: ReflTarget name is: 'ReflTarget' label: 'name'.
+        self check: SmallInteger superclass name is: 'Integer' label: 'superclass (native)'.
+        self check: ReflTarget superclass name is: 'Object' label: 'superclass (user)'.
+        self check: Object superclass printString is: 'nil' label: 'Object superclass is nil (root)'.
+        self assert: (42 class == 43 class) label: 'same class identity'.
+        self deny: (42 class == 'x' class) label: 'different class identity'.
+
+        "── identity / hash / copy (reflective) ──"
+        self assert: (self sameIdentity) label: 'identity == self'.
+        self deny: ((ReflTarget new) == (ReflTarget new)) label: 'distinct instances differ'.
+        self assert: ((ReflTarget new) ~~ (ReflTarget new)) label: '~~ distinct'.
+        self check: 42 yourself is: 42 label: 'yourself'.
+        self assert: (self identityHashStable) label: 'identityHash stable'.
+        self assert: (self copyIsIndependent) label: 'copy is a deep-enough independent object'.
+
+        "── ClassMirror (the world reflection API) ──"
+        self assert: (self allClassesHas: 'OrderedCollection') label: 'ClassMirror allClasses has OrderedCollection'.
+        self assert: (self allClassesHas: 'Fraction') label: 'ClassMirror allClasses has Fraction'.
+        self assert: (ClassMirror allClasses size > 50) label: 'allClasses is a populated world'.
+        self check: (ClassMirror instanceVariablesOf: ReflTarget) is: #('alpha' 'beta' 'gamma') label: 'instanceVariablesOf:'.
+        self assert: ((ClassMirror selectorsOf: ReflTarget) includes: 'sum') label: 'selectorsOf:'.
+
+        "── classNamed: (ST classes; nil for a bridged/unknown name) ──"
+        self check: (Worker classNamed: #OrderedCollection) name is: 'OrderedCollection' label: 'classNamed: (ST class)'.
+        self check: (Worker classNamed: #Fraction) name is: 'Fraction' label: 'classNamed: (ST class)'.
+        self assert: ((Worker classNamed: #NoSuchClassXYZ) isNil) label: 'classNamed: unknown answers nil'.
+    ]
+
+    "── helpers (keep reflective mutation off the shared assertion line) ──"
+    target123 [ | t | t := ReflTarget new. t a: 1 b: 2 c: 3. ^t ]
+    performSumOn123 [ ^self target123 perform: #sum ]
+    performAddOn: n [ | t | t := ReflTarget new. t a: 10 b: 0 c: 0. ^t perform: #add: with: n ]
+    performDnuCaught [ ^[ 42 perform: #noSuchSelXYZ. 'no-raise' ] on: Error do: [:e | 'caught'] ]
+    ivarAt1 [ | t | t := ReflTarget new. t a: 7 b: 8 c: 9. ^t instVarAt: 1 ]
+    ivarAt2 [ | t | t := ReflTarget new. t a: 7 b: 8 c: 9. ^t instVarAt: 2 ]
+    ivarAtPut [ | t | t := ReflTarget new. t a: 1 b: 2 c: 3. t instVarAt: 1 put: 99. ^t alpha ]
+    sameIdentity [ | t | t := ReflTarget new. ^t == t ]
+    identityHashStable [ | t | t := ReflTarget new. ^t identityHash = t identityHash ]
+    copyIsIndependent [
+        | p q | p := self target123. q := p copy. q instVarAt: 1 put: 99.
+        ^(p alpha = 1) and: [ q alpha = 99 ]
+    ]
+    allClassesHas: aName [ ^ClassMirror allClasses anySatisfy: [:c | c name = aName] ]
+]

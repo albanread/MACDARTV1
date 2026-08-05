@@ -101,6 +101,13 @@ Sound preset_bang(double dur, Lcg& rng);
 Sound preset_blip(double pitch, double dur);
 Sound preset_tone(double freq, double dur, Waveform wave);
 
+// The UFO warble: two sines a few Hz apart, beating against each other. NOT a
+// tremolo — the pulsing is the interference between them, which is how the
+// arcade machines did it and how the assembler original's own Wah preset does
+// it (MRASM library/audio/sound_presets.was: 0.45 per oscillator, sustain 0.92
+// so the warble holds for the whole note). detune IS the wah rate in Hz.
+Sound preset_wah(double freq, double detune, double dur);
+
 }  // namespace macdart_gamepane
 
 #endif  // MACDART_GAMEPANE_GP_SYNTH_H_

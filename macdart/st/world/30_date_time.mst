@@ -1,0 +1,260 @@
+"30_date_time.mst — Date/Time. Unusually for this porting effort, most of
+ what's MISSING here isn't a MACVM-specific scope cut — it's genuinely
+ unimplemented in Strongtalk's own Date.dlt: `julian`, `leapYear:`,
+ `daysInMonth:forYear:`, `daysInYear:`, `asSeconds`, and
+ `Date class>>julian:` are ALL literally `self unimplemented` in the real
+ source (Strongtalk never finished its own Julian-day calendar
+ arithmetic). Since `addDays:`/`subtractDays:`/`subtractDate:` all call
+ the unimplemented `julian`, they're not ported either — there is no
+ working algorithm in the original to port. What IS ported is exactly
+ Date.dlt's own working subset: construction from an explicit day/month/
+ year, comparison, accessors, weekday/month name lookup, printing.
+
+ `Date class>>today` and `Time class>>now`/`dateAndTimeNow`/`clockValue`
+ are still NOT ported — these need a real wall-clock/calendar primitive
+ (Windows `SYSTEMTIME` in the original), and MACVM's own internal
+ `millisecondClock` (src/runtime/primitives.rs, prim_millisecond_clock)
+ is `vm.start_instant.elapsed()`, elapsed time since the VM started — the
+ exact same 'not a calendar clock' semantics Strongtalk's own
+ `clockValue` doc comment already admits ('elapsed time since Smalltalk
+ started'), not a source of wall-clock time either. Calling `today`/`now`
+ on these classes is a plain doesNotUnderstand, same as every other
+ deliberately-unported method in this whole porting effort (Point's
+ Rectangle methods, Bag's `=`, ...) — no stub is added for it.
+
+ `Time class>>millisecondClockValue` IS now implemented (S22) — not a port
+ of Strongtalk's own version (which just read Windows' SYSTEMTIME), but a
+ real wall-clock primitive built via FFI (docs/FFI.md): milliseconds since
+ the Unix epoch, from clock_gettime(CLOCK_REALTIME). See the real Time
+ class's own doc comment, right at the definition, for the mmap-scratch-
+ buffer/struct-layout mechanics.
+
+ Time.dlt, by contrast, IS fully implemented in the original: it's just
+ 'seconds since midnight' integer arithmetic (fromSeconds:/hour/minute/
+ second/</=/hash/addTime:/subtractTime:/printOn:), and all of it is
+ ported faithfully and completely.
+
+ One real fix made while porting, not a straight copy: Date.dlt's own
+ `hash` calls `bitXor:` with `self month` (a Symbol) as the argument —
+ `((hash bitShift: 4) bitXor: self month) bitXor: hash` — which would
+ crash a strict bitXor: primitive expecting an Integer (MACVM's
+ SmallInteger>>bitXor: is exactly that). Substituted `monthIndex` (an
+ Integer, clearly what was intended for a distribution-mixing hash) —
+ the same class of bug-not-feature this whole effort has consistently
+ fixed rather than reproduced (e.g. Fraction>>printOn:'s nonexistent
+ `stream print:`, Integer>>/'s infinite recursion)."
+
+"I represent a calendar date: a day of the month, a month, and a year.
+ Create me with Date newDay: 17 month: #July year: 2026, or with
+ newDay:monthIndex:year: using a numeric month. I answer dayOfMonth, month
+ (a Symbol), monthIndex, and year, compare fully with < and friends, and
+ print in the style July 17, 2026. My class side translates between day
+ and month names and their indices (daysOfWeek, monthsOfYear,
+ nameOfMonth:, indexOfMonth:, and so on). There is no Date today — nothing
+ constructs a Date from the clock — and no day arithmetic (addDays: and
+ its kin are not implemented)."
+Object subclass: Date [
+    | dayOfMonth <Integer> monthIndex <Integer> year <Integer> |
+
+    Date class >> daysOfWeek ^ <Array> [
+        ^#(#Monday #Tuesday #Wednesday #Thursday #Friday #Saturday #Sunday)
+    ]
+    Date class >> monthsOfYear ^ <Array> [
+        ^#(#January #February #March #April #May #June #July #August
+           #September #October #November #December)
+    ]
+    Date class >> dayOfWeek: dayName <Symbol> ^ <Integer> [
+        ^self daysOfWeek indexOf: dayName ifAbsent: [ self error: 'invalid day name' ]
+    ]
+    Date class >> indexOfMonth: aName <Symbol> ^ <Integer> [
+        ^self monthsOfYear indexOf: aName ifAbsent: [ self error: 'invalid month name' ]
+    ]
+    Date class >> nameOfDay: dayIndex <Integer> ^ <Symbol> [
+        ^self daysOfWeek at: dayIndex
+    ]
+    Date class >> nameOfMonth: index <Integer> ^ <Symbol> [
+        ^self monthsOfYear at: index
+    ]
+    Date class >> newDay: d <Integer> monthIndex: m <Integer> year: y <Integer> ^ <Date> [
+        ^self basicNew setDay: d monthIndex: m year: y
+    ]
+    Date class >> newDay: d <Integer> month: m <Symbol> year: y <Integer> ^ <Date> [
+        ^self newDay: d monthIndex: (self indexOfMonth: m) year: y
+    ]
+    setDay: d <Integer> monthIndex: m <Integer> year: y <Integer> [
+        dayOfMonth := d.
+        monthIndex := m.
+        year := y.
+    ]
+    dayOfMonth ^ <Integer> [
+        ^dayOfMonth
+    ]
+    monthIndex ^ <Integer> [
+        ^monthIndex
+    ]
+    year ^ <Integer> [
+        ^year
+    ]
+    month ^ <Symbol> [
+        ^Date monthsOfYear at: monthIndex
+    ]
+    hash ^ <Integer> [
+        | h |
+        h := year.
+        h := ((h bitShift: 4) bitXor: monthIndex) bitXor: h.
+        h := ((h bitShift: 4) bitXor: dayOfMonth) bitXor: h.
+        ^h
+    ]
+    < other <Date> ^ <Boolean> [
+        ^year < other year
+            or: [ year = other year and: [
+                monthIndex < other monthIndex
+                    or: [ monthIndex = other monthIndex and: [ dayOfMonth < other dayOfMonth ] ] ] ]
+    ]
+    <= other <Date> ^ <Boolean> [
+        ^(other < self) not
+    ]
+    > other <Date> ^ <Boolean> [
+        ^other < self
+    ]
+    >= other <Date> ^ <Boolean> [
+        ^(self < other) not
+    ]
+    = other <Object> ^ <Boolean> [
+        (other isKindOf: Date) ifFalse: [ ^false ].
+        ^year = other year and: [ monthIndex = other monthIndex and: [ dayOfMonth = other dayOfMonth ] ]
+    ]
+    printOn: s [
+        s nextPutAll: self month.
+        s nextPut: $ .
+        dayOfMonth printOn: s.
+        s nextPutAll: ', '.
+        year printOn: s.
+    ]
+]
+
+"I represent a time of day as a number of seconds since midnight. Create
+ me with Time fromSeconds:; I answer hour, minute, second, minutes, and
+ asSeconds, compare with < and friends, and combine with addTime: and
+ subtractTime:. My class side also carries the system clocks:
+ millisecondClockValue answers real wall-clock milliseconds since the Unix
+ epoch (via a native clock primitive), while millisecondsToRun: times a
+ block using the VM's monotonic millisecond clock — the right choice for
+ durations. There is no Time now — nothing constructs a Time from the
+ current clock."
+Object subclass: Time [
+    | seconds <Integer> |
+    <classVars: ClockBuffer>
+
+    Time class >> fromSeconds: s <Integer> ^ <Time> [
+        ^self basicNew initSeconds: s
+    ]
+
+    "millisecondClockValue — S22, via FFI (docs/FFI.md), filling exactly the
+     gap this file's own header comment named: a real wall-clock primitive
+     MACVM's internal millisecondClock (elapsed-since-VM-start) never was.
+     clock_gettime(CLOCK_REALTIME, &ts) needs a pointer argument, but FFI
+     argument marshaling only accepts plain SmallIntegers (src/runtime/
+     ffi.rs's marshal_g) — there is no way to pass an Alien object itself as
+     an arg. So ClockBuffer holds the ADDRESS (a plain integer) of a 16-byte
+     scratch region obtained via a real mmap call (mmap-owned memory is the
+     right choice for a buffer handed OUT to native code as a pointer,
+     precisely because it's outside the GC heap and can never move mid-call
+     — unlike a direct Alien's inline bytes, which live inside a Smalltalk
+     object); lazily allocated once and reused forever after.
+     struct timespec { long tv_sec; long tv_nsec; } is 16 bytes, both
+     fields plain 8-byte longs at offsets 0/8 — confirmed by compiling and
+     running a real C probe against this machine's headers (not assumed),
+     which is also why clock_gettime was chosen over gettimeofday's
+     struct timeval: timeval's tv_usec is a 4-byte int, needing an accessor
+     width Alien doesn't expose; timespec maps directly onto the existing
+     signedLongAt: accessor with no width mismatch at all."
+    Time class >> ffiMmapAddr: a1 <Integer> length: a2 <Integer> prot: a3 <Integer> flags: a4 <Integer> fd: a5 <Integer> offset: a6 <Integer> [
+        <primitive: FFI function: #mmap ret: #g args: #(g g g g g g)>
+    ]
+    Time class >> ffiClockGettime: clockId <Integer> timespec: addr <Integer> [
+        <primitive: FFI function: #clock_gettime ret: #g args: #(g g)>
+    ]
+    Time class >> clockBufferAddress ^ <Integer> [
+        ClockBuffer isNil ifTrue: [
+            "PROT_READ|PROT_WRITE=3, MAP_PRIVATE|MAP_ANON=4098 (0x1002) —
+             real macOS/arm64 flag values, same as world/tests/
+             30_ffi_alien_tests.mst's own proven mmap capstone call."
+            ClockBuffer := self ffiMmapAddr: 0 length: 16 prot: 3 flags: 4098 fd: -1 offset: 0.
+        ].
+        ^ClockBuffer
+    ]
+    "Milliseconds since the Unix epoch (CLOCK_REALTIME=0) — real wall-clock
+     time, not elapsed-since-VM-start. Verified live: two calls a few
+     milliseconds apart return distinct, correctly-ordered values."
+    Time class >> millisecondClockValue ^ <Integer> [
+        | addr ts sec nsec |
+        addr := self clockBufferAddress.
+        self ffiClockGettime: 0 timespec: addr.
+        ts := Alien forAddress: addr size: 16.
+        sec := ts signedLongAt: 1.
+        nsec := ts signedLongAt: 9.
+        ^(sec * 1000) + (nsec // 1000000)
+    ]
+    "Run aBlock and answer its wall-clock duration in milliseconds. Deliberately
+     `Smalltalk millisecondClock` (elapsed-since-VM-start, monotonic), NOT
+     `millisecondClockValue` above (real epoch time, above) — a DURATION must
+     never observe a wall-clock adjustment (NTP, DST) as elapsed time; the
+     monotonic clock is the one BenchmarkDashboard already times runs with."
+    Time class >> millisecondsToRun: aBlock <[]> ^ <Integer> [
+        | t0 |
+        t0 := Smalltalk millisecondClock.
+        aBlock value.
+        ^Smalltalk millisecondClock - t0
+    ]
+    initSeconds: s <Integer> [
+        seconds := s.
+    ]
+    asSeconds ^ <Integer> [
+        ^seconds
+    ]
+    hour ^ <Integer> [
+        ^seconds // 3600
+    ]
+    minute ^ <Integer> [
+        ^(seconds \\ 3600) // 60
+    ]
+    minutes ^ <Integer> [
+        ^seconds // 60
+    ]
+    second ^ <Integer> [
+        ^seconds \\ 60
+    ]
+    hash ^ <Integer> [
+        ^seconds hash
+    ]
+    < other <Time> ^ <Boolean> [
+        ^seconds < other asSeconds
+    ]
+    <= other <Time> ^ <Boolean> [
+        ^(other < self) not
+    ]
+    > other <Time> ^ <Boolean> [
+        ^other < self
+    ]
+    >= other <Time> ^ <Boolean> [
+        ^(self < other) not
+    ]
+    = other <Object> ^ <Boolean> [
+        (other isKindOf: Time) ifFalse: [ ^false ].
+        ^seconds = other asSeconds
+    ]
+    addTime: amt <Time> ^ <Time> [
+        ^Time fromSeconds: seconds + amt asSeconds
+    ]
+    subtractTime: amt <Time> ^ <Time> [
+        ^Time fromSeconds: seconds - amt asSeconds
+    ]
+    printOn: s [
+        self hour printOn: s.
+        s nextPut: $:.
+        self minute printOn: s.
+        s nextPut: $:.
+        self second printOn: s.
+    ]
+]

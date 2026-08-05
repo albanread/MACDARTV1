@@ -1,0 +1,182 @@
+"galaxigans_smoke.mst — drive GALAXIGANS with no window at all.
+
+ The game is Smalltalk over GamePane, and every pane primitive is a documented
+ no-op in a headless VM — so the whole thing (attract, the fire tap, the dive
+ AI, bullets, bombs, collision, scoring, death and the game-over reset) runs
+ and can be asserted on without a GUI. That is the point of the port: a game
+ you can unit-test.
+
+     dart --with-st macdart/st/test/run_mst.dart macdart/st/test/galaxigans_smoke.mst
+
+ Prints one line per check and a final GALAXIGANS OK / GALAXIGANS FAILED — the
+ battery (run_all.sh) greps for the OK."
+
+| g fails check tap play spread1 spread2 seen livesBefore |
+fails := 0.
+check := [ :label :got :want |
+    got = want
+        ifTrue: [ Transcript showCr: '  ok    ', label ]
+        ifFalse: [
+            fails := fails + 1.
+            Transcript showCr: '  FAIL  ', label,
+                ' — got ', got printString, ', want ', want printString ] ].
+"One tap of fire: pressed for a frame, released the next. Holding does nothing
+ (the original's no-autofire rule), so a test that never releases never shoots."
+tap := [ GamePane stepWithKeys: 16. GamePane stepWithKeys: 0 ].
+"n frames of play, tapping fire every 12 and sweeping left then right."
+play := [ :n |
+    1 to: n do: [ :i | | mask |
+        mask := 0.
+        (i \\ 12) = 0 ifTrue: [ mask := mask + 16 ].
+        (i \\ 300) < 150 ifTrue: [ mask := mask + 1 ] ifFalse: [ mask := mask + 2 ].
+        GamePane stepWithKeys: mask ] ].
+
+g := Galaxigans launch.
+check value: 'opens on the title' value: g gameState value: #attract.
+check value: 'the fleet is full' value: g aliveCount value: 40.
+
+1 to: 30 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'the title ignores an idle frame' value: g gameState value: #attract.
+
+tap value.
+check value: 'fire starts the game' value: g gameState value: #playing.
+
+play value: 900.
+check value: 'the fleet takes losses' value: g aliveCount < 40 value: true.
+check value: 'and they score' value: g score > 0 value: true.
+Transcript showCr: '  after 900 frames: ', g summary.
+
+"Left alone against a FULL fleet, the divers reach the ship: three deaths, game
+ over, and back to the title. The whole lifecycle in one loop, nobody at the
+ keyboard. (A fresh game, because the fleet above is nearly cleared and eleven
+ survivors take far longer to find a stationary ship.) Random is seeded 1, so
+ this is the same run every time — the numbers below are exact, not typical."
+g := Galaxigans launch.
+tap value.
+check value: 'a fresh game starts full' value: g aliveCount value: 40.
+1 to: 2900 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'an idle ship dies out and resets' value: g gameState value: #attract.
+check value: 'the reset refills the fleet' value: g aliveCount value: 40.
+check value: 'and restores the lives' value: g lives value: 3.
+
+"The bonus saucer crosses and warbles the whole way: the wah is re-triggered on
+ a loop (0.9s a note, six seconds to cross) and stops when it leaves."
+g := Galaxigans launch.
+tap value.
+g summonSaucer.
+1 to: 30 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'the saucer arrives' value: (g saucerReport startsWith: 'saucer at') value: true.
+1 to: 400 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'and leaves again' value: g saucerReport value: 'saucer away'.
+
+"The saucer's rare spinning mine: one drop in eight, and it hangs in the field
+ long after a bomb would have gone. Counted rather than sampled — a live count
+ alone would miss one that had already drifted off the bottom."
+g := Galaxigans launch.
+tap value.
+g summonSaucer.
+1 to: 600 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'the saucer drops mines' value: (g mineReport includesSubstring: 'dropped 2') value: true.
+Transcript showCr: '  ', g mineReport.
+
+"The victory dance: the survivors leave their slots and orbit the middle of the
+ field on a breathing pinwheel. In formation every alien sits ON its home row,
+ so the spread from home is 0; mid-dance it is tens of pixels and CHANGES as
+ the radius breathes."
+g := Galaxigans launch.
+tap value.
+1 to: 60 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'in formation, nobody has left home' value: g danceSpread value: 0.
+g danceNow.
+1 to: 30 do: [ :i | GamePane stepWithKeys: 0 ].
+spread1 := g danceSpread.
+1 to: 90 do: [ :i | GamePane stepWithKeys: 0 ].
+spread2 := g danceSpread.
+check value: 'the dance takes them off their slots' value: spread1 > 20 value: true.
+check value: 'and the pinwheel breathes' value: spread1 = spread2 value: false.
+Transcript showCr: '  spread ', spread1 printString, ' then ', spread2 printString.
+check value: 'the dance hands off to the hall of fame' value:
+    ([ 1 to: 320 do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #hiscore.
+check value: 'and the table times out into attract' value:
+    ([ 1 to: Galaxigans hiscoreLength + 10 do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #attract.
+"The attract cycle: left alone, the cabinet keeps turning over — the title hands
+ back to the hall of fame, the table hands back to the title, for as long as
+ nobody plays. Neither state may be a dead end."
+check value: 'the title hands back to the hall of fame' value:
+    ([ 1 to: Galaxigans attractLength do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #hiscore.
+check value: 'and round it goes again' value:
+    ([ 1 to: Galaxigans hiscoreLength do: [ :i | GamePane stepWithKeys: 0 ]. g gameState ] value) value: #attract.
+
+"The hall of fame: a qualifying score slots in sorted, named YOU, and the
+ sixth row drops off; a losing score changes nothing. Headless the persistence
+ call answers ERR (no image host) and the game keeps its in-memory table —
+ the whole flow runs without a window, which is the point."
+g := Galaxigans launch.
+tap value.
+g setScore: 12345.
+g danceNow.
+1 to: 800 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: '12345 takes row four' value:
+    ((g hallReport includesSubstring: '4 YOU 12345') and:
+     [ (g hallReport includesSubstring: 'WOW') not ]) value: true.
+g setScore: 50.
+g danceNow.
+1 to: 800 do: [ :i | GamePane stepWithKeys: 0 ].
+check value: 'a losing score changes nothing' value:
+    (g hallReport includesSubstring: 'new row 0') value: true.
+
+"The capture boss: it comes for the PILOTS, not the ship. Level 3 is the first
+ the table gives one to. Watched all the way through its lifecycle — enter,
+ station, descend, charge, beam — and the abduction that costs a life."
+g := Galaxigans launch.
+tap value.
+g forceNextWave. g forceNextWave.
+check value: 'level 3 fields a boss' value: g bossOn value: true.
+seen := OrderedCollection new.
+livesBefore := g lives.
+1 to: 900 do: [ :i |
+    GamePane stepWithKeys: 0.
+    (seen includes: g bossReport) ifFalse: [ seen add: g bossReport ] ].
+check value: 'the boss enters' value: (seen includes: '#enter') value: true.
+check value: 'stations, then descends' value:
+    ((seen includes: '#station') and: [ seen includes: '#descend' ]) value: true.
+check value: 'charges the beam' value: (seen includes: '#charge') value: true.
+check value: 'fires it and takes a pilot' value:
+    (seen includes: '#beam abducting') value: true.
+check value: 'which costs a pilot' value: g pilotsTaken value: 1.
+Transcript showCr: '  boss states seen: ', seen printString.
+
+"Its own rule: never bully the player out of a LAST pilot. On one life the boss
+ does not appear AT ALL (and if lives fall to one while it is already out, it
+ gives up at the station and leaves). Watched only while the game is actually
+ playing, so a reset underneath cannot be mistaken for the rule holding."
+g := Galaxigans launch.
+tap value.
+g forceNextWave. g forceNextWave.
+g setLives: 1.
+seen := OrderedCollection new.
+1 to: 900 do: [ :i |
+    g gameState == #playing ifTrue: [
+        GamePane stepWithKeys: 0.
+        (seen includes: g bossReport) ifFalse: [ seen add: g bossReport ] ] ].
+check value: 'on a last pilot the boss never even wakes' value:
+    (seen includes: '#enter') value: false.
+check value: 'so it never fires the beam' value:
+    (seen includes: '#beam abducting') value: false.
+check value: 'and takes nothing' value: g pilotsTaken value: 0.
+
+"Every level resolves: a cosmos for the shader and five species for the grid,
+ walked through the whole table (and one past it, to prove it wraps)."
+g := Galaxigans launch.
+tap value.
+1 to: 13 do: [ :lv |
+    | rep |
+    rep := g levelReport.
+    (rep isEmpty or: [ g aliveCount ~= 40 ])
+        ifTrue: [ fails := fails + 1. Transcript showCr: '  FAIL  level ', lv printString ]
+        ifFalse: [ Transcript showCr: '  ok    ', rep ].
+    g forceNextWave ].
+
+Transcript showCr: (fails = 0
+    ifTrue: [ 'GALAXIGANS OK' ]
+    ifFalse: [ 'GALAXIGANS FAILED (', fails printString, ')' ]).

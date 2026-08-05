@@ -174,8 +174,8 @@ main(List args, SendPort ui) {
 
     if (mode == 'over') {
       g.textClear();
-      g.text(166, 96, score.toString(), 255, 120, 120);
-      g.text(166, 118, '------', 255, 255, 255);
+      g.text(166, 96, score.toString(), 255, 120, 120, 2);
+      g.text(166, 118, '------', 255, 255, 255, 2);
       if (g.key(Keys.space)) {
         score = 0; lives = 3; level = 1; speed = 3.2;
         paddleScale = 2.0; shrunk = false;
@@ -204,9 +204,9 @@ main(List args, SendPort ui) {
       ball.update();
       if (g.key(Keys.space) || serveT > 75) launch();    // attract: self-serve
       g.textClear();
-      g.text(8, 2, score.toString(), 255, 255, 255);
-      g.text(396, 2, lives.toString(), 255, 120, 120);
-      g.text(204, 2, level.toString(), 140, 220, 255);
+      g.text(8, 2, score.toString(), 255, 255, 255, 2);
+      g.text(402, 2, lives.toString(), 255, 120, 120, 2);
+      g.text(204, 2, level.toString(), 140, 220, 255, 2);
       return;
     }
 
@@ -293,8 +293,8 @@ main(List args, SendPort ui) {
     }
 
     g.textClear();
-    g.text(8, 2, score.toString(), 255, 255, 255);
-    g.text(396, 2, lives.toString(), 255, 120, 120);
-    g.text(204, 2, level.toString(), 140, 220, 255);
+    g.text(8, 2, score.toString(), 255, 255, 255, 2);
+    g.text(402, 2, lives.toString(), 255, 120, 120, 2);
+    g.text(204, 2, level.toString(), 140, 220, 255, 2);
   });
 }

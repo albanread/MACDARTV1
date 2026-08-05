@@ -1,0 +1,76 @@
+"24_readstream.mst — ReadStream (W1 'full collections protocol'). NEW
+ class. Deliberately much simpler than Strongtalk's real layered
+ BasicInputStream -> BasicReadStream -> SeqCltnReadStream hierarchy
+ (WORLD.md's 'Layer B: reimplement fresh, consult originals for protocol
+ surface' guidance for streams) — a single class over a collection+
+ position cursor, mirroring WriteStream's own pragmatic style
+ (18_writestream.mst) rather than porting the peek-buffer abstraction
+ Strongtalk's version uses internally. `next`/`peek` past the end error
+ (matches OrderedCollection>>removeFirst/removeLast's own established
+ 'invalid on empty' convention, 15_ordered.mst — no exceptions until
+ W5/S18, so this is the house v1 idiom, not a Bluebook-nil-return port)."
+
+"I am a sequential input stream over a sequenceable collection such as a
+ String or an Array. Create me with ReadStream on: aCollection, or ask any
+ collection for readStream. Send next to consume one element, peek to look
+ ahead without consuming (nil at the end), and atEnd to test exhaustion;
+ sending next past the end is an error. Richer protocol: next: (a slice),
+ upTo: (read through a delimiter), nextLine, peekFor:, skip:,
+ skipSeparators, upToEnd, position/position:, reset, and do: over the
+ remaining elements."
+Object subclass: ReadStream [
+    | collection <SequenceableCollection> position <Integer> |
+
+    ReadStream class >> on: aCollection <SequenceableCollection> ^ <ReadStream> [
+        | s |
+        s := self basicNew.
+        s setOn: aCollection.
+        ^s
+    ]
+    setOn: aCollection <SequenceableCollection> [
+        collection := aCollection.
+        position := 0.
+    ]
+    atEnd ^ <Boolean> [
+        ^position >= collection size
+    ]
+    next ^ <Object> [
+        self atEnd ifTrue: [ ^self error: 'end of stream' ].
+        position := position + 1.
+        ^collection at: position
+    ]
+    peek ^ <Object> [
+        self atEnd ifTrue: [ ^nil ].
+        ^collection at: position + 1
+    ]
+    skip: n <Integer> [
+        position := position + n.
+    ]
+    reset [
+        position := 0.
+    ]
+    position ^ <Integer> [
+        ^position
+    ]
+    position: p <Integer> [
+        position := p.
+    ]
+    size ^ <Integer> [
+        ^collection size
+    ]
+    upToEnd ^ <SequenceableCollection> [
+        | r |
+        r := collection copyFrom: position + 1 to: collection size.
+        position := collection size.
+        ^r
+    ]
+    do: aBlock <[Object]> [
+        [ self atEnd ] whileFalse: [ aBlock value: self next ]
+    ]
+]
+
+Object subclass: Collection [
+    readStream ^ <ReadStream> [
+        ^ReadStream on: self
+    ]
+]

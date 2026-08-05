@@ -1,0 +1,157 @@
+"15_ordered.mst — OrderedCollection (sprint_s06_detail.md #15). NEW class
+ (not genesis-pinned): instvars declared here via the parser's create-path,
+ not Universe::genesis(). array/firstIndex/lastIndex: elements live at
+ firstIndex..lastIndex in array; empty iff lastIndex < firstIndex."
+
+"I am the growable sequence — the everyday list. add: and addLast:
+ append, addFirst: prepends, and I grow automatically: my elements live
+ in an internal Array with slack at both ends, so adding at either end
+ is cheap. Remove with removeFirst, removeLast, remove:ifAbsent:,
+ removeAtIndex: or removeAllSuchThat:. Indexing is 1-based through at:
+ and at:put:, which stop with an error when the index is out of range.
+ Convert any collection to me with asOrderedCollection."
+
+SequenceableCollection subclass: OrderedCollection [
+    | array <Array> firstIndex <Integer> lastIndex <Integer> |
+
+    OrderedCollection class >> new ^ <OrderedCollection> [
+        ^self basicNew init
+    ]
+    init ^ <Self> [
+        array := Array new: 8.
+        firstIndex := 1.
+        lastIndex := 0.
+    ]
+    size ^ <Integer> [
+        ^lastIndex - firstIndex + 1
+    ]
+    isEmpty ^ <Boolean> [
+        ^lastIndex < firstIndex
+    ]
+    "Preserves the current elements while doubling capacity, resetting to a
+     firstIndex of 1 (also reclaims any front slack)."
+    makeRoomAtEnd [
+        | newArray n |
+        n := self size.
+        newArray := Array new: (array size max: 1) * 2.
+        1 to: n do: [:i | newArray at: i put: (array at: firstIndex + i - 1) ].
+        array := newArray.
+        firstIndex := 1.
+        lastIndex := n.
+    ]
+    "Mirrors makeRoomAtEnd but leaves slack at the FRONT (elements pushed
+     to the high end of the new array) so addFirst: has room to grow into."
+    makeRoomAtFront [
+        | newArray n cap extra |
+        n := self size.
+        cap := (array size max: 1) * 2.
+        newArray := Array new: cap.
+        extra := cap - n.
+        1 to: n do: [:i | newArray at: extra + i put: (array at: firstIndex + i - 1) ].
+        array := newArray.
+        firstIndex := extra + 1.
+        lastIndex := cap.
+    ]
+    addLast: v <Object> ^ <Object> [
+        lastIndex = array size ifTrue: [ self makeRoomAtEnd ].
+        lastIndex := lastIndex + 1.
+        array at: lastIndex put: v.
+        ^v
+    ]
+    add: v <Object> ^ <Object> [
+        "addLast:'s body inlined by hand: the forwarding send cost more than
+         the append itself (51ns vs 15ns) once add: reached here as a plain
+         per-site InstanceCall."
+        lastIndex = array size ifTrue: [ self makeRoomAtEnd ].
+        lastIndex := lastIndex + 1.
+        array at: lastIndex put: v.
+        ^v
+    ]
+    addFirst: v <Object> ^ <Object> [
+        firstIndex = 1 ifTrue: [ self makeRoomAtFront ].
+        firstIndex := firstIndex - 1.
+        array at: firstIndex put: v.
+        ^v
+    ]
+    removeFirst ^ <Object> [
+        | v |
+        self isEmpty ifTrue: [ ^self error: 'collection is empty' ].
+        v := array at: firstIndex.
+        array at: firstIndex put: nil.
+        firstIndex := firstIndex + 1.
+        ^v
+    ]
+    removeLast ^ <Object> [
+        | v |
+        self isEmpty ifTrue: [ ^self error: 'collection is empty' ].
+        v := array at: lastIndex.
+        array at: lastIndex put: nil.
+        lastIndex := lastIndex - 1.
+        ^v
+    ]
+    "Remove the element at logical index i (1-based), shifting the tail down
+     one slot and niling the freed slot. The mutating core the remove:-family
+     builds on (Strongtalk AddableSequenceableCollection>>removeAt:)."
+    removeAtIndex: i <Integer> ^ <Object> [
+        | v |
+        (i between: 1 and: self size) ifFalse: [ ^self error: 'index out of range' ].
+        v := self at: i.
+        i to: self size - 1 do: [:j |
+            array at: firstIndex + j - 1 put: (array at: firstIndex + j) ].
+        array at: lastIndex put: nil.
+        lastIndex := lastIndex - 1.
+        ^v
+    ]
+    "Remove the first element equal to oldObject; evaluate anExceptionBlock if
+     none. Reuses the inherited indexOf:ifAbsent:."
+    remove: oldObject <Object> ifAbsent: anExceptionBlock <[]> ^ <Object> [
+        | i |
+        i := self indexOf: oldObject ifAbsent: [ ^anExceptionBlock value ].
+        ^self removeAtIndex: i
+    ]
+    remove: oldObject <Object> ^ <Object> [
+        ^self remove: oldObject ifAbsent: [ self error: 'object not found' ]
+    ]
+    "Remove one occurrence of each element of aCollection; answers it."
+    removeAll: aCollection <Collection> ^ <Collection> [
+        aCollection do: [:each | self remove: each ].
+        ^aCollection
+    ]
+    "Remove every element for which aBlock answers true; answers self."
+    removeAllSuchThat: aBlock <[Object,^Boolean]> ^ <Self> [
+        | keep |
+        keep := OrderedCollection new.
+        self do: [:each | (aBlock value: each) ifFalse: [ keep add: each ] ].
+        array := keep asArray.
+        firstIndex := 1.
+        lastIndex := keep size.
+        ^self
+    ]
+    at: i <Integer> ^ <Object> [
+        (i between: 1 and: self size) ifFalse: [ ^self error: 'index out of range' ].
+        ^array at: firstIndex + i - 1
+    ]
+    at: i <Integer> put: v <Object> ^ <Object> [
+        (i between: 1 and: self size) ifFalse: [ ^self error: 'index out of range' ].
+        array at: firstIndex + i - 1 put: v.
+        ^v
+    ]
+    do: aBlock <[Object]> [
+        firstIndex to: lastIndex do: [:i | aBlock value: (array at: i) ]
+    ]
+    collect: aBlock <[Object,^Object]> ^ <OrderedCollection> [
+        | r |
+        r := OrderedCollection new.
+        self do: [:each | r add: (aBlock value: each) ].
+        ^r
+    ]
+]
+
+Object subclass: Collection [
+    asOrderedCollection ^ <OrderedCollection> [
+        | r |
+        r := OrderedCollection new.
+        self do: [:each | r add: each ].
+        ^r
+    ]
+]

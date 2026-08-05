@@ -1,0 +1,37 @@
+"Feature test: the String / Symbol / Character protocol. Expected values are the
+ human-verified spec (standard Smalltalk string semantics)."
+STestCase subclass: TestStrings [
+    tests [
+        self check: 'hello' size is: 5 label: 'size'.
+        self check: ('hello' at: 1) is: $h label: 'at: -> Character'.
+        self check: ('foo' , 'bar') is: 'foobar' label: 'concat'.
+        self check: 'foobar' asUppercase is: 'FOOBAR' label: 'asUppercase'.
+        self check: 'FooBar' asLowercase is: 'foobar' label: 'asLowercase'.
+        self check: 'abc' reverse is: 'cba' label: 'reverse'.
+        self check: ('hello world' indexOf: $o) is: 5 label: 'indexOf: char'.
+        self check: ('hello' copyFrom: 2 to: 4) is: 'ell' label: 'copyFrom:to:'.
+        self check: 'hello' asSymbol is: #hello label: 'asSymbol'.
+        self check: #hello asString is: 'hello' label: 'symbol asString'.
+        self check: '127' asInteger is: 127 label: 'asInteger'.
+        self check: '-42' asInteger is: -42 label: 'asInteger negative'.
+        self check: ('a,b,c' tokenize: ',') size is: 3 label: 'tokenize: count'.
+        self check: (('a,b,c' tokenize: ',') at: 2) is: 'b' label: 'tokenize: element'.
+        self check: ('hello' includesSubstring: 'ell') is: true label: 'includesSubstring:'.
+        self check: ('hello' occurrencesOf: $l) is: 2 label: 'occurrencesOf:'.
+        self check: ('  hi  ' trimSeparators) is: 'hi' label: 'trimSeparators'.
+        self check: ('' isEmpty) is: true label: 'empty isEmpty'.
+        self check: ('x' isEmpty) is: false label: 'nonempty isEmpty'.
+        self check: ('abc' < 'abd') is: true label: 'lexical <'.
+        self check: ('abc' = 'abc') is: true label: 'string ='.
+        self check: ($a < $b) is: true label: 'char <'.
+        self check: ($A asInteger) is: 65 label: 'char asInteger'.
+        self check: (65 asCharacter) is: $A label: 'asCharacter'.
+        self check: ('hello' indexOf: $z) is: 0 label: 'indexOf: absent -> 0'.
+        self check: ('The quick' substrings: ' ') size is: 2 label: 'substrings:'.
+        self check: (String with: $a with: $b) is: 'ab' label: 'with:with:'.
+        self check: (String new: 3 withAll: $x) is: 'xxx' label: 'new:withAll:'.
+        self check: ('hello world' select: [ :c | c isVowel ]) is: 'eoo' label: 'string select: -> String'.
+        self check: ('hello' reject: [ :c | c isVowel ]) is: 'hll' label: 'string reject: -> String'.
+        self check: ('hello' select: [ :c | c isVowel ]) class name is: 'String' label: 'string select: species is String'.
+    ]
+]

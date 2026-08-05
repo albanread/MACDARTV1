@@ -10,6 +10,10 @@
 #   ./start-gui.sh -s              supervise: restart it if it dies unexpectedly
 #   ./start-gui.sh --no-observe    leave the vm-service off (it is the ONE control
 #                                  plane: no Tcl driving, no debugger Attach)
+#   ./start-gui.sh --app <Class>   run ONE class from the image as a standalone
+#                                  windowed app, no IDE (install it first)
+#   ./start-gui.sh --game <Name>   run a game/demo standalone (add --fullscreen
+#                                  to launch a game pane straight to full screen)
 #
 # `dartui` is the GUI host: the `dart` binary plus a thread-0 AppKit host, so the
 # UI isolate runs where AppKit is legal. It takes the workspace script as its
@@ -31,7 +35,7 @@ LOG=/tmp/macdart-gui.log
 LAST_GOOD="$HOME/.macdart/workspace.last-good.dart"
 
 background=0 rebuild=0 fresh=0 restore=0 supervise=0
-observe=1 obsport=8181
+observe=1 obsport=8181 appname="" gamename="" wantfull=0
 while [ $# -gt 0 ]; do
   case "$1" in
     -b|--background) background=1 ;;
@@ -41,7 +45,13 @@ while [ $# -gt 0 ]; do
     -s|--supervise)  supervise=1 ;;
     --no-observe)    observe=0 ;;
     --observe=*)     obsport="${1#--observe=}" ;;
-    -h|--help)       sed -n '3,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --app)           appname="${2:?--app needs a class name}"; shift ;;
+    --app=*)         appname="${1#--app=}" ;;
+    --game|--demo)   gamename="${2:?--game needs a name}"; shift ;;
+    --game=*)        gamename="${1#--game=}" ;;
+    --demo=*)        gamename="${1#--demo=}" ;;
+    --fullscreen|--full) wantfull=1 ;;
+    -h|--help)       sed -n '3,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "start-gui.sh: unknown option '$1' (try --help)" >&2; exit 2 ;;
   esac
   shift
@@ -121,6 +131,11 @@ if [ "$observe" = 1 ]; then
   echo '  (macdart/tcl/dartui.tcl - obs for VM introspection, ui for the GUI)' 
 fi
 
+POST=()
+[ -n "$appname" ] && POST+=(--app "$appname")
+[ -n "$gamename" ] && POST+=(--game "$gamename")
+[ "$wantfull" = 1 ] && POST+=(--fullscreen)
+
 echo "image:   $IMAGE"
 
 # Keep it running across an unexpected death, but never in a tight loop: a fault
@@ -133,7 +148,7 @@ if [ "$supervise" = 1 ]; then
   stamp="$(mktemp /tmp/macdart-gui.stamp.XXXXXX)"
   while true; do
     touch "$stamp"
-    "$DARTUI" "${ARGS[@]}" "$UI_SCRIPT" || rc=$?
+    "$DARTUI" "${ARGS[@]}" "$UI_SCRIPT" ${POST[@]+"${POST[@]}"} || rc=$?
     rc=${rc:-0}
     [ "$rc" = 0 ] && { rm -f "$stamp"; echo "workspace exited cleanly"; exit 0; }
     if [ "$rc" = 70 ]; then
@@ -164,8 +179,8 @@ if [ "$supervise" = 1 ]; then
 fi
 
 if [ "$background" = 1 ]; then
-  nohup "$DARTUI" "${ARGS[@]}" "$UI_SCRIPT" >"$LOG" 2>&1 </dev/null &
+  nohup "$DARTUI" "${ARGS[@]}" "$UI_SCRIPT" ${POST[@]+"${POST[@]}"} >"$LOG" 2>&1 </dev/null &
   echo "started in the background (pid $!), logging to $LOG"
 else
-  exec "$DARTUI" "${ARGS[@]}" "$UI_SCRIPT"
+  exec "$DARTUI" "${ARGS[@]}" "$UI_SCRIPT" ${POST[@]+"${POST[@]}"}
 fi

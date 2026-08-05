@@ -1,0 +1,377 @@
+"62_ioworker.mst — IoWorker: a dedicated I/O worker VM that multiplexes many
+ file descriptors through one kqueue, so no other VM ever blocks on I/O
+ (docs/asyncio_design.md slice B). Pure Smalltalk on world/61 (Posix/Kqueue) +
+ the world/47 Worker channel — ZERO new Rust.
+
+ The property this delivers: the primary (and every compute worker) runs free
+ while the IoWorker sleeps in kevent on their behalf; readiness comes back as
+ ordinary worker messages. Errors are VALUES in messages, and a wedged IoWorker
+ is a throwaway the supervisor respawns — I/O never raises, never blocks a peer.
+ That is the fail-fast, let-it-crash story applied to I/O.
+
+ KEY FACT that makes it work: worker VMs are threads in ONE process, so file
+ descriptors are shared across VMs. A pipe/socket opened anywhere is valid in
+ the IoWorker — no fd needs to 'cross' a heap boundary (fds are ints, not oops).
+
+ Two faces, one class (class vars/methods run in the IoWorker VM; instance
+ handle runs in the requester):
+   worker side  — `serveOnKq:` installs the message handler over a kqueue the
+                  PRIMARY made; `handle:`/`pump:` do bounded reads and accepts.
+   primary side — `IoWorker spawn` boots one; `watchRead:onData:` /
+                  `watchAccept:onConnection:` register continuations;
+                  `startPumping`/`stopPumping` drive the loop.
+
+ Cadence (the wake): the pump sleeps in an INFINITE kevent — zero CPU when
+ idle, no heartbeat. The problem that creates: the worker only reads its inbox
+ BETWEEN dispatches, so a new watch request sent mid-sleep would wait forever.
+ The wake is the kqueue's own EVFILT_USER 'user signal': the primary CREATES
+ the kqueue, registers the user event, and bakes the kq fd into the boot doit —
+ so after every non-pump send it pokes (NOTE_TRIGGER on the shared fd) and the
+ sleeping kevent returns NOW. The trigger LATCHES (a poke with nobody sleeping
+ just makes the next poll return once, EV_CLEAR resets it), so send-then-poke
+ can never lose a wakeup — the race that rules out raw POSIX signals on Darwin
+ (kevent has no pselect-style atomic mask). NEVER poke a #pump send: a pump
+ that wakes its own sleep busy-loops."
+
+"I am a dedicated I/O worker VM: I sleep in the kernel watching many file
+ descriptors through one kqueue and message you back when data or
+ connections arrive, so no other VM ever blocks on I/O. On the requesting
+ side, `IoWorker spawn` boots one; watchRead:onData: registers a two-arg
+ continuation [:bytes :eof | ...] for a readable fd, and
+ watchAccept:onConnection: a one-arg continuation for a listening socket;
+ startPumping begins the poll loop (infinite kernel sleeps, woken by a
+ poke whenever you register something new) and stopPumping / terminate end
+ it. Reads and accepts are bounded by what the kernel reported, so they
+ never block; errors are values in messages, never raises. File
+ descriptors are shared across worker VMs, so an fd opened anywhere is
+ valid here. My class side is the server that runs inside the spawned
+ worker itself."
+Object subclass: IoWorker [
+    | worker kq readHandlers acceptHandlers datagramHandlers pumping |
+    <classVars: Kq Buf Accepting Datagrams>
+
+    "── worker side: the server that runs INSIDE the spawned IoWorker VM ──
+     The boot doit carries the primary-made kqueue's fd (fds are shared
+     across VMs), so the primary can poke a kqueue it owns from birth —
+     no 'what is your kq fd?' handshake."
+    IoWorker class >> bootSourceOnKq: kqFd [ ^'IoWorker serveOnKq: ', kqFd printString ]
+    IoWorker class >> serveOnKq: kqFd [
+        Kq := Kqueue onFd: kqFd.
+        Buf := NativeBuffer page.
+        Accepting := Dictionary new.
+        Datagrams := Dictionary new.
+        Worker onMessage: [ :m | IoWorker handle: m payload ]
+    ]
+    "Pure kqueue mutations (no messaging), so `handle:`'s reply is the only
+     worker-only part — the rest is unit-testable in one VM. A LISTENER is
+     watched with the same EVFILT_READ (readable = pending connections),
+     but must be remembered: `drain:` must accept on it, never read it."
+    IoWorker class >> watchReadFd: fd [ Kq watchRead: fd ]
+    IoWorker class >> unwatchReadFd: fd [ Kq unwatchRead: fd ]
+    IoWorker class >> watchAcceptFd: fd [
+        Accepting at: fd put: true.
+        Kq watchRead: fd
+    ]
+    "Tombstone (Dictionary has no removeKey: — the codebase idiom): a nil
+     value makes `drain:`'s at:ifAbsent: route the fd as DATA again, which
+     matters when the OS reuses a closed listener's fd number for a data
+     socket — without this, the stale `Accepting` mark would send the new
+     fd's readiness into dead accept() calls and silently drop its bytes."
+    IoWorker class >> unwatchAcceptFd: fd [
+        Accepting at: fd put: nil.
+        Kq unwatchRead: fd
+    ]
+    "A DATAGRAM socket is watched with the same EVFILT_READ, but drained
+     with recvfrom (which captures the peer) instead of read (which drops
+     it) — so a datagram server can answer its sender. Marked, like a
+     listener, so `drain:` routes it to `drainDatagram:`."
+    IoWorker class >> watchDatagramFd: fd [
+        Datagrams at: fd put: true.
+        Kq watchRead: fd
+    ]
+    IoWorker class >> unwatchDatagramFd: fd [
+        Datagrams at: fd put: nil.
+        Kq unwatchRead: fd
+    ]
+
+    IoWorker class >> handle: req [
+        | tag |
+        tag := req at: 1.
+        tag == #watchRead ifTrue: [
+            self watchReadFd: (req at: 2).
+            ^Worker reply: (Array with: #watched with: (req at: 2)) ].
+        tag == #unwatchRead ifTrue: [
+            self unwatchReadFd: (req at: 2).
+            ^Worker reply: (Array with: #unwatched with: (req at: 2)) ].
+        tag == #watchAccept ifTrue: [
+            self watchAcceptFd: (req at: 2).
+            ^Worker reply: (Array with: #watched with: (req at: 2)) ].
+        tag == #unwatchAccept ifTrue: [
+            self unwatchAcceptFd: (req at: 2).
+            ^Worker reply: (Array with: #unwatched with: (req at: 2)) ].
+        tag == #watchDatagram ifTrue: [
+            self watchDatagramFd: (req at: 2).
+            ^Worker reply: (Array with: #watched with: (req at: 2)) ].
+        tag == #unwatchDatagram ifTrue: [
+            self unwatchDatagramFd: (req at: 2).
+            ^Worker reply: (Array with: #unwatched with: (req at: 2)) ].
+        tag == #pump ifTrue: [ ^self pump: (req at: 2) ].
+        Worker reply: (Array with: #err with: #unknownRequest)
+    ]
+
+    "Poll once (ms < 0 = block FOREVER — the poke is what ends an idle
+     sleep) and answer a batch of tagged tuples:
+       {#data. fd. bytes. eof}      — a bounded read on a readable fd
+       {#accept. listener. newFd}   — one per accepted connection
+     A read is bounded by min(kevent data, page size): it can't block even
+     on a blocking fd, and a socket buffer larger than the page just
+     arrives across several pumps (kqueue is level-triggered). The bytes
+     answered are sized by the read's actual return — never stale page
+     tail. Accepts are bounded by `data` (the pending-connection count),
+     so they can't block either; a client that vanished between kevent and
+     accept just yields rc < 0, skipped. EVFILT_READ = -1; EV_EOF = 32768.
+     The EVFILT_USER wake event (filter -10) falls through the filter
+     guard untouched — a poke just ends the sleep with an empty batch.
+     Pure (no messaging) so it is unit-testable in one VM; `pump:` wraps
+     it in the reply."
+    IoWorker class >> drain: ms [
+        | events results |
+        events := ms < 0 ifTrue: [ Kq pollForever ] ifFalse: [ Kq pollMs: ms ].
+        results := OrderedCollection new.
+        events do: [ :e |
+            (e at: 2) = -1 ifTrue: [
+                "Route each readable fd by how it was registered: an
+                 acceptor accepts, a datagram socket recvfrom's (peer and
+                 all), everything else is a plain bounded read."
+                (Accepting at: (e at: 1) ifAbsent: [ nil ]) notNil
+                    ifTrue: [ self drainAccepts: e into: results ]
+                    ifFalse: [
+                        (Datagrams at: (e at: 1) ifAbsent: [ nil ]) notNil
+                            ifTrue: [ results add: (self drainDatagram: e) ]
+                            ifFalse: [ results add: (self drainData: e) ] ] ] ].
+        ^results asArray
+    ]
+    IoWorker class >> drainData: e [
+        | fd n rc bytes eof |
+        fd := e at: 1.
+        n := (e at: 3) min: 4096.
+        eof := (e at: 4) >= 32768.
+        rc := n > 0 ifTrue: [ Posix read: fd into: Buf address count: n ] ifFalse: [ 0 ].
+        rc < 0 ifTrue: [ rc := 0 ].
+        bytes := ByteArray new: rc.
+        1 to: rc do: [ :i | bytes at: i put: (Buf byteAt: i - 1) ].
+        ^Array with: #data with: fd with: bytes with: eof
+    ]
+    "One datagram off a readable datagram socket, via recvfrom — the peer
+     sockaddr the kernel fills in is what a `read` would have dropped.
+     Answers {#datagram. fd. bytes. octets(4-elem Array). port}; the
+     primary side rebuilds an InetAddress from the octets (this worker
+     stays free of the world/61c socket-class globals, which load after
+     me). Payload at Buf 0..2047, peer sockaddr at 2048, socklen at 3072
+     — no overlap. Bounded by the kevent-reported count, so it can't
+     block; one recvfrom yields exactly one datagram."
+    IoWorker class >> drainDatagram: e [
+        | fd n rc bytes sa |
+        fd := e at: 1.
+        n := (e at: 3) min: 2048.
+        Buf u32At: 3072 put: 128.       "value-result socklen (>= 16)"
+        rc := n > 0
+            ifTrue: [ Posix recvfromFd: fd buf: Buf address len: n flags: 0
+                            addr: Buf address + 2048 addrLenPtr: Buf address + 3072 ]
+            ifFalse: [ 0 ].
+        rc < 0 ifTrue: [ rc := 0 ].
+        bytes := ByteArray new: rc.
+        1 to: rc do: [ :i | bytes at: i put: (Buf byteAt: i - 1) ].
+        sa := 2048.
+        ^Array with: #datagram with: fd with: bytes
+               with: (Array with: (Buf byteAt: sa + 4) with: (Buf byteAt: sa + 5)
+                            with: (Buf byteAt: sa + 6) with: (Buf byteAt: sa + 7))
+               with: ((Buf byteAt: sa + 2) * 256 + (Buf byteAt: sa + 3))
+    ]
+    IoWorker class >> drainAccepts: e into: results [
+        | listener newFd |
+        listener := e at: 1.
+        (e at: 3) timesRepeat: [
+            newFd := Posix acceptOn: listener.
+            newFd >= 0 ifTrue: [
+                results add: (Array with: #accept with: listener with: newFd) ] ]
+    ]
+    IoWorker class >> pump: ms [
+        Worker reply: (Array with: #io with: (self drain: ms))
+    ]
+
+    "── primary side: the handle a requester holds ──"
+    IoWorker class >> spawn [
+        | q |
+        q := Kqueue new.
+        q registerUserEvent.
+        ^self new setWorker: (Worker spawn: (self bootSourceOnKq: q fd)) kqueue: q
+    ]
+    setWorker: w kqueue: aKqueue [
+        worker := w.
+        kq := aKqueue.
+        readHandlers := Dictionary new.
+        acceptHandlers := Dictionary new.
+        datagramHandlers := Dictionary new.
+        pumping := false.
+        ^self
+    ]
+    worker [ ^worker ]
+
+    "The wake: fire the kqueue's user event so a pump sleeping in an
+     infinite kevent returns NOW (and the pending request envelope gets
+     dispatched right after). Latches if nothing is sleeping — harmless."
+    poke [ kq triggerUserEvent. ^self ]
+
+    "Register a continuation for fd's readable data. `aBlock` is a 2-arg block
+     `[:bytes :eof | ...]`, fired once per pump that reports data on fd."
+    watchRead: fd onData: aBlock [
+        readHandlers at: fd put: aBlock.
+        worker send: (Array with: #watchRead with: fd).
+        self poke.
+        ^self
+    ]
+    unwatchRead: fd [
+        "Tombstone the continuation (Dictionary has no removeKey: — the
+         codebase-wide idiom); `deliver:`'s at:ifAbsent: skips a nil."
+        readHandlers at: fd put: nil.
+        worker send: (Array with: #unwatchRead with: fd).
+        self poke.
+        ^self
+    ]
+    "Register a continuation for a LISTENING socket's incoming connections.
+     `aBlock` is a 1-arg block `[:newFd | ...]`, fired once per accepted
+     connection (the IoWorker did the accept — bounded by the kevent-
+     reported backlog count — and the new fd is just an int in the
+     message; being process-wide, it is immediately usable here)."
+    watchAccept: fd onConnection: aBlock [
+        acceptHandlers at: fd put: aBlock.
+        worker send: (Array with: #watchAccept with: fd).
+        self poke.
+        ^self
+    ]
+    "The accept-side twin of unwatchRead: — tombstone the continuation AND
+     clear the worker's `Accepting` mark, so a reused fd number routes as
+     data again (TcpListener close depends on this)."
+    unwatchAccept: fd [
+        acceptHandlers at: fd put: nil.
+        worker send: (Array with: #unwatchAccept with: fd).
+        self poke.
+        ^self
+    ]
+    "Register a continuation for a DATAGRAM socket's incoming packets — the
+     non-blocking answer to `UdpSocket receive`. `aBlock` is a 3-arg block
+     `[:bytes :octets :port | ...]` (`octets` a 4-element Array; the socket
+     class layer, world/61c, wraps it as an InetAddress). Fired once per
+     datagram, WITH the sender, so a datagram server never blocks in
+     recvfrom on a peer's behalf — the whole point of the IoWorker model."
+    watchDatagram: fd onPacket: aBlock [
+        datagramHandlers at: fd put: aBlock.
+        worker send: (Array with: #watchDatagram with: fd).
+        self poke.
+        ^self
+    ]
+    unwatchDatagram: fd [
+        datagramHandlers at: fd put: nil.
+        worker send: (Array with: #unwatchDatagram with: fd).
+        self poke.
+        ^self
+    ]
+
+    "Dispatch one #io batch of tagged tuples to the registered per-fd
+     continuations: {#data. fd. bytes. eof}, {#accept. listener. newFd},
+     and {#datagram. fd. bytes. octets. port}. The datagram continuation
+     is fired with the raw octets Array (not an InetAddress) so this class
+     stays free of the world/61c socket globals that load after it — the
+     UdpSocket layer rebuilds the address."
+    deliver: batch [
+        batch do: [ :io |
+            | h |
+            (io at: 1) == #data ifTrue: [
+                h := readHandlers at: (io at: 2) ifAbsent: [ nil ].
+                h isNil ifFalse: [ h value: (io at: 3) value: (io at: 4) ] ].
+            (io at: 1) == #accept ifTrue: [
+                h := acceptHandlers at: (io at: 2) ifAbsent: [ nil ].
+                h isNil ifFalse: [ h value: (io at: 3) ] ].
+            (io at: 1) == #datagram ifTrue: [
+                h := datagramHandlers at: (io at: 2) ifAbsent: [ nil ].
+                h isNil ifFalse: [
+                    h value: (io at: 3) value: (io at: 4) value: (io at: 5) ] ] ]
+    ]
+
+    "Send one poll; its reply dispatches the data and, while `pumping`, re-arms
+     the next poll — a self-sustaining chain driven by the reply, never a spin
+     (each link only fires when the previous reply lands). Deliberately NO
+     poke here — see the header (a pump waking its own sleep busy-loops)."
+    pumpOnce: ms [
+        "Guard the re-arm with worker isAlive, not just pumping: covers the
+         case where the death is ALREADY known to the registry (a prior
+         failed send, or the supervisor's own childDied: has already run
+         and terminate:'d the corpse) by the time this reply is processed.
+         Known NOT covered (docs/otp_workers_design.md O3's honest limit,
+         same family as its own 'in-flight batch lost' caveat): isAlive's
+         registry entry is only marked dead LAZILY -- by a failed send or
+         by the supervisor's own #workerDied handling, never proactively
+         the instant a worker thread actually exits -- so a reply for an
+         OLDER, already-succeeded poll can still be processed (and see
+         isAlive answer stale-true) BEFORE the newer died-envelope from the
+         SAME worker's later crash is even dispatched; the re-arm send can
+         still lose that exact race and raise (no non-raising send exists
+         in this Smalltalk to fully close it). A supervised caller that
+         crashes ITS OWN watched worker deliberately (e.g. a test) should
+         stopPumping first to sidestep this window entirely, exactly as
+         terminate already does for a deliberate stop."
+        worker send: (Array with: #pump with: ms)
+              onReply: [ :reply |
+                  self deliver: (reply at: 2).
+                  (pumping and: [ worker isAlive ]) ifTrue: [ self pumpOnce: ms ] ]
+    ]
+    "The normal mode: infinite sleeps, poke-woken. `startPumping: ms` keeps
+     a bounded heartbeat available (tests, belt-and-braces callers)."
+    startPumping [ ^self startPumping: -1 ]
+    startPumping: ms [
+        pumping ifTrue: [ ^self ].
+        pumping := true.
+        self pumpOnce: ms.
+        ^self
+    ]
+    stopPumping [
+        "Stop the chain, and poke so an in-flight infinite pump returns now
+         (its reply sees pumping = false and does not re-arm)."
+        pumping := false.
+        self poke.
+        ^self
+    ]
+
+    "── supervised recovery (docs/otp_workers_design.md §6) ────────────────
+     The kqueue and every kernel-level watch registered on it (watchRead:/
+     watchAccept:/watchDatagram: — all plain kevent() calls against `kq`'s
+     fd) live in the PRIMARY and belong to the KERNEL OBJECT, not to
+     whichever thread happens to be polling it — so both survive the
+     WORKER VM's death untouched. Only three things die with it: the
+     dispatch loop itself, the in-flight #pump reply (any batch already in
+     transit when the crash hit — at-most-once, the honest cost), and
+     `pumping`'s guarantee that a chain is actually running. A supervised
+     restart's initSource is the SAME `bootSourceOnKq: kq fd` every time
+     (the fd never changes), so recovery is just: swap in the fresh worker
+     handle and re-arm the pump — no watch is ever re-sent, because none
+     was ever lost."
+    rebindAfterRestart: w [
+        worker := w.
+        pumping := false.   "clear startPumping's guard -- the old chain is dead"
+        self startPumping
+    ]
+
+    terminate [
+        "Order matters: stop re-arming FIRST (a reply landing after
+         terminate must not send #pump to a dead worker), then wake any
+         in-flight sleep so the worker can wind down. The kq fd is NOT
+         closed here: the worker thread may still be inside kevent on it,
+         and closing an fd under a sleeping kevent is undefined on Darwin —
+         one leaked fd per IoWorker lifetime is the honest price."
+        pumping := false.
+        self poke.
+        worker terminate.
+        ^self
+    ]
+]

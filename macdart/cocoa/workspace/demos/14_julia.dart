@@ -83,6 +83,10 @@ main(List args, SendPort ui) {
       }
     }
 
+    // The overlay is a retained buffer, not a per-frame canvas: without the
+    // clear, every frame's counter is printed OVER the last one and the digits
+    // silt up into solid blocks.
+    cmds.add(<dynamic>['gptextclear']);
     cmds.add(<dynamic>['gptext', 8, 6, frame.toString(), 230, 230, 255]);
     ui.send(['draw', cmds]);         // apply palette/HUD, then present the buffer
     frame++;

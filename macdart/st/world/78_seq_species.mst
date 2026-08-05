@@ -1,0 +1,35 @@
+"78_seq_species.mst — MACDART: String>>select:/reject: answer a String, and
+ Interval>>select:/reject: answer an Array — finishing the species contract that
+ 77_array_species.mst started for Array. Collection's base select: (21_collections
+ _ext.mst) builds a plain OrderedCollection; a SequenceableCollection should keep
+ its own species (Squeak/ANSI). String builds the result char-by-char through a
+ WriteStream (a fixed String can't grow); Interval has no storage of its own, so
+ it materializes via asArray then reuses Array>>select: (Array in, Array out).
+ Loads after 10/12/17/21/77 (file 78); reopen replaces the inherited versions for
+ String/Symbol and Interval receivers only."
+
+String >> select: aBlock [
+    | s |
+    s := WriteStream on: String new.
+    self do: [:each | (aBlock value: each) ifTrue: [ s nextPut: each ] ].
+    ^s contents
+]
+String >> reject: aBlock [
+    ^self select: [:each | (aBlock value: each) not ]
+]
+"collect: keeps the String species too (the block answers Characters):
+ 'abc' collect: [:c | c asUppercase] is 'ABC', not an OrderedCollection."
+String >> collect: aBlock [
+    | s |
+    s := WriteStream on: String new.
+    self do: [:each | s nextPut: (aBlock value: each) ].
+    ^s contents
+]
+
+"The older Squeak spellings subStrings / subStrings: — same as the lowercase
+ substrings the corpus defines (kept so both cases answer)."
+String >> subStrings [ ^self substrings ]
+String >> subStrings: separators [ ^self substrings: separators ]
+
+Interval >> select: aBlock [ ^self asArray select: aBlock ]
+Interval >> reject: aBlock [ ^self asArray reject: aBlock ]

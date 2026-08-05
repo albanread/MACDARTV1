@@ -21,6 +21,12 @@ Dart 2 abandoned that. It became a *soundly* typed language with a separate
 "kernel" front-end, compiled ahead of time; the in-VM parser and the optional-
 types model were removed. That is a different language and a different machine.
 
+A sibling project, [**MACVM**](https://github.com/albanread/MACVM), takes the
+other branch of that lineage directly: a from-scratch Smalltalk VM (not a
+port) with its own moving GC, a JIT that deoptimizes safely on live method
+redefinition, and a Cocoa-hosted image — Strongtalk's ideas pursued on their
+own terms rather than inherited secondhand through Dart.
+
 **This project targets V1 specifically:**
 
 - **Not Dart 2** — no sound null-safety, no kernel front-end. V1's recursive-
@@ -35,6 +41,16 @@ optimizing JIT that patches its own code and deoptimizes on demand — running a
 a native arm64 JIT on Apple Silicon, which it was never built to do (the 2017
 arm64 backend existed only for iOS, where Dart ran ahead-of-time and never
 patched code at runtime).
+
+For a source-grounded tour of that machine — the in-VM parser, the two-tier
+speculative JIT, its optimization passes, the ARM64 backend, and the
+deoptimization safety net that lets it speculate — see the study in
+[`docs/dart-vm-compiler.md`](docs/dart-vm-compiler.md). Two companion notes go
+further: [`docs/dart-vm-frontend-guide.md`](docs/dart-vm-frontend-guide.md) shows
+how to write a *new* front-end that emits the VM's IL, and
+[`docs/dart-vm-hosting-languages.md`](docs/dart-vm-hosting-languages.md) uses the
+VM's per-function front-end selection to host another language (Smalltalk, Lisp,
+…) *alongside* full Dart — keeping all of `dart:core`.
 
 ## What the port actually is
 
@@ -82,17 +98,62 @@ Zero crashes across all 5,033 cases — essentially parity with upstream 1.24.3.
 The remaining failures are tests needing `-D` environment flags, checked-mode
 runs, or Dart-2 features — not VM defects.
 
+## Benchmarks — the second language runs fast, too
+
+The Smalltalk that runs on this VM isn't a toy: the same checksum-verified
+Smalltalk benchmarks run three ways under one microsecond-clocked protocol
+([MACVM's `xvm-bench.sh`](https://github.com/albanread/MACVM/blob/main/scripts/xvm-bench.sh):
+a cold run, 30 warmup iterations, then 41 single-workload samples, best-of-7,
+JIT hot on every VM). **MACDART's Smalltalk-on-the-Dart-VM beats Cog — the
+production Squeak/Pharo JIT — on six of seven, and ties the seventh**, and
+splits with the sibling [MACVM](https://github.com/albanread/MACVM) Rust
+Smalltalk VM (MACDART wins the compute/dispatch-bound benches, MACVM the
+allocation-bound ones). µs per iteration, warm — lower is better:
+
+| bench     | MACDART | Cog (Pharo 13) | MACVM |
+|-----------|--------:|------:|------:|
+| arith     | 715 | 5224 | 1411 |
+| fib       | 6935 | 18726 | 9034 |
+| sieve     | 196 | 362 | 180 |
+| dict      | 457 | 1024 | 255 |
+| alloc     | 384 | 701 | 587 |
+| richards  | 628 | 2223 | 1087 |
+| deltablue | 300 | 280 | 150 |
+
+Cog is never meaningfully ahead: the closest row, `deltablue`, is 299 vs 279 —
+inside the harness's noise, so a statistical tie rather than a win for either.
+That row was a **4.6× loss** before a twelve-commit front-end arc (1271 → 299 µs)
+that removed dispatch overhead from the Smalltalk layer — helper fast-paths,
+`(isolate, cid, selector)` caches over the extension-holder resolution,
+compile-time symbol interning, per-site block-call lowering. **No VM source was
+touched**; the laws that arc established are written up in
+[`docs/dart_engine_laws.md`](docs/dart_engine_laws.md), and the full three-way
+record is in [`docs/cog_bench.md`](docs/cog_bench.md).
+
+MACVM still wins the allocation-bound three (sieve, dict, deltablue) — a
+generational scavenger beats a boxing runtime on allocation churn, which is the
+honest structural limit here, not a tuning gap. It has also since narrowed
+MACDART's lead on the compute rows (richards 2.3× → 1.7×) with a register-
+allocator arc of its own, so these numbers are a snapshot of two moving targets,
+not a finish line.
+
 ## Building
 
 The reference sources are **not** vendored in this repo — only the port (the
 scripts, the CMake build, and the patch). To build, you supply a Dart 1.24.3
-checkout as the source quarry:
+checkout as the source quarry. Dart V1 is end-of-life, so we do **not** depend
+on `dart-lang/sdk` staying online: the quarry comes from our own byte-verbatim
+mirror, [`albanread/dart-v1-sdk`](https://github.com/albanread/dart-v1-sdk)
+(a private snapshot of `dart-lang/sdk` @ `1.24.3`, commit `0b0b41ef2` — see its
+`PROVENANCE.md`). The build is fully offline once the quarry is present.
 
 ```bash
-# 1. Get the reference sources (the last V1 release), placed at ../sdk:
-git clone --depth 1 --branch 1.24.3 https://github.com/dart-lang/sdk.git sdk
+# 1. Get the reference sources (the last V1 release) at ../sdk, from our mirror:
+./macdart/port/get-sdk.sh            # clones albanread/dart-v1-sdk -> ./sdk
+#   (override the source with MACDART_SDK_MIRROR=<url-or-path> if you have a fork)
 
-# 2. Extract the needed subset into the owned tree and apply the port patch:
+# 2. Extract the needed subset into the owned tree and apply the port patch
+#    (auto-runs get-sdk.sh if ../sdk is still absent):
 ./macdart/port/extract.sh
 
 # 3. Build (CMake + Ninja, C++14):
@@ -147,7 +208,20 @@ scroll offset — never raw pixels, applied atomically so there is no
 mid-frame tearing. For workloads that want the pixels anyway (a live Julia
 set, a software rasterizer), a direct-framebuffer mode hands a Dart isolate a
 `Uint8List` that *is* the GPU's own shared memory — writes land with no copy
-and no protocol. Full design in [`GAMEPANE_PLAN.md`](GAMEPANE_PLAN.md).
+and no protocol. Full design in [`GAMEPANE_PLAN.md`](GAMEPANE_PLAN.md); the
+Smalltalk games that ride it — what a game *is* here, the six that ship, how to
+write another, and how to drive one from a script — are in
+[`GAME_LIBRARY.md`](GAME_LIBRARY.md). Their art has its own tool: **Games ▸
+Sprite Editor**, a utility window of Cocoa controls around the real Metal pane
+— paint the 16-colour sprites, edit the palette, flip through animation frames
+with the engine itself previewing at 1x/2x/4x — and Save writes the sheet as
+an ordinary class in the image whose `installOn: pane` hands a game the whole
+sprite in one send ([`SPRITE_EDITOR_PLAN.md`](SPRITE_EDITOR_PLAN.md)). Its
+sibling **Games ▸ Sound Editor** does the same for the synth: the full ADSR/
+sweep/noise/echo recipe on sliders, auditioned through the real synth, the
+envelope drawn on the pane, presets and randomize to explore from — saved as a
+class whose `playOn: slot` is the whole consumption API
+([`SOUND_EDITOR_PLAN.md`](SOUND_EDITOR_PLAN.md)).
 
 Pong is the minimal worked example (← → or A/D, space to serve). Sprite
 Invaders and Brickout are the two full games: sprites, a destructible
@@ -171,6 +245,48 @@ Cocoa database that's always exactly right for this binary — catching a
 typo'd selector, an unknown class, or a call that would overflow the
 bridge's 8-register float-argument limit, before the code ever runs. Design
 in [`COCOA_STATIC_CHECK_PLAN.md`](COCOA_STATIC_CHECK_PLAN.md).
+
+A running **game** gets a debugger of its own shape, because a game is not a
+call stack — it is a loop of discrete frames. Its whole frame is one
+`GamePane stepWithKeys:` invited by the UI timer, so gating that invitation is
+the entire mechanism: `gppause` parks the loop between frames, `gpstep [n]`
+takes frames by hand (immediately, not at 33fps — stepping a thousand frames to
+reach the next attract flip is instant), `gpwhere` reports where you are and how
+many draw ops the last frame produced, `gpkeys <mask>` feeds the next frames a
+held-key mask instead of the keyboard, and `gprun` hands the loop back. Nothing
+is suspended while parked, so the ordinary `doit` reads *and pokes* the live
+game between frames, and `gpsnap` writes the exact frame you stopped on to PNG.
+Hold fire for one frame and watch the op count jump from 62 to 463 as the wave
+forms — that is the whole feature, and it cost far less than the debugger.
+
+## Apps, and running them standalone
+
+Beyond demos, an *app* is an ordinary image class with a `build(ui)` method that
+lays out a surface of native Cocoa controls — `label`/`field`/`button`,
+`checkbox`/`slider`/`popup`/`secure`/`progress`, a scrolling `list`, `tabs`, a
+`scroll` container larger than the window, and a `canvas` that draws (and reports
+clicks) through the same op vocabulary the demos use — with `row`/`column`/`grid`
+helpers to place them and a handler per widget (`onClick`, `onSlide`, …). Edit
+the class, press **Save to Image**, and the app hot-reloads *and re-runs
+`build()` while keeping its state* — the reason the App pane exists. Example apps
+live in `macdart/cocoa/workspace/apps/` (a calculator, a temperature converter, a
+control gallery); install one from the **Apps** menu and Run it on the App tab.
+See [`APP_PANE_PLAN.md`](APP_PANE_PLAN.md).
+
+An app **or** a game can also run on its own, **no IDE** — same class, same
+image, same hot reload, just a bare window:
+
+```bash
+./start-gui.sh --app Calculator                # one image class, full-window
+./start-gui.sh --game brickout                 # a game/demo in its own window
+./start-gui.sh --game invaders --fullscreen    # a game straight to full screen
+```
+
+(equivalently `dartui … workspace.dart --app <Class>` / `--game <Name>`, or the
+`MACDART_APP` / `MACDART_GAME` env vars). A game's Metal pane fills the window
+exactly as it does on the Demos tab, and `--fullscreen` reuses the pane's own
+fullscreen path. An app class must already be in the image — install it in the
+workspace first; games and demos are read from `macdart/cocoa/workspace/demos/`.
 
 ## Licensing
 

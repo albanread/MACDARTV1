@@ -1,0 +1,72 @@
+"App: Fractions"
+"An exact-arithmetic calculator — the demo only Smalltalk can give you: type
+ two fractions (or integers), pick an operation, and the result is an EXACT
+ Fraction (1/3 + 1/6 answers 1/2, never 0.4999…), with the decimal shown
+ beside it. Everything routes through the world's real Fraction class; the
+ fields re-parse on every keystroke, so the result is always live. Install
+ from the Apps menu; after that this is an ordinary image class — open it in
+ the Browser, change an op, Accept, and the running app rebuilds in place."
+Object subclass: FractionsApp [
+    | ui a b op |
+
+    build: aUi [
+        ui := aUi.
+        a isNil ifTrue: [ a := '1/3' ].
+        b isNil ifTrue: [ b := '1/6' ].
+        op isNil ifTrue: [ op := '+' ].
+        ui title: 'Fractions - exact arithmetic'.
+        ui label: 'la' text: 'a' frame: { 8. 12. 20. 18 }.
+        ui field: 'fa' text: a frame: { 30. 8. 140. 24 }
+           onText: [ :s | a := s. self show ].
+        ui label: 'lb' text: 'b' frame: { 8. 44. 20. 18 }.
+        ui field: 'fb' text: b frame: { 30. 40. 140. 24 }
+           onText: [ :s | b := s. self show ].
+        ui button: 'add' title: 'a + b' frame: { 190. 8. 70. 26 }
+           onClick: [ :x | op := '+'. self show ].
+        ui button: 'sub' title: 'a - b' frame: { 190. 40. 70. 26 }
+           onClick: [ :x | op := '-'. self show ].
+        ui button: 'mul' title: 'a x b' frame: { 266. 8. 70. 26 }
+           onClick: [ :x | op := '*'. self show ].
+        ui button: 'div' title: 'a / b' frame: { 266. 40. 70. 26 }
+           onClick: [ :x | op := '/'. self show ].
+        ui box: 'rbox' title: 'exact' frame: { 8. 84. 420. 74 }.
+        ui label: 'res' text: '' frame: { 20. 108. 396. 22 }.
+        ui label: 'dec' text: '' frame: { 20. 130. 396. 18 }.
+        self show.
+    ]
+
+    "Parse '2/3' or '5' into an exact number; nil when unfinished typing."
+    parse: s [
+        | t i n d |
+        t := s trimSeparators.
+        t isEmpty ifTrue: [ ^nil ].
+        i := t indexOf: $/.
+        i = 0 ifTrue: [ ^t asInteger ].
+        n := (t copyFrom: 1 to: i - 1) trimSeparators asInteger.
+        d := (t copyFrom: i + 1 to: t size) trimSeparators asInteger.
+        (n isNil or: [ d isNil or: [ d = 0 ] ]) ifTrue: [ ^nil ].
+        ^n / d
+    ]
+
+    show [
+        | x y r |
+        x := self parse: a.
+        y := self parse: b.
+        (x isNil or: [ y isNil ])
+            ifTrue: [ ui set: 'res' text: '(type two fractions, like 1/3 and 1/6)'.
+                      ui set: 'dec' text: ''.
+                      ^self ].
+        r := [ op = '+' ifTrue: [ x + y ]
+               ifFalse: [ op = '-' ifTrue: [ x - y ]
+               ifFalse: [ op = '*' ifTrue: [ x * y ]
+               ifFalse: [ x / y ] ] ] ]
+                 on: ZeroDivide do: [ :e | nil ].
+        r isNil
+            ifTrue: [ ui set: 'res' text: 'divide by zero'.
+                      ui set: 'dec' text: '' ]
+            ifFalse: [ ui set: 'res' text: a trimSeparators , ' ' , op , ' ' ,
+                           b trimSeparators , '  =  ' , r printString.
+                       ui set: 'dec' text: 'as a decimal: ' ,
+                           (r asFloat) printString ].
+    ]
+]

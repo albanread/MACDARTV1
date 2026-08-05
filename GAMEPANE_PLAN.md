@@ -21,7 +21,7 @@ architecture already contains the machinery MACVM had to invent.
 **Converted (the engine, Rust → ObjC++/C++):** the layered Metal pane —
 shader background, 8-bit indexed framebuffer with per-scanline palettes,
 overscan + scroll, 8 buffer slots with a GPU compute blitter, 16-colour
-sprites with per-sprite palettes, seven-segment text overlay — plus the SFX
+sprites with per-sprite palettes, a 5x7-atlas text overlay — plus the SFX
 synthesizer and its AVAudioEngine playback. Ported into `macdart/cocoa/` as
 part of the `dart_cocoa` static library; no Rust in the build.
 
@@ -91,7 +91,7 @@ per frame (mutate the retained scene):
   ['gpblit', src, dst, mode, ...]  slot-to-slot GPU blit (copy/key/and/or/xor/clear)
   ['gpswap']                       front/back buffer swap
   ['gpplay', id]                   trigger a sound
-  ['gptext', x, y, s, r, g, b]     HUD overlay
+  ['gptext', x, y, s, r, g, b, ?scale]  HUD overlay (scale defaults to 1)
 ```
 
 The UI isolate applies the whole list, renders the four layers in order
@@ -184,9 +184,16 @@ Per subsystem, with the facts that will bite a careless port:
   rects panic there; here they must clip), and the CPU-mirror writeback sets
   `dirty[dst]=false` unconditionally, silently discarding pre-blit CPU draws
   — the port reconciles by uploading a dirty destination before blitting.
-- **TextOverlay (284 lines).** Viewport-sized RGBA8 CPU buffer, seven-segment
-  digits (`[0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F]`), letters as
-  placeholder boxes, one full-screen sampled pass, alpha-blended, Load.
+- **TextOverlay (284 lines).** Viewport-sized RGBA8 CPU buffer, one full-screen
+  sampled pass, alpha-blended, Load. The Rust's seven-segment digits (letters
+  drawn as placeholder boxes) are gone: this port bakes a **5x7 pixel atlas**
+  for the whole printable range (`kFont5x7`, 665 bytes, nothing loaded at
+  runtime), 6px advance / 8px line, `\n` honoured, and an integer `scale` that
+  blocks each font pixel — one font from HUD to title screen. Hand-set pixels,
+  not a rasterised system font: the overlay lives on the LOGICAL pane, which
+  the layer blows up with a nearest filter, so anti-aliased outlines would
+  arrive as a blur. `demos/18_fontsheet.dart` is the sheet that proves it —
+  an unmapped byte still draws as a hollow box, and that box IS the report.
 - **ShaderPane (160 lines).** Runtime `newLibraryWithSource:` of a fixed
   header (`Uniforms{time, aspect, p[8]}` + big-triangle vertex fn) + the
   game's `fmain` body. Compile errors must surface as a logged Dart error,
@@ -265,8 +272,7 @@ Worth quarrying later, recorded so it isn't re-discovered: the
 `AVAudioSourceNode` render-callback glue (`AudioManager.mm:1483-1560`, ~75
 lines — the pattern for *realtime* voices if `VoiceBank` ever goes live;
 preallocate the callback buffer, theirs mallocs on the audio thread), the
-copper-bar/gradient `PaletteAutomation` structs, the prebuilt Unscii font
-atlases (a real font for the text overlay someday), and `CAMetalLayer`
+copper-bar/gradient `PaletteAutomation` structs, and `CAMetalLayer`
 config details (`framebufferOnly`, `maximumDrawableCount=3`,
 backing-scale handling in `viewDidChangeBackingProperties`).
 
@@ -374,11 +380,137 @@ range-validate at the native boundary, throw not abort; `gpsnap` for honest
 headless verification.
 
 **Open (decide before or during implementation):**
-- whether games later also run in the **language isolate** (image classes,
-  hot-reload-while-playing, breakpoints in `onStep` — the full liveness
-  story) once the App-pane channel exists; the wire is deliberately
-  driver-agnostic so this adds a driver, not a rewrite;
+- ~~whether games later also run in the **language isolate**~~ **DONE — the
+  Smalltalk game driver.** The world's `GamePane`/`Sound`/`Tune` primitives
+  (200..215) re-point via `80_gamepane_wiring.mst` at dart:cocoa's `stGp*`
+  helpers, which buffer the exact gp* wire ops; the language isolate's
+  `stgame` command launches an image game (Breakout, Worms), registers a
+  dedicated tick port (`['port', ctl]`), pushes `['draw', [gpopen + setup]]`,
+  and answers each tick by mapping keycodes→`GamePane stepWithKeys:` bits and
+  pushing the drained buffer. The UI routes those lang pushes into `_onDemoMsg`
+  (`gStGameActive`) — exactly "a driver, not a rewrite". Music works: an ABC
+  twin (`_stAbcParse`) lives in dart:cocoa → `gptune`+`gpmusic`; SFX presets
+  park at slots 54..63. Games menu: Brickout/Invaders/Pong + the ST games.
+  Headless-tested by `st/test/gamepane_wire.dart` (battery tier); GUI-tested in
+  `gui_smoke.sh` (launch → frames tick → gpsnap → stop).
+
+  **GALAXIGANS (demos/galaxigans.mst) is the driver's proof at scale** — a Galaxian/Galaga
+  fixed shooter ported from 6251 lines of x64 assembler
+  (`MRASM/projects/galaxigans`) into ~560 lines of Smalltalk, keeping the
+  original's own constants so the two are comparable. It brought three things
+  the driver did not have:
+  - **a pane size per game** (`_kStGames` `'size': [w,h]`) — it opens the
+    original's 640x360 field instead of the two originals' 320x240;
+  - **HUD text for Smalltalk** (`GamePane>>text:x:y:r:g:b:[scale:]`,
+    `textClear`) over the pane's 5x7 atlas;
+  - **wire-owned sprite ids.** The engine numbers defs/instances from 0 on
+    every `gpopen`; Smalltalk's `GamePane class>>nextId` is monotonic for the
+    life of the isolate. Relaunching a game therefore had the second run's
+    sprites refused ("id out of sequence") and every move after "gpplace: bad
+    instance" — an invisible fleet. `stGpDefineSprite` now allocates the
+    engine's ids itself and maps ST's onto them, cleared with the rest of the
+    per-run state by `stGpReset`.
+
+  It is a FILED-IN game, not part of the world: it lives in `demos/` with the
+  other playable files, so picking it from the Games menu installs its five
+  classes into the running image and the Edit button opens THE FILE — every
+  class — where Save writes back to disk. Three things make that work for a
+  multi-class game: the header marker `"Game: …"` routes a scanned file to the
+  Games menu, `runStFileDemo` launches the class with a class-side `launch`
+  (taking the first class found would have started the alien), and the game
+  declares its own pane through class-side `paneWidth`/`paneHeight` rather than
+  needing a row in `_kStGames`.
+
+  It is driven headless in the battery (`st/test/galaxigans_smoke.mst`, tier
+  5b, which files the game in first): with no window every pane primitive is a no-op, so attract, the fire
+  tap, the dive AI, collision, scoring, death, the game-over reset and every
+  level of the table all run and are asserted on. `Random new` is seeded 1, so
+  the run is identical every time.
+
+  **Second pass — the species library, the levels, and layer 0.** The
+  assembler's ten creatures (`galaxigans_aliens2.was`) port VERBATIM: its art
+  rows are `'.'`-plus-hex, character for character the format `defineSprite:`
+  takes, and its palettes are the comment block above each table. Each of the
+  forty formation sprites is defined once carrying ALL twenty frames (ten
+  species x two flap frames), so a level change is a frame offset and a
+  repaint rather than forty new definitions. That needed two more wire verbs —
+  `Sprite>>addFrame:` (`gpframe`) and `moveTo:y:frame:`/`hide` (`gpplace`
+  frame index / `gphide`) — and the twelve-row level table (cosmos scene +
+  formation theme) came across as literal arrays.
+
+  **Third pass — the mine and the dance.** The saucer's rare SPINNING MINE
+  (`galaxigans_mine.was`) drops in place of a bomb about one time in eight, at
+  the original's own ratio, drifts down half a pixel a frame while turning a
+  full circle every 32, and is both threat and treat: it kills the ship on
+  contact and pays 150 to shoot. Its eight rotation frames come across as
+  sprite frames on one definition — the same `addFrame:` the fleet's flap uses.
+  The triumphal VICTORY DANCE (`galaxigans_dance.was`) replaces the flat
+  game-over pause: every survivor leaves formation and orbits the middle of the
+  field on a pinwheel whose radius breathes at half the angular rate, integer
+  sines throughout (the table the dive weave already needed), so it is exactly
+  reproducible and asserted on headless — spread 0 in formation, tens of pixels
+  mid-dance, and CHANGING as it breathes.
+
+  **Fourth pass — the capture boss and its beam.** The boss's lifecycle is the
+  original's state machine (idle/enter/station/descend/charge/beam/return),
+  including the rule that it never appears when the player is on a last pilot.
+  The tractor beam needed the one thing the ST GamePane still could not reach:
+  the PER-SCANLINE palette (`gplinepal`). The beam is a cone drawn once in
+  palette index 1, and it flows by rewriting what index 1 means on each
+  scanline — the copper-bar mechanism, the original's own `BeamCascade`, and no
+  pixel redrawn per frame. `GamePane>>linePaletteAt:index:r:g:b:` opens that to
+  every ST game, not just this one. The boss also brought the pilot row (the
+  lives, as figures the beam actually comes for) and a second beating preset,
+  `Sound bossHum` — the saucer's wah an octave and a half down.
+
+  **The music.** The original's four melodic cues are transcribed note for note
+  from its inline ABC — title (GM 52 choir), stage clear (GM 9 glockenspiel),
+  saucer arrival (GM 91 pad) and 'Alien Victory' (GM 80 square lead), the tune
+  the aliens dance to. One dialect difference, in the port's favour: the
+  assembler writes `%%MIDI program <voice> <gm#>` while this pane's ABC reader
+  takes the GM number directly, so `program 1 80` becomes `program 80`. That
+  the instrument survives is asserted at the wire (gamepane_wire.dart reads the
+  compiled MIDI and checks the dance emits a program change to 80) — "a tune
+  played" would not have caught a misread program field.
+
+  **Fifth pass — the hall of fame, persisted the Smalltalk way.** The last
+  gameplay subsystem: after the dance the score slots into a six-row table as
+  YOU (the original's InsertHiScore, sorted, last row dropped) and the table
+  shows for 360 frames. The persistence is the point: the hall is a CLASS IN
+  THE IMAGE (GxHallOfFame) whose whole state is one class-side method, created
+  and rewritten by the game through STHostService acceptEditorClass: — the
+  same parse-checked, image-persisted, hot-reloading path the Browser's own
+  Accept uses. Scores survive a full app restart; the hall is browsable and
+  editable as source; and it lives OUTSIDE demos/galaxigans.mst so re-filing
+  the game in cannot clobber it. One consequence worth knowing: the accept
+  hot-reloads the image, which replaces the running game's own class —
+  instances morph (the workspace contract) but class variables reset, so the
+  game re-registers its Current handle after every save. Headless there is no
+  image host: saveHall's ERR reply is shrugged off and the whole flow still
+  runs, which is how the battery drives it.
+
+  Layer 0 is now reachable from Smalltalk too (`GamePane>>shader:` /
+  `shaderParam:value:`): the original's twelve HLSL cosmos scenes — nebula,
+  galaxy, black hole, alien world, moon, supernova, wormhole, gas giant,
+  aurora, pulsar, plasma, binary stars — are translated to MSL with the same
+  maths and constants (`frac`->`fract`, `lerp`->`mix`, the hardcoded 1.7778
+  aspect taken from the uniform). The indexed layer clears to index 0
+  (transparent) so the shader shows through, which also retired the game's own
+  plotted starfield: the scenes carry their own parallax stars, exactly as the
+  original's starfield module did.
 - whether the M4 shader layer accepts arbitrary MSL from game files (it is
   compiled at runtime; a bad shader must fail as a logged error, never an
   abort);
-- ABC tunes in M4 or deferred entirely.
+- ~~ABC tunes in M4 or deferred entirely~~ — tunes are in (see above).
+
+## Standalone game windows (done)
+
+`dartui … workspace.dart --game <Name>` (or `--demo <Name>`, `MACDART_GAME=`,
+`./start-gui.sh --game <Name>`) runs a game/demo in its own bare window, no IDE:
+`buildStandaloneGameWindow` makes a full-window `gDemoView`, and the game pane
+opens over it exactly as on the Demos tab (`gpEnter` uses the view's frame +
+superview), scaled 2× from 424×240. Add `--fullscreen` to open straight into
+the game pane's fullscreen (reuses `gpFullscreen`, the Full button's path; the
+flag is checked once in `gpEnter`). `runDemoAt` skips the tab switch and the
+`renderDemo` redisplay guard widens for standalone (so canvas demos present
+too, not just Metal games). Same standalone plumbing as the app pane's `--app`.

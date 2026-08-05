@@ -1,0 +1,14 @@
+"07a_largeint_bytes.mst — MACDART: LargeInteger's byte protocol on Dart ints.
+
+ 07_largeinteger.mst declares byteAt:/byteAt:put:/size/hash as bare
+ <primitive: 40/41/28/44> reading the class's own little-endian digit bytes.
+ MACDART ints are Dart Mint/Bigint (native bignum arithmetic), so those bodies
+ answered the receiver. This overlay re-points the READS at the real magnitude:
+ byteAt: i = the 1-based little-endian byte; size rides the stSizeOf helper
+ (Integer>>size = magnitude byte count). NOT wired, by design: byteAt:put: (a
+ Dart int is immutable, and the byte-by-byte CONSTRUCTION path is unused —
+ arithmetic is native) and hash (MACDART maps EVERY int to SmallInteger, whose
+ hash IS self — Smalltalk's own SmallInteger>>hash; there is no distinct
+ LargeInteger to hash differently, and 2^60 is a Dart Smi anyway). Loads after 07."
+
+LargeInteger >> byteAt: i [ <stprim: stIntByteAt> ]

@@ -1,0 +1,142 @@
+"80_gamepane_wiring.mst — MACDART: the GamePane primitives reach the Metal pane.
+
+ 43_gamepane.mst speaks MACVM's numbered game primitives (<primitive: 200..215>),
+ which this VM never had — every draw/sound call silently answered self and no
+ frame ever reached the engine. This overlay re-points those methods (same
+ selectors, same arity; the corpus stays verbatim) at dart:cocoa's stGp* helpers,
+ which append the exact gp* wire ops a Dart game ships (gpcls/gppset/gpline/
+ gpfill/gpdisc/gppal, gpsprite+gpspawn/gpspritepal/gpplace, gpsound+gpplay,
+ gptune+gpmusic — ABC compiled by dart:cocoa's twin of demos/abc.dart) into a
+ per-isolate command buffer. The language isolate's `stgame` driver drains that
+ buffer once per tick and pushes ['draw', cmds] to the UI, so an ST game rides
+ the same pane, pacing, keystate and teardown machinery as a Dart one
+ (GAMEPANE_PLAN.md §8: 'adds a driver, not a rewrite').
+
+ Headless (no driver) the buffer fills and is never shipped — the corpus's
+ documented 'silently a no-op' contract holds, and st/test/gamepane_wire.dart
+ asserts the exact ops without a GUI. run/stop only flip the driver's flag; the
+ frame loop itself is owned by the UI timer, exactly as 43's comments promise.
+ One deferral: blit: (215) buffers nothing yet (neither shipped game uses it;
+ it logs once). Loads after 43 (file 80); reopen replaces the primitive stubs."
+
+GamePane >> clearR: r g: g b: b [ <stprim: stGpClearRGB> ]
+GamePane >> paletteAt: index r: r g: g b: b [ <stprim: stGpPal> ]
+GamePane >> cls: index [ <stprim: stGpCls> ]
+GamePane >> point: x y: y color: c [ <stprim: stGpPset> ]
+GamePane >> line: x0 y: y0 to: x1 y: y1 color: c [ <stprim: stGpLine> ]
+GamePane >> fill: x y: y width: w height: h color: c [ <stprim: stGpFill> ]
+GamePane >> disc: cx y: cy radius: r color: c [ <stprim: stGpDisc> ]
+GamePane >> present [ <stprim: stGpPresent> ]
+GamePane >> blit: aByteArray [ <stprim: stGpBlit> ]
+GamePane >> run [ <stprim: stGpRun> ]
+GamePane >> stop [ <stprim: stGpStop> ]
+
+"The frame loop's two blocks move to the Dart side (dart:cocoa's _stGpStep /
+ _stGpTeardown). 43 keeps them in GamePane's CLASS VARIABLES, which is exactly
+ right for MACVM and exactly wrong here: in this workspace an accept reloads
+ the whole ST world, so every class-side variable comes back nil while the
+ game object itself survives by morph. A game that loses its StepBlock that way
+ is not interrupted, it is ENDED — the UI timer goes on inviting frames and
+ every one finds nothing to run, so the game freezes on its current frame,
+ alive and permanently still. Galaxigans persists its high scores BY accepting
+ a class, so a qualifying game froze the hall of fame forever; editing any
+ class in the Browser froze whatever was playing. Same selectors, same arity,
+ same chaining contract (onStep: answers the receiver) — the corpus stays
+ verbatim and its own comments stay true, the storage just moved somewhere a
+ reload cannot reach."
+GamePane >> onStep: aBlock [ <stprim: stGpOnStep> ]
+GamePane >> onReset: aBlock [ <stprim: stGpOnReset> ]
+GamePane class >> stepBlock [ <stprim: stGpStepBlock> ]
+GamePane class >> resetBlock [ <stprim: stGpResetBlock> ]
+GamePane class >> clearBlocks [ <stprim: stGpClearBlocks> ]
+
+"43's own bodies, reading the blocks from their new home. stepWithKeys: stays
+ THE single entry to a frame — the UI tick, the stepper and every headless test
+ all come through here, so a stepped frame is the same frame taken by hand."
+GamePane class >> stepWithKeys: mask [
+    | b |
+    Keys := mask.
+    b := self stepBlock.
+    b isNil ifFalse: [ b value ].
+    ^self
+]
+GamePane class >> reset [
+    | r |
+    r := self resetBlock.
+    r isNil ifFalse: [ r value ].
+    self clearBlocks.
+    Keys := 0.
+    ^self
+]
+GamePane >> primDefineSprite: id rows: hexRows [ <stprim: stGpDefineSprite> ]
+GamePane >> primSpriteColor: id index: index r: r g: g b: b [ <stprim: stGpSpriteColor> ]
+GamePane >> primMoveSprite: id x: x y: y [ <stprim: stGpMoveSprite> ]
+
+Sound >> primPlay: n [ <stprim: stGpPlay> ]
+
+"Custom synth effects (SOUND_EDITOR_PLAN.md) — the full ADSR recipe the
+ eleven presets are hand-tuned points in, opened to Smalltalk. `params` is
+ the flat contract list (duration, a d s r, sweep x2, noise, distortion,
+ echo x3, seed, oscCount, then wave/freq/amp/phase/pw per oscillator);
+ effect:slot: renders and parks it in a slot (define-once cached), playSlot:
+ fires it. A saved sound sheet's playOn: is these two sends."
+Sound class >> effect: params slot: n [ <stprim: stGpEffect> ]
+Sound class >> playSlot: n [ <stprim: stGpPlaySlot> ]
+Tune >> primPlayTune: s [ <stprim: stGpPlayTune> ]
+
+"The HUD text overlay — NEW here, not part of MACVM's corpus (its pane had
+ seven-segment digits and drew every letter as an empty box, so its GamePane
+ never offered text at all). This pane carries a real 5x7 ASCII atlas over the
+ indexed layer, in RGB rather than palette indices; `scale` blocks each font
+ pixel, so one font covers a HUD and a title screen. The overlay is RETAINED
+ between frames: a changing score wants textClear first, or each frame prints
+ over the last until the digits are solid blocks."
+GamePane >> textClear [ <stprim: stGpTextClear> ]
+GamePane >> text: aString x: x y: y r: r g: g b: b scale: k [
+    <stprim: stGpText>
+]
+GamePane >> text: aString x: x y: y r: r g: g b: b [
+    ^self text: aString x: x y: y r: r g: g b: b scale: 1
+]
+
+"The shader background (layer 0) and multi-frame sprites — also NEW here. A
+ Smalltalk game can now compile its own MSL for the bottom layer and animate a
+ sprite from frames held on its definition, which is what world/49's twelve
+ cosmos backdrops and its flapping fleet need."
+GamePane >> shader: mslSource [ <stprim: stGpShader> ]
+GamePane >> shaderParam: index value: aNumber [ <stprim: stGpShaderParam> ]
+GamePane >> primAddFrame: id rows: hexRows [ <stprim: stGpAddFrame> ]
+GamePane >> primPlace: id x: x y: y frame: f [ <stprim: stGpPlaceFrame> ]
+GamePane >> primHide: id [ <stprim: stGpHide> ]
+
+Sprite >> addFrame: hexRows [
+    "Add another frame of art to my definition (same size as the first).
+     Answer myself, so frames can be chained onto a fresh sprite."
+    pane primAddFrame: id rows: hexRows.
+    ^self
+]
+Sprite >> moveTo: x y: y frame: f [
+    "Move me and pick which frame of my definition to show."
+    pane primPlace: id x: x y: y frame: f.
+    ^self
+]
+Sprite >> hide [
+    "Stop drawing me until the next moveTo:."
+    pane primHide: id.
+    ^self
+]
+
+"The UFO warble — preset 10, beyond MACVM's ten. Two sines a few Hz apart beat
+ against each other; the beat IS the wah, so the pulse rate is the detune, not
+ a tremolo. Loop it while a saucer is on screen (it runs 0.9s)."
+Sound class >> saucer [ ^self preset: 10 ]
+
+"The capture boss's tractor hum — the same beating trick as the saucer, an
+ octave and a half down and slower (110 Hz, 4 Hz apart)."
+Sound class >> bossHum [ ^self preset: 11 ]
+
+"The PER-SCANLINE palette. Indices 1..15 can hold a different colour on every
+ line of the pane, so a shape drawn ONCE in one of them changes colour down the
+ screen and animates by rewriting the line colours — no pixel redrawn. This is
+ the copper-bar mechanism, and it is how world/49's tractor beam flows."
+GamePane >> linePaletteAt: line index: i r: r g: g b: b [ <stprim: stGpLinePal> ]

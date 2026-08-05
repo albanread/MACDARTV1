@@ -281,6 +281,15 @@ Sound preset_blip(double pitch, double dur) {
   return preset_beep(800.0 * pitch, dur);
 }
 
+Sound preset_wah(double freq, double detune, double dur) {
+  Effect e(dur);
+  e.add_osc(kSine, freq, 0.45);            // the two beat partners, equal amp
+  e.add_osc(kSine, freq + detune, 0.45);   // detune Hz apart == wahs per second
+  e.set_env(0.01, 0.1, 0.92, 0.2);         // high sustain: hold the warble
+  Lcg rng(0);
+  return render(e, rng);
+}
+
 Sound preset_tone(double freq, double dur, Waveform wave) {
   Effect e(dur);
   e.set_env(0.01, 0.05, 0.8, 0.1);

@@ -65,8 +65,22 @@ include_directories(${RT} ${RT}/include ${DC} ${RT}/third_party ${COCOA})
 # separate Release build dir gives a fast dart (NDEBUG compiles out Dart's
 # ASSERT/heap-verification; -O2 optimizes). Debug keeps -O0 -g for iteration.
 add_compile_options(-Wall -Wno-unused-parameter -Wno-unused-function)
-add_compile_options($<IF:$<CONFIG:Debug>,-g,-O2>)
-add_compile_options($<$<CONFIG:Debug>:-O0>)
+# Debug keeps -g -O0. Non-Debug optimization defaults to -O3 + ThinLTO +
+# Apple-Silicon tuning — measured ~4-5% faster on allocation/runtime-bound
+# workloads (alloc, DeltaBlue) than plain -O2, with pure-compute benches
+# unchanged (the JIT emits the same code regardless) and every benchmark
+# checksum intact. (Plain -O2 was silently overriding CMake's Release -O3.)
+# Overridable without editing this file, e.g. -DMACDART_RELEASE_OPT="-O2".
+# LTO flags must also reach the linker, hence add_link_options.
+set(MACDART_RELEASE_OPT "-O3 -flto=thin -mcpu=apple-m1" CACHE STRING
+    "Non-Debug optimization flags (space-separated; override to taste)")
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  add_compile_options(-g -O0)
+else()
+  separate_arguments(_macdart_opt UNIX_COMMAND "${MACDART_RELEASE_OPT}")
+  add_compile_options(${_macdart_opt})
+  add_link_options(${_macdart_opt})
+endif()
 # The VM type-puns pervasively; -fno-strict-aliasing is required for correct
 # optimized codegen (upstream passes it too). Without it, -O2 miscompiles the
 # flow-graph compiler into a NULL deref.
@@ -235,6 +249,11 @@ add_library(dart_cocoa STATIC
   ${COCOA}/cocoa_abi.cc        # @encode -> ABI-token classifier
   ${COCOA}/workspace_natives.cc # live-workspace eval primitives (Dart_EvaluateExpr)
   ${COCOA}/sqlite_natives.cc   # SQLite image store (libsqlite3)
+  ${MACDART_ROOT}/st/st_lexer.cc   # MACVM Smalltalk (.mst) reader: tokenizer
+  ${MACDART_ROOT}/st/st_parser.cc  # MACVM Smalltalk (.mst) reader: parser
+  ${MACDART_ROOT}/st/st_loader.cc  # ST -> VM object model registration (Sprint 2)
+  ${MACDART_ROOT}/st/st_flow_graph_builder.cc # ST AST -> Dart IL (Sprint 3)
+  ${MACDART_ROOT}/st/st_natives.cc # stLoad + stInvokeStatic natives
   ${COCOA}/gamepane/gp_synth.cc   # game pane: SFX synth (pure C++)
   ${COCOA}/gamepane/gp_engine.mm  # game pane: layered Metal engine
   ${COCOA}/gamepane/gp_natives.mm # game pane: the Dart boundary

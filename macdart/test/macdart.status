@@ -1,0 +1,23 @@
+# macdart.status — MACDART-LOCAL test expectations, layered ON TOP of each
+# upstream suite's own *.status files by runtests.py (load_status).
+#
+# Use this for outcomes that are real on the MACDART config
+# (compiler=none runtime=vm system=macos arch=arm64) but that upstream's status
+# files only record for OTHER configs — so the harness stops flagging them as
+# "unexpected" (its real-VM-bug signal) without us misrepresenting $-variables.
+# Keys are SUITE-RELATIVE, same as upstream (e.g. mirrors/invocation_fuzz_test).
+# Every entry MUST carry a comment explaining why it is expected here.
+
+[ $runtime == vm ]
+
+# The reflective fuzzer: enumerates EVERY method in the system and invokes each
+# with garbage values (null, ints, empty arrays, ...) hunting for native-method
+# crashes — by design, not a product code path. It crashes the 1.24.3
+# macos-arm64 VM. Upstream marks it Crash on $system==fuchsia and on the dartk/
+# dartkp Kernel compiler, RuntimeError on dart2js (dart-lang/sdk#29086, closed),
+# and Skip-on-timeout for dartk-vm-debug-x64 (#29439, closed) — but records
+# NOTHING for the plain vm/none config, so our harness saw it as unexpected.
+# Recorded here as a known crash (still counted in the XCRASH bucket, never
+# hidden) so it does not pollute the unexpected-crash signal. Hardening the
+# offending native against fuzzed args is a separate, optional task.
+mirrors/invocation_fuzz_test: Crash

@@ -1,0 +1,118 @@
+"type_conformance.mst — what Smalltalk's types ARE on this VM.
+
+ MACDART hosts Smalltalk on the Dart VM by mapping Smalltalk's kernel classes
+ straight onto Dart's built-ins: a SmallInteger IS a Dart int, a Boolean IS a
+ Dart bool, nil IS null. There is no wrapper object and no boxing layer — which
+ is exactly why the compiler cannot tell the two languages apart, and why the
+ loop tax is 1.00x.
+
+ The price is that Dart's semantics show through wherever the two languages
+ disagree. This file PINS that boundary. Some probes below assert real Smalltalk
+ behaviour; others record a deliberate DEVIATION, so that if the mapping ever
+ changes, a test says so instead of a user finding out.
+
+ Deliberately standalone: it uses only literals, the operators the front-end
+ maps to Dart IL tokens, identity (==/~~, a StrictCompare), and the inlined
+ control flow (ifTrue:/ifFalse:/and:/or:). It needs NO world image loaded, so it
+ tests the mapping itself rather than the library on top of it.
+
+ Run:  macdart/st/test/run_conformance.sh"
+
+Object subclass: TypeConformance [
+
+    "--- integers: Dart int (Smi), promoting to Mint/Bigint by itself ---"
+    intAdd            [ ^40 + 2 ]
+    intMul            [ ^6 * 7 ]
+    intIdentity       [ ^42 == 42 ]            "immediates: identity is value"
+    intNotIdentity    [ ^42 ~~ 43 ]
+    intCompare        [ ^(3 < 4) and: [ 4 >= 4 ] ]
+    intBig            [ ^1073741824 * 1073741824 ]   "past Smi -> Mint, exact?"
+    intBigIdentity    [ | a b | a := 1073741824 * 1073741824.
+                        b := 1073741824 * 1073741824. ^a == b ]
+    intMod            [ ^7 \\ 2 ]
+
+    "DIVISION is where the mapping most conspicuously does NOT let Dart through:
+     stDivide (cocoa.dart) keeps Smalltalk's EXACT division. 4 / 2 answers the
+     int 2, where Dart's own 4 / 2 is the double 2.0.
+
+     An INEXACT division (3 / 2) asks for the world's Fraction class. With the
+     world loaded that is what it answers; standalone, stDivide's probe misses
+     and it falls back to a plain double. That fallback only became reachable
+     when the natives learned to raise a catchable error — see HAZARD below."
+    intDivideExact    [ ^4 / 2 ]
+    intDivideExact2   [ ^100 / 10 ]
+    intDivideInexact  [ ^3 / 2 ]
+
+    "--- booleans: Dart bool ---"
+    boolTrue          [ ^true ]
+    boolIdentity      [ ^true == true ]
+    boolPickFalse     [ ^(1 > 2) ifTrue: [ 'yes' ] ifFalse: [ 'no' ] ]
+    boolAnd           [ ^true and: [ false ] ]
+    boolOr            [ ^false or: [ true ] ]
+
+    "--- nil: Dart null ---"
+    nilValue          [ ^nil ]
+    nilIdentity       [ ^nil == nil ]
+    nilNotFalse       [ ^nil ~~ false ]        "nil and false are distinct"
+
+    "--- floats: Dart double ---"
+    floatAdd          [ ^1.5 + 1.5 ]
+    floatMixed        [ ^1 + 1.5 ]             "int + double promotes"
+    floatIdentity     [ ^1.5 == 1.5 ]          "boxed doubles: identity?"
+
+    "--- symbols: INTERNED Dart Strings (Symbols::New) ---"
+    symbolIdentity    [ ^#foo == #foo ]        "interning must hold"
+    symbolEquals      [ ^#foo = #foo ]
+
+    "--- strings: Dart Strings (String::New per literal) ---"
+    stringEquals      [ ^'foo' = 'foo' ]
+    stringIdentity    [ ^'foo' == 'foo' ]      "two literals, two objects?"
+
+    "Symbol and String are the SAME runtime type here — there is no Symbol ext
+     in the dispatch chain. Smalltalk keeps them as different classes."
+    symbolVsString    [ ^#foo = 'foo' ]
+    symbolIsString    [ ^#foo == 'foo' ]
+
+    "--- characters: one-character Dart Strings ---
+     The world file 09_character.mst promises `$a == $a` via a flyweight table,
+     but a $a LITERAL compiles to a fresh String::New. This is the probe that
+     says whether that promise survives the literal path."
+    charEquals        [ ^$a = $a ]
+    charIdentity      [ ^$a == $a ]
+    charVsString      [ ^$a = 'a' ]            "distinct classes in Smalltalk"
+
+    "--- blocks: Dart closures ---"
+    blockValue        [ ^[ :x | x + 1 ] value: 41 ]
+    blockCapture      [ | n b | n := 10. b := [ :x | x + n ]. n := 20. ^b value: 1 ]
+
+    "--- collections: Dart List ---"
+    arrayLiteral      [ ^#(1 2 3) ]
+    byteArrayLiteral  [ ^#[1 2 3] ]
+
+    "HAZARD found by this test on its first run, 2026-07-27 — now FIXED.
+
+     `3 / 2` and `42 become: 43` both ask for something that is not loaded:
+     stDivide probes for the world's Fraction class, and become: is looked up
+     on a _Smi. Those misses were reported by the natives with Dart_NewApiError,
+     which is NOT a catchable Dart exception — it terminates the isolate. Two
+     consequences, both of which made a comment in the source untrue:
+
+       - stDivide's `catch (_) { _stFractionPresent = false; }` in cocoa.dart
+         was UNREACHABLE. It documents 'a plain double otherwise'; what actually
+         happened was that the process died. Every inexact integer division in
+         a standalone .mst did this.
+       - the same for any stSend/stNew/stInvokeStatic naming something absent:
+         a typo was not an error, it was an exit.
+
+     st_natives.cc now raises a catchable error (STThrow) at all eleven sites,
+     and both probes below are ordinary checks."
+
+    "--- values the driver inspects from the Dart side ---"
+    anInt             [ ^42 ]
+    aFloat            [ ^1.5 ]
+    aString           [ ^'hello' ]
+    aSymbol           [ ^#hello ]
+    aChar             [ ^$a ]
+    aBool             [ ^true ]
+    aBlock            [ ^[ :x | x ] ]
+]

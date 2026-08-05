@@ -1,0 +1,121 @@
+"Feature test: the CLASS side of the metaclass split — a missing class-side
+ selector is LOUD, and the constructors its old silence was hiding exist.
+
+ History, because this suite earned it twice over. A class-side send that
+ resolved to nothing used to answer nil; the silence hid five never-written
+ methods (`with:` on OrderedCollection/Set/Bag, `WriteStream with:`,
+ `Transcript basicPrint:`). Making it raise then appeared to corrupt
+ UNRELATED String code whole suites later — at:put: landing on a Type — and
+ the raise was reverted on a re-entrancy theory. The real culprit was
+ nothing of the sort: core-snapshot classes finalize members LAZILY, and an
+ ST ext-chain walk could mark _Type finalized with its members never parsed,
+ killing the patched _Type>>noSuchMethod for the whole process. The
+ LAZY-PARSE GUARD in st_loader.cc fixes that at the root; the raise is back;
+ these assertions keep both stories from regressing."
+STestCase subclass: TestClassSide [
+    tests [
+        "--- a missing class-side selector RAISES, exactly as an instance one
+             does — and through every calling shape, because the corruption
+             this suite remembers was SHAPE-dependent (a first-class block was
+             the poison; inline was fine) ---"
+        self should: [ Set totallyBogusSelector ] raise: Error
+             label: 'unary miss on a class raises'.
+        self should: [ Set bogusWith: 3 ] raise: Error
+             label: 'keyword miss on a class raises'.
+        self should: [ Object bogusThing ] raise: Error
+             label: 'miss on a bridged class raises'.
+        self should: [ OrderedCollection alsoBogus ] raise: Error
+             label: 'miss on a growable collection raises'.
+        self should: [ Set new bogusSelector ] raise: Error
+             label: 'instance miss raises too (pinned together)'.
+        self check: ([ | b | b := [ Set storedBlockBogus ].
+                       [ b value ] on: Error do: [ :e | #caught ] ] value)
+             is: #caught label: 'a stored-block miss is catchable'.
+        self check: 'poison' asUppercase is: 'POISON'
+             label: 'and String new: survives it (the old corruption)'.
+        self should: [ Set perform: #performedBogus ] raise: Error
+             label: 'perform: of a missing class-side selector raises'.
+        self check: 'again' asUppercase is: 'AGAIN'
+             label: 'and String new: survives that too'.
+
+        "--- the error NAMES the class, in Smalltalk terms — not the Dart
+             internals (`Class _Type@0150898 has no method`) it once leaked ---"
+        self assert: ([ Set bogusWith: 3 ] on: Error do: [ :e |
+                         e messageText includesSubstring: 'Set class' ])
+             label: 'the message names `Set class`'.
+        self deny: ([ Set bogusWith: 3 ] on: Error do: [ :e |
+                        e messageText includesSubstring: '_Type' ])
+             label: 'no _Type in the message'.
+        self deny: ([ Object bogusThing ] on: Error do: [ :e |
+                        e messageText includesSubstring: 'ext ' ])
+             label: 'the holder suffix never reaches the message'.
+
+        "--- a DELIBERATELY unported method raises rather than answering nil.
+             30_date_time.mst has always PROMISED `Date today` is a plain
+             doesNotUnderstand (it needs a wall-clock primitive); the engine
+             now delivers what the doc says. ---"
+        self should: [ Date today ] raise: Error
+             label: 'Date today raises, as its own doc promised'.
+        self assert: (Date newDay: 4 monthIndex: 8 year: 2026) notNil
+             label: 'the ported Date constructor still works'.
+
+        "--- the `with:` family on the GROWABLE collections ---
+             Array and String always had their own (the fixed-size shape:
+             `new:` then at:put:). These inherit from Collection class, which
+             builds with `self new` + add:."
+        self check: (Set with: 1) size is: 1 label: 'Set with:'.
+        self check: (Set with: 1 with: 2) size is: 2 label: 'Set with:with:'.
+        self check: (Set with: 1 with: 1) size is: 1 label: 'Set with: dedupes'.
+        self check: (OrderedCollection with: 3) first is: 3
+             label: 'OrderedCollection with:'.
+        self check: (OrderedCollection with: 1 with: 2) size is: 2
+             label: 'OrderedCollection with:with:'.
+        self check: (OrderedCollection with: 1 with: 2 with: 3) last is: 3
+             label: 'OrderedCollection with:with:with:'.
+        self check: (OrderedCollection with: 1 with: 2 with: 3 with: 4) size is: 4
+             label: 'OrderedCollection with: x4'.
+        self check: (Bag with: 5) size is: 1 label: 'Bag with:'.
+        self check: (Bag with: 5 with: 5) size is: 2
+             label: 'Bag with: keeps duplicates'.
+
+        "Argument order is preserved for the sequenceable one — add: in order,
+         not reversed."
+        self check: (OrderedCollection with: 'a' with: 'b') first is: 'a'
+             label: 'with: preserves argument order'.
+
+        "The inherited factory must build the SUBCLASS, not Collection — the
+         same trap `withAll:` fell into once, where `self new` from an
+         inherited factory took a bare-basicNew path that skipped the
+         subclass's own init."
+        self assert: ((Set with: 1) isKindOf: Set) label: 'with: answers a Set'.
+        self assert: ((OrderedCollection with: 1) isKindOf: OrderedCollection)
+             label: 'with: answers an OrderedCollection'.
+        self assert: ((Bag with: 1) isKindOf: Bag) label: 'with: answers a Bag'.
+
+        "The fixed-size ones keep their own versions — the bridge table for the
+         1-arg String case, the ST methods above it for the rest."
+        self check: (Array with: 1 with: 2) size is: 2 label: 'Array with: still works'.
+        self check: (String with: $a) is: 'a' label: 'String with: still works'.
+        self check: (String with: $a with: $b) is: 'ab' label: 'String with:with:'.
+
+        "--- WriteStream with:, `on:`'s appending twin ---
+             on: starts at zero and overwrites; with: starts at the END, so
+             writes extend what is already there."
+        self check: ((WriteStream with: 'abc') nextPutAll: 'de'; contents) is: 'abcde'
+             label: 'WriteStream with: appends'.
+        self check: ((WriteStream on: String new) nextPutAll: 'de'; contents) is: 'de'
+             label: 'WriteStream on: still starts empty'.
+        self check: (WriteStream with: '') contents is: ''
+             label: 'WriteStream with: an empty seed'.
+
+        "--- Transcript basicPrint: ---
+             The low-level write the world's TranscriptStream defines show: in
+             terms of. The name `Transcript` resolves to the PRELUDE class, not
+             to the world's `Transcript := TranscriptStream new` instance, and
+             the prelude class did not have it — so the primitive-coverage
+             probe had been asserting 'printed, survived' about a send that
+             only ever did the surviving."
+        self assert: (Transcript basicPrint: '') notNil
+             label: 'basicPrint: answers something'.
+    ]
+]

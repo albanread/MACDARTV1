@@ -1,0 +1,12 @@
+"82_number_math.mst — MACDART: raisedTo: for EVERY exponent.
+
+ 51_number_ext's raisedTo: (kept verbatim there) supports only integer
+ exponents and signals on anything else — so `2 raisedTo: 0.5` errored where
+ every Smalltalk answers sqrt 2. This overlay re-points it at dart:cocoa's
+ stRaisedTo: integer exponents stay EXACT (an int base promotes through the
+ bignum tower; a Fraction accumulates via its own *; a negative exponent
+ answers the exact reciprocal — a Fraction for an int base), and a fractional
+ exponent goes through doubles (math.pow). 51's `**` delegates to raisedTo:,
+ so it inherits all of this. Loads after 51 (file 82); reopen replaces."
+
+Number >> raisedTo: aNumber [ <stprim: stRaisedTo> ]

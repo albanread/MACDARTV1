@@ -1,0 +1,121 @@
+"primitive_probes.mst — the probes for primitive_coverage.dart.
+
+ Each method performs ONE send that lands on a world method whose whole body is
+ a bare <primitive: N>. Written in Smalltalk on purpose: that is the path real
+ code takes — an ordinary send to a native receiver, missing in Dart, arriving
+ at the extension holder through noSuchMethod. Calling stSend from Dart instead
+ tests a different (direct-lookup) path and proves nothing about user code.
+
+ Every expected answer is deliberately DIFFERENT from the receiver, because the
+ failure being hunted is a method that silently answers self."
+
+Object subclass: PrimProbe [
+
+    "SmallInteger — bit operations have no Dart operator mapping"
+    bitAnd      [ ^5 bitAnd: 3 ]        "1, not 5"
+    bitOr       [ ^5 bitOr: 2 ]         "7, not 5"
+    bitXor      [ ^5 bitXor: 3 ]        "6, not 5"
+    bitShift    [ ^1 bitShift: 4 ]      "16, not 1"
+    intAsDouble [ ^3 asDouble ]         "3.0 (a double), not the int 3"
+
+    "Double — the transcendentals"
+    dsqrt       [ ^4.0 sqrt ]           "2.0, not 4.0"
+    dfloor      [ ^2.7 floor ]          "2, not 2.7"
+    dln         [ ^1.0 ln ]             "0.0, not 1.0"
+    dexp        [ ^1.0 exp ]            "2.718…, not 1.0"
+    dcos        [ ^0.0 cos ]            "1.0, not 0.0"
+    dsin        [ ^1.5707963267948966 sin ]   "1.0"
+    dtan        [ ^0.7853981633974483 tan ]   "1.0"
+    datan       [ ^1.0 atan ]           "0.785…, not 1.0"
+
+    "String"
+    strSize     [ ^'abc' size ]         "3"
+    strHash     [ ^'abc' hash ]         "an integer"
+    strCompare  [ ^'abc' compare: 'abc' ]
+
+    "Array — at: is 1-based in Smalltalk"
+    arrSize     [ ^#(7 8 9) size ]      "3"
+    arrAt       [ ^#(7 8 9) at: 1 ]     "7"
+    arrAtPut    [ | a | a := Array new: 3. a at: 1 put: 42. ^a at: 1 ]   "42"
+
+    "BlockClosure"
+    blkValue    [ ^[ 42 ] value ]
+    blkValue1   [ ^[ :x | x + 1 ] value: 41 ]
+    blkValue2   [ ^[ :a :b | a * b ] value: 6 value: 7 ]
+
+    "Object"
+    objIdentity [ ^'x' == 'y' ]         "false"
+    objIdHash   [ ^42 identityHash ]    "an integer"
+
+    "--- round 2: the remainder the first pass could only list ---
+     Where the right answer is not obvious (a hash, a byte count) the probe
+     asks the ONE question that matters instead: did it answer the receiver?"
+
+    "ByteArray"
+    baSize      [ ^#[1 2 3] size ]              "3"
+    baAt        [ ^#[7 8 9] at: 1 ]             "7"
+    baAtPut     [ | b | b := ByteArray new: 3. b at: 1 put: 42. ^b at: 1 ]
+    baHash      [ ^#[1 2 3] hash ]              "an integer, not the array"
+    baCompare   [ ^#[1 2 3] compare: #[1 2 3] ] "an integer"
+    baReplace   [ | b | b := ByteArray new: 3. b replaceFrom: 1 to: 3 with: #[7 8 9]. ^b at: 2 ]
+
+    "LargeInteger — self would be the huge receiver, so ask ~= self"
+    liSizeNotSelf [ | n | n := 1073741824 * 1073741824. ^(n size) ~= n ]
+    liHashNotSelf [ | n | n := 1073741824 * 1073741824. ^(n hash) ~= n ]
+    liByteAt      [ ^(1073741824 * 1073741824) byteAt: 1 ]
+
+    "String"
+    strAsSymbol [ ^('abc' asSymbol) == #abc ]   "true"
+    strByteAt   [ ^'abc' basicByteAt: 1 ]       "97"
+
+    "Object reflection / allocation"
+    objClass      [ ^42 class ]
+    objBasicNewNe [ ^(PrimProbe basicNew) == PrimProbe ]   "false: an instance"
+    objInstVarAt  [ | c | c := PrimCell new. c setV: 42. ^c instVarAt: 1 ]
+
+    "BlockClosure"
+    blkValue3     [ ^[ :a :b :c | a + b + c ] value: 1 value: 2 value: 39 ]
+    blkValueWith  [ ^[ :a :b | a * b ] valueWithArguments: #(6 7) ]
+    blkEnsure     [ | x | x := 0. [ x := 1 ] ensure: [ x := x + 41 ]. ^x ]
+    blkCurtailed  [ | x | x := 0. [ x := 42 ] ifCurtailed: [ x := 0 - 1 ]. ^x ]
+
+    "Double"
+    dPrintDigitsNotSelf [ ^(1.5 printDigits) ~= 1.5 ]
+
+    "--- round 3: error:, mutation, allocation ---"
+
+    "error: must RAISE (the driver catches). A silent self would answer the
+     PrimProbe instance and the guard below would never run."
+    doError     [ self error: 'boom'. ^'NOT RAISED' ]
+
+    "String mutation: at:put: routes through basicByteAt:put:. If that is
+     unsupported the store is lost."
+    strAtPut    [ | s | s := String new: 3. s at: 1 put: $x. ^(s at: 1) asInteger ]
+    strNewSize  [ ^(String new: 3) size ]
+
+    "basicNew: — indexed allocation (Array new: goes through it in MACVM)"
+    arrNewSize  [ ^(Array new: 5) size ]
+
+    "halt answers self and is otherwise a no-op — DOCUMENTED behavior, so a
+     self-answer here is CORRECT, not the bug pattern"
+    haltIsSelf  [ ^self halt == self ]
+
+    "basicByteAt:put: directly (the raw store under at:put:)"
+    basicBytePut [ | s | s := String new: 2. s basicByteAt: 1 put: 65. ^s basicByteAt: 1 ]
+
+    "basicPrint: writes to the transcript — must not answer self or crash"
+    doBasicPrint [ ^Transcript basicPrint: 'x' ]
+
+    "ClassMirror reflection (needs the world). Broken: the primitives answer
+     self/empty. Vestigial in MACDART (the browser reflects the SQLite image
+     and dart:mirrors, not ClassMirror), so tracked open, not fixed."
+    cmAllClasses [ ^ClassMirror allClasses size ]
+    cmSelectors  [ ^(ClassMirror selectorsOf: Object) size ]
+    cmIvars      [ ^(ClassMirror instanceVariablesOf: Association) size ]
+]
+
+Object subclass: PrimCell [
+    | v |
+    setV: x [ v := x ]
+    v [ ^v ]
+]

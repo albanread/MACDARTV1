@@ -210,59 +210,6 @@
    if (Dart_IsError(result)) {
      const char* err_msg = Dart_GetError(library);
 
---- a/runtime/bin/main.cc
-+++ b/runtime/bin/main.cc
-@@ -1283,6 +1283,11 @@
- }
- 
- 
-+// Defined in macdart/cocoa/cocoa_host.mm — only linked into the `dartui`
-+// executable (DART_UI_HOST). Services the UI isolate on OS thread 0 via
-+// [NSApp run] + a Dart_HandleMessages() pump.
-+extern "C" int macdart_run_ui_host(void);
-+
- bool RunMainIsolate(const char* script_name, CommandLineOptions* dart_options) {
-   // Call CreateIsolateAndSetup which creates an isolate and loads up
-   // the specified application script.
-@@ -1450,8 +1455,22 @@
-                            kNumIsolateArgs, isolate_args);
-       CHECK_RESULT(result);
- 
-+#if defined(DART_UI_HOST)
-+      // GUI host build (`dartui`): main() was just queued as the startup
-+      // message. Instead of Dart_RunLoop() (which services the isolate on a pool
-+      // thread, where AppKit rejects NSWindow/NSView work), run [NSApp run] on
-+      // THIS thread — OS thread 0 — with a CFRunLoopSource that calls
-+      // Dart_HandleMessages(). So main() and all UI-isolate Dart (incl. the
-+      // control socket and AppKit callbacks) run where AppKit is legal.
-+      // See macdart/cocoa/cocoa_host.mm and WORKSPACE_PLAN.md.
-+      int ui_rc = macdart_run_ui_host();
-+      result = (ui_rc == 0) ? Dart_Null()
-+                            : Dart_NewApiError("dartui host exited non-zero");
-+      CHECK_RESULT(result);
-+#else
-       // Keep handling messages until the last active receive port is closed.
-       result = Dart_RunLoop();
-+#endif  // DART_UI_HOST
-       // Generate an app snapshot after execution if specified.
-       if (gen_snapshot_kind == kAppJIT) {
-         if (!Dart_IsCompilationError(result)) {
-@@ -1611,6 +1630,15 @@
-   bool print_flags_seen = false;
-   bool verbose_debug_seen = false;
- 
-+#if defined(DART_UI_HOST)
-+  // The workspace toolbar reports JIT counters (functions compiled/optimized and
-+  // generated code bytes). INC_STAT in vm/compiler_stats.h is compiled behind
-+  // FLAG_compiler_stats, so without this they would read a flat 0. Costs an
-+  // atomic increment and a timer scope per compilation. See
-+  // Dart_WorkspaceVmStats and macdart/cocoa/workspace/workspace.dart.
-+  vm_options.AddArgument("--compiler_stats");
-+#endif
-+
-   // Perform platform specific initialization.
-   if (!Platform::Initialize()) {
-     Log::PrintErr("Initialization failed\n");
 --- a/runtime/vm/dart_api_impl.cc
 +++ b/runtime/vm/dart_api_impl.cc
 @@ -6277,6 +6277,72 @@
@@ -371,3 +318,549 @@
  /*
   * ========
   * Timeline
+--- a/runtime/lib/type_patch.dart	2026-07-25 09:31:56.890865745 +0100
++++ b/runtime/lib/type_patch.dart	2026-07-29 21:49:46.423514394 +0100
+@@ -10,7 +10,22 @@
+ }
+ 
+ // Equivalent of RawType.
+-class _Type extends _AbstractType {}
++class _Type extends _AbstractType {
++  // MACDART ST front-end (Sprint 11b): a Smalltalk class VALUE is a Type, so
++  // a send to one held in a variable (`benchClass runOne`) IC-misses to here.
++  // The hook — set by dart:cocoa when the ST runtime initializes — tries
++  // class-side dispatch on the metaclass shadow chain and answers [result],
++  // or null for a genuine miss (which then follows the normal NSM path).
++  noSuchMethod(Invocation inv) {
++    var hook = internal.VMLibraryHooks.stTypeNSM;
++    if (hook != null && inv.isMethod && inv.namedArguments.isEmpty) {
++      var r = hook(this, internal.Symbol.getName(inv.memberName),
++                   inv.positionalArguments);
++      if (r != null) return r[0];
++    }
++    return super.noSuchMethod(inv);
++  }
++}
+ 
+ // Equivalent of RawTypeRef.
+ class _TypeRef extends _AbstractType {}
+--- a/runtime/lib/internal_patch.dart	2026-07-25 09:31:56.888181484 +0100
++++ b/runtime/lib/internal_patch.dart	2026-07-29 22:37:53.551539175 +0100
+@@ -13,6 +13,16 @@
+     native "Internal_makeFixedListUnmodifiable";
+ 
+ class VMLibraryHooks {
++  // MACDART ST front-end (Sprint 11b): tried by _Type.noSuchMethod so a
++  // Smalltalk class VALUE held in a variable is a first-class receiver.
++  // Set by dart:cocoa; (type, String selector, List args) -> [result] | null.
++  static var stTypeNSM;
++
++  // MACDART ST front-end (Sprint 11c): tried by Object.noSuchMethod so the
++  // world image's core-class extensions (Integer>>fib, ...) dispatch on Dart
++  // native receivers. Same contract as stTypeNSM.
++  static var stObjNSM;
++
+   // Example: "dart:isolate _Timer._factory"
+   static var timerFactory;
+ 
+--- a/runtime/lib/object_patch.dart	2026-07-25 09:31:56.889502489 +0100
++++ b/runtime/lib/object_patch.dart	2026-07-29 22:37:38.534235152 +0100
+@@ -44,6 +44,21 @@
+ 
+   @patch
+   dynamic noSuchMethod(Invocation invocation) {
++    // MACDART ST front-end (Sprint 11c): the world image extends core classes
++    // (`Number subclass: Integer [ fib [...] ]`) whose instances here are
++    // Dart natives — a genuine miss on any receiver first tries the ST
++    // extension-holder chain for the receiver's kind. The hook (set by
++    // dart:cocoa when the ST runtime initializes) answers [result] on a hit,
++    // null on a miss (then the normal NSM error proceeds). Zero cost until a
++    // send has already missed.
++    var stHook = internal.VMLibraryHooks.stObjNSM;
++    if (stHook != null &&
++        invocation.isMethod &&
++        invocation.namedArguments.isEmpty) {
++      var r = stHook(this, internal.Symbol.getName(invocation.memberName),
++          invocation.positionalArguments);
++      if (r != null) return r[0];
++    }
+     return _noSuchMethod(
+         invocation.isMethod,
+         internal.Symbol.getName(invocation.memberName),
+--- a/runtime/bin/main.cc	2026-07-25 09:31:56.877152483 +0100
++++ b/runtime/bin/main.cc	2026-07-29 23:39:47.717743868 +0100
+@@ -36,6 +36,16 @@
+ 
+ #include "vm/kernel.h"
+ 
++// MACDART ST front-end (--with-st): boot the vendored Smalltalk world into
++// the main isolate before main() runs. The logic lives in macdart/st
++// (st::BootWorldForMain); only this hook is in the VM tree.
++namespace st {
++const char* BootWorldForMain(const char* explicit_dir,
++                             const char* exe_path,
++                             char* msg_buf,
++                             int msg_cap);
++}
++
+ namespace dart {
+ namespace bin {
+ 
+@@ -110,6 +120,9 @@
+ // URIs and the loading of libraries, parts and scripts.
+ static bool trace_loading = false;
+ 
++static bool with_st = false;
++static const char* with_st_path = NULL;
++
+ 
+ static char* app_script_uri = NULL;
+ static const uint8_t* app_isolate_snapshot_data = NULL;
+@@ -555,6 +568,19 @@
+ }
+ 
+ 
++static bool ProcessWithStOption(const char* option_value,
++                                CommandLineOptions* vm_options) {
++  ASSERT(option_value != NULL);
++  with_st = true;
++  if (*option_value == '=') {
++    with_st_path = option_value + 1;
++  } else if (*option_value != '\0') {
++    return false;
++  }
++  return true;
++}
++
++
+ static struct {
+   const char* option_name;
+   bool (*process)(const char* option, CommandLineOptions* vm_options);
+@@ -590,6 +616,7 @@
+     {"--short_socket_write", ProcessShortSocketWriteOption},
+     {"--root-certs-file=", ProcessRootCertsFileOption},
+     {"--root-certs-cache=", ProcessRootCertsCacheOption},
++    {"--with-st", ProcessWithStOption},
+     {NULL, NULL}};
+ 
+ 
+@@ -1283,6 +1310,11 @@
+ }
+ 
+ 
++// Defined in macdart/cocoa/cocoa_host.mm — only linked into the `dartui`
++// executable (DART_UI_HOST). Services the UI isolate on OS thread 0 via
++// [NSApp run] + a Dart_HandleMessages() pump.
++extern "C" int macdart_run_ui_host(void);
++
+ bool RunMainIsolate(const char* script_name, CommandLineOptions* dart_options) {
+   // Call CreateIsolateAndSetup which creates an isolate and loads up
+   // the specified application script.
+@@ -1428,6 +1460,19 @@
+ 
+       if (gen_snapshot_kind == kAppJIT) Dart_SortClasses();
+ 
++      // MACDART --with-st: load the vendored Smalltalk world before main().
++      if (with_st) {
++        char st_msg[512];
++        st_msg[0] = '\0';
++        const char* st_err = ::st::BootWorldForMain(
++            with_st_path, Platform::GetExecutableName(), st_msg,
++            sizeof(st_msg));
++        if (st_err != NULL) {
++          ErrorExit(kErrorExitCode, "--with-st: %s\n", st_err);
++        }
++        Log::PrintErr("%s\n", st_msg);
++      }
++
+       // The helper function _getMainClosure creates a closure for the main
+       // entry point which is either explicitly or implictly exported from the
+       // root library.
+@@ -1450,8 +1495,22 @@
+                            kNumIsolateArgs, isolate_args);
+       CHECK_RESULT(result);
+ 
++#if defined(DART_UI_HOST)
++      // GUI host build (`dartui`): main() was just queued as the startup
++      // message. Instead of Dart_RunLoop() (which services the isolate on a pool
++      // thread, where AppKit rejects NSWindow/NSView work), run [NSApp run] on
++      // THIS thread — OS thread 0 — with a CFRunLoopSource that calls
++      // Dart_HandleMessages(). So main() and all UI-isolate Dart (incl. the
++      // control socket and AppKit callbacks) run where AppKit is legal.
++      // See macdart/cocoa/cocoa_host.mm and WORKSPACE_PLAN.md.
++      int ui_rc = macdart_run_ui_host();
++      result = (ui_rc == 0) ? Dart_Null()
++                            : Dart_NewApiError("dartui host exited non-zero");
++      CHECK_RESULT(result);
++#else
+       // Keep handling messages until the last active receive port is closed.
+       result = Dart_RunLoop();
++#endif  // DART_UI_HOST
+       // Generate an app snapshot after execution if specified.
+       if (gen_snapshot_kind == kAppJIT) {
+         if (!Dart_IsCompilationError(result)) {
+@@ -1611,6 +1670,15 @@
+   bool print_flags_seen = false;
+   bool verbose_debug_seen = false;
+ 
++#if defined(DART_UI_HOST)
++  // The workspace toolbar reports JIT counters (functions compiled/optimized and
++  // generated code bytes). INC_STAT in vm/compiler_stats.h is compiled behind
++  // FLAG_compiler_stats, so without this they would read a flat 0. Costs an
++  // atomic increment and a timer scope per compilation. See
++  // Dart_WorkspaceVmStats and macdart/cocoa/workspace/workspace.dart.
++  vm_options.AddArgument("--compiler_stats");
++#endif
++
+   // Perform platform specific initialization.
+   if (!Platform::Initialize()) {
+     Log::PrintErr("Initialization failed\n");
+--- a/runtime/vm/flow_graph_inliner.cc	2026-07-25 09:31:56.971461723 +0100
++++ b/runtime/vm/flow_graph_inliner.cc	2026-07-30 17:17:34.854423019 +0100
+@@ -23,6 +23,17 @@
+ #include "vm/object_store.h"
+ #include "vm/timer.h"
+ 
++namespace st {
++// ST inlining: build an ST callee graph with the inliner's exit collector +
++// block-id offset (mirrors the compiler.cc BuildFlowGraph hook, extended for
++// inlining). Without this, an ST callee routes into the kernel FlowGraphBuilder
++// and misreads the st::Node marker.
++::dart::FlowGraph* BuildGraph(::dart::ParsedFunction*,
++                              const ::dart::ZoneGrowableArray<
++                                  const ::dart::ICData*>&,
++                              ::dart::InlineExitCollector*, intptr_t);
++}  // namespace st
++
+ namespace dart {
+ 
+ DEFINE_FLAG(int,
+@@ -796,13 +807,21 @@
+             new (Z) InlineExitCollector(caller_graph_, call);
+         FlowGraph* callee_graph;
+         if (UseKernelFrontEndFor(parsed_function)) {
+-          kernel::TreeNode* node = static_cast<kernel::TreeNode*>(
+-              parsed_function->function().kernel_function());
+-
+-          kernel::FlowGraphBuilder builder(
+-              node, parsed_function, *ic_data_array, exit_collector,
+-              Compiler::kNoOSRDeoptId, caller_graph_->max_block_id() + 1);
+-          {
++          // MACDART: an ST method carries a NON-NULL marker (an st::Node) and
++          // builds through the ST inliner path. The noSuchMethod/invokeField
++          // dispatcher kinds also reach here but with a NULL marker — they
++          // stay on the kernel FlowGraphBuilder (which handles a NULL node).
++          if (parsed_function->function().kernel_function() != NULL) {
++            CSTAT_TIMER_SCOPE(thread(), graphinliner_build_timer);
++            callee_graph = ::st::BuildGraph(
++                parsed_function, *ic_data_array, exit_collector,
++                caller_graph_->max_block_id() + 1);
++          } else {
++            kernel::TreeNode* node = static_cast<kernel::TreeNode*>(
++                parsed_function->function().kernel_function());
++            kernel::FlowGraphBuilder builder(
++                node, parsed_function, *ic_data_array, exit_collector,
++                Compiler::kNoOSRDeoptId, caller_graph_->max_block_id() + 1);
+             CSTAT_TIMER_SCOPE(thread(), graphinliner_build_timer);
+             callee_graph = builder.BuildGraph();
+           }
+@@ -1260,7 +1279,9 @@
+       }
+ 
+       if (target.IsNull()) {
+-        TRACE_INLINING(THR_Print("     Bailout: non-closure operator\n"));
++        TRACE_INLINING(THR_Print(
++            "     Bailout: non-closure operator (arg0 def=%s)\n",
++            call->ArgumentAt(0)->OriginalDefinition()->DebugName()));
+         continue;
+       }
+ 
+--- a/runtime/vm/object.cc	2026-07-25 09:31:56.984713441 +0100
++++ b/runtime/vm/object.cc	2026-07-30 20:18:15.928847000 +0100
+@@ -9526,6 +9526,11 @@
+   ASSERT(line_number > 0);
+ 
+   if (kind() == RawScript::kKernelTag) {
++    // MACDART: ST scripts (st:mst/N) are kernel-tagged with a line_starts
++    // table (Sprint 16) — TokenPositions are byte offsets, and this branch
++    // maps a line to its offset range with no TokenStream. This MUST run
++    // before the TokenStream guard below (which is what makes source-level
++    // ST breakpoints resolve).
+     const Array& line_starts_array = Array::Handle(line_starts());
+     if (line_starts_array.IsNull()) {
+       // Scripts in the AOT snapshot do not have a line starts array.
+@@ -9533,7 +9538,12 @@
+       *last_token_index = TokenPosition::kNoSource;
+       return;
+     }
+-    ASSERT(line_starts_array.Length() >= line_number);
++    if (line_starts_array.Length() < line_number) {
++      // A line past the end of the source (an over-eager IDE request).
++      *first_token_index = TokenPosition::kNoSource;
++      *last_token_index = TokenPosition::kNoSource;
++      return;
++    }
+     Smi& value = Smi::Handle();
+     value ^= line_starts_array.At(line_number - 1);
+     *first_token_index = TokenPosition(value.Value());
+@@ -9547,6 +9557,15 @@
+     return;
+   }
+ 
++  // MACDART: a non-kernel script with no TokenStream (should not happen for ST
++  // now that they are kernel-tagged, but keep the guard — the TokenStream walk
++  // below dereferences null and segv'd the GUI before).
++  if (tokens() == TokenStream::null()) {
++    *first_token_index = TokenPosition::kNoSource;
++    *last_token_index = TokenPosition::kNoSource;
++    return;
++  }
++
+   Zone* zone = Thread::Current()->zone();
+   *first_token_index = TokenPosition::kNoSource;
+   *last_token_index = TokenPosition::kNoSource;
+--- a/runtime/vm/compiler.cc	2026-07-25 09:31:56.962975982 +0100
++++ b/runtime/vm/compiler.cc	2026-07-30 20:20:51.599885000 +0100
+@@ -45,6 +45,21 @@
+ #include "vm/timeline.h"
+ #include "vm/timer.h"
+ 
++// MACDART: the Smalltalk (.mst) IL builder (macdart/st/st_flow_graph_builder.cc,
++// tracked outside the gitignored runtime tree). ST-marked functions route here
++// instead of the dormant kernel builder — see BuildFlowGraph below and
++// ST_PLAN.md Sprint 3. Declared at file scope; compiler.cc is `namespace dart`.
++namespace st {
++::dart::FlowGraph* BuildGraph(
++    ::dart::ParsedFunction*,
++    const ::dart::ZoneGrowableArray<const ::dart::ICData*>&,
++    intptr_t);
++// Scope-only prep for the ST var-descriptor path (ComputeLocalVarDescriptors):
++// route an ST method here instead of the kernel ScopeBuilder, which segvs on
++// the ST marker (the profiler/GC/debugger walking an unoptimized ST frame).
++void PrepareScopes(::dart::ParsedFunction*);
++}  // namespace st
++
+ namespace dart {
+ 
+ DEFINE_FLAG(bool,
+@@ -135,6 +150,13 @@
+     const ZoneGrowableArray<const ICData*>& ic_data_array,
+     intptr_t osr_id) {
+   if (UseKernelFrontEndFor(parsed_function)) {
++    // MACDART: an ST-marked function carries a non-NULL kernel_function_ slot
++    // (reused as the Smalltalk marker, ST_PLAN.md §2.2). The noSuchMethod /
++    // invokeField dispatcher kinds also reach here but with a NULL marker and
++    // stay on the kernel builder below.
++    if (parsed_function->function().kernel_function() != NULL) {
++      return st::BuildGraph(parsed_function, ic_data_array, osr_id);
++    }
+     kernel::TreeNode* node = static_cast<kernel::TreeNode*>(
+         parsed_function->function().kernel_function());
+     kernel::FlowGraphBuilder builder(node, parsed_function, ic_data_array, NULL,
+@@ -369,6 +391,30 @@
+   if (cls.is_marked_for_parsing()) {
+     return Error::null();
+   }
++  // MACDART: an ST class (st:mst / st:prelude library) has NO Dart source —
++  // routing it to the Parser segv's (no TokenStream). This path is reached by
++  // the DEBUGGER's FindBestFit -> EnsureIsFinalized when resolving a
++  // breakpoint. Finalize it directly via the loader's ClassFinalizer path,
++  // exactly like a typedef class does below.
++  {
++    const Library& lib = Library::Handle(cls.library());
++    if (!lib.IsNull()) {
++      const String& url = String::Handle(lib.url());
++      if (url.StartsWith(String::Handle(String::New("st:")))) {
++        LongJumpScope jump;
++        if (setjmp(*jump.Set()) == 0) {
++          ClassFinalizer::FinalizeClass(cls);
++          return Error::null();
++        } else {
++          Thread* thread = Thread::Current();
++          Error& error = Error::Handle(thread->zone());
++          error = thread->sticky_error();
++          thread->clear_sticky_error();
++          return error.raw();
++        }
++      }
++    }
++  }
+   // If the class is a typedef class there is no need to try and
+   // compile it. Just finalize it directly.
+   if (cls.IsTypedefClass()) {
+@@ -1593,7 +1639,9 @@
+       Parser::ParseFunction(parsed_function);
+       parsed_function->AllocateVariables();
+     } else {
+-      parsed_function->EnsureKernelScopes();
++      // MACDART: the marker is an st::Node (V1 has no real kernel), so the
++      // kernel ScopeBuilder would segv on it. Route to the ST scope builder.
++      ::st::PrepareScopes(parsed_function);
+     }
+     const LocalVarDescriptors& var_descs = LocalVarDescriptors::Handle(
+         parsed_function->node_sequence()->scope()->GetVarDescriptors(function));
+--- a/runtime/vm/debugger.h
++++ b/runtime/vm/debugger.h
+@@ -335,7 +335,15 @@
+   // Print the activation frame into |jsobj|. if |full| is false, script
+   // and local variable objects are only references. if |full| is true,
+   // the complete script, function, and, local variable objects are included.
+-  void PrintToJSONObject(JSONObject* jsobj, bool full = false);
++  // |with_vars| = false prints the frame's location WITHOUT reading its
++  // variables — for frames of code that is RUNNING rather than paused
++  // (the synthesized kResume top frame), where slots may be uninitialized
++  // (a stack-overflow check interrupts at function entry) or optimized
++  // away, and reading them can fault (MACDART: SEGV in VariableAt when a
++  // service getIsolate landed while Smalltalk-built code was mid-flight).
++  void PrintToJSONObject(JSONObject* jsobj,
++                         bool full = false,
++                         bool with_vars = true);
+ 
+   RawObject* GetAsyncAwaiter();
+   RawObject* GetCausalStack();
+@@ -343,7 +351,7 @@
+   bool HandlesException(const Instance& exc_obj);
+ 
+  private:
+-  void PrintToJSONObjectRegular(JSONObject* jsobj, bool full);
++  void PrintToJSONObjectRegular(JSONObject* jsobj, bool full, bool with_vars);
+   void PrintToJSONObjectAsyncCausal(JSONObject* jsobj, bool full);
+   void PrintToJSONObjectAsyncSuspensionMarker(JSONObject* jsobj, bool full);
+   void PrintToJSONObjectAsyncActivation(JSONObject* jsobj, bool full);
+--- a/runtime/vm/debugger.cc
++++ b/runtime/vm/debugger.cc
+@@ -1111,7 +1111,18 @@
+   if (deopt_frame_.IsNull()) {
+     return GetVariableValue(LocalVarAddress(fp(), slot_index));
+   } else {
+-    return deopt_frame_.At(LocalVarIndex(deopt_frame_offset_, slot_index));
++    // The var descriptors describe the UNOPTIMIZED frame; this frame's values
++    // come from the deopt materialization, which holds only what the
++    // optimizer's environment knew. A descriptor slot beyond it (Smalltalk-
++    // built functions allocate builder temps the environment never carries)
++    // used to read out of the array — in release, straight into whatever
++    // heap memory followed. Answer the optimizer's own sentinel instead,
++    // exactly what an honestly-elided variable reports.
++    const intptr_t index = LocalVarIndex(deopt_frame_offset_, slot_index);
++    if ((index < 0) || (index >= deopt_frame_.Length())) {
++      return Symbols::OptimizedOut().raw();
++    }
++    return deopt_frame_.At(index);
+   }
+ }
+ 
+@@ -1218,20 +1229,33 @@
+ RawObject* ActivationFrame::GetContextVar(intptr_t var_ctx_level,
+                                           intptr_t ctx_slot) {
+   const Context& ctx = GetSavedCurrentContext();
+-  ASSERT(!ctx.IsNull());
++  // A frame whose context slot has not been (or is no longer) a real context
++  // has nothing to read a context variable from.
++  if (ctx.IsNull()) {
++    return Symbols::OptimizedOut().raw();
++  }
+ 
+   // The context level at the PC/token index of this activation frame.
+   intptr_t frame_ctx_level = ContextLevel();
+ 
++  // On any mismatch between the descriptors and the frame's actual chain,
++  // ANSWER THE SENTINEL rather than read anyway: the old code printed a
++  // diagnostic and then fell through to the very out-of-bounds ctx.At the
++  // diagnostic had just described (release strips the ASSERTs between), and
++  // the diagnostic itself dumped the suspect context. Debug builds keep the
++  // loud asserts.
+   intptr_t level_diff = frame_ctx_level - var_ctx_level;
+   if (level_diff == 0) {
+     if ((ctx_slot < 0) || (ctx_slot >= ctx.num_variables())) {
+-      PrintContextMismatchError(ctx_slot, frame_ctx_level, var_ctx_level);
++      ASSERT((ctx_slot >= 0) && (ctx_slot < ctx.num_variables()));
++      return Symbols::OptimizedOut().raw();
+     }
+-    ASSERT((ctx_slot >= 0) && (ctx_slot < ctx.num_variables()));
+     return ctx.At(ctx_slot);
+   } else {
+-    ASSERT(level_diff > 0);
++    if (level_diff < 0) {
++      ASSERT(level_diff > 0);
++      return Symbols::OptimizedOut().raw();
++    }
+     Context& var_ctx = Context::Handle(ctx.raw());
+     while (level_diff > 0 && !var_ctx.IsNull()) {
+       level_diff--;
+@@ -1239,10 +1263,10 @@
+     }
+     if (var_ctx.IsNull() || (ctx_slot < 0) ||
+         (ctx_slot >= var_ctx.num_variables())) {
+-      PrintContextMismatchError(ctx_slot, frame_ctx_level, var_ctx_level);
++      ASSERT(!var_ctx.IsNull());
++      ASSERT((ctx_slot >= 0) && (ctx_slot < var_ctx.num_variables()));
++      return Symbols::OptimizedOut().raw();
+     }
+-    ASSERT(!var_ctx.IsNull());
+-    ASSERT((ctx_slot >= 0) && (ctx_slot < var_ctx.num_variables()));
+     return var_ctx.At(ctx_slot);
+   }
+ }
+@@ -1362,9 +1386,11 @@
+ }
+ 
+ 
+-void ActivationFrame::PrintToJSONObject(JSONObject* jsobj, bool full) {
++void ActivationFrame::PrintToJSONObject(JSONObject* jsobj,
++                                        bool full,
++                                        bool with_vars) {
+   if (kind_ == kRegular) {
+-    PrintToJSONObjectRegular(jsobj, full);
++    PrintToJSONObjectRegular(jsobj, full, with_vars);
+   } else if (kind_ == kAsyncCausal) {
+     PrintToJSONObjectAsyncCausal(jsobj, full);
+   } else if (kind_ == kAsyncSuspensionMarker) {
+@@ -1377,7 +1403,9 @@
+ }
+ 
+ 
+-void ActivationFrame::PrintToJSONObjectRegular(JSONObject* jsobj, bool full) {
++void ActivationFrame::PrintToJSONObjectRegular(JSONObject* jsobj,
++                                               bool full,
++                                               bool with_vars) {
+   const Script& script = Script::Handle(SourceScript());
+   jsobj->AddProperty("type", "Frame");
+   jsobj->AddProperty("kind", KindToCString(kind_));
+@@ -1391,6 +1419,18 @@
+     // location.
+     jsobj->AddProperty("script", script, !full);
+   }
++  // A frame that is RUNNING (not stopped at a debugger safe point) has no
++  // trustworthy variables to print: an interrupt lands wherever it lands —
++  // at a function-entry stack-overflow check the slots (including the saved
++  // context, whose descriptor carries no visibility range) are still
++  // uninitialized, and optimized frames materialize only what the deopt
++  // environment knew. Reading them is how a service getIsolate once took
++  // down the whole GUI mid-Smalltalk. Location and function still print;
++  // the caller says whether variables are safe (with_vars).
++  if (!with_vars) {
++    JSONArray jsvars(jsobj, "vars");
++    return;
++  }
+   {
+     JSONArray jsvars(jsobj, "vars");
+     const int num_vars = NumLocalVariables();
+--- a/runtime/vm/service_event.cc
++++ b/runtime/vm/service_event.cc
+@@ -226,7 +226,15 @@
+   }
+   if ((top_frame() != NULL) && Isolate::Current()->compilation_allowed()) {
+     JSONObject jsFrame(&jsobj, "topFrame");
+-    top_frame()->PrintToJSONObject(&jsFrame);
++    // A kResume event's top frame is SYNTHESIZED for an isolate that is
++    // still RUNNING (Isolate::PrintJSON answering getIsolate): it says where
++    // execution is, but its slots are live and untrustworthy — an interrupt
++    // at a function-entry stack-overflow check sees them uninitialized, and
++    // reading them once SEGV'd the GUI mid-Smalltalk. Real pause events
++    // (breakpoint, exception, step) are at safe points and keep their
++    // variables.
++    top_frame()->PrintToJSONObject(&jsFrame, false,
++                                   kind() != ServiceEvent::kResume);
+     intptr_t index = 0;  // Avoid ambiguity in call to AddProperty.
+     jsFrame.AddProperty("index", index);
+   }

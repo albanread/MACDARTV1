@@ -1,0 +1,55 @@
+"Feature test: the exception protocol — signal / on:do: / ensure: / messageText,
+ the handler actions return:/return/retry/pass, the standard error classes, and
+ native Dart errors surfacing as catchable ST Errors. Expected values are the
+ human-verified spec (ANSI Smalltalk exception semantics)."
+STestCase subclass: TestExceptions [
+    tests [
+        "--- on:do: catches a signalled error, handler value replaces ---"
+        self check: (self caught) is: 'caught' label: 'on:do: catches Error'.
+        self check: (self messageOf) is: 'boom' label: 'exception messageText'.
+        self check: (self handlerValue) is: 42 label: 'handler value replaces body'.
+        self check: (self noRaiseValue) is: 5 label: 'no raise -> body value'.
+        self check: (self viaError) is: 'custom' label: 'self error: messageText'.
+
+        "--- ensure: runs on BOTH normal and exceptional exit ---"
+        self check: (self ensureNormal) is: 'body-ensure' label: 'ensure: on normal exit'.
+        self check: (self ensureRaise) is: 'ran' label: 'ensure: on exceptional exit'.
+        self check: (self nestedRaise) is: 'caught-deep' label: 'catch through nested block'.
+        self check: (self viaNew) is: 'made' label: 'Error new signal:'.
+
+        "--- handler actions (ANSI) ---"
+        self check: (self viaReturn) is: 7 label: 'e return: forces the value'.
+        self check: (self viaReturnNil) is: nil label: 'e return -> nil'.
+        self check: (self viaRetry) is: 3 label: 'e retry re-runs the protected block'.
+        self check: (self viaPass) is: 'outer' label: 'e pass -> next enclosing handler'.
+
+        "--- the standard error hierarchy + native errors reified ---"
+        self check: (self divZeroSpecific) is: 'zd' label: 'on: ZeroDivide do: catches // 0'.
+        self check: (self divZeroBroad) is: 'err' label: 'div-by-zero is-a Error'.
+        self check: (self indexError) is: 'idx' label: 'native RangeError is-a Error'.
+        self assert: (ZeroDivide new isKindOf: Error) label: 'ZeroDivide is-a Error'.
+        self check: (self warned) is: 'w' label: 'Warning signal: + messageText'.
+
+        "--- should:raise: helper ---"
+        self should: [ Error signal: 'x' ] raise: Error label: 'signal: raises Error'.
+        self should: [ self error: 'y' ] raise: Error label: 'error: raises Error'.
+        self should: [ 1 // 0 ] raise: ZeroDivide label: '// 0 raises ZeroDivide'.
+    ]
+    caught [ ^[ Error signal: 'boom'. 'not reached' ] on: Error do: [ :e | 'caught' ] ]
+    messageOf [ ^[ Error signal: 'boom' ] on: Error do: [ :e | e messageText ] ]
+    handlerValue [ ^[ Error signal: 'x'. 0 ] on: Error do: [ :e | 42 ] ]
+    noRaiseValue [ ^[ 5 ] on: Error do: [ :e | 999 ] ]
+    viaError [ ^[ self error: 'custom' ] on: Error do: [ :e | e messageText ] ]
+    ensureNormal [ | s | s := 'body'. [ s := s ] ensure: [ s := s , '-ensure' ]. ^s ]
+    ensureRaise [ | s | s := ''. [ [ Error signal: 'x' ] ensure: [ s := 'ran' ] ] on: Error do: [ :e | nil ]. ^s ]
+    nestedRaise [ ^[ [ Error signal: 'deep' ] value ] on: Error do: [ :e | 'caught-deep' ] ]
+    viaNew [ ^[ Error new signal: 'made' ] on: Error do: [ :e | e messageText ] ]
+    viaReturn [ ^[ Error signal: 'x'. 0 ] on: Error do: [ :e | e return: 7 ] ]
+    viaReturnNil [ ^[ Error signal: 'x'. 0 ] on: Error do: [ :e | e return ] ]
+    viaRetry [ | n | n := 0. ^[ n := n + 1. n < 3 ifTrue: [ Error signal: 'a' ]. n ] on: Error do: [ :e | e retry ] ]
+    viaPass [ ^[ [ Error signal: 'i' ] on: Error do: [ :e | e pass ] ] on: Error do: [ :e | 'outer' ] ]
+    divZeroSpecific [ ^[ 7 // 0 ] on: ZeroDivide do: [ :e | 'zd' ] ]
+    divZeroBroad [ ^[ 7 // 0 ] on: Error do: [ :e | 'err' ] ]
+    indexError [ ^[ #(1 2 3) at: 99 ] on: Error do: [ :e | 'idx' ] ]
+    warned [ ^[ Warning signal: 'w' ] on: Warning do: [ :e | e messageText ] ]
+]

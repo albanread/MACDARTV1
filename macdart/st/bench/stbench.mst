@@ -1,0 +1,45 @@
+"stbench.mst — the SHARED Smalltalk benchmark workloads (ST_PLAN.md Sprint 8).
+
+ Runs VERBATIM on both VMs:
+   - MACVM:      cat stbench.mst macvm_driver.mst | its `macvm run`
+   - MACDART-ST: stLoad'ed by run_macdart.dart, driven via stNew/stSend
+ Pure compute, no printing, no timing — the drivers own that. Instance
+ methods deliberately: every recursion/iteration is a real dynamic send
+ (InstanceCall + inline cache) on both VMs, which is the thing being
+ measured. run_macdart.dart carries a line-for-line native Dart mirror
+ (DBench/DCell), so the same algorithms also run as ordinary Dart on the
+ same MACDART VM — the ST-front-end tax measure."
+
+Object subclass: STCell [
+    | v |
+    put: x [ v := x ]
+    val [ ^v ]
+]
+
+Object subclass: STBench [
+    fib: n [
+        n < 2 ifTrue: [ ^n ].
+        ^ (self fib: n - 1) + (self fib: n - 2)
+    ]
+
+    sumTo: n [
+        | s i |
+        s := 0. i := 1.
+        [ i <= n ] whileTrue: [ s := s + i. i := i + 1 ].
+        ^s
+    ]
+
+    blocks: n [
+        | s b i |
+        s := 0. b := [:x | x + 1]. i := 0.
+        [ i < n ] whileTrue: [ s := s + (b value: i). i := i + 1 ].
+        ^s
+    ]
+
+    alloc: n [
+        | i c |
+        i := 0.
+        [ i < n ] whileTrue: [ c := STCell new. c put: i. i := i + 1 ].
+        ^ c val
+    ]
+]

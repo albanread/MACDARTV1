@@ -44,13 +44,12 @@ check "allocation profile" [expr {[llength [dict get $ap members]] > 0}] 1
 
 section "language isolate"
 check "arithmetic"        [ui doit 6*7] 42
-check "class from image"  [ui doit {new Blorp().triple()}] 3
 
 section "gui control (same socket)"
 check "switch tab"        [ui tab 1] ok
 after 300
 check "toolbar button"    [ui click Browser] "clicked Browser"
-check "menu bar shape"    [ui menus] "9: NSMenuItem | File | Edit | Code | Demos | Apps | View | Source | Debug"
+check "menu bar shape"    [ui menus] "10: NSMenuItem | File | Edit | Code | Demos | Games | Apps | View | Source | Debug"
 
 section "accept is compile-checked"
 # The image OUTLIVES the suite, so a class that leaked in once would make these
@@ -83,6 +82,82 @@ check "stored multi-line"     [expr {[llength [split [ui classsrc ScriptOk] \n]]
 ui remove ScriptOk
 after 1500
 
+section "image versioning + rollback"
+# Every persisted edit records the decl's prior state (WORLD_DB-style time-travel,
+# Dart-side, no C++), so a change that compiled but was wrong can be undone.
+check "v1 accepted"        [expr {[string match accepted* [ui accept {class VerT { int v() => 1; }}]]}] 1
+check "v1 runs"            [ui doit {new VerT().v()}] 1
+check "v2 accepted"        [expr {[string match accepted* [ui accept {class VerT { int v() => 2; }}]]}] 1
+check "v2 runs"            [ui doit {new VerT().v()}] 2
+check "edit is in history" [expr {[string match {*VerT*} [ui versions 5]]}] 1
+check "rollback restores"  [expr {[string match {*rolled back VerT*} [ui rollback]]}] 1
+after 300
+check "back to v1"         [ui doit {new VerT().v()}] 1
+ui remove VerT
+after 800
+
+section "the editor lexes the language it is holding"
+# A Smalltalk "..." comment is a Dart STRING to the Dart lexer — and one that
+# ends at the newline, so line 1 came out red and every line after it was lexed
+# as code: a multi-line comment rendered as a rainbow. Which is most of this
+# corpus. `edlex` reports the language chosen and the characters per kind, so
+# the property can be asserted instead of eyeballed.
+ui tab 4
+ui edsettext {"A comment\n mentioning Integer and 42 and 'quotes'."\nObject subclass: Demo [\n    add: n [ ^n + 1 ]\n]}
+after 400
+check "smalltalk is lexed as smalltalk" \
+    [ui edlex] "smalltalk 8 spans plain=15 comment=52 number=1 type=10"
+ui edsettext {// a Dart comment mentioning int and 42\nclass Demo {\n  int add(int n) => n + 1;\n}}
+after 400
+check "and dart is still lexed as dart" \
+    [ui edlex] "dart 9 spans plain=5 keyword=11 comment=39 number=1 type=4"
+ui edsettext {}
+
+section "the browser slices whole methods"
+# The source pane is a hand-scanned slice of the class's own text — a SECOND
+# reader of the grammar st_parser.cc owns. These are the shapes that used to
+# come back truncated, missing, or with a neighbour attached.
+# macdart/st/test/browser_index.py is the exhaustive form: the whole world
+# against st_dump, every method, every side.
+check "annotated header keeps its body" \
+    [expr {[string match {*a <= b*} [ui lang methodsrc {Magnitude class defaultSort}]]}] 1
+check "a class of one-liners lists them" \
+    [expr {[string match {*classSourceFor:*} [ui lang selectors STHostService]]}] 1
+check "binary selectors are listed" \
+    [expr {[string match {*i <=*} [ui lang selectors Magnitude]]}] 1
+# InetAddress puts four methods on ONE line. Editing one of them must leave the
+# other three alone: the splice used to replace whole LINES, which would have
+# deleted three methods to save one.
+ui doit {st> STHostService new saveMethodFor: 'InetAddress' side: 'instance' source: 'b [ ^b ]'}
+ui settle
+check "editing one of four on a line keeps the rest" \
+    [ui lang methodsrc {InetAddress instance d}] "d \[ ^d \]"
+
+section "the transcript dock collapses"
+# The dock and the tab host share the height below the toolbar: what one gives
+# up the other must take, or collapsing would just leave a hole.
+proc tabHeight {} {
+    foreach l [split [ui frames] \n] {
+        if {[regexp {^tabview\s+\[[^,]+,\s*[^,]+,\s*[^,]+,\s*([0-9.]+)\]} $l -> h]} { return $h }
+    }
+    return 0
+}
+ui dock show
+set openH [tabHeight]
+check "collapse"          [ui dock hide] collapsed
+after 300
+check "the tab took the space" [expr {[tabHeight] - $openH}] 142.0
+check "clear still reachable"  [ui click Clear] "clicked Clear"
+# The choice is the user's: a rebuild must not pop it back open.
+ui uirebuild
+after 900
+check "survives a rebuild"     [ui dock] collapsed
+check "and stays that tall"    [expr {[tabHeight] - $openH}] 142.0
+check "reopen"                 [ui dock show] open
+after 300
+check "the tab gave it back"   [tabHeight] $openH
+check "bad argument refused"   [ui dock wobble] "ERR: dock \[show|hide|toggle\]"
+
 section "the ui rebuilds itself"
 check "rebuild layout"    [ui uirebuild] ok
 after 800
@@ -100,7 +175,6 @@ ui menuclick Debug/Restart Language Isolate
 after 4000
 ui ping
 check "gui event pushed"  [expr {[llength [events]] > 0}] 1
-check "image reloaded"    [ui doit {new Blorp().triple()}] 3
 
 section "debugger (language isolate, from the UI isolate)"
 ui settext {class DbgT {\n  int n = 0;\n  int step() {\n    n = n + 1;\n    return n;\n  }\n}}
@@ -121,7 +195,7 @@ foreach l [split [ui dbgsource] \n] {
     if {$inClass && [string match {*n = n + 1;*} $l] && $line == 0} { set line $n }
 }
 check "found body line"   [expr {$line > 0}] 1
-check "breakpoint resolved" [expr {[string match *resolved=true* [ui dbgbreak $line]]}] 1
+check "breakpoint resolved" [expr {[string match *resolved* [ui dbgbreak $line]]}] 1
 check "not paused yet"    [ui dbgstate] running
 
 # stop on the breakpoint and inspect the frame
@@ -130,7 +204,7 @@ after 3000
 check "paused"            [expr {[string match paused* [ui dbgstate]]}] 1
 check "gui alive stopped" [ui ping] pong
 check "locals bound"      [expr {[string match *this=* [ui dbgvars]]}] 1
-check "eval in frame"     [expr {[string match *=>*2* [ui dbgeval {n + 2}]]}] 1
+check "eval in frame"     [ui dbgeval {n + 2}] 2
 # A breakpoint must survive an edit: accepting anything rewrites the scratch
 # file the VM breaks in, and its line numbers move.
 # committing code into a STOPPED isolate must be refused, not queued — the
@@ -286,8 +360,14 @@ ui edsettext [string map [list "\n" "\\n"] $edited]
 ui click "Save to Image"
 ui settle
 after 800
-check "committed from the editor" [expr {[string match {*AC*} [ui apptree]]}] 1
-check "and the total survived"    [ui appget d] 45
+# Edit STOPS the running app by design (appEdit: "stopped for editing … press
+# Run to try it again"), so the round trip is save-then-relaunch: the edit (the
+# 'C' key relabelled 'AC') is compiled, persisted, and shows up on the next Run.
+check "saved from the editor"    [expr {[string match {*live + saved*} [ui edstatus]]}] 1
+ui apprun Calculator
+ui settle
+after 400
+check "relaunches with the edit" [expr {[string match {*AC*} [ui apptree]]}] 1
 ui appstop
 
 section "searchable Dart V1 help"

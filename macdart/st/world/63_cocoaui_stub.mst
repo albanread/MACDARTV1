@@ -1,0 +1,53 @@
+"63_cocoaui_stub.mst — CG1 placeholder for the conditional Cocoa GUI world
+ layer (docs/cocoa_gui_design.md §12.3, sprint_cocoa_gui.md CG1). Loaded ONLY
+ via `frontend::world::load_list(vm, world/cocoaui.list)`, NEVER from
+ world/world.list — so the CLI, the WKWebView GUI, and the base test suite
+ carry none of it. Its whole job in CG1 is to prove the extra layer compiles
+ and runs on top of an already-booted base world (a fresh class that is absent
+ from the base world, present only after load_list). The real CocoaUI /
+ view-wrapper classes arrive in CG2+ (files 64+)."
+"I am a tiny marker class for the optional native-GUI world layer, which
+ loads on top of an already-booted base world. I exist to prove that layer
+ compiles and runs: `ping` answers a Symbol a headless check can verify.
+ I have no other behavior."
+Object subclass: CocoaUIStub [
+    "A trivial marker from the conditional layer. `ping` answers a Symbol so a
+     headless gate can prove not just that the class resolves but that a method
+     of it actually runs (an oop from the extra layer, printString-checkable)."
+    CocoaUIStub class >> ping [ ^#cocoaUiStubReady ]
+]
+
+"── STHostService — the MACDART host binding (ST_PLAN Sprint 14) ─────────
+ MACVM's browsers talked to an ObjC MacvmHostService because their image
+ data lived in the Rust host. OURS lives in the workspace language isolate
+ — the very isolate the browser code runs in — so the host service is pure
+ Smalltalk: each read is a direct <stprim:> into dart:cocoa, answered by
+ the workspace's image hook (language.dart installs it over the SQLite
+ decls). Replies are Smalltalk Strings in the exact wire formats the
+ parsers expect (US-separated fields, space-separated token lists).
+ onMain answers self: there is nothing to hop for. Image WRITES are
+ read-only in v1 — edit through the workspace Browser; Accept here says
+ so instead of failing silently."
+Object subclass: STHostService [
+    onMain [ ^self ]
+    packageTree [ <stprim: stHostPackageTree> ]
+    browseRecords [ <stprim: stHostBrowseRecords> ]
+    commentFor: cls [ <stprim: stHostComment> ]
+    classSourceFor: cls [ <stprim: stHostClassSource> ]
+    sourceForClass: cls side: side selector: sel [ <stprim: stHostMethodSource> ]
+    requestBrowser2Refresh [ CocoaBrowser2 doRefresh ]
+    colorizeStorage: ts [ ^self ]
+    saveMethodFor: cls side: side source: text [ <stprim: stHostSaveMethod> ]
+    newClassFrom: text [ <stprim: stHostNewClass> ]
+    setCommentFor: cls comment: text [ <stprim: stHostSetComment> ]
+    acceptEditorClass: text [ <stprim: stHostAcceptClass> ]
+    "Persist a class the PROGRAM generated (a saved table, a preferences
+     holder), parse-checked and stored exactly like the accept above — but
+     WITHOUT hot-reloading the world. The accept's reload re-inits every class's
+     class-side state, which nils the frame loop's step block and freezes a
+     running game on the frame that saved; this makes only the saved class live.
+     Save from inside a running callback through here, not acceptEditorClass:."
+    storeEditorClass: text [ <stprim: stHostStoreClass> ]
+    removeClassNamed: cls [ <stprim: stHostRemoveClass> ]
+    removeMethodFor: cls side: side selector: sel [ <stprim: stHostRemoveMethod> ]
+]

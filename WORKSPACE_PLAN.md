@@ -94,7 +94,10 @@ Copied from MACVM's `control.rs` + `objc.rs`, but simpler and better in Dart.
 - **One `NSWindow`**, content stacked in three bands: a **toolbar** (view-switcher
   buttons = the tab bar), a **tabless `NSTabView`** (`setTabViewType: 6`
   NSNoTabsNoBorder — AppKit owns view swap/clip/repaint), and a bottom
-  **transcript** dock (newest-first, read-only).
+  **transcript** dock (newest-first, read-only). The dock **collapses** to its
+  one-line strip (its toggle, ⌘T, or `dock hide|show|toggle`) and the tab host
+  takes the height — `layoutChrome()` owns all three bands, so a rebuild lands
+  correctly on a window that has since been resized.
 - **Tabs are lazy class-side "view controllers"** that self-register
   (`registerViewNamed:title:icon:container:onShow:`) and build their views on
   first show. Start with **Workspace**, grow **Browser / Docs / Editor** exactly

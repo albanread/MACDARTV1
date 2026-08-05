@@ -1,0 +1,104 @@
+"61e_fftchart.mst — the FFT demo for the workspace's DEMOS PANE (MACDART).
+
+ FftScope (61b) is the live Cocoa-window scope; this is its one-shot canvas
+ sibling for the vector demos pane (the WaveChart/BenchmarkDashboard family):
+ a single frame answered as HTML5-canvas JSON, so the pane can render — and
+ re-ask — without a window of its own. It is a genuine end-to-end exercise of
+ the whole FFI floor: Accelerate is dlopen'd through the FFI, the signal is
+ built and transformed by vDSP on GC-stable NativeFloatArray pages, and the
+ magnitude spectrum is read back through Alien. Three pure tones go in (bins
+ 12, 28, 50); three sharp peaks come out.
+
+ One entry point, commandsForWidth:height:, matching the pane's producer
+ contract. Native arrays are freed on the way out (explicit lifecycle)."
+Object subclass: FftChart [
+    | stream |
+
+    FftChart class >> new [ ^self basicNew ]
+    FftChart class >> n [ ^256 ]
+    FftChart class >> log2n [ ^8 ]
+
+    "The pane producer: answer one frame of canvas ops as a JSON string."
+    commandsForWidth: width height: height [
+        | n fft re im mag t twoPi maxm midY specTop specBot |
+        n := FftChart n.
+        twoPi := 2 * Double pi.
+        Accel ensureLoaded.
+        fft := FftSetup log2n: FftChart log2n.
+        re  := NativeFloatArray lanes: n.
+        im  := NativeFloatArray lanes: n.
+        mag := NativeFloatArray lanes: n.
+        t   := NativeFloatArray lanes: n.
+
+        "── build the signal: three sinusoids, entirely in vDSP ──"
+        re rampFrom: 0 step: twoPi * 12 / n. re sinInto: re.
+        t rampFrom: 0 step: twoPi * 28 / n. t sinInto: t. t scaleBy: 0.7.  re add: t into: re.
+        t rampFrom: 0 step: twoPi * 50 / n. t sinInto: t. t scaleBy: 0.45. re add: t into: re.
+
+        stream := WriteStream on: String new.
+        stream nextPutAll: '[["clearRect",0,0,'.
+        self putNum: width; put: ','; putNum: height; put: ']'.
+        stream nextPutAll: ',["fillStyle","#0b0f1a"],["fillRect",0,0,'.
+        self putNum: width; put: ','; putNum: height; put: ']'.
+
+        "── top half: the time-domain trace (read re BEFORE the transform) ──"
+        midY := height // 4.
+        self fillText: 'signal: 3 tones (bins 12, 28, 50)' at: 12 y: 16 colour: '#9fb3c8'.
+        self strokeStyle: '#4fc3f7' width: 1.5.
+        stream nextPutAll: ',["beginPath"],["moveTo",0,'.
+        self putNum: midY; put: ']'.
+        1 to: n do: [ :i |
+            | x y |
+            x := ((i - 1) * width) // (n - 1).
+            y := midY - (((re at: i) * (midY - 12) / 2.2) truncated).
+            stream nextPutAll: ',["lineTo",'. self putNum: x; put: ','; putNum: y; put: ']' ].
+        stream nextPutAll: ',["stroke"]'.
+
+        "── transform, then |X| = sqrt(re^2 + im^2), all in vDSP ──"
+        im clear.
+        fft forwardReal: re imag: im.
+        re multiply: re into: mag.
+        im multiply: im into: t.
+        mag add: t into: mag.
+        mag sqrtInto: mag.
+
+        "peak magnitude over the first half, for scaling"
+        maxm := 0.0001.
+        1 to: n // 2 do: [ :j | (mag at: j) > maxm ifTrue: [ maxm := mag at: j ] ].
+
+        "── bottom half: the magnitude spectrum as filled bars ──"
+        specTop := height // 2.
+        specBot := height - 18.
+        self fillText: 'spectrum — Accelerate vDSP FFT' at: 12 y: specTop - 8 colour: '#9fb3c8'.
+        self strokeStyle: '#2a3550' width: 1.0.
+        stream nextPutAll: ',["beginPath"],["moveTo",0,'. self putNum: specBot; put: ']'.
+        stream nextPutAll: ',["lineTo",'. self putNum: width; put: ','; putNum: specBot; put: ']'.
+        stream nextPutAll: ',["stroke"]'.
+        stream nextPutAll: ',["fillStyle","#7be08a"]'.
+        1 to: n // 2 do: [ :j |
+            | x bh bw |
+            bw := (width // (n // 2)) max: 1.
+            x := ((j - 1) * width) // (n // 2).
+            bh := ((mag at: j) * (specBot - specTop) / maxm) truncated.
+            bh > 0 ifTrue: [
+                stream nextPutAll: ',["fillRect",'. self putNum: x; put: ','.
+                self putNum: specBot - bh; put: ','. self putNum: bw; put: ','.
+                self putNum: bh; put: ']' ] ].
+
+        stream nextPutAll: ']'.
+
+        fft free. re free. im free. mag free. t free.
+        ^stream contents
+    ]
+
+    "── little JSON helpers (mirror WaveChart) ──"
+    putNum: n [ stream nextPutAll: n printString ]
+    put: aString [ stream nextPutAll: aString ]
+    strokeStyle: c width: lw [
+        stream nextPutAll: ',["strokeStyle","'. stream nextPutAll: c.
+        stream nextPutAll: '"],["lineWidth",'. self putNum: lw. stream nextPutAll: ']' ]
+    fillText: s at: x y: y colour: c [
+        stream nextPutAll: ',["fillStyle","'. stream nextPutAll: c.
+        stream nextPutAll: '"],["fillText","'. stream nextPutAll: s.
+        stream nextPutAll: '",'. self putNum: x; put: ','; putNum: y; put: ']' ]
+]

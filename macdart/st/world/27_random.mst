@@ -1,0 +1,67 @@
+"27_random.mst — Random. Ports Strongtalk's real algorithm exactly: the
+ classic Park-Miller 'Minimal Standard' LCG (multiplier 16807, modulus
+ 2^31-1 = 2147483647). Strongtalk's own Random.dlt does this arithmetic in
+ Floats ('seed <Float>', actualNext's temp/modulus-truncated modulo dance)
+ — a workaround for 1980s Smalltalk-80's narrow SmallInteger range.
+ MACVM's SmallInteger is a full 62-bit signed range (oops/layout.rs:
+ SMI_MAX = 2^61-1), and `16807 * (modulus-1)` is only ~2^45 — comfortably
+ inside it — so this port uses exact integer arithmetic (`\\`) for the LCG
+ step itself, converting to Double only for the final `next`/`nextInteger`
+ result. No float rounding is involved in the generator's own state at all.
+
+ Verified against Strongtalk's own published conformance vector
+ (Random.dlt classSide>>test, its ONLY correctness check): seed 1, after
+ 10000 calls to `next`, the seed must land on exactly 1043618065 — the
+ well-known Park & Miller reference test vector for this exact generator,
+ not a MACVM-specific number invented for this port. See
+ world/tests/24_random_tests.mst."
+
+"I am a pseudo-random number generator: the classic Park-Miller minimal
+ standard generator, computed in exact integer arithmetic. Send next for a
+ Double strictly between 0 and 1, or nextInteger for a non-negative
+ integer; peek and peekInteger answer the upcoming value without advancing
+ me. Create me with new (seed 1) or newWithSeed: — equal seeds always
+ produce identical sequences, so runs are reproducible. The seed should
+ lie between 1 and 2147483647."
+Object subclass: Random [
+    | seed <Integer> |
+
+    Random class >> modulus ^ <Integer> [
+        ^2147483647
+    ]
+    Random class >> multiplier ^ <Integer> [
+        ^16807
+    ]
+    Random class >> new ^ <Random> [
+        ^self newWithSeed: 1
+    ]
+    "Strongtalk's own comment: seed should be between 1 and 2147483647.
+     Not enforced here (no exceptions until W5) — an out-of-range seed
+     just produces a non-conformant sequence, not a crash."
+    Random class >> newWithSeed: aSeed <Integer> ^ <Random> [
+        ^self basicNew setSeed: aSeed
+    ]
+    setSeed: aSeed <Integer> [
+        seed := aSeed.
+    ]
+    seed ^ <Integer> [
+        ^seed
+    ]
+    "Advances the generator and returns a Double in (0, 1)."
+    next ^ <Double> [
+        seed := (self class multiplier * seed) \\ self class modulus.
+        ^seed asDouble / self class modulus asDouble
+    ]
+    "Like next, but does not advance the generator."
+    peek ^ <Double> [
+        | candidate |
+        candidate := (self class multiplier * seed) \\ self class modulus.
+        ^candidate asDouble / self class modulus asDouble
+    ]
+    nextInteger ^ <Integer> [
+        ^(SmallInteger maxVal asDouble * self next) truncated
+    ]
+    peekInteger ^ <Integer> [
+        ^(SmallInteger maxVal asDouble * self peek) truncated
+    ]
+]

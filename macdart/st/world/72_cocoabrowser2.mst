@@ -1,0 +1,1171 @@
+"72_cocoabrowser2.mst — CocoaBrowser2: the V2 class browser, ADDITIVE. The V1
+ browser (66_cocoabrowser.mst) is untouched and still registered; this is a
+ SECOND 'Browser V2' view the shell's tab bar / View menu offers alongside it.
+
+ A classic Smalltalk-80 four-pane form — the axis V1 (a class HIERARCHY tree)
+ does not offer:
+
+     HSplit (draggable dividers)                        VSplit (below)
+     ┌────────────┬──────────┬──────────────┬──────────┐
+     │ categories │ classes  │ [inst|class] │ methods  │
+     │ world ▸    │          │ protocols    │          │
+     │  cocoaui ▸ │          │              │          │
+     ├────────────┴──────────┴──────────────┴──────────┤
+     │ [Comment|Definition|Source]                      │
+     │ source / class comment / class definition        │
+     └──────────────────────────────────────────────────┘
+
+ SYSTEM CATEGORIES come free from the M1 package lists (host `packageTree`):
+ a class's category IS its package (its source-file stem), and packages group
+ under `world` / `cocoaui`. PROTOCOLS are DERIVED heuristically from selector
+ shape (`protocolOf:`) — the `.mst` format never carried per-method protocols,
+ so every stored method is 'as yet unclassified'; bucketing by selector makes
+ the pane useful now (accessing/testing/printing/…). The COMMENT is the stored
+ class comment (host `commentFor:`).
+
+ READS AND WRITES: V2 began read-only but now carries the full editing surface
+ (Accept method/class source, New/Remove class and method, comment editing),
+ through the same host-service flows as V1. All reads are pure host SQLite
+ (`MacvmHostService`) — the same image V1, the editor, and the Find views
+ read; no VM reflection relay.
+
+ Re-entrancy (the view_refresh.rs law, as V1): a callback (onShow, a row click)
+ NEVER builds the model + reloads inline — `requestRefresh` flips a host flag
+ that `drain_perform` services top-level (`CocoaBrowser2 doRefresh`); table
+ reloads triggered from a selection callback defer one run-loop turn
+ (`deferReload:`)."
+
+"I am Browser V2: a classic Smalltalk-80 four-pane browser — categories,
+ classes, instance/class protocols, methods — offered alongside the
+ hierarchy-tree browser. Categories come from the package a class's source
+ file belongs to; protocols are derived heuristically from selector shape
+ (the stored format never carried per-method protocols). The bottom pane
+ shows method source, the stored class comment, or the class definition,
+ switched by a segmented control — and each is editable: Accept saves to
+ the image (a method also compiles live on the primary VM; a definition's
+ shape change waits for the next launch), and New Class / New Method /
+ Remove round out the editing set. I run in the UI worker VM and read and
+ write through the host service."
+Object subclass: CocoaBrowser2 [
+    <classVars: Tree Records Svc Side SourceMode EditMode ShellSuper RemoveArmed CatRows CatNodes
+                SelectedPackage SelectedPackageName SelectedClass SelectedProtocol SelectedMethod
+                Classes Protocols Methods
+                CatHandles CatHandleList ActionDelegates SourceTextDelegate
+                Container VSplit HSplit CatPane ClassListPane ProtoPane MethodPane
+                CatScroll CatOutline CatCol CatDelegate
+                ClassScroll ClassTable ClassCol ClassFace ClassDelegate
+                NewClassBtn RemoveClassBtn NewMethodBtn RemoveMethodBtn
+                SideSeg ProtoScroll ProtoTable ProtoCol ProtoFace ProtoDelegate
+                MethScroll MethTable MethCol MethFace MethDelegate
+                SourcePane ModeSeg EditBar AcceptBtn CancelBtn ModeLabel SourceScroll SourceView>
+
+    CocoaBrowser2 class >> sourcePaneHeight [ ^210.0 ]
+
+    "── registration (mirrors V1's tab-host protocol) ──"
+    CocoaBrowser2 class >> register [
+        CocoaUI registerViewNamed: #browser2 title: 'Browser V2' icon: 'hierarchy'
+                container: [ self containerView ]
+                onShow: [ Tree isNil ifTrue: [ self requestRefresh ] ]
+    ]
+    CocoaBrowser2 class >> containerView [
+        Container isNil ifTrue: [ self buildView ].
+        ^Container
+    ]
+    CocoaBrowser2 class >> requestRefresh [
+        "FLAG ONLY — the host flips a Rust atomic + wakes the run loop; the
+         DB query + model build + reload run TOP-LEVEL from drain_perform
+         (never nested in this callback). Same contract as V1's requestRefresh."
+        self hostService onMain requestBrowser2Refresh
+    ]
+    CocoaBrowser2 class >> doRefresh [
+        "TOP-LEVEL only (drain_perform servicing the flag, or a `gui doit`)."
+        Container isNil ifTrue: [ ^self ].
+        self fetchModel.
+        self installModel.
+    ]
+    CocoaBrowser2 class >> environmentRestarted [
+        Tree isNil ifFalse: [ self requestRefresh ].
+    ]
+
+    "── host service (image reads AND writes: saveMethodFor:/newClassFrom:/
+     removeClassNamed:/removeMethodFor:/setCommentFor:/acceptEditorClass: all
+     go through the same vetted flows V1 uses) ──"
+    "MACDART: the host service is PURE SMALLTALK (STHostService, 63) — the
+     image data lives in the same isolate the browser runs in, so a 'host
+     read' is a local call; its onMain answers itself (no hop needed)."
+    CocoaBrowser2 class >> hostService [
+        Svc isNil ifTrue: [ Svc := STHostService new ].
+        ^Svc
+    ]
+    CocoaBrowser2 class >> readReply: ns [
+        "MACDART: STHostService answers Smalltalk Strings directly — no
+         NSString unwrap, no release. A nil still surfaces as an ERR."
+        ns isNil ifTrue: [ ^'ERR no host service' ].
+        ^ns
+    ]
+    CocoaBrowser2 class >> sideString [
+        ^Side == #class ifTrue: [ 'class' ] ifFalse: [ 'instance' ]
+    ]
+    "── DBG4 breakpoint support: the current selection, for the Debug menu's
+       Break on Entry. The class name carries the ' class' suffix on the class
+       side, matching the VM's resolve_method_by_name grammar. ──"
+    CocoaBrowser2 class >> selectedClassName [ ^SelectedClass ]
+    CocoaBrowser2 class >> selectedMethodName [ ^SelectedMethod ]
+    CocoaBrowser2 class >> selectedBreakpointClass [
+        SelectedClass isNil ifTrue: [ ^nil ].
+        ^Side == #class ifTrue: [ SelectedClass , ' class' ] ifFalse: [ SelectedClass ]
+    ]
+
+    "── fetch + parse the model (two host reads: the category tree + the flat
+       per-class selector records) ──"
+    CocoaBrowser2 class >> fetchModel [
+        Tree := self parseTree: (self readReply: (self hostService onMain packageTree)).
+        Records := self parseRecords: (self readReply: (self hostService onMain browseRecords)).
+    ]
+    CocoaBrowser2 class >> parseTree: text [
+        "MACDART: index loops only (to:do: bodies inline into the method) —
+         a real closure nested in another real closure that captures its
+         locals is the engine's one deferred case, and the original's
+         do:-in-do:/at:ifAbsent: shapes tripped it."
+        | lines lists line f found |
+        lines := self linesOf: text.
+        lists := OrderedCollection new.
+        1 to: lines size do: [ :li |
+            line := lines at: li.
+            line isEmpty ifFalse: [
+                f := self fieldsOf: line.
+                f size >= 2 ifTrue: [
+                    found := nil.
+                    1 to: lists size do: [ :k |
+                        ((lists at: k) at: 1) = (f at: 1) ifTrue: [ found := lists at: k ] ].
+                    found isNil ifTrue: [
+                        found := Array with: (f at: 1) with: OrderedCollection new.
+                        lists add: found ].
+                    (found at: 2) add: (Array with: (f at: 2)
+                        with: (self tokensOf: (f size >= 3 ifTrue: [ f at: 3 ] ifFalse: [ '' ]))) ] ] ].
+        1 to: lists size do: [ :k |
+            (lists at: k) at: 2 put: ((lists at: k) at: 2) asArray ].
+        ^lists asArray
+    ]
+    CocoaBrowser2 class >> parseRecords: text [
+        "Flat browseRecords -> Dictionary className -> {superclass. instSels. classSels}
+         (index loops — see parseTree:)."
+        | dict lines line f |
+        dict := Dictionary new.
+        lines := self linesOf: text.
+        1 to: lines size do: [ :li |
+            line := lines at: li.
+            line isEmpty ifFalse: [
+                f := self fieldsOf: line.
+                f size >= 6 ifTrue: [
+                    dict at: (f at: 1) put: (Array with: (f at: 2)
+                                                   with: (self tokensOf: (f at: 5))
+                                                   with: (self tokensOf: (f at: 6))) ] ] ].
+        ^dict
+    ]
+    CocoaBrowser2 class >> superOf: aClass [
+        | rec s |
+        rec := (Records isNil or: [ aClass isNil ]) ifTrue: [ nil ] ifFalse: [ Records at: aClass ifAbsent: [ nil ] ].
+        rec isNil ifTrue: [ ^'Object' ].
+        s := rec at: 1.
+        ^(s isEmpty or: [ s = 'nil' ]) ifTrue: [ 'Object' ] ifFalse: [ s ]
+    ]
+
+    "── pure string helpers (self-contained; V2 does not lean on V1) ──"
+    "MACDART: the per-character accumulators were O(n^2) over our records
+     text and blew the workspace watchdog — one engine split is O(n)."
+    CocoaBrowser2 class >> linesOf: text [
+        ^STSystem split: text by: 10
+    ]
+    CocoaBrowser2 class >> fieldsOf: aString [
+        "Split on the unit separator (31) — returns every field, unpadded."
+        ^STSystem split: aString by: 31
+    ]
+    CocoaBrowser2 class >> tokensOf: aString [
+        | out |
+        out := OrderedCollection new.
+        (STSystem split: aString by: 32) do: [ :t |
+            t isEmpty ifFalse: [ out add: t ] ].
+        ^out asArray
+    ]
+    CocoaBrowser2 class >> splitPath: aString [
+        | out cur |
+        out := OrderedCollection new. cur := 0.
+        aString do: [ :ch |
+            ch = $. ifTrue: [ out add: cur. cur := 0 ]
+                    ifFalse: [ cur := cur * 10 + (ch value - 48) ] ].
+        out add: cur.
+        ^out asArray
+    ]
+    CocoaBrowser2 class >> string: str hasPrefix: pre [
+        str size < pre size ifTrue: [ ^false ].
+        ^(str copyFrom: 1 to: pre size) = pre
+    ]
+    CocoaBrowser2 class >> sortStrings: aColl [
+        "Small insertion sort (protocol/method lists are short) — no reliance on
+         asSortedCollection. `aColl` may be any indexable (Array/OrderedColl)."
+        | arr n tmp j |
+        arr := Array new: aColl size.
+        1 to: aColl size do: [ :i | arr at: i put: (aColl at: i) ].
+        n := arr size.
+        2 to: n do: [ :i |
+            j := i.
+            [ j > 1 and: [ (arr at: j - 1) > (arr at: j) ] ] whileTrue: [
+                tmp := arr at: j - 1. arr at: j - 1 put: (arr at: j). arr at: j put: tmp.
+                j := j - 1 ] ].
+        ^arr
+    ]
+
+    "── category tree accessors ──"
+    CocoaBrowser2 class >> listCount [ ^Tree isNil ifTrue: [ 0 ] ifFalse: [ Tree size ] ]
+    CocoaBrowser2 class >> packagesAt: i [ ^(Tree at: i + 1) at: 2 ]
+    CocoaBrowser2 class >> listNameAt: i [ ^(Tree at: i + 1) at: 1 ]
+    CocoaBrowser2 class >> packageAtList: i pkg: j [ ^(self packagesAt: i) at: j + 1 ]
+
+    "── category outline handles (path '' = root, 'i' = list, 'i.j' = pkg) ──"
+    CocoaBrowser2 class >> catHandleFor: path [
+        | k h |
+        CatHandles isNil ifTrue: [ CatHandles := Dictionary new. CatHandleList := OrderedCollection new ].
+        k := path asSymbol.
+        h := CatHandles at: k ifAbsent: [ nil ].
+        h isNil ifTrue: [ h := Cocoa nsString: path. CatHandles at: k put: h. CatHandleList add: h ].
+        ^h
+    ]
+    CocoaBrowser2 class >> releaseCatHandles [
+        CatHandleList isNil ifTrue: [ ^self ].
+        CatHandleList do: [ :h | h isValid ifTrue: [ h release ] ].
+        CatHandles := nil. CatHandleList := nil.
+    ]
+    CocoaBrowser2 class >> catPathOf: item [
+        ^item isNil ifTrue: [ '' ] ifFalse: [ item sendString: 'description' ]
+    ]
+
+    "── outline data source (categories) ──"
+    CocoaBrowser2 class >> outlineView: ov numberOfChildrenOfItem: item [
+        | parts |
+        item isNil ifTrue: [ ^self listCount ].
+        parts := self splitPath: (self catPathOf: item).
+        parts size = 1 ifTrue: [ ^(self packagesAt: (parts at: 1)) size ].
+        ^0
+    ]
+    CocoaBrowser2 class >> outlineView: ov isItemExpandable: item [
+        ^(self outlineView: ov numberOfChildrenOfItem: item) > 0
+    ]
+    CocoaBrowser2 class >> outlineView: ov child: i ofItem: item [
+        | p |
+        item isNil ifTrue: [ ^self catHandleFor: i printString ].
+        p := self catPathOf: item.
+        ^self catHandleFor: p , '.' , i printString
+    ]
+    CocoaBrowser2 class >> outlineView: ov objectValueForTableColumn: col byItem: item [
+        | parts |
+        parts := self splitPath: (self catPathOf: item).
+        parts size = 1 ifTrue: [ ^self listNameAt: (parts at: 1) ].
+        ^(self packageAtList: (parts at: 1) pkg: (parts at: 2)) at: 1
+    ]
+    CocoaBrowser2 class >> outlineViewSelectionDidChange: aNote [
+        | row item parts |
+        CatOutline isNil ifTrue: [ ^self ].
+        row := CatOutline onMain selectedRow.
+        row < 0 ifTrue: [ ^self ].
+        item := CatOutline onMain itemAtRow: row.
+        item isNil ifTrue: [ ^self ].
+        parts := self splitPath: (self catPathOf: item).
+        item release.
+        parts size = 2 ifTrue: [
+            SelectedPackage := self packageAtList: (parts at: 1) pkg: (parts at: 2).
+            SelectedPackageName := SelectedPackage at: 1.
+            Classes := SelectedPackage at: 2.
+            self clearClassSelection.
+            self deferReload: ClassTable ]
+    ]
+    CocoaBrowser2 class >> clearClassSelection [
+        self disarmRemove.
+        SelectedClass := nil. SelectedProtocol := nil. SelectedMethod := nil. ShellSuper := nil.
+        Protocols := Array new: 0. Methods := Array new: 0.
+        EditMode := #viewing.
+        self deferReload: ProtoTable. self deferReload: MethTable.
+        self setEditable: false label: 'select a class'.
+        self showSource: '"select a class"'.
+    ]
+
+    "── table faces (classes / protocols / methods) ──"
+    CocoaBrowser2 class >> rowsFor: aTag [
+        aTag == #classes ifTrue: [ ^Classes isNil ifTrue: [ 0 ] ifFalse: [ Classes size ] ].
+        aTag == #protocols ifTrue: [ ^Protocols isNil ifTrue: [ 0 ] ifFalse: [ Protocols size ] ].
+        aTag == #methods ifTrue: [ ^Methods isNil ifTrue: [ 0 ] ifFalse: [ Methods size ] ].
+        ^0
+    ]
+    CocoaBrowser2 class >> valueFor: aTag row: aRow [
+        | list |
+        list := aTag == #classes ifTrue: [ Classes ]
+                ifFalse: [ aTag == #protocols ifTrue: [ Protocols ] ifFalse: [ Methods ] ].
+        (list isNil or: [ aRow >= list size ]) ifTrue: [ ^'' ].
+        ^list at: aRow + 1
+    ]
+    CocoaBrowser2 class >> selectionChangedFor: aTag [
+        aTag == #classes ifTrue: [ ^self classRowSelected ].
+        aTag == #protocols ifTrue: [ ^self protocolRowSelected ].
+        aTag == #methods ifTrue: [ ^self methodRowSelected ].
+    ]
+    CocoaBrowser2 class >> classRowSelected [
+        | row |
+        ClassTable isNil ifTrue: [ ^self ].
+        row := ClassTable onMain selectedRow.
+        (row < 0 or: [ Classes isNil or: [ row >= Classes size ] ]) ifTrue: [ ^self ].
+        self selectClass: (Classes at: row + 1).
+    ]
+    CocoaBrowser2 class >> protocolRowSelected [
+        | row p |
+        ProtoTable isNil ifTrue: [ ^self ].
+        row := ProtoTable onMain selectedRow.
+        (row < 0 or: [ Protocols isNil or: [ row >= Protocols size ] ]) ifTrue: [ ^self ].
+        p := Protocols at: row + 1.
+        SelectedProtocol := p = '(all)' ifTrue: [ nil ] ifFalse: [ p ].
+        Methods := self methodsForProtocol.
+        self deferReload: MethTable.
+    ]
+    CocoaBrowser2 class >> methodRowSelected [
+        | row |
+        MethTable isNil ifTrue: [ ^self ].
+        row := MethTable onMain selectedRow.
+        (row < 0 or: [ Methods isNil or: [ row >= Methods size ] ]) ifTrue: [ ^self ].
+        SelectedMethod := Methods at: row + 1.
+        SourceMode := #source. self syncModeSeg. self renderSource.
+    ]
+    "── click actions (wired via setAction: on each table). NSTableView fires
+       tableViewSelectionDidChange: ONLY when the selected INDEX changes, so a
+       re-click on the already-selected row never updates the views. The table's
+       action fires on EVERY click (reading clickedRow), so clicking always
+       refreshes the panes — the fix for 'the 2nd selection does nothing'. Rows
+       are non-editable labels (the columns setEditable: false), so a click
+       selects the row instead of entering cell text-edit. ──"
+    CocoaBrowser2 class >> classClicked [
+        | row |
+        ClassTable isNil ifTrue: [ ^self ].
+        row := ClassTable onMain selectedRow.
+        (row < 0 or: [ Classes isNil or: [ row >= Classes size ] ]) ifTrue: [ ^self ].
+        self selectClass: (Classes at: row + 1).
+    ]
+    CocoaBrowser2 class >> protocolClicked [
+        | row p |
+        ProtoTable isNil ifTrue: [ ^self ].
+        row := ProtoTable onMain selectedRow.
+        (row < 0 or: [ Protocols isNil or: [ row >= Protocols size ] ]) ifTrue: [ ^self ].
+        p := Protocols at: row + 1.
+        SelectedProtocol := p = '(all)' ifTrue: [ nil ] ifFalse: [ p ].
+        Methods := self methodsForProtocol.
+        self deferReload: MethTable.
+    ]
+    CocoaBrowser2 class >> methodClicked [
+        | row |
+        MethTable isNil ifTrue: [ ^self ].
+        row := MethTable onMain selectedRow.
+        (row < 0 or: [ Methods isNil or: [ row >= Methods size ] ]) ifTrue: [ ^self ].
+        SelectedMethod := Methods at: row + 1.
+        SourceMode := #source. self syncModeSeg. self renderSource.
+    ]
+
+    "── method selection core (shared by the table click and scripting;
+       scripting/DBG4 selects a method without a click) ──"
+    CocoaBrowser2 class >> selectMethod: aName [
+        SelectedMethod := aName.
+        SourceMode := #source. self syncModeSeg. self renderSource.
+    ]
+
+    "── class selection core (shared by the table click and scripting) ──"
+    CocoaBrowser2 class >> selectClass: aName [
+        self disarmRemove.
+        SelectedClass := aName. SelectedMethod := nil.
+        ShellSuper := self superOf: aName.
+        self deriveProtocols.
+        SelectedProtocol := nil.
+        Methods := self methodsForProtocol.
+        SourceMode := #comment. self syncModeSeg. self renderSource.
+        self deferReload: ProtoTable. self deferReload: MethTable.
+    ]
+    CocoaBrowser2 class >> currentSideSelectors [
+        | rec |
+        SelectedClass isNil ifTrue: [ ^Array new: 0 ].
+        rec := Records isNil ifTrue: [ nil ] ifFalse: [ Records at: SelectedClass ifAbsent: [ nil ] ].
+        rec isNil ifTrue: [ ^Array new: 0 ].
+        ^Side == #class ifTrue: [ rec at: 3 ] ifFalse: [ rec at: 2 ]
+    ]
+    CocoaBrowser2 class >> deriveProtocols [
+        | sels protos out |
+        sels := self currentSideSelectors.
+        protos := OrderedCollection new.
+        sels do: [ :s | | p | p := self protocolOf: s. (protos includes: p) ifFalse: [ protos add: p ] ].
+        out := OrderedCollection new.
+        out add: '(all)'.
+        (self sortStrings: protos) do: [ :p | out add: p ].
+        Protocols := out asArray.
+    ]
+    CocoaBrowser2 class >> methodsForProtocol [
+        | sels out |
+        sels := self currentSideSelectors.
+        SelectedProtocol isNil ifTrue: [ ^self sortStrings: sels ].
+        out := OrderedCollection new.
+        sels do: [ :s | (self protocolOf: s) = SelectedProtocol ifTrue: [ out add: s ] ].
+        ^self sortStrings: out
+    ]
+
+    "── the protocol heuristic (explicit selectors first, then prefix rules) ──"
+    CocoaBrowser2 class >> protocolOf: sel [
+        (#('do:' 'collect:' 'select:' 'reject:' 'detect:' 'detect:ifNone:' 'inject:into:'
+           'do:separatedBy:' 'reverseDo:' 'keysAndValuesDo:' 'keysDo:' 'valuesDo:' 'with:do:'
+           'associationsDo:' 'timesRepeat:' 'from:to:do:') includes: sel) ifTrue: [ ^'enumerating' ].
+        (#('+' '-' '*' '/' '//' '\\' 'abs' 'negated' 'sqrt' 'squared' 'reciprocal' 'raisedTo:'
+           'rem:' 'quo:' 'gcd:' 'lcm:' 'factorial' 'truncated' 'rounded' 'floor' 'ceiling')
+           includes: sel) ifTrue: [ ^'arithmetic' ].
+        (#('=' '~=' '==' '~~' '<' '>' '<=' '>=' 'hash' 'compare:' 'max:' 'min:' 'between:and:')
+           includes: sel) ifTrue: [ ^'comparing' ].
+        (#('at:' 'at:put:' 'at:ifAbsent:' 'at:ifAbsentPut:' 'at:ifPresent:' 'size' 'first' 'last'
+           'add:' 'addAll:' 'remove:' 'remove:ifAbsent:' 'removeKey:' 'removeKey:ifAbsent:' ','
+           'value' 'value:' 'key' 'keys' 'values' 'name' 'name:') includes: sel) ifTrue: [ ^'accessing' ].
+        (#('printOn:' 'printString' 'printNl' 'storeOn:' 'storeString') includes: sel) ifTrue: [ ^'printing' ].
+        (#('notNil' 'isNil' 'isEmpty' 'notEmpty' 'includes:' 'occurrencesOf:' 'respondsTo:'
+           'ifNil:' 'ifNotNil:' 'ifNil:ifNotNil:') includes: sel) ifTrue: [ ^'testing' ].
+        ((sel = 'initialize') or: [ self string: sel hasPrefix: 'init' ]) ifTrue: [ ^'initialization' ].
+        (self string: sel hasPrefix: 'print') ifTrue: [ ^'printing' ].
+        (self string: sel hasPrefix: 'display') ifTrue: [ ^'printing' ].
+        (self string: sel hasPrefix: 'as') ifTrue: [ ^'converting' ].
+        (self string: sel hasPrefix: 'is') ifTrue: [ ^'testing' ].
+        (self string: sel hasPrefix: 'copy') ifTrue: [ ^'copying' ].
+        ^'other'
+    ]
+
+    "── side toggle (instance / class) ──"
+    CocoaBrowser2 class >> sideChanged [
+        Side := (SideSeg onMain selectedSegment) = 1 ifTrue: [ #class ] ifFalse: [ #instance ].
+        SelectedClass isNil ifFalse: [ self selectClass: SelectedClass ].
+    ]
+
+    "── source pane: Comment / Definition / Source modes ──"
+    "renderSource is the VIEW/navigation path: it sets EditMode + editability +
+     the Accept-bar label from (mode, class, method). The CREATE paths
+     (newClass/newMethod) set their own template + EditMode directly."
+    CocoaBrowser2 class >> renderSource [
+        SelectedClass isNil ifTrue: [
+            EditMode := #viewing.
+            self setEditable: false label: 'select a category, then a class'.
+            ^self showSource: '"select a category, then a class"' ].
+        SourceMode == #definition ifTrue: [ ^self showDefinition ].
+        SourceMode == #source ifTrue: [ ^self showMethodSource ].
+        ^self showComment
+    ]
+    CocoaBrowser2 class >> showComment [
+        | c |
+        c := self readReply: (self hostService onMain commentFor: SelectedClass).
+        EditMode := #comment.
+        self showSource: (c isEmpty ifTrue: [ '"(no class comment yet — type one and Accept)"' ] ifFalse: [ c ]).
+        self setEditable: true label: 'comment: ', SelectedClass, ' — Accept saves to the image'.
+    ]
+    CocoaBrowser2 class >> showDefinition [
+        | src |
+        src := self readReply: (self hostService onMain classSourceFor: SelectedClass).
+        EditMode := #definition.
+        self showSource: (src isEmpty ifTrue: [ '"no stored definition for ', SelectedClass, '"' ] ifFalse: [ src ]).
+        self setEditable: true label: 'definition: ', SelectedClass, ' — Accept saves to the image (next launch)'.
+    ]
+    CocoaBrowser2 class >> showMethodSource [
+        | src |
+        SelectedMethod isNil ifTrue: [
+            EditMode := #viewing.
+            self setEditable: false label: 'select a method (or + New Method)'.
+            ^self showSource: '"select a method, or press + New Method"' ].
+        src := self readReply: (self hostService onMain
+                   sourceForClass: SelectedClass side: self sideString selector: SelectedMethod).
+        EditMode := #method.
+        self showSource: (src isEmpty
+            ifTrue: [ '"no stored source (primitive?) — type a method here and Accept to define one"' ]
+            ifFalse: [ src ]).
+        self setEditable: true label: 'edit ', SelectedClass, '>>', SelectedMethod, ' — Accept saves (image + live)'.
+    ]
+    CocoaBrowser2 class >> showSource: aString [
+        SourceView isNil ifTrue: [ ^self ].
+        SourceView onMain setString: aString.
+        self recolorize.
+    ]
+    CocoaBrowser2 class >> setEditable: aBool label: aLabel [
+        SourceView isNil ifFalse: [ SourceView onMain setEditable: aBool ].
+        ModeLabel isNil ifFalse: [ ModeLabel onMain setStringValue: aLabel ].
+        AcceptBtn isNil ifFalse: [ AcceptBtn onMain setEnabled: aBool ].
+    ]
+
+    "── editing: Accept dispatches on EditMode; every write reuses V1's own host
+       flows + the M5 live-compile gate (liveReopen:). ── "
+    CocoaBrowser2 class >> accept [
+        (EditMode == #newMethod or: [ EditMode == #method ]) ifTrue: [ ^self acceptMethod ].
+        EditMode == #newClass ifTrue: [ ^self acceptClass ].
+        EditMode == #comment ifTrue: [ ^self acceptComment ].
+        EditMode == #definition ifTrue: [ ^self acceptDefinition ].
+    ]
+    CocoaBrowser2 class >> cancelEdit [
+        SelectedClass isNil ifTrue: [ ^self renderSource ].
+        self renderSource.
+    ]
+    "TWO round trips (check the primary has the class, THEN reopen) — the exact
+     §4.4 gate V1 uses, extracted so the nested uiDoit send can't greedily
+     absorb a trailing ifFalse: (see world/66's own comment)."
+    CocoaBrowser2 class >> liveReopen: reopenSource for: cls onDone: doneBlock onSkipped: skipBlock [
+        "MACDART: one VM, one image — the accept that just succeeded IS the
+         live state (it went through the workspace's checked accept, which
+         reloads the ST layer). Complete straight into the success branch."
+        doneBlock value: 'nil'
+    ]
+    CocoaBrowser2 class >> acceptMethod [
+        | cls text reply sel reopen |
+        cls := SelectedClass.
+        cls isNil ifTrue: [ ^self ].
+        text := self sourceString.
+        reply := self readReply: (self hostService onMain saveMethodFor: cls side: self sideString source: text).
+        (self isOk: reply) ifFalse: [ ^CocoaUI appendTranscript: 'browser v2: not saved — ', (self errorOf: reply) ].
+        sel := self payloadOf: reply.
+        reopen := ShellSuper, ' subclass: ', cls, ' [', String lf, text, String lf, ']'.
+        "Like V1's acceptMethod: the reply continuation ONLY sets the refresh
+         flag — never rebuilds inline. drain_perform rebuilds top-level (which
+         re-selects the class, so the new selector shows)."
+        self liveReopen: reopen for: cls
+            onDone: [ :r |
+                r = 'nil'
+                    ifTrue: [ CocoaUI appendTranscript: 'browser v2: saved ', cls, '>>', sel, ' (image + live)' ]
+                    ifFalse: [ CocoaUI appendTranscript: 'browser v2: saved ', cls, '>>', sel, ' to the image, live compile failed: ', r ].
+                CocoaBrowser2 requestRefresh ]
+            onSkipped: [ CocoaUI appendTranscript: 'browser v2: saved ', cls, '>>', sel,
+                                ' to the image — primary lacks this package, not applied live'.
+                CocoaBrowser2 requestRefresh ].
+    ]
+    CocoaBrowser2 class >> acceptClass [
+        | text reply name |
+        text := self sourceString.
+        reply := self readReply: (self hostService onMain newClassFrom: text).
+        (self isOk: reply) ifFalse: [ ^CocoaUI appendTranscript: 'browser v2: not created — ', (self errorOf: reply) ].
+        name := self payloadOf: reply.
+        Worker uiDoit: text onReply: [ :r |
+            r = 'nil'
+                ifTrue: [ CocoaUI appendTranscript: 'browser v2: created ', name, ' (image + live)' ]
+                ifFalse: [ CocoaUI appendTranscript: 'browser v2: created ', name, ' in the image, live compile failed: ', r ].
+            CocoaBrowser2 requestRefresh ].
+        EditMode := #viewing.
+    ]
+    CocoaBrowser2 class >> acceptComment [
+        | cls reply |
+        cls := SelectedClass.
+        cls isNil ifTrue: [ ^self ].
+        reply := self readReply: (self hostService onMain setCommentFor: cls comment: self sourceString).
+        (self isOk: reply)
+            ifTrue: [ CocoaUI appendTranscript: 'browser v2: saved comment for ', cls, ' (image)'. self showComment ]
+            ifFalse: [ CocoaUI appendTranscript: 'browser v2: comment not saved — ', (self errorOf: reply) ].
+    ]
+    CocoaBrowser2 class >> acceptDefinition [
+        | reply |
+        SelectedClass isNil ifTrue: [ ^self ].
+        reply := self readReply: (self hostService onMain acceptEditorClass: self sourceString).
+        (self isOk: reply)
+            ifTrue: [ CocoaUI appendTranscript: 'browser v2: ', (self payloadOf: reply). self requestRefresh ]
+            ifFalse: [ CocoaUI appendTranscript: 'browser v2: ', (self errorOf: reply) ].
+    ]
+    "New Class / New Method load an editable TEMPLATE into the source pane."
+    CocoaBrowser2 class >> newClass [
+        | sc |
+        sc := SelectedClass isNil ifTrue: [ 'Object' ] ifFalse: [ SelectedClass ].
+        self disarmRemove.
+        EditMode := #newClass.
+        self showSource: sc, ' subclass: NewClass [', String lf, String lf, ']'.
+        self setEditable: true label: 'new class — edit, then Accept (image + live)'.
+        CocoaUI window isNil ifFalse: [ CocoaUI window onMain makeFirstResponder: SourceView ].
+    ]
+    CocoaBrowser2 class >> newMethod [
+        | template |
+        SelectedClass isNil ifTrue: [ ^CocoaUI appendTranscript: 'browser v2: select a class first' ].
+        self disarmRemove.
+        template := Side == #class
+            ifTrue: [ SelectedClass, ' class >> messageSelector [', String lf,
+                      (String with: Character tab), '"Say what this method does."', String lf, ']' ]
+            ifFalse: [ 'messageSelector [', String lf,
+                       (String with: Character tab), '"Say what this method does."', String lf, ']' ].
+        EditMode := #newMethod. SourceMode := #source. self syncModeSeg.
+        self showSource: template.
+        self setEditable: true label: 'new ', self sideString, ' method on ', SelectedClass, ' — edit, then Accept'.
+        CocoaUI window onMain makeFirstResponder: SourceView.
+    ]
+    "Remove — two-click arm/confirm (no modal run loop)."
+    CocoaBrowser2 class >> disarmRemove [
+        RemoveArmed := nil.
+        RemoveClassBtn isNil ifFalse: [ RemoveClassBtn onMain setTitle: 'Remove Class' ].
+        RemoveMethodBtn isNil ifFalse: [ RemoveMethodBtn onMain setTitle: 'Remove Method' ].
+    ]
+    CocoaBrowser2 class >> removeClassPressed [
+        | cls reply |
+        cls := SelectedClass.
+        cls isNil ifTrue: [ ^CocoaUI appendTranscript: 'browser v2: select a class first' ].
+        RemoveArmed == #class ifFalse: [ RemoveArmed := #class. ^RemoveClassBtn onMain setTitle: 'Remove ', cls, '?' ].
+        reply := self readReply: (self hostService onMain removeClassNamed: cls).
+        self disarmRemove.
+        (self isOk: reply)
+            ifTrue: [ CocoaUI appendTranscript: 'browser v2: removed ', cls, ' from the image (live until restart)'. self requestRefresh ]
+            ifFalse: [ CocoaUI appendTranscript: 'browser v2: ', (self errorOf: reply) ].
+    ]
+    CocoaBrowser2 class >> removeMethodPressed [
+        | cls sel reply |
+        cls := SelectedClass. sel := SelectedMethod.
+        (cls isNil or: [ sel isNil ]) ifTrue: [ ^CocoaUI appendTranscript: 'browser v2: select a method first' ].
+        RemoveArmed == #method ifFalse: [ RemoveArmed := #method. ^RemoveMethodBtn onMain setTitle: 'Remove ', sel, '?' ].
+        reply := self readReply: (self hostService onMain removeMethodFor: cls side: self sideString selector: sel).
+        self disarmRemove.
+        (self isOk: reply)
+            ifTrue: [ CocoaUI appendTranscript: 'browser v2: removed ', cls, '>>', sel, ' from the image (live until restart)'. self requestRefresh ]
+            ifFalse: [ CocoaUI appendTranscript: 'browser v2: ', (self errorOf: reply) ].
+    ]
+    "── reply parsing (OK <payload> / ERR <message>) ──"
+    CocoaBrowser2 class >> isOk: reply [ ^(reply size >= 2) and: [ (reply copyFrom: 1 to: 2) = 'OK' ] ]
+    CocoaBrowser2 class >> payloadOf: reply [ ^reply size > 3 ifTrue: [ reply copyFrom: 4 to: reply size ] ifFalse: [ '' ] ]
+    CocoaBrowser2 class >> errorOf: reply [ ^reply size > 4 ifTrue: [ reply copyFrom: 5 to: reply size ] ifFalse: [ reply ] ]
+    CocoaBrowser2 class >> textDidChange: aNote [ self recolorize ]
+    CocoaBrowser2 class >> recolorize [
+        | ts |
+        SourceView isNil ifTrue: [ ^self ].
+        ts := SourceView onMain textStorage.
+        ts isNil ifTrue: [ ^self ].
+        self hostService onMain colorizeStorage: ts.
+        ts release.
+    ]
+    CocoaBrowser2 class >> modeChanged [
+        | seg |
+        ModeSeg isNil ifTrue: [ ^self ].
+        seg := ModeSeg onMain selectedSegment.
+        SourceMode := seg = 0 ifTrue: [ #comment ]
+                      ifFalse: [ seg = 1 ifTrue: [ #definition ] ifFalse: [ #source ] ].
+        self renderSource.
+    ]
+    CocoaBrowser2 class >> syncModeSeg [
+        ModeSeg isNil ifTrue: [ ^self ].
+        ModeSeg onMain setSelectedSegment:
+            (SourceMode == #definition ifTrue: [ 1 ]
+             ifFalse: [ SourceMode == #source ifTrue: [ 2 ] ifFalse: [ 0 ] ]).
+    ]
+    CocoaBrowser2 class >> applyCodeFont [
+        SourceView isNil ifFalse: [ SourceView onMain setFont: (CocoaUI fixedFontOfSize: 12.0) ]
+    ]
+
+    "── deferred reloads (never reload synchronously from a callback) ──"
+    CocoaBrowser2 class >> deferReload: aView [
+        "MACDART: our #table sources are SNAPSHOTS — push this pane's current
+         model rows first, then reload (same-isolate, so a direct reload is
+         safe; the original deferred to escape a sync host callback we no
+         longer have)."
+        aView isNil ifTrue: [ ^self ].
+        aView isValid ifFalse: [ ^self ].   "MACDART: a torn-down browser's view
+         can still be reached by an in-flight refresh — released, not nil"
+        aView == ClassTable ifTrue: [ self pushRows: Classes to: ClassDelegate ].
+        aView == ProtoTable ifTrue: [ self pushRows: Protocols to: ProtoDelegate ].
+        aView == MethTable ifTrue: [ self pushRows: Methods to: MethDelegate ].
+        aView == CatOutline ifTrue: [ self pushRows: CatRows to: CatDelegate ].
+        aView onMain reloadData
+    ]
+    CocoaBrowser2 class >> pushRows: anArray to: aDelegate [
+        "ONE main-thread hop per snapshot (US-joined; the source splits
+         ObjC-side) — per-row hops starved the language isolate and froze
+         the workspace window's own event handling."
+        aDelegate isNil ifTrue: [ ^self ].
+        aDelegate isValid ifFalse: [ ^self ].   "MACDART: released by teardown
+         but still referenced by a stale refresh - skip, never send to a dead ref"
+        aDelegate onMain setRowsJoined: (STCocoa joinRows: anArray).
+    ]
+
+    "── install a freshly-fetched model (TOP-LEVEL: direct reload + expand ok) ──"
+    CocoaBrowser2 class >> installModel [
+        "TOP-LEVEL only (drain_perform servicing the refresh flag). Rebuild the
+         outline, then RE-APPLY the preserved selection so an edit's refresh keeps
+         the user's place — the V1 model (installSnapshot keeps its selection;
+         it NEVER re-selects from a reply continuation, which is what corrupted
+         walk_frames into a SIGSEGV recover loop)."
+        self rebuildCatModel.
+        self deferReload: CatOutline.
+        self disarmRemove.
+        self reselectAfterRefresh.
+        self deferReload: ClassTable. self deferReload: ProtoTable. self deferReload: MethTable.
+    ]
+    CocoaBrowser2 class >> classesInPackage: aName [
+        | ln pkgs |
+        aName isNil ifTrue: [ ^Array new: 0 ].
+        Tree isNil ifTrue: [ ^Array new: 0 ].
+        1 to: Tree size do: [ :i |
+            ln := Tree at: i. pkgs := ln at: 2.
+            1 to: pkgs size do: [ :j |
+                ((pkgs at: j) at: 1) = aName ifTrue: [ ^(pkgs at: j) at: 2 ] ] ].
+        ^Array new: 0
+    ]
+    CocoaBrowser2 class >> reselectAfterRefresh [
+        "Preserve the METHOD selection + source mode too (review finding: after
+         an Accept the pane jumped to the class comment) — selectClass: resets
+         both, so capture before and re-apply after, if the method survived."
+        | keepMethod keepMode |
+        keepMethod := SelectedMethod. keepMode := SourceMode.
+        Classes := self classesInPackage: SelectedPackageName.
+        (SelectedClass notNil and: [ Records notNil and: [ Records includesKey: SelectedClass ] ])
+            ifTrue: [
+                self selectClass: SelectedClass.
+                (keepMethod notNil and: [ self currentSideSelectors includes: keepMethod ])
+                    ifTrue: [
+                        SelectedMethod := keepMethod.
+                        SourceMode := keepMode.
+                        self syncModeSeg. self renderSource ] ]
+            ifFalse: [ self clearClassSelection ].
+    ]
+
+    "── build ──"
+    CocoaBrowser2 class >> wireAction: aControl to: aBlock [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+    ]
+    CocoaBrowser2 class >> newScrollIn: rect [
+        | s |
+        s := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain initWithFrame: rect.
+        s onMain setHasVerticalScroller: true.
+        s onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        ^s
+    ]
+    CocoaBrowser2 class >> newTableColumnId: anId [
+        | c |
+        c := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain initWithIdentifier: anId.
+        c onMain setWidth: 900.0.
+        ^c
+    ]
+    CocoaBrowser2 class >> buttonRowHeight [ ^30.0 ]
+    CocoaBrowser2 class >> actionButton: title frame: rect action: aBlock in: aView [
+        "A bottom-pinned NSButton (maskMaxYMargin = flexible space above, so the
+         row stays at the pane bottom on resize — V1's CG8 float-bug fix)."
+        | btn |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: CocoaUI maskMaxYMargin.
+        self wireAction: btn to: aBlock.
+        aView onMain addSubview: btn.
+        ^btn
+    ]
+    CocoaBrowser2 class >> hostFrame [
+        "Sprint 15: the workspace's Browser TAB sets BrowserTabFrame before
+         asking for the container; the shell's content host and a standalone
+         default remain as fallbacks."
+        | host |
+        BrowserTabFrame isNil ifFalse: [ ^BrowserTabFrame ].
+        host := CocoaUI contentHost.
+        ^host isNil
+            ifTrue: [ Array with: 0.0 with: 0.0 with: 980.0 with: 620.0 ]
+            ifFalse: [ host onMain frame ]
+    ]
+    CocoaBrowser2 class >> buildView [
+        | frame w h topH cw |
+        frame := self hostFrame.
+        w := frame at: 3. h := frame at: 4.
+        topH := h - self sourcePaneHeight.
+        Side := #instance. SourceMode := #comment.
+        ActionDelegates := OrderedCollection new.
+        Container := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        VSplit := ((Cocoa classNamed: 'NSSplitView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        VSplit onMain setVertical: false.
+        VSplit onMain setDividerStyle: 3.
+        VSplit onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        HSplit := ((Cocoa classNamed: 'NSSplitView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: topH).
+        HSplit onMain setVertical: true.
+        HSplit onMain setDividerStyle: 3.
+        cw := w / 4.0.
+        self buildCatPane: (Array with: 0.0 with: 0.0 with: cw with: topH).
+        self buildClassListPane: (Array with: 0.0 with: 0.0 with: cw with: topH).
+        self buildProtoPane: (Array with: 0.0 with: 0.0 with: cw with: topH).
+        self buildMethodPane: (Array with: 0.0 with: 0.0 with: cw with: topH).
+        HSplit onMain addSubview: CatPane.
+        HSplit onMain addSubview: ClassListPane.
+        HSplit onMain addSubview: ProtoPane.
+        HSplit onMain addSubview: MethodPane.
+        self buildSourcePane: (Array with: 0.0 with: 0.0 with: w with: self sourcePaneHeight).
+        VSplit onMain addSubview: HSplit.
+        VSplit onMain addSubview: SourcePane.
+        VSplit onMain adjustSubviews. HSplit onMain adjustSubviews.
+        VSplit onMain setPosition: topH ofDividerAtIndex: 0.
+        HSplit onMain setPosition: cw ofDividerAtIndex: 0.
+        HSplit onMain setPosition: cw * 2 ofDividerAtIndex: 1.
+        HSplit onMain setPosition: cw * 3 ofDividerAtIndex: 2.
+        Container onMain addSubview: VSplit.
+        self showSource: '"select a category, then a class"'.
+    ]
+    CocoaBrowser2 class >> buildCatPane: rect [
+        | w h |
+        w := rect at: 3. h := rect at: 4.
+        CatPane := ((Cocoa classNamed: 'NSView') onMain alloc) onMain initWithFrame: rect.
+        CatPane onMain setAutoresizesSubviews: true.
+        CatScroll := self newScrollIn: (Array with: 0.0 with: 0.0 with: w with: h).
+        "MACDART: a FLAT snapshot table instead of the outline — our #table
+         sources answer from an ObjC-side snapshot (no sync VM entry), and
+         the two-level category tree flattens losslessly (packages indented
+         under their list)."
+        CatOutline := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        CatCol := self newTableColumnId: 'cat'.
+        CatOutline onMain addTableColumn: CatCol.
+        CatOutline onMain setHeaderView: nil.
+        CatDelegate := MacvmDelegate tableSourceOn: self.
+        CatOutline onMain setDataSource: CatDelegate.
+        CatOutline onMain setColumnAutoresizingStyle: 1.
+        CatCol onMain setEditable: false.
+        self wireAction: CatOutline to: [ self catClicked ].
+        CatScroll onMain setDocumentView: CatOutline.
+        CatPane onMain addSubview: CatScroll.
+    ]
+    CocoaBrowser2 class >> rebuildCatModel [
+        "Flatten Tree -> parallel label/node arrays: a list row {#list. name},
+         a package row {#pkg. pkgNode} (label indented)."
+        | rows nodes ln pkgs pkg |
+        rows := OrderedCollection new. nodes := OrderedCollection new.
+        Tree isNil ifFalse: [
+            1 to: Tree size do: [ :i |
+                ln := Tree at: i.
+                rows add: (ln at: 1). nodes add: (Array with: #list with: ln).
+                pkgs := ln at: 2.
+                1 to: pkgs size do: [ :j |
+                    pkg := pkgs at: j.
+                    rows add: '    ' , (pkg at: 1).
+                    nodes add: (Array with: #pkg with: pkg) ] ] ].
+        CatRows := rows asArray. CatNodes := nodes asArray.
+    ]
+    CocoaBrowser2 class >> catClicked [
+        | row node pkg |
+        CatOutline isNil ifTrue: [ ^self ].
+        row := CatOutline onMain selectedRow.
+        (row < 0 or: [ CatNodes isNil or: [ row >= CatNodes size ] ]) ifTrue: [ ^self ].
+        node := CatNodes at: row + 1.
+        (node at: 1) == #pkg ifFalse: [ ^self ].
+        pkg := node at: 2.
+        SelectedPackage := pkg.
+        SelectedPackageName := pkg at: 1.
+        Classes := pkg at: 2.
+        self clearClassSelection.
+        self deferReload: ClassTable.
+    ]
+    CocoaBrowser2 class >> buildClassListPane: rect [
+        | w h brh |
+        w := rect at: 3. h := rect at: 4.
+        brh := self buttonRowHeight.
+        ClassListPane := ((Cocoa classNamed: 'NSView') onMain alloc) onMain initWithFrame: rect.
+        ClassListPane onMain setAutoresizesSubviews: true.
+        ClassScroll := self newScrollIn: (Array with: 0.0 with: brh with: w with: h - brh).
+        ClassTable := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - brh).
+        ClassCol := self newTableColumnId: 'class'.
+        ClassTable onMain addTableColumn: ClassCol.
+        ClassTable onMain setHeaderView: nil.
+        ClassFace := (Worker classNamed: #CocoaBrowser2Face) on: #classes.
+        ClassDelegate := MacvmDelegate tableSourceOn: ClassFace.
+        ClassTable onMain setDataSource: ClassDelegate.
+        ClassTable onMain setDelegate: ClassDelegate.
+        ClassTable onMain setColumnAutoresizingStyle: 1.
+        ClassCol onMain setEditable: false.
+        self wireAction: ClassTable to: [ self classClicked ].
+        ClassScroll onMain setDocumentView: ClassTable.
+        ClassListPane onMain addSubview: ClassScroll.
+        NewClassBtn := self actionButton: '+ New Class'
+            frame: (Array with: 4.0 with: 3.0 with: (w / 2) - 8 with: 24.0)
+            action: [ self newClass ] in: ClassListPane.
+        RemoveClassBtn := self actionButton: 'Remove Class'
+            frame: (Array with: (w / 2) + 4 with: 3.0 with: (w / 2) - 8 with: 24.0)
+            action: [ self removeClassPressed ] in: ClassListPane.
+    ]
+    CocoaBrowser2 class >> buildProtoPane: rect [
+        | w h |
+        w := rect at: 3. h := rect at: 4.
+        ProtoPane := ((Cocoa classNamed: 'NSView') onMain alloc) onMain initWithFrame: rect.
+        ProtoPane onMain setAutoresizesSubviews: true.
+        SideSeg := ((Cocoa classNamed: 'NSSegmentedControl') onMain alloc) onMain
+            initWithFrame: (Array with: 4.0 with: h - 26.0 with: w - 8.0 with: 22.0).
+        SideSeg onMain setSegmentCount: 2.
+        SideSeg onMain setLabel: 'instance' forSegment: 0.
+        SideSeg onMain setLabel: 'class' forSegment: 1.
+        SideSeg onMain setSelectedSegment: 0.
+        SideSeg onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        self wireAction: SideSeg to: [ self sideChanged ].
+        ProtoPane onMain addSubview: SideSeg.
+        ProtoScroll := self newScrollIn: (Array with: 0.0 with: 0.0 with: w with: h - 28.0).
+        ProtoTable := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - 28.0).
+        ProtoCol := self newTableColumnId: 'proto'.
+        ProtoTable onMain addTableColumn: ProtoCol.
+        ProtoTable onMain setHeaderView: nil.
+        ProtoFace := (Worker classNamed: #CocoaBrowser2Face) on: #protocols.
+        ProtoDelegate := MacvmDelegate tableSourceOn: ProtoFace.
+        ProtoTable onMain setDataSource: ProtoDelegate.
+        ProtoTable onMain setDelegate: ProtoDelegate.
+        ProtoTable onMain setColumnAutoresizingStyle: 1.
+        ProtoCol onMain setEditable: false.
+        self wireAction: ProtoTable to: [ self protocolClicked ].
+        ProtoScroll onMain setDocumentView: ProtoTable.
+        ProtoPane onMain addSubview: ProtoScroll.
+    ]
+    CocoaBrowser2 class >> buildMethodPane: rect [
+        | w h brh |
+        w := rect at: 3. h := rect at: 4.
+        brh := self buttonRowHeight.
+        MethodPane := ((Cocoa classNamed: 'NSView') onMain alloc) onMain initWithFrame: rect.
+        MethodPane onMain setAutoresizesSubviews: true.
+        MethScroll := self newScrollIn: (Array with: 0.0 with: brh with: w with: h - brh).
+        MethTable := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - brh).
+        MethCol := self newTableColumnId: 'method'.
+        MethTable onMain addTableColumn: MethCol.
+        MethTable onMain setHeaderView: nil.
+        MethFace := (Worker classNamed: #CocoaBrowser2Face) on: #methods.
+        MethDelegate := MacvmDelegate tableSourceOn: MethFace.
+        MethTable onMain setDataSource: MethDelegate.
+        MethTable onMain setDelegate: MethDelegate.
+        MethTable onMain setColumnAutoresizingStyle: 1.
+        MethCol onMain setEditable: false.
+        self wireAction: MethTable to: [ self methodClicked ].
+        MethScroll onMain setDocumentView: MethTable.
+        MethodPane onMain addSubview: MethScroll.
+        NewMethodBtn := self actionButton: '+ New Method'
+            frame: (Array with: 4.0 with: 3.0 with: (w / 2) - 8 with: 24.0)
+            action: [ self newMethod ] in: MethodPane.
+        RemoveMethodBtn := self actionButton: 'Remove Method'
+            frame: (Array with: (w / 2) + 4 with: 3.0 with: (w / 2) - 8 with: 24.0)
+            action: [ self removeMethodPressed ] in: MethodPane.
+    ]
+    CocoaBrowser2 class >> smallButton: title frame: rect action: aBlock [
+        "A top-bar button (pinned to the pane TOP via maskMinYMargin)."
+        | btn |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: CocoaUI maskMinYMargin.
+        self wireAction: btn to: aBlock.
+        SourcePane onMain addSubview: btn.
+        ^btn
+    ]
+    CocoaBrowser2 class >> buildSourcePane: rect [
+        | w h barH tc |
+        w := rect at: 3. h := rect at: 4. barH := 28.0.
+        SourcePane := ((Cocoa classNamed: 'NSView') onMain alloc) onMain initWithFrame: rect.
+        SourcePane onMain setAutoresizesSubviews: true.
+        ModeSeg := ((Cocoa classNamed: 'NSSegmentedControl') onMain alloc) onMain
+            initWithFrame: (Array with: 4.0 with: h - barH + 2.0 with: 228.0 with: 22.0).
+        ModeSeg onMain setSegmentCount: 3.
+        ModeSeg onMain setLabel: 'Comment' forSegment: 0.
+        ModeSeg onMain setLabel: 'Definition' forSegment: 1.
+        ModeSeg onMain setLabel: 'Source' forSegment: 2.
+        ModeSeg onMain setSelectedSegment: 0.
+        ModeSeg onMain setAutoresizingMask: CocoaUI maskMinYMargin.
+        self wireAction: ModeSeg to: [ self modeChanged ].
+        SourcePane onMain addSubview: ModeSeg.
+        AcceptBtn := self smallButton: 'Accept'
+            frame: (Array with: 236.0 with: h - barH + 1.0 with: 74.0 with: 24.0) action: [ self accept ].
+        CancelBtn := self smallButton: 'Cancel'
+            frame: (Array with: 314.0 with: h - barH + 1.0 with: 74.0 with: 24.0) action: [ self cancelEdit ].
+        ModeLabel := ((Cocoa classNamed: 'NSTextField') onMain alloc) onMain
+            initWithFrame: (Array with: 396.0 with: h - barH + 4.0 with: w - 404.0 with: 18.0).
+        ModeLabel onMain setEditable: false.
+        ModeLabel onMain setBordered: false.
+        ModeLabel onMain setDrawsBackground: false.
+        ModeLabel onMain setFont: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 10.0).
+        ModeLabel onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        SourcePane onMain addSubview: ModeLabel.
+        SourceScroll := self newScrollIn: (Array with: 0.0 with: 0.0 with: w with: h - barH).
+        SourceView := ((Cocoa classNamed: 'NSTextView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - barH).
+        SourceView onMain setEditable: false.
+        SourceView onMain setFont: (CocoaUI fixedFontOfSize: 12.0).
+        SourceView onMain setAutomaticQuoteSubstitutionEnabled: false.
+        SourceView onMain setAutomaticDashSubstitutionEnabled: false.
+        SourceView onMain setAutomaticTextReplacementEnabled: false.
+        SourceView onMain setVerticallyResizable: true.
+        SourceView onMain setHorizontallyResizable: false.
+        SourceView onMain setAutoresizingMask: CocoaUI maskWidthSizable.
+        tc := SourceView onMain textContainer.
+        tc isNil ifFalse: [ tc onMain setWidthTracksTextView: true. tc release ].
+        "Live syntax colour while editing (every text change, incl. programmatic
+         setString: — see V1's own note)."
+        SourceTextDelegate := MacvmDelegate textDelegateOn: self.
+        SourceView onMain setDelegate: SourceTextDelegate.
+        SourceScroll onMain setDocumentView: SourceView.
+        SourcePane onMain addSubview: SourceScroll.
+    ]
+
+    "── scripting/automation (rusttcl `gui doit` — I drive + screenshot) ──"
+    CocoaBrowser2 class >> scriptSelectPackage: aName [
+        | ln pkgs pkg |
+        Tree isNil ifTrue: [ ^self ].
+        1 to: Tree size do: [ :i |
+            ln := Tree at: i. pkgs := ln at: 2.
+            1 to: pkgs size do: [ :j |
+                pkg := pkgs at: j.
+                (pkg at: 1) = aName ifTrue: [
+                    SelectedPackage := pkg. SelectedPackageName := aName. Classes := pkg at: 2.
+                    self clearClassSelection. self deferReload: ClassTable. ^self ] ] ].
+    ]
+    CocoaBrowser2 class >> scriptSelectClass: aName [ self selectClass: aName ]
+    CocoaBrowser2 class >> scriptClickCategory: i [
+        "Headless reproduction of a REAL category click: select the row on
+         the actual table, then run the click handler."
+        CatOutline isNil ifTrue: [ ^'no table' ].
+        CatOutline onMain selectRowIndexes:
+            ((Cocoa classNamed: 'NSIndexSet') onMain indexSetWithIndex: i)
+            byExtendingSelection: false.
+        self catClicked.
+        ^'sel: ' , SelectedPackageName printString , ' classes: ' ,
+            (Classes isNil ifTrue: [ 'nil' ] ifFalse: [ Classes size printString ])
+    ]
+    CocoaBrowser2 class >> scriptSelectProtocol: aName [
+        | i |
+        Protocols isNil ifTrue: [ ^self ].
+        i := 0. 1 to: Protocols size do: [ :k | (Protocols at: k) = aName ifTrue: [ i := k ] ].
+        i = 0 ifTrue: [ ^self ].
+        SelectedProtocol := aName = '(all)' ifTrue: [ nil ] ifFalse: [ aName ].
+        Methods := self methodsForProtocol. self deferReload: MethTable.
+    ]
+    CocoaBrowser2 class >> scriptSelectMethod: aName [
+        SelectedMethod := aName. SourceMode := #source. self syncModeSeg. self renderSource.
+    ]
+    CocoaBrowser2 class >> scriptSetSide: sym [
+        Side := sym.
+        SideSeg isNil ifFalse: [ SideSeg onMain setSelectedSegment: (sym == #class ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+        SelectedClass isNil ifFalse: [ self selectClass: SelectedClass ].
+    ]
+    CocoaBrowser2 class >> scriptSetMode: sym [ SourceMode := sym. self syncModeSeg. self renderSource ]
+    CocoaBrowser2 class >> scriptType: aString [ SourceView isNil ifFalse: [ SourceView onMain setString: aString. self recolorize ] ]
+    CocoaBrowser2 class >> scriptAccept [ self accept ]
+    CocoaBrowser2 class >> scriptCancel [ self cancelEdit ]
+    CocoaBrowser2 class >> scriptNewClass [ self newClass ]
+    CocoaBrowser2 class >> scriptNewMethod [ self newMethod ]
+
+    "── reveal a class + method from OUTSIDE (the Find pane): find the package
+       that holds the class, select it, the class, the side and the method, and
+       highlight the rows — so a search result opens exactly where it lives,
+       instead of switching to the browser at a random place. ──"
+    CocoaBrowser2 class >> selectRow: row inTable: aTable [
+        (aTable isNil or: [ row < 0 ]) ifTrue: [ ^self ].
+        aTable isValid ifFalse: [ ^self ].
+        aTable onMain selectRowIndexes:
+            ((Cocoa classNamed: 'NSIndexSet') onMain indexSetWithIndex: row)
+            byExtendingSelection: false.
+        aTable onMain scrollRowToVisible: row
+    ]
+    CocoaBrowser2 class >> revealClass: aName selector: aSel side: aSide [
+        | pkgName found |
+        Container isNil ifTrue: [ ^'no browser' ].
+        "Build the full model + render the category outline first, so all three
+         list panes are populated before we drill into one of them."
+        self doRefresh.
+        Tree isNil ifTrue: [ ^'no model' ].
+        "1. the package that holds aName"
+        pkgName := nil. found := nil.
+        1 to: Tree size do: [ :i | | pkgs |
+            pkgs := (Tree at: i) at: 2.
+            1 to: pkgs size do: [ :j | | pkg |
+                pkg := pkgs at: j.
+                (pkgName isNil and: [ (pkg at: 2) includes: aName ]) ifTrue: [
+                    pkgName := pkg at: 1. found := pkg ] ] ].
+        pkgName isNil ifTrue: [ ^'not found: ', aName ].
+        SelectedPackage := found. SelectedPackageName := pkgName.
+        Classes := found at: 2.
+        self deferReload: ClassTable.
+        "2. the side"
+        Side := (aSide = 'class') ifTrue: [ #class ] ifFalse: [ #instance ].
+        SideSeg isNil ifFalse: [
+            SideSeg onMain setSelectedSegment: (Side == #class ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+        "3. the class (model: protocols, methods, source)"
+        self selectClass: aName.
+        self selectRow: (Classes indexOf: aName) - 1 inTable: ClassTable.
+        "4. the method, if the result carried one"
+        (aSel isNil or: [ aSel isEmpty ]) ifFalse: [
+            SelectedMethod := aSel. SourceMode := #source.
+            self syncModeSeg. self renderSource.
+            Methods isNil ifFalse: [
+                self selectRow: (Methods indexOf: aSel) - 1 inTable: MethTable ] ].
+        ^'revealed ', aName
+    ]
+
+    CocoaBrowser2 class >> scriptRemoveClass [ self removeClassPressed ]
+    CocoaBrowser2 class >> scriptRemoveMethod [ self removeMethodPressed ]
+    CocoaBrowser2 class >> editModeName [ ^EditMode isNil ifTrue: [ 'nil' ] ifFalse: [ EditMode asString ] ]
+    CocoaBrowser2 class >> currentClassNames [ ^Classes isNil ifTrue: [ Array new: 0 ] ifFalse: [ Classes ] ]
+    CocoaBrowser2 class >> currentProtocolNames [ ^Protocols isNil ifTrue: [ Array new: 0 ] ifFalse: [ Protocols ] ]
+    CocoaBrowser2 class >> currentMethodNames [ ^Methods isNil ifTrue: [ Array new: 0 ] ifFalse: [ Methods ] ]
+    CocoaBrowser2 class >> sourceString [
+        "MACDART: the text read must hop to main (MACVM ran main-inline)."
+        ^SourceView isNil
+            ifTrue: [ '' ]
+            ifFalse: [ STCocoa utf8: (SourceView onMain string) ]
+    ]
+    CocoaBrowser2 class >> packageNames [
+        | out ln pkgs |
+        out := OrderedCollection new.
+        Tree isNil ifFalse: [
+            1 to: Tree size do: [ :i |
+                ln := Tree at: i. pkgs := ln at: 2.
+                1 to: pkgs size do: [ :j | out add: ((pkgs at: j) at: 1) ] ] ].
+        ^out asArray
+    ]
+
+    "── teardown (UI-worker rebuild, CG9) ──"
+    CocoaBrowser2 class >> releaseView: v [ v isNil ifFalse: [ v isValid ifTrue: [ v release ] ] ]
+    CocoaBrowser2 class >> teardownIfAny [
+        Container isNil ifFalse: [ self teardown ]
+    ]
+    CocoaBrowser2 class >> teardown [
+        self releaseCatHandles.
+        CatDelegate isNil ifFalse: [ CatDelegate isValid ifTrue: [ CatDelegate release ] ].
+        ClassDelegate isNil ifFalse: [ ClassDelegate isValid ifTrue: [ ClassDelegate release ] ].
+        ProtoDelegate isNil ifFalse: [ ProtoDelegate isValid ifTrue: [ ProtoDelegate release ] ].
+        MethDelegate isNil ifFalse: [ MethDelegate isValid ifTrue: [ MethDelegate release ] ].
+        SourceTextDelegate isNil ifFalse: [ SourceTextDelegate isValid ifTrue: [ SourceTextDelegate release ] ].
+        ActionDelegates isNil ifFalse: [ ActionDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
+        Svc isNil ifFalse: [ Svc isValid ifTrue: [ Svc release ] ].
+        self releaseView: CatCol. self releaseView: ClassCol. self releaseView: ProtoCol. self releaseView: MethCol.
+        self releaseView: CatOutline. self releaseView: ClassTable. self releaseView: ProtoTable. self releaseView: MethTable.
+        self releaseView: CatScroll. self releaseView: ClassScroll. self releaseView: ProtoScroll. self releaseView: MethScroll.
+        self releaseView: NewClassBtn. self releaseView: RemoveClassBtn. self releaseView: NewMethodBtn. self releaseView: RemoveMethodBtn.
+        self releaseView: SideSeg. self releaseView: ModeSeg. self releaseView: AcceptBtn. self releaseView: CancelBtn. self releaseView: ModeLabel.
+        self releaseView: SourceView. self releaseView: SourceScroll.
+        self releaseView: CatPane. self releaseView: ClassListPane. self releaseView: ProtoPane.
+        self releaseView: MethodPane. self releaseView: SourcePane.
+        self releaseView: HSplit. self releaseView: VSplit. self releaseView: Container.
+        Tree := nil. Records := nil. Svc := nil. Side := nil. SourceMode := nil. EditMode := nil.
+        ShellSuper := nil. RemoveArmed := nil. SourceTextDelegate := nil.
+        SelectedPackage := nil. SelectedClass := nil. SelectedProtocol := nil. SelectedMethod := nil.
+        Classes := nil. Protocols := nil. Methods := nil. ActionDelegates := nil.
+        CatDelegate := nil. ClassDelegate := nil. ProtoDelegate := nil. MethDelegate := nil.
+        ClassFace := nil. ProtoFace := nil. MethFace := nil.
+        NewClassBtn := nil. RemoveClassBtn := nil. NewMethodBtn := nil. RemoveMethodBtn := nil.
+        CatCol := nil. ClassCol := nil. ProtoCol := nil. MethCol := nil.
+        CatOutline := nil. ClassTable := nil. ProtoTable := nil. MethTable := nil.
+        CatScroll := nil. ClassScroll := nil. ProtoScroll := nil. MethScroll := nil.
+        SideSeg := nil. ModeSeg := nil. AcceptBtn := nil. CancelBtn := nil. ModeLabel := nil.
+        SourceView := nil. SourceScroll := nil.
+        CatPane := nil. ClassListPane := nil. ProtoPane := nil. MethodPane := nil. SourcePane := nil.
+        HSplit := nil. VSplit := nil. Container := nil.
+    ]
+]
+
+"CocoaBrowser2Face — one receiver per table (classes/protocols/methods) so the
+ shared data-source selectors dispatch to the right pane; minted BY NAME at
+ build time (the same late-bind idiom V1's CocoaTableFace uses)."
+"I am a per-table receiver for Browser V2's classes, protocols and methods
+ tables: each instance carries a tag and forwards row count, cell value
+ and selection changes to CocoaBrowser2, so the shared data-source
+ selectors reach the right pane."
+Object subclass: CocoaBrowser2Face [
+    | tag |
+    CocoaBrowser2Face class >> on: aTag [ ^self new setTag: aTag ]
+    setTag: aTag [ tag := aTag ]
+    numberOfRowsInTableView: aTable [ ^CocoaBrowser2 rowsFor: tag ]
+    tableView: aTable objectValueForTableColumn: aCol row: aRow [ ^CocoaBrowser2 valueFor: tag row: aRow ]
+    tableViewSelectionDidChange: aNote [ CocoaBrowser2 selectionChangedFor: tag ]
+]

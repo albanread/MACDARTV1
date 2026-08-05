@@ -1,0 +1,31 @@
+"posix.mst — a class definition exercising the class-body grammar.
+ Derived from the MACVM Posix wrapper snippets."
+
+Object subclass: Posix [
+    | fd buffer chunk |                    "instance variables"
+    <classVars: Scratch>                   "a class-body pragma"
+    "── open a file for reading ──"
+
+    openForRead: aPath [                   "keyword selector, temps, return"
+        | f |
+        f := self primOpen: aPath flags: 0.
+        ^f
+    ]
+
+    Posix class >> kqueue [                "class-side method, pragma-only body"
+        <primitive: FFI function: #kqueue ret: #g args: #()>
+    ]
+
+    readInto: buf count: n [               "block args, whileTrue:, cascade"
+        [ n := self primRead: buf count: 4096. n > 0 ]
+            whileTrue: [ self process: buf ].
+        1 to: n do: [ :i |
+            chunk basicByteAt: i put: (buf byteAt: i - 1) ].
+        self flush; sync; close.
+        ^self
+    ]
+
+    = other [                              "binary method pattern"
+        ^fd = (other fd)
+    ]
+]

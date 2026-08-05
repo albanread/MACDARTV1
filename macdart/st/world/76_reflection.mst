@@ -1,0 +1,35 @@
+"76_reflection.mst — MACDART: class reflection over Dart Types.
+
+ MACVM's ClassMirror/Behavior read a class's name / superclass / own selectors /
+ own variables straight from the class OBJECT's layout (instVarAt: KLASS_*_INDEX
+ and the numbered reflection primitives 98/99/157/158). MACDART classes are Dart
+ Types with a different layout, so those bare <primitive: N> bodies answered the
+ receiver. This overlay re-points the layout-dependent methods at the VM's real
+ Class API through <stprim:> natives — the corpus (34_tools.mst, 03_behavior.mst)
+ stays verbatim; reopen replaces the same-selector methods here. Loads after both
+ (file 76), so ClassMirror and Behavior already exist."
+
+Behavior >> name [ <stprim: stClassNameOf> ]
+Behavior >> superclass [ <stprim: stSuperclassOf> ]
+
+"respondsTo: is <primitive: 246> in 59_reflection.mst (a MACVM method-dictionary
+ walk that doesn't exist here, so it fell to primitiveFailed:). Re-point it at a
+ real lookup that walks BOTH the receiver's own class chain (ST objects) AND the
+ native extension holders (a Smi's methods live in `Integer ext`, not on _Smi)."
+Object >> respondsTo: aSymbol [ <stprim: stRespondsTo> ]
+
+"numArgs is <primitive: 248> in 59_reflection.mst (a CompiledBlock arity read
+ that doesn't exist here). Re-point it at the closure's real fixed-parameter
+ count (minus the implicit context arg)."
+BlockClosure >> numArgs [ <stprim: stBlockNumArgs> ]
+
+ClassMirror class >> allClasses [ <stprim: stAllClasses> ]
+ClassMirror class >> selectorsOf: aBehavior [ <stprim: stSelectorsOf> ]
+ClassMirror class >> instanceVariablesOf: aBehavior [ <stprim: stInstVarNamesOf> ]
+ClassMirror class >> classVariablesOf: aBehavior [ <stprim: stClassVarNamesOf> ]
+
+"instVarNames read MACVM's Rust KLASS layout (`self instVarAt: 6`), garbage on
+ a Dart Type; re-point it at the class's real declared fields (same source the
+ ClassMirror uses). instVarAt:put: is the reflective store the corpus lacked."
+Behavior >> instVarNames [ <stprim: stInstVarNamesOf> ]
+Object >> instVarAt: i put: v [ <stprim: stInstVarAtPut> ]

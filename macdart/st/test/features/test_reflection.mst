@@ -1,0 +1,61 @@
+"Feature test: reflection / class introspection. Expected values are the
+ human-verified spec. All native flyweights now report their ST class."
+STestCase subclass: TestReflection [
+    tests [
+        "--- instance -> class -> name ---"
+        self check: 3 class name is: 'SmallInteger' label: 'SmallInteger class name'.
+        self check: 'hi' class name is: 'String' label: 'String class name'.
+        self check: true class name is: 'True' label: 'True class name'.
+        self check: false class name is: 'False' label: 'False class name'.
+        self check: nil class name is: 'UndefinedObject' label: 'nil class name'.
+        self check: (3/4) class name is: 'Fraction' label: 'Fraction class name'.
+        self check: $a class name is: 'Character' label: 'Character (native flyweight) class name'.
+        self check: #foo class name is: 'Symbol' label: 'Symbol (native flyweight) class name'.
+
+        "--- native flyweights are-kind-of their ST class ---"
+        self assert: ($a isKindOf: Character) label: 'char isKindOf: Character'.
+        self assert: ($a isKindOf: Magnitude) label: 'char isKindOf: Magnitude (inherited)'.
+        self assert: (#foo isKindOf: Symbol) label: 'symbol isKindOf: Symbol'.
+        self assert: (#foo isKindOf: String) label: 'symbol isKindOf: String (Symbol is-a String)'.
+        self deny: ($a isKindOf: Integer) label: 'char is not an Integer'.
+        self check: OrderedCollection new class name is: 'OrderedCollection' label: 'OC class name'.
+
+        "--- class identity ---"
+        self assert: (3 class == 4 class) label: 'same class identity'.
+        self deny: (3 class == 'x' class) label: 'different class identity'.
+
+        "--- isKindOf: walks the superclass chain ---"
+        self assert: (3 isKindOf: Integer) label: 'int isKindOf: Integer'.
+        self assert: (3 isKindOf: Number) label: 'int isKindOf: Number (inherited)'.
+        self assert: (3 isKindOf: Object) label: 'int isKindOf: Object (root)'.
+        self deny: (3 isKindOf: String) label: 'int not isKindOf: String'.
+        self assert: ('hi' isKindOf: String) label: 'string isKindOf: String'.
+        self assert: (OrderedCollection new isKindOf: Collection) label: 'OC isKindOf: Collection'.
+
+        "--- respondsTo: walks the class chain AND the native ext holders ---"
+        self assert: (3 respondsTo: #printString) label: 'int respondsTo: #printString (ext)'.
+        self assert: (3 respondsTo: #+) label: 'int respondsTo: #+ (native op)'.
+        self deny: (3 respondsTo: #fooBarNope) label: 'int denies an unknown selector'.
+        self assert: ('hi' respondsTo: #asUppercase) label: 'string respondsTo: #asUppercase'.
+        self assert: (#(1 2) respondsTo: #collect:) label: 'array respondsTo: #collect:'.
+        self assert: (OrderedCollection new respondsTo: #add:) label: 'OC respondsTo: #add:'.
+        self deny: (OrderedCollection new respondsTo: #nope) label: 'OC denies an unknown selector'.
+        self assert: (nil respondsTo: #isNil) label: 'nil respondsTo: #isNil'.
+
+        "--- class-side name / superclass on class literals ---"
+        self check: Object name is: 'Object' label: 'Object class name'.
+        self check: Integer name is: 'Integer' label: 'Integer class name'.
+        self check: OrderedCollection name is: 'OrderedCollection' label: 'OC class name'.
+        self check: Integer superclass name is: 'Number' label: 'Integer superclass'.
+        self assert: (Integer superclass == Number) label: 'superclass identity'.
+        self check: SmallInteger superclass name is: 'Integer' label: 'SmallInteger superclass'.
+        self assert: Object superclass isNil label: 'Object superclass is nil (root)'.
+        self check: Number printString is: 'Number' label: 'class printString (not "Number ext")'.
+
+        "--- ClassMirror sweep (M5) ---"
+        self assert: (self allClassNames includes: 'OrderedCollection') label: 'allClasses includes OrderedCollection'.
+        self assert: (self allClassNames includes: 'Fraction') label: 'allClasses includes Fraction'.
+        self assert: (self allClassNames size > 50) label: 'allClasses is a populated world'.
+    ]
+    allClassNames [ ^(ClassMirror allClasses) collect: [ :c | c name ] ]
+]

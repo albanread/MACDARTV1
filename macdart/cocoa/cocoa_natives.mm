@@ -6,14 +6,17 @@
 // through the fixed-shape shim + the noSuchMethod ergonomic layer come in later
 // phases; see MACDART/COCOA_PLAN.md.
 #import <Foundation/Foundation.h>
+#include <malloc/malloc.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <atomic>
+#include <memory>
 #include <dlfcn.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "include/dart_api.h"
+#include "include/dart_native_api.h"
 #include "cocoa_natives.h"
 #include "cocoa_abi.h"
 
@@ -28,6 +31,117 @@ enum { SH_VOID = 0, SH_GPR, SH_FPR, SH_F32, SH_HFA2, SH_HFA4, SH_INTPAIR };
 // ObjC autorelease pool primitives (libobjc).
 extern "C" void* objc_autoreleasePoolPush(void);
 extern "C" void objc_autoreleasePoolPop(void*);
+
+// --- Sprint 13b: the action trampoline (callbacks INTO Smalltalk) ----------
+// An STActionTarget holds a raw Dart port + an integer ticket and NOTHING
+// else (the MACVM C4 contract: no guest object is ever stored ObjC-side).
+// AppKit fires it on the MAIN thread; the IMP posts [ticket, selector] to the
+// language isolate via Dart_PostCObject (thread-safe, non-blocking) and
+// returns — the ST handler runs asynchronously in its own isolate and does
+// its UI work through onMain sends. The three IMPs are the selector family
+// MACVM's world wires (macvmAction:/macvmDoIt:/macvmPrintIt:).
+@interface STActionTarget : NSObject {
+ @public
+  Dart_Port port_;
+  int64_t ticket_;
+}
+@end
+
+static void STPostAction(Dart_Port port, int64_t ticket, const char* sel,
+                         int64_t arg) {
+  if (port == ILLEGAL_PORT) return;
+  Dart_CObject t, s, a, msg;
+  t.type = Dart_CObject_kInt64;
+  t.value.as_int64 = ticket;
+  s.type = Dart_CObject_kString;
+  s.value.as_string = const_cast<char*>(sel);
+  a.type = Dart_CObject_kInt64;
+  a.value.as_int64 = arg;
+  Dart_CObject* elems[3] = {&t, &s, &a};
+  msg.type = Dart_CObject_kArray;
+  msg.value.as_array.length = 3;
+  msg.value.as_array.values = elems;
+  Dart_PostCObject(port, &msg);  // a dead port is a no-op — fails closed
+}
+
+@implementation STActionTarget
+- (void)macvmAction:(id)sender {
+  STPostAction(port_, ticket_, "macvmAction:", 0);
+}
+- (void)macvmDoIt:(id)sender {
+  STPostAction(port_, ticket_, "macvmDoIt:", 0);
+}
+- (void)macvmPrintIt:(id)sender {
+  STPostAction(port_, ticket_, "macvmPrintIt:", 0);
+}
+@end
+
+
+// --- Sprint 13c: the SNAPSHOT table source -----------------------------
+// AppKit's data-source questions (numberOfRowsInTableView:, objectValue...)
+// are SYNCHRONOUS on the main thread. Routing them into the language
+// isolate would deadlock the moment ST does `tbl onMain reloadData` (the
+// language thread blocks on main; main would block on language). So the
+// snapshot LIVES HERE: an NSMutableArray of row strings the ST side pushes
+// via setRows: (an ordinary async-safe bridge send); the questions answer
+// from it without ever entering a VM. Selection changes go OUT through the
+// same async post as button actions, carrying the row index.
+// Foundation types only: table/column parameters are plain `id` (the class
+// is an informal data source; AppKit dispatches by respondsToSelector:).
+@interface STTableSource : NSObject {
+ @public
+  Dart_Port port_;
+  int64_t ticket_;
+  NSMutableArray* rows_;
+}
+@end
+
+@implementation STTableSource
+- (instancetype)init {
+  self = [super init];
+  if (self) rows_ = [[NSMutableArray alloc] init];
+  return self;
+}
+- (void)dealloc {
+  [rows_ release];
+  [super dealloc];
+}
+- (void)setRows:(id)rows {
+  [rows_ removeAllObjects];
+  if (rows != nil) [rows_ addObjectsFromArray:rows];
+}
+- (void)setRowsJoined:(id)joined {
+  // ONE hop for a whole snapshot: rows arrive US-joined (char 31) in a
+  // single NSString and split here — the per-row onMain chatter (a hop per
+  // addObject: plus one per nsString:) starved the language isolate and,
+  // with it, the workspace's own event handling.
+  [rows_ removeAllObjects];
+  if (joined == nil) return;
+  NSString* s = (NSString*)joined;
+  if ([s length] == 0) return;
+  NSArray* parts =
+      [s componentsSeparatedByString:[NSString stringWithFormat:@"%c", 31]];
+  [rows_ addObjectsFromArray:parts];
+}
+- (long)numberOfRowsInTableView:(id)tv {
+  return (long)[rows_ count];
+}
+- (id)tableView:(id)tv objectValueForTableColumn:(id)col row:(long)row {
+  if (row < 0 || (unsigned long)row >= [rows_ count]) return nil;
+  return [rows_ objectAtIndex:(unsigned long)row];
+}
+- (void)tableViewSelectionDidChange:(id)notification {
+  // performSelector: is object-return only — an NSInteger through it is a
+  // misread on arm64. Cast objc_msgSend for the integer read.
+  id tv = ((id (*)(id, SEL))objc_msgSend)(notification,
+                                          sel_registerName("object"));
+  long row = tv ? ((long (*)(id, SEL))objc_msgSend)(
+                      tv, sel_registerName("selectedRow"))
+                : -1;
+  STPostAction(port_, ticket_, "tableViewSelectionDidChange:", (int64_t)row);
+}
+@end
+
 
 namespace dart {
 namespace bin {
@@ -76,6 +190,30 @@ static double DoubleFromDart(Dart_Handle h) {
   if (Dart_IsDouble(h)) { double d = 0; Dart_DoubleValue(h, &d); return d; }
   if (Dart_IsInteger(h)) { int64_t v = 0; Dart_IntegerToInt64(h, &v); return (double)v; }
   return 0.0;
+}
+
+// Cocoa_makeActionTarget(SendPort, int ticket) -> a wrapped, owned target.
+static Dart_Handle WrapObject(id obj, const char* sel, bool pre_owned);
+static void ST_makeActionTarget(Dart_NativeArguments args) {
+  Dart_Port port = ILLEGAL_PORT;
+  Dart_SendPortGetId(Dart_GetNativeArgument(args, 0), &port);
+  int64_t ticket = IntArg(args, 1);
+  STActionTarget* t = [[STActionTarget alloc] init];
+  t->port_ = port;
+  t->ticket_ = ticket;
+  // "new" family: the alloc ref IS the wrapper's owned ref (no extra retain).
+  Dart_SetReturnValue(args, WrapObject(t, "newActionTarget", false));
+}
+
+// Cocoa_makeTableSource(SendPort, int ticket) -> a wrapped, owned source.
+static void ST_makeTableSource(Dart_NativeArguments args) {
+  Dart_Port port = ILLEGAL_PORT;
+  Dart_SendPortGetId(Dart_GetNativeArgument(args, 0), &port);
+  int64_t ticket = IntArg(args, 1);
+  STTableSource* t = [[STTableSource alloc] init];
+  t->port_ = port;
+  t->ticket_ = ticket;
+  Dart_SetReturnValue(args, WrapObject(t, "newTableSource", false));
 }
 
 // --- object wrapping: retain-on-wrap + release-on-GC finalizer -------------
@@ -159,12 +297,16 @@ static Dart_Handle MakeCocoa(int64_t handle) {
 // Wrap an object return in a Cocoa. Non-+1-family results are retained so the
 // wrapper owns exactly one strong ref, released by ReleaseFinalizer on GC.
 // Classes and nil are wrapped plainly (never retained/released).
-static Dart_Handle WrapObject(id obj, const char* sel) {
+static Dart_Handle WrapObject(id obj, const char* sel,
+                              bool pre_owned = false) {
   if (obj == nil) return MakeCocoa(0);
   bool is_class = class_isMetaClass(object_getClass(obj));
   Dart_Handle cocoa = MakeCocoa((int64_t)obj);
   if (Dart_IsError(cocoa) || is_class) return cocoa;
-  if (!IsPlusOneFamily(sel)) [obj retain];
+  // pre_owned: the main-thread hop already retained (it MUST — an
+  // autoreleased result can be freed by the main pool before this thread
+  // touches it); exactly one owned reference exists either way.
+  if (!pre_owned && !IsPlusOneFamily(sel)) [obj retain];
   Dart_WeakPersistentHandle wph =
       Dart_NewWeakPersistentHandle(cocoa, (void*)obj, 0, ReleaseFinalizer);
   Dart_SetField(cocoa, WphName(), Dart_NewInteger((int64_t)wph));
@@ -192,7 +334,7 @@ static void PoisonReceiver(Dart_Handle receiver) {
 // Resolves the method's @encode, classifies it (AAPCS64 tokens), marshals each
 // Dart arg into the flat GPR/FPR buffers per its token, dispatches through the
 // fixed-shape shim, and returns the result as the matching Dart value.
-static void Cocoa_send(Dart_NativeArguments args) {
+static void CocoaSendCommon(Dart_NativeArguments args, bool on_main) {
   Dart_Handle receiver = Dart_GetNativeArgument(args, 0);
   Dart_Handle hf = Dart_GetField(receiver, HandleName());
   int64_t h = 0;
@@ -201,6 +343,38 @@ static void Cocoa_send(Dart_NativeArguments args) {
   const char* sel_name = NULL;
   Dart_StringToCString(Dart_GetNativeArgument(args, 1), &sel_name);
   SEL sel = sel_registerName(sel_name);
+
+  // LIVENESS GUARD: objc_msgSend on a freed/dangling/garbage handle is the
+  // segv that abort()s the GUI. Validate the handle first and throw a
+  // CATCHABLE Dart error instead — a stale send reports to the Transcript,
+  // it never takes the process down. Three cases:
+  //  * arm64 TAGGED pointer (bit 63 set): a real object with no heap block —
+  //    objc_msgSend is always safe (NSNumber/short-NSString/NSDate). Allow.
+  //  * a live malloc block (malloc_size > 0): a heap instance. Allow.
+  //  * a pointer into a loaded image (dladdr resolves it): a CLASS or
+  //    metaclass — classes live in the binary's __objc_data, NOT the heap,
+  //    so malloc_size is 0 for them; `Cocoa.cls(...).alloc()` (how the whole
+  //    workspace window is built) must pass. Allow.
+  //  * none of the above: freed/dangling/garbage — the segv that abort()s the
+  //    GUI. Refuse with a CATCHABLE error instead. Both malloc_size and
+  //    dladdr are safe to call on ANY pointer (no deref of the target).
+  if (h != 0) {
+    const uint64_t uh = (uint64_t)h;
+    const bool tagged = (uh & 0x8000000000000000ULL) != 0;
+    if (!tagged && uh >= 0x1000ULL && malloc_size((void*)h) == 0) {
+      Dl_info info;
+      if (dladdr((void*)h, &info) == 0) {   // not heap, not an image → dead
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "dart:cocoa: STALE HANDLE 0x%llx for selector '%s' — refusing "
+                 "send (a released/dangling Cocoa reference)",
+                 (unsigned long long)uh, sel_name ? sel_name : "?");
+        fprintf(stderr, "%s\n", buf);
+        Dart_ThrowException(Dart_NewStringFromCString(buf));
+        return;
+      }
+    }
+  }
 
   // Resolve the concrete method's type encoding (object_getClass handles both
   // instance and class sends — a class's metaclass holds its class methods).
@@ -242,6 +416,13 @@ static void Cocoa_send(Dart_NativeArguments args) {
     using namespace macdart_cocoa;
     if (tok == TOK_F) {
       if (fi < 8) fpr[fi++] = DoubleFromDart(el);
+    } else if (tok == TOK_SEL) {         // SEL: a Dart String names the selector
+      if (Dart_IsString(el)) {
+        const char* c = NULL; Dart_StringToCString(el, &c);
+        if (gi < 6) gpr[gi++] = (uint64_t)sel_registerName(c ? c : "");
+      } else if (gi < 6) {
+        gpr[gi++] = GprFromDart(el);     // already a SEL-as-int
+      }
     } else if (tok == TOK_CSTR) {        // char*: Dart String -> raw C string
       if (Dart_IsString(el)) {
         const char* c = NULL; Dart_StringToCString(el, &c);
@@ -272,7 +453,72 @@ static void Cocoa_send(Dart_NativeArguments args) {
   else rk = SH_GPR;
 
   uint64_t out_gpr[2] = {0}; double out_fpr[4] = {0}; char err[256] = {0};
-  int ok = macdart_objc_send(target, sel, rk, gpr, fpr, stk, out_gpr, out_fpr, err, 256);
+  int ok;
+  bool hop_owned = false;   // the main-thread block already holds our ref
+  if (on_main && ![NSThread isMainThread]) {
+    // The C3 hop (Sprint 13): run the objc_msgSend ON THE MAIN THREAD —
+    // AppKit is main-thread-only. dispatch_async + a timed semaphore, NOT
+    // dispatch_sync: a headless host (the plain `dart` CLI) has no run loop
+    // draining the main queue, and this must FAIL CLEANLY there, exactly as
+    // MACVM's bridge doc specifies. The block owns a heap context, so a
+    // timed-out send that runs later scribbles on its own heap block, never
+    // on our dead stack frame.
+    struct MainSendCtx {
+      void* target; void* sel; int rk; int retain_obj;
+      uint64_t g[6]; double f[8]; uint64_t st[4];
+      uint64_t og[2]; double of[4]; char err[256]; int ok;
+    };
+    __block std::shared_ptr<MainSendCtx> ctx(new MainSendCtx());
+    ctx->target = (void*)target; ctx->sel = (void*)sel; ctx->rk = rk;
+    // An OBJECT result must be retained ON THE MAIN THREAD, inside this
+    // event, or the main autorelease pool can free it before we wrap it.
+    ctx->retain_obj = (ret_tok == TOK_OBJ) && !IsPlusOneFamily(sel_name);
+    memcpy(ctx->g, gpr, sizeof(ctx->g));
+    memcpy(ctx->f, fpr, sizeof(ctx->f));
+    memcpy(ctx->st, stk, sizeof(ctx->st));
+    ctx->err[0] = '\0'; ctx->ok = 0;
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    std::shared_ptr<MainSendCtx> blk = ctx;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      @try {
+        blk->ok = macdart_objc_send(blk->target, blk->sel, blk->rk, blk->g,
+                                    blk->f, blk->st, blk->og, blk->of,
+                                    blk->err, 256);
+        if (blk->ok && blk->retain_obj && blk->og[0] != 0) {
+          [(id)blk->og[0] retain];
+        }
+      } @catch (NSException* e) {
+        snprintf(blk->err, sizeof(blk->err), "dart:cocoa: NSException %s: %s",
+                 [[e name] UTF8String] ?: "?",
+                 [[e reason] UTF8String] ?: "");
+        blk->ok = 0;
+      }
+      dispatch_semaphore_signal(done);
+    });
+    if (dispatch_semaphore_wait(
+            done, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) != 0) {
+      Dart_ThrowException(Dart_NewStringFromCString(
+          "dart:cocoa: sendMain — the main run loop is not draining "
+          "(headless host, or the UI thread is blocked)"));
+      return;
+    }
+    ok = ctx->ok;
+    hop_owned = true;
+    memcpy(out_gpr, ctx->og, sizeof(out_gpr));
+    memcpy(out_fpr, ctx->of, sizeof(out_fpr));
+    memcpy(err, ctx->err, sizeof(err));
+  } else {
+    // The design contract (49_cocoa.mst): a thrown NSException surfaces as
+    // an ordinary catchable error — the VM never dies for one.
+    @try {
+      ok = macdart_objc_send(target, sel, rk, gpr, fpr, stk, out_gpr,
+                             out_fpr, err, 256);
+    } @catch (NSException* e) {
+      snprintf(err, sizeof(err), "dart:cocoa: NSException %s: %s",
+               [[e name] UTF8String] ?: "?", [[e reason] UTF8String] ?: "");
+      ok = 0;
+    }
+  }
   if (!ok) {
     Dart_ThrowException(Dart_NewStringFromCString(err[0] ? err : "dart:cocoa: send failed"));
     return;
@@ -280,7 +526,7 @@ static void Cocoa_send(Dart_NativeArguments args) {
 
   // Deliver the result as the matching Dart value.
   if (ret_tok == TOK_OBJ) {                // id/Class -> retained Cocoa wrapper
-    Dart_Handle wrapped = WrapObject((id)out_gpr[0], sel_name);
+    Dart_Handle wrapped = WrapObject((id)out_gpr[0], sel_name, hop_owned);
     if (IsInitFamily(sel_name)) PoisonReceiver(receiver);
     Dart_SetReturnValue(args, wrapped);
   } else if (ret_tok == TOK_CSTR) {        // char* -> Dart String
@@ -487,12 +733,67 @@ void Workspace_uiReady(Dart_NativeArguments args);
 void Cocoa_setSelectorAction(Dart_NativeArguments args);
 void Cocoa_setSplitMinSize(Dart_NativeArguments args);
 
+// Smalltalk loader native (defined in macdart/st/st_natives.cc) — parses a
+// `.mst` source string and registers its classes/methods/fields into the live
+// VM object model (ST_PLAN.md Sprint 2). Returns a summary or "ERR: ...".
+void ST_load(Dart_NativeArguments args);
+
+// Smalltalk invocation surface (defined in macdart/st/st_natives.cc) — look up a
+// loaded ST class's class-side (static) method by selector and call it, JIT-
+// compiling its body on first use (ST_PLAN.md Sprint 3). Returns the result.
+void ST_invokeStatic(Dart_NativeArguments args);
+void ST_new(Dart_NativeArguments args);
+void ST_send(Dart_NativeArguments args);
+void ST_eq(Dart_NativeArguments args);
+void ST_symbolFor(Dart_NativeArguments args);
+void ST_classSend(Dart_NativeArguments args);
+void ST_basicNewFromType(Dart_NativeArguments args);
+void ST_run(Dart_NativeArguments args);
+void ST_classSendTry(Dart_NativeArguments args);
+void ST_extSendTry(Dart_NativeArguments args);
+void ST_classOf(Dart_NativeArguments args);
+void ST_loadFresh(Dart_NativeArguments args);
+void ST_outline(Dart_NativeArguments args);
+void ST_sendTry(Dart_NativeArguments args);
+void ST_getField(Dart_NativeArguments args);
+void ST_hasMethod(Dart_NativeArguments args);
+void ST_respondsTo(Dart_NativeArguments args);
+void ST_blockNumArgs(Dart_NativeArguments args);
+void ST_classNamed(Dart_NativeArguments args);
+void ST_asSymbol(Dart_NativeArguments args);
+void ST_ffiCall(Dart_NativeArguments args);
+void ST_peekByte(Dart_NativeArguments args);
+void ST_pokeByte(Dart_NativeArguments args);
+void ST_peekF64(Dart_NativeArguments args);
+void ST_pokeF64(Dart_NativeArguments args);
+void ST_peekI64(Dart_NativeArguments args);
+void ST_pokeI64(Dart_NativeArguments args);
+void ST_classNameOf(Dart_NativeArguments args);
+void ST_superclassOf(Dart_NativeArguments args);
+void ST_allClasses(Dart_NativeArguments args);
+void ST_selectorsOf(Dart_NativeArguments args);
+void ST_instVarNamesOf(Dart_NativeArguments args);
+void ST_classVarNamesOf(Dart_NativeArguments args);
+void ST_gcScavenge(Dart_NativeArguments args);
+void ST_gcFull(Dart_NativeArguments args);
+void ST_gcStats(Dart_NativeArguments args);
+void ST_isKindOf(Dart_NativeArguments args);
+void ST_check(Dart_NativeArguments args);
+void ST_becomeForward(Dart_NativeArguments args);
+void ST_become(Dart_NativeArguments args);
+void ST_shallowCopy(Dart_NativeArguments args);
+void ST_instVarAt(Dart_NativeArguments args);
+void ST_instVarAtPut(Dart_NativeArguments args);
+
 // Reverse-callback natives (defined in cocoa_callbacks.mm) — target-action,
 // delegates, and the syntax-highlight span applier.
 void Cocoa_registerCallbackDispatch(Dart_NativeArguments args);
 void Cocoa_makeActionTarget(Dart_NativeArguments args);
 void Cocoa_wireAction(Dart_NativeArguments args);
+void Cocoa_attachGutter(Dart_NativeArguments args);
+void Cocoa_gutterSetLines(Dart_NativeArguments args);
 void Cocoa_applySpans(Dart_NativeArguments args);
+void Cocoa_quitOnClose(Dart_NativeArguments args);
 void Cocoa_keyWatch(Dart_NativeArguments args);
 void Cocoa_keyCapture(Dart_NativeArguments args);
 void Cocoa_keyState(Dart_NativeArguments args);
@@ -513,12 +814,25 @@ void Sqlite_close(Dart_NativeArguments args);
 void Sqlite_exec(Dart_NativeArguments args);
 void Sqlite_query(Dart_NativeArguments args);
 
+
+// Sprint 13: the two faces of one send path — Cocoa_sendMain hops the
+// objc_msgSend onto the main thread (AppKit work from the language isolate).
+static void Cocoa_send(Dart_NativeArguments args) {
+  CocoaSendCommon(args, false);
+}
+static void Cocoa_sendMain(Dart_NativeArguments args) {
+  CocoaSendCommon(args, true);
+}
+
 #define COCOA_NATIVE_LIST(V)                                                   \
   V(Cocoa_getpid, 0)                                                           \
   V(Cocoa_nsStringFromCString, 1)                                              \
   V(Cocoa_nsStringLength, 1)                                                   \
   V(Cocoa_nsStringUtf8, 1)                                                     \
   V(Cocoa_send, 3)                                                             \
+  V(Cocoa_sendMain, 3)                                                         \
+  V(ST_makeActionTarget, 2)                                                    \
+  V(ST_makeTableSource, 2)                                                     \
   V(Cocoa_getClass, 1)                                                         \
   V(Cocoa_classExists, 1)                                                      \
   V(Cocoa_selectorInfo, 2)                                                     \
@@ -536,10 +850,57 @@ void Sqlite_query(Dart_NativeArguments args);
   V(Workspace_uiReady, 0)                                                      \
   V(Cocoa_setSelectorAction, 3)                                                \
   V(Cocoa_setSplitMinSize, 2)                                                  \
+  V(ST_load, 1)                                                                \
+  V(ST_invokeStatic, 3)                                                        \
+  V(ST_new, 1)                                                                 \
+  V(ST_send, 3)                                                                \
+  V(ST_eq, 2)                                                                  \
+  V(ST_symbolFor, 1)                                                           \
+  V(ST_classSend, 3)                                                           \
+  V(ST_basicNewFromType, 1)                                                    \
+  V(ST_run, 1)                                                                 \
+  V(ST_classSendTry, 3)                                                        \
+  V(ST_extSendTry, 3)                                                          \
+  V(ST_classOf, 1)                                                             \
+  V(ST_loadFresh, 1)                                                           \
+  V(ST_outline, 1)                                                             \
+  V(ST_sendTry, 3)                                                             \
+  V(ST_getField, 2)                                                            \
+  V(ST_hasMethod, 2)                                                           \
+  V(ST_respondsTo, 2)                                                          \
+  V(ST_blockNumArgs, 1)                                                        \
+  V(ST_classNamed, 1)                                                          \
+  V(ST_asSymbol, 1)                                                            \
+  V(ST_ffiCall, 2)                                                             \
+  V(ST_peekByte, 1)                                                            \
+  V(ST_pokeByte, 2)                                                            \
+  V(ST_peekF64, 1)                                                             \
+  V(ST_pokeF64, 2)                                                             \
+  V(ST_peekI64, 1)                                                             \
+  V(ST_pokeI64, 2)                                                             \
+  V(ST_classNameOf, 1)                                                         \
+  V(ST_superclassOf, 1)                                                        \
+  V(ST_allClasses, 0)                                                          \
+  V(ST_selectorsOf, 1)                                                         \
+  V(ST_instVarNamesOf, 1)                                                      \
+  V(ST_classVarNamesOf, 1)                                                     \
+  V(ST_gcScavenge, 0)                                                          \
+  V(ST_gcFull, 0)                                                              \
+  V(ST_gcStats, 0)                                                             \
+  V(ST_isKindOf, 2)                                                            \
+  V(ST_check, 1)                                                               \
+  V(ST_becomeForward, 2)                                                       \
+  V(ST_become, 2)                                                              \
+  V(ST_shallowCopy, 1)                                                         \
+  V(ST_instVarAt, 2)                                                           \
+  V(ST_instVarAtPut, 3)                                                        \
   V(Cocoa_registerCallbackDispatch, 1)                                         \
   V(Cocoa_makeActionTarget, 1)                                                 \
   V(Cocoa_wireAction, 2)                                                       \
+  V(Cocoa_attachGutter, 2)                                                     \
+  V(Cocoa_gutterSetLines, 3)                                                   \
   V(Cocoa_applySpans, 2)                                                       \
+  V(Cocoa_quitOnClose, 1)                                                      \
   V(Cocoa_keyWatch, 0)                                                         \
   V(Cocoa_keyCapture, 1)                                                       \
   V(Cocoa_keyState, 0)                                                         \

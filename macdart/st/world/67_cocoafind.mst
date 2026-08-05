@@ -1,0 +1,303 @@
+"67_cocoafind.mst — CocoaFind: the native find view (CG8) — Implementors and
+ Senders of a selector, the web GUI's find tools as a native table. Loaded
+ ONLY via world/cocoaui.list, after 66_cocoabrowser.mst (it reuses the
+ browser's reply parsing and jump helpers).
+
+ The queries are the image's own — image_store::implementors_of and
+ senders_of (the persisted method_sends index that made the web's senders
+ accurate) — reached through two thin MacvmHostService adapters. Reply
+ format: one line per hit, fields separated by the unit separator (0x1F):
+   implementors:  Class US side
+   senders:       Class US sendingSelector US side
+
+ The payoff feature: selecting a result row JUMPS to the browser — switch
+ view, select the class (disclosing ancestors), flip the side, select the
+ selector — all through CocoaBrowser's own scripting helpers, so a find hit
+ lands on the real method with its source showing."
+
+"I am the Find tab: Implementors, Senders, and Definitions searches over
+ the image, shown as a native results table. Type into the combobox — it
+ offers type-ahead over every selector and class name in the image — press
+ one of the three buttons, then click a hit to jump to the class browser
+ with the class, side and selector selected and the source showing.
+ Senders results come from the persisted send index, so they are accurate,
+ not textual. I run in the UI worker VM and query through the host
+ service."
+Object subclass: CocoaFind [
+    <classVars: Container SearchField ImplBtn SendBtn DefBtn ResultsScroll
+                Results RCol ResultsFace ResultsDelegate ActionDelegates
+                Rows Kind>
+
+    CocoaFind class >> stripHeight [ ^34.0 ]
+
+    CocoaFind class >> register [
+        CocoaUI registerViewNamed: #find title: 'Find' icon: 'implementors'
+                container: [ self containerView ]
+                onShow: [ self requestRefreshOptions.
+                          CocoaUI window onMain makeFirstResponder: SearchField ]
+    ]
+    CocoaFind class >> containerView [
+        Container isNil ifTrue: [ self buildView ].
+        ^Container
+    ]
+
+    "── the queries (host-served; reuse the browser's reply reader) ──"
+    CocoaFind class >> searchTerm [
+        SearchField isNil ifTrue: [ ^'' ].
+        ^SearchField sendString: 'stringValue'
+    ]
+    "FLAG ONLY (never query + populate from inside a callback — see
+     view_refresh.rs / CocoaBrowser requestRefresh for why): a plain host call
+     that flips a Rust atomic and wakes the run loop. drain_perform services it
+     with a fresh top-level exec of doRefreshOptions."
+    CocoaFind class >> requestRefreshOptions [
+        CocoaBrowser hostService onMain requestFindRefresh
+    ]
+    "Fill the combobox's type-ahead options from the image (DB-queried): every
+     selector (for Implementors/Senders) + every class name (for Definitions).
+     Called TOP-LEVEL only (drain_perform, or directly from a `gui doit`)."
+    CocoaFind class >> doRefreshOptions [
+        | names |
+        SearchField isNil ifTrue: [ ^self ].
+        SearchField onMain removeAllItems.
+        names := self splitLines: (CocoaBrowser readReply: (CocoaBrowser hostService onMain allSelectors)).
+        names do: [ :n | n isEmpty ifFalse: [ SearchField onMain addItemWithObjectValue: n ] ].
+        names := self splitLines: (CocoaBrowser readReply: (CocoaBrowser hostService onMain classNames)).
+        names do: [ :n | n isEmpty ifFalse: [ SearchField onMain addItemWithObjectValue: n ] ].
+    ]
+    CocoaFind class >> splitLines: aString [
+        | lines line lf |
+        lines := OrderedCollection new. line := ''. lf := Character value: 10.
+        aString do: [ :ch |
+            ch = lf ifTrue: [ line isEmpty ifFalse: [ lines add: line ]. line := '' ]
+                    ifFalse: [ line := line , (String with: ch) ] ].
+        line isEmpty ifFalse: [ lines add: line ].
+        ^lines
+    ]
+    "FLAG ONLY (never query + populate from inside a callback — see
+     view_refresh.rs / requestRefreshOptions above): a button click or
+     Enter-in-field is a C6 callback; the actual query + installRows: (which
+     ends in `Results reloadData`, itself firing NESTED C6 data-source
+     callbacks) must run top-level or it fails closed — Rows populates
+     correctly but the table never visually redraws. drain_perform services
+     the flag with a fresh top-level exec of doFindQuery."
+    CocoaFind class >> findImplementors [
+        self searchTerm isEmpty ifTrue: [ ^self ].
+        Kind := #implementors.
+        self requestFindQuery
+    ]
+    CocoaFind class >> findSenders [
+        self searchTerm isEmpty ifTrue: [ ^self ].
+        Kind := #senders.
+        self requestFindQuery
+    ]
+    CocoaFind class >> findDefinitions [
+        "The web's 'Find Definition' kind: classes whose NAME contains the
+         term (the term is a class name here, not a selector)."
+        self searchTerm isEmpty ifTrue: [ ^self ].
+        Kind := #definitions.
+        self requestFindQuery
+    ]
+    CocoaFind class >> requestFindQuery [
+        CocoaBrowser hostService onMain requestFindQuery
+    ]
+    "Run the query `Kind`/searchTerm already name (set by findImplementors/
+     findSenders/findDefinitions just before requesting this) and install
+     the results. Called TOP-LEVEL only (drain_perform) — see the flag-only
+     methods' own doc above."
+    CocoaFind class >> doFindQuery [
+        | term |
+        term := self searchTerm.
+        term isEmpty ifTrue: [ ^self ].
+        Kind == #implementors ifTrue: [
+            ^self installRows: (CocoaBrowser readReply:
+                (CocoaBrowser hostService onMain implementorsOf: term)) ].
+        Kind == #senders ifTrue: [
+            ^self installRows: (CocoaBrowser readReply:
+                (CocoaBrowser hostService onMain sendersOf: term)) ].
+        Kind == #definitions ifTrue: [
+            ^self installRows: (CocoaBrowser readReply:
+                (CocoaBrowser hostService onMain definitionsOf: term)) ].
+    ]
+
+    "Parse 'a US b (US c)? lf ...' into Rows = Arrays {class. selector-or-nil. side}."
+    CocoaFind class >> installRows: reply [
+        | rows line us lf |
+        rows := OrderedCollection new.
+        line := OrderedCollection new.
+        us := Character value: 31.
+        lf := Character value: 10.
+        line := ''.
+        reply do: [ :ch |
+            ch = lf
+                ifTrue: [ line isEmpty ifFalse: [ rows add: (self parseLine: line) ]. line := '' ]
+                ifFalse: [ line := line , (String with: ch) ] ].
+        line isEmpty ifFalse: [ rows add: (self parseLine: line) ].
+        Rows := rows asArray.
+        Results isNil ifFalse: [ Results onMain reloadData ].
+    ]
+    CocoaFind class >> parseLine: aLine [
+        | parts |
+        parts := CocoaBrowser splitShell: aLine.  "same US-field splitter"
+        "definitions lines are a bare class name; implementors lines are
+         Class US side (2 fields -> selector nil); senders lines are
+         Class US selector US side."
+        Kind == #definitions ifTrue: [
+            ^Array with: (parts at: 1) with: nil with: 'instance' ].
+        ^((parts at: 3) isEmpty and: [ Kind == #implementors ])
+            ifTrue: [ Array with: (parts at: 1) with: nil with: (parts at: 2) ]
+            ifFalse: [ Array with: (parts at: 1) with: (parts at: 2) with: (parts at: 3) ]
+    ]
+    CocoaFind class >> rowCount [
+        ^Rows isNil ifTrue: [ 0 ] ifFalse: [ Rows size ]
+    ]
+    CocoaFind class >> rowLabel: aRow [
+        | r label |
+        (Rows isNil or: [ aRow >= Rows size ]) ifTrue: [ ^'' ].
+        r := Rows at: aRow + 1.
+        label := r at: 1.
+        (r at: 3) = 'class' ifTrue: [ label := label , ' class' ].
+        (r at: 2) isNil ifFalse: [ label := label , ' >> ' , (r at: 2) ].
+        ^label
+    ]
+    CocoaFind class >> rowSelected [
+        "JUMP: open the hit in the browser via its own scripting helpers.
+         For an implementors hit the found selector IS the search term."
+        | row r cls sel side |
+        Results isNil ifTrue: [ ^self ].
+        row := Results onMain selectedRow.
+        (row < 0 or: [ Rows isNil or: [ row >= Rows size ] ]) ifTrue: [ ^self ].
+        r := Rows at: row + 1.
+        cls := r at: 1.
+        CocoaUI switchToView: #browser.
+        "jumpToClass: works even when the browser has never been opened —
+         it defers until the first snapshot lands. A definitions hit is the
+         CLASS itself; the other kinds continue to the method."
+        Kind == #definitions
+            ifTrue: [ CocoaBrowser jumpToClass: cls side: nil selector: nil ]
+            ifFalse: [
+                sel := (r at: 2) isNil ifTrue: [ self searchTerm ] ifFalse: [ r at: 2 ].
+                side := (r at: 3) = 'class' ifTrue: [ #class ] ifFalse: [ #instance ].
+                CocoaBrowser jumpToClass: cls side: side selector: sel ].
+    ]
+
+    "── build ──"
+    CocoaFind class >> buildView [
+        | host frame w h |
+        host := CocoaUI contentHost.
+        frame := host onMain frame.
+        w := frame at: 3.
+        h := frame at: 4.
+        ActionDelegates := OrderedCollection new.
+        Container := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+        Container onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Container onMain setAutoresizesSubviews: true.
+
+        "A COMBOBOX with type-ahead over every selector + class name in the
+         image (not a bare field) — a name-lookup box always offers a lookup."
+        SearchField := ((Cocoa classNamed: 'NSComboBox') onMain alloc) onMain
+            initWithFrame: (Array with: 6.0 with: h - 30.0 with: w - 384.0 with: 24.0).
+        SearchField onMain setCompletes: true.
+        SearchField onMain setNumberOfVisibleItems: 14.
+        SearchField onMain setPlaceholderString: 'selector or class name'.
+        SearchField onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskMinYMargin.
+        self wireAction: SearchField to: [ self findImplementors ].
+        Container onMain addSubview: SearchField.
+        self requestRefreshOptions.
+
+        ImplBtn := self stripButton: 'Implementors'
+            frame: (Array with: w - 372.0 with: h - 30.0 with: 118.0 with: 24.0)
+            action: [ self findImplementors ].
+        SendBtn := self stripButton: 'Senders'
+            frame: (Array with: w - 248.0 with: h - 30.0 with: 118.0 with: 24.0)
+            action: [ self findSenders ].
+        DefBtn := self stripButton: 'Definitions'
+            frame: (Array with: w - 124.0 with: h - 30.0 with: 118.0 with: 24.0)
+            action: [ self findDefinitions ].
+
+        ResultsScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight).
+        ResultsScroll onMain setHasVerticalScroller: true.
+        ResultsScroll onMain setAutoresizingMask: CocoaUI maskWidthSizable + CocoaUI maskHeightSizable.
+        Results := ((Cocoa classNamed: 'NSTableView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h - self stripHeight).
+        RCol := ((Cocoa classNamed: 'NSTableColumn') onMain alloc) onMain
+            initWithIdentifier: 'hit'.
+        RCol onMain setWidth: 900.0.
+        Results onMain addTableColumn: RCol.
+        Results onMain setHeaderView: nil.
+        ResultsFace := (Worker classNamed: #CocoaFindFace) new.
+        ResultsDelegate := MacvmDelegate tableSourceOn: ResultsFace.
+        Results onMain setDataSource: ResultsDelegate.
+        Results onMain setDelegate: ResultsDelegate.
+        ResultsScroll onMain setDocumentView: Results.
+        Container onMain addSubview: ResultsScroll.
+    ]
+    CocoaFind class >> stripButton: title frame: rect action: aBlock [
+        | btn holder delegate |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: CocoaUI maskMinXMargin + CocoaUI maskMinYMargin.
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+        Container onMain addSubview: btn.
+        ^btn
+    ]
+    CocoaFind class >> wireAction: aControl to: aBlock [
+        | holder delegate |
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        aControl onMain setTarget: delegate.
+        aControl onMain setAction: 'macvmAction:'.
+        ActionDelegates add: delegate.
+    ]
+
+    "── scripting/automation (rusttcl `gui doit`) ──"
+    CocoaFind class >> typeTerm: aString [
+        SearchField isNil ifFalse: [ SearchField onMain setStringValue: aString ]
+    ]
+    CocoaFind class >> optionCount [
+        ^SearchField isNil ifTrue: [ 0 ] ifFalse: [ SearchField onMain numberOfItems ]
+    ]
+    CocoaFind class >> selectResult: anIndex [
+        Results isNil ifTrue: [ ^self ].
+        Results onMain selectRowIndexes: ((Cocoa classNamed: 'NSIndexSet') onMain
+                                              indexSetWithIndex: anIndex)
+                byExtendingSelection: false.
+        self rowSelected.
+    ]
+
+    CocoaFind class >> teardown [
+        ResultsDelegate isNil ifFalse: [ ResultsDelegate isValid ifTrue: [ ResultsDelegate release ] ].
+        ActionDelegates isNil ifFalse: [
+            ActionDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
+        CocoaBrowser releaseView: RCol.
+        CocoaBrowser releaseView: Results.
+        CocoaBrowser releaseView: ResultsScroll.
+        CocoaBrowser releaseView: SearchField.
+        CocoaBrowser releaseView: ImplBtn.
+        CocoaBrowser releaseView: SendBtn.
+        CocoaBrowser releaseView: DefBtn.
+        CocoaBrowser releaseView: Container.
+        Rows := nil. Kind := nil. ResultsDelegate := nil. ActionDelegates := nil.
+        ResultsFace := nil. RCol := nil. Results := nil. ResultsScroll := nil.
+        SearchField := nil. ImplBtn := nil. SendBtn := nil. DefBtn := nil.
+        Container := nil.
+    ]
+]
+
+"The results table's own receiver (same reason as the browser's table faces:
+ table-source selectors are shared, receivers must be distinct objects)."
+"I am the Find results table's data-source receiver: I answer row count
+ and row labels from CocoaFind and forward a selection to its jump."
+Object subclass: CocoaFindFace [
+    numberOfRowsInTableView: aTable [ ^CocoaFind rowCount ]
+    tableView: aTable objectValueForTableColumn: aCol row: aRow [
+        ^CocoaFind rowLabel: aRow ]
+    tableViewSelectionDidChange: aNote [ CocoaFind rowSelected ]
+]

@@ -172,7 +172,12 @@ hatch is a later decision, not a v1 feature.
 | `canvas` | NSImage + `Pixmap` blit | the Demos tab |
 
 `canvas` is worth calling out: it reuses the demo draw protocol wholesale, so an
-app gets a drawing area and the two features share one renderer.
+app gets a drawing area and the two features share one renderer. ✅ SHIPPED —
+`renderDemo` was generalised to `renderInto(image, w, h, cmds)`; the Demos tab
+and every app `canvas` now share it. App API: `canvas(id, frame:, bg:)` +
+`draw(id, ops)` (clear/rect/oval/line/text/blit, coords top-left). Draw lists
+accumulate; begin with a `clear`. The gallery's Inputs tab has a live example
+(a bar the slider fills, in the popup's colour).
 
 **Needs a probe before shipping** (§ the probe law): `checkbox`/`radio`
 (`setButtonType:`), visible `tabs` (`setTabViewType(0)` — the workspace uses
@@ -282,12 +287,26 @@ Plus a snapshot on each surface for the visual.
   fix (§7). Built immediately after M1 rather than last, because an abstraction
   with only one implementation is an abstraction nobody has tested — and because
   moving a live app between hosts is the feature that proves the whole design.
-- **M3 — vocabulary.** `list`, `popup`, `checkbox`, `box`, `tabs` (each probed
-  first), `grid`/`row`/`column` helpers.
+- **M3 — vocabulary.** ✅ DONE. `checkbox` (NSButton switch), `slider`
+  (NSSlider), `popup` (NSPopUpButton), `secure` (NSSecureTextField), `progress`
+  (NSProgressIndicator), `box` (NSBox group), `list` (NSTableView), `tabs`
+  (NSTabView), and `scroll` (an NSScrollView container whose content can exceed
+  the pane) all shipped. Interactive handlers are wrapped so the app gets a
+  typed value (bool/double/String); `set` grew `value`/`checked`/`items`/
+  `selected`. Containers route widgets via `tab(id,n)` / `into(id)` / `pane()`,
+  with the coordinate flip taken from the tab's contentRect or the scroll's
+  content height (a not-yet-shown page reads 0). Layout helpers `row`/`column`/
+  `grid` return frame lists (pure Dart). Live reference: `apps/gallery.dart`
+  (three tabs: inputs, a list, and a scrolling form).
 - **M4 — liveness polish.** Re-run on Accept and on resize, error banner,
   `canvas` widget over the Pixmap path, Apps menu.
-- **M5 — standalone.** `dartui --app Calc`: the same class from the same image,
-  its own process, no workspace chrome. The reason §2 exists.
+- **M5 — standalone.** ✅ DONE. `dartui … workspace.dart --app <Class>` (or
+  `MACDART_APP=<Class>`, or `./start-gui.sh --app <Class>`) runs one image class
+  full-window, no IDE chrome — same class, same image, same hot reload, in the
+  language isolate as always. `main` reads the arg/env, `buildStandaloneWindow`
+  makes a bare window (app surface + a Quit menu) instead of the IDE, and
+  `appRun` uses the pane's real size and skips the tab switch. `log` is now
+  null-safe (no transcript standalone).
 
 ## 11. Decisions locked, and what is still open
 

@@ -21,7 +21,13 @@ SRC="$(cd "$DEST/../sdk" && pwd)"              # sdk/  (reference quarry)
 
 echo "extract: SRC=$SRC"
 echo "extract: DEST=$DEST"
-[ -f "$SRC/tools/VERSION" ] || { echo "ERROR: reference SDK not found at $SRC" >&2; exit 1; }
+# The reference tree comes from our OWNED mirror (albanread/dart-v1-sdk), not
+# dart-lang/sdk — see port/get-sdk.sh. Bootstrap it automatically if absent.
+if [ ! -f "$SRC/tools/VERSION" ]; then
+  echo "extract: reference tree missing at $SRC — bootstrapping via get-sdk.sh"
+  "$HERE/get-sdk.sh"
+fi
+[ -f "$SRC/tools/VERSION" ] || { echo "ERROR: reference SDK not found at $SRC (run port/get-sdk.sh)" >&2; exit 1; }
 
 # rsync excludes applied to every runtime subtree copy.
 COMMON_EXCLUDES=(
@@ -88,7 +94,7 @@ ZLIB
 # extract. Idempotent: skip if already applied.
 if patch -p1 --dry-run -d "$DEST" < "$HERE/../patches/macdart-port.patch" >/dev/null 2>&1; then
   patch -p1 -d "$DEST" < "$HERE/../patches/macdart-port.patch"
-  echo "extract: applied macdart-port.patch (3 VM fixes)"
+  echo "extract: applied macdart-port.patch (VM fixes incl. the frame-printer hardening)"
 else
   echo "extract: macdart-port.patch already applied (or does not apply) — skipping"
 fi

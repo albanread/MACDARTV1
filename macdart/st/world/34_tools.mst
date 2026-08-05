@@ -1,0 +1,672 @@
+"34_tools.mst — the first Phase-W reflection tools (docs/APPS.md §2/§5/§6),
+ enough to render the start page's own smappl:
+   <smappl visual='ClassHierarchyOutliner imbeddedVisualForClass: Object'>
+
+ Layers (APPS.md §1): a VM reflection primitive (allClasses, R1) → a
+ Smalltalk mirror (ClassMirror) → a tool (ClassHierarchyOutliner, a Visual
+ from 33_smappl.mst) → an HtmlWriter fragment. VmHandle::render_fragment
+ sends the tool #htmlFragment and splices the answer into the page (D-G5).
+
+ Scope: a static, fully-expanded class-NAME tree — proves the
+ primitive→mirror→HtmlWriter→fragment path end to end. Deferred to later
+ waves: lazy expand/collapse (D-G5 toggle messages), method/category nodes
+ (needs a selectorsOf: primitive, APPS.md R2), filtering, and the
+ ClassOutliner/Border chain. subclassMirrors re-sweeps allClasses per node
+ (O(n^2)); fine at world scale, revisit when it matters."
+
+"--- HtmlWriter: the fragment builder (docs/APPS.md §6) ---"
+"I build HTML fragment strings for the web GUI tools. I hold a
+ WriteStream and offer just two writing messages: raw: appends markup
+ verbatim, while escaped: appends text with angle brackets and ampersands
+ converted to character entities so arbitrary names and source code
+ display safely. contents answers the accumulated fragment. The browser
+ and find views all compose their pages through me."
+Object subclass: HtmlWriter [
+    | stream |
+    HtmlWriter class >> new [
+        ^self basicNew init
+    ]
+    init [
+        stream := WriteStream on: String new.
+        ^self
+    ]
+    raw: aString [
+        stream nextPutAll: aString.
+        ^self
+    ]
+    escaped: aString [
+        aString do: [ :ch |
+            ch = $< ifTrue: [ stream nextPutAll: '&lt;' ]
+            ifFalse: [ ch = $> ifTrue: [ stream nextPutAll: '&gt;' ]
+            ifFalse: [ ch = $& ifTrue: [ stream nextPutAll: '&amp;' ]
+            ifFalse: [ stream nextPut: ch ] ] ] ].
+        ^self
+    ]
+    contents [
+        ^stream contents
+    ]
+]
+
+"--- CodeView: an embedded source view/editor — smappl shape 5 (gui/smappl.md
+ §3.5). The corpus (tour/progenv4.html, progenv6.html) writes
+ `((CodeView forString) doneBlock: [...]; model: 'source') imbeddedVisual
+ with3DBorder withBorder: (Border standard3DRaised: true)`. It renders the
+ source into the SAME transparent-textarea-over-highlighted-<pre> editor the
+ class browser uses (smtk.js hardens + syntax-colours any `.st-code-editor`), so
+ an inline method illustration reads exactly like a browsed method. The source
+ the VM receives is already HTML-UNESCAPED (preprocess::resolve_smappl unescapes
+ data-code for the evaluator), so it holds real `<`/`>`/`&` — `escaped:` puts
+ them back for the textarea. Subclasses Visual (33_smappl.mst) to inherit the
+ identity `with3DBorder`/`withBorder:` decoration chain. `doneBlock:` (the accept
+ callback) is retained but not wired — the corpus views are read-along source
+ illustrations, not accepting editors; wire it when an accepting embed appears
+ (mirror the outliner's smapplAccept). ---"
+"I am an embedded source-code view for web GUI pages: a documentation
+ page can show a method body in the same syntax-coloured editor box the
+ class browser uses. Build me with CodeView forString, hand me the text
+ with model:, and I render it via htmlFragment; imbeddedVisual answers
+ myself. The doneBlock: accept callback is retained but not wired — my
+ instances serve as read-along source illustrations, not accepting
+ editors."
+Visual subclass: CodeView [
+    | source doneBlock |
+    CodeView class >> forString [
+        "TextView's generic factory in Strongtalk; here just a fresh instance."
+        ^self basicNew
+    ]
+    doneBlock: aBlock [
+        doneBlock := aBlock.
+        ^self
+    ]
+    model: aString [
+        source := aString.
+        ^self
+    ]
+    imbeddedVisual [
+        "Application>>imbeddedVisual builds the on-screen widget; the HTML bridge
+         is identity — the receiver already answers #htmlFragment."
+        ^self
+    ]
+    htmlFragment [
+        | html |
+        html := HtmlWriter new.
+        html raw: '<div class="st-code-editor st-smappl-editor st-smappl-codeview">'.
+        html raw: '<pre class="st-code-highlight" aria-hidden="true"></pre>'.
+        html raw: '<textarea class="st-code-input" spellcheck="false">'.
+        html escaped: (source isNil ifTrue: [ '' ] ifFalse: [ source ]).
+        html raw: '</textarea></div>'.
+        ^html contents
+    ]
+]
+
+"--- ClassMirror: source-level reflection of a class (docs/APPS.md §2) ---"
+"I provide source-level reflection on a class, backed by VM primitives.
+ My class side answers system-wide queries: allClasses (every class in the
+ system), selectorsOf: (a behavior's own selectors — pass the metaclass
+ for the class side), instanceVariablesOf: and classVariablesOf: (own
+ variable names in declaration order), primitiveOf:selector: (a method's
+ primitive number, 0 for none), and methodSends:selector:target: (does a
+ method send a given selector). An instance of me wraps one class: send
+ name, theClass, subclassMirrors, instanceSelectors, classSelectors,
+ instanceVariables, and classVariables. The browsing and find tools are
+ built on me."
+Object subclass: ClassMirror [
+    | klass |
+    ClassMirror class >> on: aClass [
+        ^self basicNew setClass: aClass
+    ]
+    "R1 (docs/APPS.md §3): every class object, as an Array. The VM keeps no
+     subclass index — subclasses are computed image-side by filtering this."
+    ClassMirror class >> allClasses [
+        <primitive: 98>
+    ]
+    "R2 (docs/APPS.md §3): a behavior's own (not inherited) selectors, as an
+     Array of Symbols in unspecified order. Pass a class for instance
+     selectors, `aClass class` (the metaclass) for class-side selectors."
+    ClassMirror class >> selectorsOf: aBehavior [
+        <primitive: 99>
+        "Fallback (a non-behavior argument fails the primitive): no selectors."
+        ^Array new: 0
+    ]
+    "R2 (docs/APPS.md §3): the primitive number of aBehavior's method for
+     aSelector — 0 = not a primitive, a positive id = a table primitive, -1 =
+     an FFI primitive. Lets the browser show primitive methods read-only."
+    ClassMirror class >> primitiveOf: aBehavior selector: aSelector [
+        <primitive: 62>
+        ^0
+    ]
+    "R2 (docs/APPS.md §3): does aBehavior's method for mSel SEND tSel? (Scans
+     the method's inline-cache table; the senders find tool uses it.)"
+    ClassMirror class >> methodSends: aBehavior selector: mSel target: tSel [
+        <primitive: 63>
+        ^false
+    ]
+    "R2 (docs/APPS.md §3): a class's OWN instance-variable names, as an Array of
+     Symbols in declaration (slot) order — the variable half of reflection, the
+     analogue of selectorsOf:."
+    ClassMirror class >> instanceVariablesOf: aBehavior [
+        <primitive: 157>
+        ^Array new: 0
+    ]
+    "R2: a class's OWN class-variable names, as an Array of Symbols."
+    ClassMirror class >> classVariablesOf: aBehavior [
+        <primitive: 158>
+        ^Array new: 0
+    ]
+    setClass: c [
+        klass := c.
+        ^self
+    ]
+    theClass [
+        ^klass
+    ]
+    name [
+        ^klass name asString
+    ]
+    "Direct subclasses as ClassMirrors, via the allClasses sweep."
+    subclassMirrors [
+        | subs |
+        subs := OrderedCollection new.
+        ClassMirror allClasses do: [ :c |
+            (c superclass == klass) ifTrue: [ subs add: (ClassMirror on: c) ] ].
+        ^subs
+    ]
+    "Own selectors, alphabetically sorted (Symbol < Symbol is String compare)."
+    instanceSelectors [
+        ^(ClassMirror selectorsOf: klass) asSortedCollection
+    ]
+    classSelectors [
+        ^(ClassMirror selectorsOf: klass class) asSortedCollection
+    ]
+    "Own variables, kept in DECLARATION order (slot order is meaningful, unlike
+     selectors) — the dynamic, VM-exercising half of the dual placement; the Rust
+     browser renders the same names from the image without touching the VM."
+    instanceVariables [
+        ^ClassMirror instanceVariablesOf: klass
+    ]
+    classVariables [
+        ^ClassMirror classVariablesOf: klass
+    ]
+]
+
+"--- ClassHierarchyOutliner: a class tree, rendered to HTML (APPS.md §5.2) ---"
+"I render a class hierarchy as an expandable HTML tree for the web GUI
+ class browser: the root class open, descendants collapsed, each class
+ name a link that opens a ClassOutliner on that class, plus an affordance
+ for creating a new class. Create me with imbeddedVisualForClass: aClass
+ or for: aClassMirror; the GUI asks me for htmlFragment. The ported filter
+ messages (filterOnCommentsContaining: and friends) answer myself
+ unchanged, so a filtered embed renders the full tree."
+Visual subclass: ClassHierarchyOutliner [
+    | rootMirror |
+    "The start page's shorthand (gui/smappl.md §3.3): answer a Visual for the
+     hierarchy rooted at aClass."
+    ClassHierarchyOutliner class >> imbeddedVisualForClass: aClass [
+        ^self basicNew setRoot: (ClassMirror on: aClass)
+    ]
+    ClassHierarchyOutliner class >> for: aMirror [
+        ^self basicNew setRoot: aMirror
+    ]
+    setRoot: m [
+        rootMirror := m.
+        ^self
+    ]
+    "Corpus filter chain (gui/smappl.md §3.3): progenv2.html narrows the
+     embedded hierarchy to HTML-related classes (filterOnCommentsContaining:
+     '%HTML'), ui.html to UI classes (filterOnUIUserClasses); `orSubclasses`
+     widens a filtered set back to include subclasses. MACVM keeps NO class
+     comments, and this world lacks those library classes, so the filters
+     can't actually select — they answer self and the full rooted tree renders
+     (a live, browsable embedded outliner, just unfiltered). Honest
+     degradation, not a dead placeholder box; wire real filtering when class
+     comments and those classes exist."
+    filterOnCommentsContaining: aString [ ^self ]
+    filterOnUIUserClasses [ ^self ]
+    orSubclasses [ ^self ]
+    htmlFragment [
+        | html |
+        html := HtmlWriter new.
+        "The root class name is stamped on the outliner so a drill-down into a
+         class (ClassOutliner) can offer a `back to hierarchy` that returns
+         here (smtk.js smapplOpenClass/smapplOpenHierarchy -> vm_host)."
+        html raw: '<div class="st-outliner" data-hierarchy-root="'.
+        html escaped: rootMirror name.
+        html raw: '">'.
+        "A '＋ new class' affordance at the top of the hierarchy (defined below)."
+        self newClassNodeOn: html.
+        "The root renders open; its descendants render collapsed (a browsable
+         tree, not one giant wall). Collapse/expand is client-side in
+         smtk.js — the whole tree ships once, cheap at world scale; a truly
+         lazy server round trip (D-G5 toggle protocol) is a later step for
+         large trees."
+        self render: rootMirror on: html open: true.
+        html raw: '</div>'.
+        ^html contents
+    ]
+    "A collapsible '＋ new class' node: expand it to reveal a class-definition
+     template; Cmd+S in that editor CREATES the class (name/superclass parsed
+     from the source), versions it into the image, and live-compiles it
+     (smtk.js .st-smappl-new-class-src -> smapplNewClass -> vm_host). It reuses
+     the ordinary node/twisty markup so the existing client-side expand works."
+    newClassNodeOn: html [
+        html raw: '<div class="st-node closed st-add-node"><span class="st-header st-selector">'.
+        html raw: '<span class="st-tw" data-tw>&#9656; </span>&#43; new class</span>'.
+        html raw: '<div class="st-children" style="display:none">'.
+        html raw: '<div class="st-code-editor st-smappl-editor">'.
+        html raw: '<pre class="st-code-highlight" aria-hidden="true"></pre>'.
+        html raw: '<textarea class="st-smappl-new-class-src st-code-input" spellcheck="false">'.
+        html raw: 'Object subclass: NewClass [
+]'.
+        html raw: '</textarea></div>'.
+        html raw: '<div class="st-smappl-hint">&#8984;S to create (versioned)</div>'.
+        html raw: '</div></div>'.
+    ]
+    render: mirror on: html open: isOpen [
+        | subs |
+        subs := mirror subclassMirrors.
+        html raw: '<div class="st-node">'.
+        html raw: '<span class="st-header st-class">'.
+        subs isEmpty
+            ifTrue: [ html raw: '<span class="st-tw-leaf"></span>' ]
+            ifFalse: [ isOpen
+                ifTrue:  [ html raw: '<span class="st-tw" data-tw>&#9662; </span>' ]
+                ifFalse: [ html raw: '<span class="st-tw" data-tw>&#9656; </span>' ] ].
+        "The class name opens its method browser (ClassOutliner) on click."
+        html raw: '<span class="st-class-link" data-open-class="'.
+        html escaped: mirror name.
+        html raw: '">'.
+        html escaped: mirror name.
+        html raw: '</span>'.
+        subs isEmpty ifFalse: [
+            isOpen
+                ifTrue:  [ html raw: '<div class="st-children">' ]
+                ifFalse: [ html raw: '<div class="st-children" style="display:none">' ].
+            subs do: [ :sub | self render: sub on: html open: false ].
+            html raw: '</div>'.
+        ].
+        html raw: '</div>'.
+    ]
+]
+
+"--- ClassOutliner: a single class's methods, instance + class side (§3.4) ---"
+"I render a single class for the web GUI class browser: its instance and
+ class variables, its instance-side and class-side methods, and its
+ subclasses, as an expandable HTML outline. Each ordinary method opens
+ into an editable, syntax-coloured source box where accepting saves a new
+ version; a primitive method shows a read-only note instead, since its
+ body is VM code rather than Smalltalk source. I also offer affordances
+ for adding variables and creating new methods. Create me with
+ ClassOutliner for: aClassOrMirror."
+Visual subclass: ClassOutliner [
+    | mirror |
+    "Accept a ClassMirror or a bare class (the corpus uses `for: (ClassMirror
+     on: X)`; be lenient)."
+    ClassOutliner class >> for: aMirrorOrClass [
+        ^self basicNew setMirror:
+            ((aMirrorOrClass isKindOf: ClassMirror)
+                ifTrue: [ aMirrorOrClass ]
+                ifFalse: [ ClassMirror on: aMirrorOrClass ])
+    ]
+    setMirror: m [
+        mirror := m.
+        ^self
+    ]
+    "The corpus pre-opens one method on-screen (virtualmachine2.html:
+     `openSide: true selector: #simpleTest:`). MACVM's fragment already renders
+     every selector (collapsed, client-side expandable in smtk.js), so this is a
+     no-op — it just has to exist for the embed to build."
+    openSide: aBool selector: aSelector [
+        ^self
+    ]
+    htmlFragment [
+        | html |
+        html := HtmlWriter new.
+        html raw: '<div class="st-outliner st-classoutliner">'.
+        html raw: '<div class="st-node open"><span class="st-header st-class">'.
+        html escaped: mirror name.
+        html raw: '</span><div class="st-children">'.
+        "Sides render OPEN so their method lists show at a glance; individual
+         methods stay closed (source on demand). Many classes are abstract
+         (their methods live on subclasses), so a Subclasses section lets you
+         drill down to where the code actually is — e.g. Boolean -> True/False."
+        self variablesOn: html.
+        self side: 'instance' selectors: mirror instanceSelectors behavior: mirror theClass on: html.
+        self side: 'class' selectors: mirror classSelectors behavior: mirror theClass class on: html.
+        self subclassesOn: html.
+        html raw: '</div></div></div>'.
+        ^html contents
+    ]
+    subclassesOn: html [
+        | subs |
+        subs := mirror subclassMirrors.
+        subs isEmpty ifTrue: [ ^self ].
+        html raw: '<div class="st-node open"><span class="st-header st-side">'.
+        html raw: '<span class="st-tw" data-tw>&#9662; </span>subclasses ('.
+        html raw: subs size printString.
+        html raw: ')</span><div class="st-children">'.
+        subs do: [ :sub |
+            html raw: '<div class="st-node"><span class="st-header st-class">'.
+            html raw: '<span class="st-tw-leaf"></span>'.
+            html raw: '<span class="st-class-link" data-open-class="'.
+            html escaped: sub name.
+            html raw: '">'.
+            html escaped: sub name.
+            html raw: '</span></span></div>' ].
+        html raw: '</div></div>'.
+    ]
+    variablesOn: html [
+        "Instance and class variables, read from the LIVE VM via ClassMirror
+         (primitives 157/158) — the dynamic, VM-exercising half of the dual
+         placement. Shown above the methods (a class's shape, then its
+         behaviour). Each group renders even when empty so its '＋ add'
+         affordance is always reachable."
+        self varGroup: 'instance variables' kind: 'instance' names: mirror instanceVariables on: html.
+        self varGroup: 'class variables' kind: 'class' names: mirror classVariables on: html.
+    ]
+    varGroup: label kind: kind names: names on: html [
+        html raw: '<div class="st-node open"><span class="st-header st-side">'.
+        html raw: '<span class="st-tw" data-tw>&#9662; </span>'.
+        html escaped: label.
+        html raw: ' ('.
+        html raw: names size printString.
+        html raw: ')</span><div class="st-children">'.
+        names do: [ :n |
+            html raw: '<div class="st-node"><span class="st-header st-var">'.
+            html raw: '<span class="st-tw-leaf"></span>'.
+            html escaped: n asString.
+            html raw: '</span></div>' ].
+        self addVarNodeFor: kind on: html.
+        html raw: '</div></div>'.
+    ]
+    addVarNodeFor: kind on: html [
+        "A collapsible '＋ add {kind} variable' node: expand it to reveal a
+         single-line name field; Enter/Cmd+S adds the variable (smtk.js
+         .st-smappl-new-var-src -> smapplAddVar -> vm_host). A CLASS variable goes
+         live immediately; an INSTANCE variable is persisted and applies on the
+         next VM restart (instance shape is fixed once a class is defined). The
+         target class rides on data-src-class; `kind` = 'instance'|'class'."
+        html raw: '<div class="st-node closed st-add-node"><span class="st-header st-selector">'.
+        html raw: '<span class="st-tw" data-tw>&#9656; </span>&#43; add '.
+        html raw: kind.
+        html raw: ' variable</span><div class="st-children" style="display:none">'.
+        html raw: '<input type="text" class="st-smappl-new-var-src" spellcheck="false" data-src-class="'.
+        html escaped: mirror name.
+        html raw: '" data-var-kind="'.
+        html raw: kind.
+        html raw: '" placeholder="'.
+        html raw: kind.
+        html raw: ' variable name"><div class="st-smappl-hint">&#8617; or &#8984;S to add</div>'.
+        html raw: '</div></div>'.
+    ]
+    side: label selectors: sels behavior: behavior on: html [
+        "A side (instance/class) whose children are its selectors, rendered
+         open; each selector is a collapsible node. A NORMAL method's body is
+         the editable source box; a PRIMITIVE method's body is a read-only note
+         (its implementation is VM C code, not Smalltalk source you can edit)."
+        html raw: '<div class="st-node open"><span class="st-header st-side">'.
+        html raw: '<span class="st-tw" data-tw>&#9662; </span>'.
+        html escaped: label.
+        html raw: ' side ('.
+        html raw: sels size printString.
+        html raw: ')</span><div class="st-children">'.
+        sels do: [ :sel | | prim |
+            prim := ClassMirror primitiveOf: behavior selector: sel.
+            html raw: '<div class="st-node closed"><span class="st-header st-selector">'.
+            html raw: '<span class="st-tw" data-tw>&#9656; </span>'.
+            html escaped: sel asString.
+            prim = 0 ifFalse: [ html raw: ' <span class="st-prim-badge">primitive</span>' ].
+            html raw: '</span><div class="st-children" style="display:none">'.
+            prim = 0
+                ifTrue:  [ self editorFor: sel side: label on: html ]
+                ifFalse: [ self primNote: prim on: html ].
+            html raw: '</div></div>' ].
+        "'＋ new method' affordance at the end of this side's method list."
+        self newMethodNodeFor: label on: html.
+        html raw: '</div></div>'.
+    ]
+    "A collapsible '＋ new method' node for a side: expand it to reveal a blank
+     method template; Cmd+S CREATES the method (selector parsed from the message
+     pattern), versions it into the image, and live-compiles it (smtk.js
+     .st-smappl-new-method-src -> smapplNewMethod -> vm_host). `label` is the
+     side ('instance'/'class'); the target class rides on data-src-class."
+    newMethodNodeFor: label on: html [
+        html raw: '<div class="st-node closed st-add-node"><span class="st-header st-selector">'.
+        html raw: '<span class="st-tw" data-tw>&#9656; </span>&#43; new method</span>'.
+        html raw: '<div class="st-children" style="display:none">'.
+        html raw: '<div class="st-code-editor st-smappl-editor">'.
+        html raw: '<pre class="st-code-highlight" aria-hidden="true"></pre>'.
+        html raw: '<textarea class="st-smappl-new-method-src st-code-input" spellcheck="false" data-src-class="'.
+        html escaped: mirror name.
+        html raw: '" data-src-side="'.
+        html raw: label.
+        html raw: '">'.
+        html raw: 'messageSelector
+    "Say what this method does."'.
+        html raw: '</textarea></div>'.
+        html raw: '<div class="st-smappl-hint">&#8984;S to create (versioned)</div>'.
+        html raw: '</div></div>'.
+    ]
+    "The editable, syntax-coloured source box: the class browser's own overlay
+     editor (a transparent .st-code-input textarea over a highlighted
+     .st-code-highlight <pre>, coloured live client-side by smtk.js's
+     highlightSmalltalk — no round trip). The worker/headless renderer fills
+     the textarea from image_store; Cmd+S accepts, versioning the edit."
+    editorFor: sel side: label on: html [
+        html raw: '<div class="st-code-editor st-smappl-editor">'.
+        html raw: '<pre class="st-code-highlight" aria-hidden="true"></pre>'.
+        html raw: '<textarea class="st-smappl-src st-code-input" spellcheck="false" data-src-class="'.
+        html escaped: mirror name.
+        html raw: '" data-src-side="'.
+        html raw: label.
+        html raw: '" data-src-sel="'.
+        html escaped: sel asString.
+        html raw: '"></textarea>'.
+        html raw: '</div>'.
+        html raw: '<div class="st-smappl-hint">&#8984;S to accept (versioned)</div>'.
+    ]
+    "A read-only note for a primitive method (VM-implemented, not editable)."
+    primNote: prim on: html [
+        html raw: '<div class="st-prim-note">'.
+        prim < 0
+            ifTrue:  [ html raw: '&#10216;FFI primitive&#10217;' ]
+            ifFalse: [ html raw: '&#10216;primitive ', prim printString, '&#10217;' ].
+        html raw: ' — implemented in the VM, not editable.</div>'.
+    ]
+]
+
+"--- ImplementorsView: every class that defines a selector (find tool,
+     docs/APPS.md §5.4). A Visual so render_fragment can drive it. ---"
+"I render the Implementors find-results page of the built-in web browser
+ tooling: given a selector name, I sweep every class with ClassMirror and
+ list each one that defines it, on the instance or class side, with links
+ into the class outliner. Create me with ImplementorsView of: aString. The
+ environment's native find tools have since superseded me."
+Visual subclass: ImplementorsView [
+    | query |
+    ImplementorsView class >> of: aString [
+        ^self basicNew setQuery: aString
+    ]
+    setQuery: q [
+        query := q.
+        ^self
+    ]
+    htmlFragment [
+        | html count |
+        html := HtmlWriter new.
+        html raw: '<div class="st-find-results"><div class="st-find-head">Implementors of &#8220;'.
+        html escaped: query.
+        html raw: '&#8221;</div>'.
+        count := 0.
+        ClassMirror allClasses do: [ :c | | m |
+            m := ClassMirror on: c.
+            (self defines: (ClassMirror selectorsOf: c))
+                ifTrue: [ count := count + 1. self item: m side: 'instance' on: html ].
+            (self defines: (ClassMirror selectorsOf: c class))
+                ifTrue: [ count := count + 1. self item: m side: 'class' on: html ] ].
+        count = 0 ifTrue: [ html raw: '<div class="st-find-empty">(no implementors)</div>' ].
+        html raw: '</div>'.
+        ^html contents
+    ]
+    "Does this selector list contain `query` (compared by name)?"
+    defines: sels [
+        ^(sels detect: [ :s | s asString = query ] ifNone: [ nil ]) notNil
+    ]
+    item: mirror side: side on: html [
+        html raw: '<div class="st-find-item"><span class="st-class-link" data-open-class="'.
+        html escaped: mirror name.
+        html raw: '">'.
+        html escaped: mirror name.
+        html raw: '</span> <span class="st-find-side">', side, '</span> &#187; '.
+        html escaped: query.
+        html raw: '</div>'.
+    ]
+]
+
+"--- SendersView: every method that SENDS a selector (find tool, APPS.md §5.4).
+     Uses methodSends: (an IC-table scan) so no per-method allocation. ---"
+"I render the Senders find-results page of the built-in web browser
+ tooling: given a selector name, I scan every method in the system and
+ list those that send it, using a VM primitive that inspects each method's
+ call sites rather than its source text. Create me with SendersView of:
+ aString. The environment's native find tools have since superseded me."
+Visual subclass: SendersView [
+    | query target |
+    SendersView class >> of: aString [
+        ^self basicNew setQuery: aString
+    ]
+    setQuery: q [
+        query := q.
+        target := q asSymbol.
+        ^self
+    ]
+    htmlFragment [
+        | html count |
+        html := HtmlWriter new.
+        html raw: '<div class="st-find-results"><div class="st-find-head">Senders of &#8220;'.
+        html escaped: query.
+        html raw: '&#8221;</div>'.
+        count := 0.
+        ClassMirror allClasses do: [ :c | | m |
+            m := ClassMirror on: c.
+            (ClassMirror selectorsOf: c) do: [ :s |
+                (ClassMirror methodSends: c selector: s target: target)
+                    ifTrue: [ count := count + 1. self item: m selector: s side: 'instance' on: html ] ].
+            (ClassMirror selectorsOf: c class) do: [ :s |
+                (ClassMirror methodSends: c class selector: s target: target)
+                    ifTrue: [ count := count + 1. self item: m selector: s side: 'class' on: html ] ] ].
+        count = 0 ifTrue: [ html raw: '<div class="st-find-empty">(no senders)</div>' ].
+        html raw: '</div>'.
+        ^html contents
+    ]
+    item: mirror selector: sel side: side on: html [
+        html raw: '<div class="st-find-item"><span class="st-class-link" data-open-class="'.
+        html escaped: mirror name.
+        html raw: '">'.
+        html escaped: mirror name.
+        html raw: '</span> <span class="st-find-side">', side, '</span> &#187; '.
+        html escaped: sel asString.
+        html raw: '</div>'.
+    ]
+]
+
+"--- DefinitionsView: classes whose name matches a query (Find definition,
+     APPS.md §5.4). Case-insensitive substring over class names. ---"
+"I render the Find Definition results page of the built-in web browser
+ tooling: given a query string, I list every class whose name contains it,
+ compared case-insensitively, each entry linking to that class's outliner.
+ Create me with DefinitionsView of: aString. The environment's native find
+ tools have since superseded me."
+Visual subclass: DefinitionsView [
+    | query |
+    DefinitionsView class >> of: aString [
+        ^self basicNew setQuery: aString
+    ]
+    setQuery: q [
+        query := q.
+        ^self
+    ]
+    htmlFragment [
+        | html count |
+        html := HtmlWriter new.
+        html raw: '<div class="st-find-results"><div class="st-find-head">Classes matching &#8220;'.
+        html escaped: query.
+        html raw: '&#8221;</div>'.
+        count := 0.
+        ClassMirror allClasses do: [ :c | | m |
+            m := ClassMirror on: c.
+            (self contains: m name sub: query) ifTrue: [
+                count := count + 1.
+                html raw: '<div class="st-find-item"><span class="st-class-link" data-open-class="'.
+                html escaped: m name.
+                html raw: '">'.
+                html escaped: m name.
+                html raw: '</span></div>' ] ].
+        count = 0 ifTrue: [ html raw: '<div class="st-find-empty">(no matching classes)</div>' ].
+        html raw: '</div>'.
+        ^html contents
+    ]
+    "Case-insensitive: does `sub` occur anywhere in `hay`?"
+    contains: hay sub: sub [
+        | h n |
+        h := hay asLowercase.
+        n := sub asLowercase.
+        n size = 0 ifTrue: [ ^true ].
+        n size > h size ifTrue: [ ^false ].
+        1 to: h size - n size + 1 do: [ :i |
+            (self matches: n in: h at: i) ifTrue: [ ^true ] ].
+        ^false
+    ]
+    matches: sub in: hay at: pos [
+        1 to: sub size do: [ :j |
+            ((hay at: pos + j - 1) = (sub at: j)) ifFalse: [ ^false ] ].
+        ^true
+    ]
+]
+
+"--- UiBrowserService: the primary-side browse snapshot (Cocoa GUI CG7) ---
+ The #refresh(#browser) verb's producer: project the LIVE class hierarchy into
+ a names-only nested tree — Strings/Arrays/smis only, so the worker pickle can
+ never refuse it and no class oop can leak across a VM boundary (design R3;
+ the pickle REFUSING classes is the enforcement, proven in the embed gate).
+ Node shape (6 slots):
+   {name. instVarNames. classVarNames. instSelectors. classSelectors. children}
+ Selectors alphabetically sorted (ClassMirror's own order), children in
+ allClasses order — the SAME projection the WKWebView outliner renders
+ (ClassHierarchyOutliner's subclassMirrors walk), so the two GUIs browse
+ identical rows (the CG7 differential gate pins this)."
+"I produce the class-browser snapshot the native GUI renders. My class
+ side's browseSnapshot walks the live hierarchy from Object and answers a
+ nested tree of plain Arrays, Strings, and integers — for each class: its
+ name, instance and class variable names, instance-side and class-side
+ selectors, and its children. Keeping the snapshot to plain data means it
+ can cross safely to the user-interface worker, with no class objects
+ leaking between virtual machines."
+Object subclass: UiBrowserService [
+    UiBrowserService class >> browseSnapshot [
+        ^self nodeFor: (ClassMirror on: Object)
+    ]
+    UiBrowserService class >> nodeFor: aMirror [
+        | node |
+        node := Array new: 6.
+        node at: 1 put: aMirror name.
+        node at: 2 put: (self namesOf: aMirror instanceVariables).
+        node at: 3 put: (self namesOf: aMirror classVariables).
+        node at: 4 put: (self namesOf: aMirror instanceSelectors).
+        node at: 5 put: (self namesOf: aMirror classSelectors).
+        node at: 6 put: (self childrenOf: aMirror).
+        ^node
+    ]
+    "A collection of Symbols -> an Array of Strings (pickle-plain, UI-ready)."
+    UiBrowserService class >> namesOf: symbols [
+        | out |
+        out := OrderedCollection new.
+        symbols do: [ :s | out add: s asString ].
+        ^out asArray
+    ]
+    UiBrowserService class >> childrenOf: aMirror [
+        | out |
+        out := OrderedCollection new.
+        aMirror subclassMirrors do: [ :m | out add: (self nodeFor: m) ].
+        ^out asArray
+    ]
+]

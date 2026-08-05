@@ -1,0 +1,25 @@
+"83_gamepane_direct.mst — GamePane direct-buffer bridge (GAMEPANE_PLAN.md §6b).
+
+ blit: (215, wired in 80_gamepane_wiring.mst) is a documented no-op stub on
+ this VM: it buffers nothing (neither Breakout nor Worms uses it, so the
+ wiring was deferred). MandelZoom/MandelVM (world/45, world/46) render one
+ whole CPU-generated frame per tick — the same shape as demos/14_julia.dart,
+ not Breakout's few dozen retained draw calls — so rather than finish the
+ indexed/base64 blit path, they get the SAME direct-GPU-memory write Julia
+ already proves works: two new selectors below, wired straight to
+ dart:cocoa's gpBackbuffer, bypassing the per-isolate command buffer
+ entirely for the pixel data (the palette still rides that buffer — gpdpal
+ is just another wire op the driver ships at the next tick, same as gppal).
+
+ A game opts into this by setting 'direct': true on its language.dart
+ _kStGames entry — _stGame then opens the pane with gpopen's direct flag
+ BEFORE the game's own setup runs, so directPal:/directBlit: have a real
+ backbuffer from frame one. Calling them on an indexed-mode pane is a
+ harmless no-op (gpBackbuffer answers null there), matching every other
+ stGp* helper's headless/not-ready contract.
+
+ Loads after 80 (file 83); reopen adds new selectors, GamePane's own
+ corpus-ported methods are untouched."
+
+GamePane >> directPal: index r: r g: g b: b [ <stprim: stGpDirectPal> ]
+GamePane >> directBlit: aByteArray [ <stprim: stGpDirectBlit> ]

@@ -173,15 +173,18 @@ void Cocoa_gpApply(Dart_NativeArguments args) {
         } else if (strcmp(op, "gptext") == 0 && cn >= 7) {
           const char* s = ElStr(c, 3);
           if (s != NULL) eng->text()->draw_text(ElInt(c, 1), ElInt(c, 2), s,
-              ClampByte(ElInt(c, 4)), ClampByte(ElInt(c, 5)), ClampByte(ElInt(c, 6)));
+              ClampByte(ElInt(c, 4)), ClampByte(ElInt(c, 5)), ClampByte(ElInt(c, 6)),
+              cn > 7 ? (int)ElInt(c, 7) : 1);      // optional pixel scale
         } else if (strcmp(op, "gpfull") == 0 && cn >= 2) {
           eng->set_fullscreen(ElInt(c, 1) != 0);
-        } else if (strcmp(op, "gpsound") != 0 && strcmp(op, "gpplay") != 0 &&
+        } else if (strcmp(op, "gpsound") != 0 && strcmp(op, "gpeffect") != 0 &&
+                   strcmp(op, "gpplay") != 0 &&
                    strcmp(op, "gptune") != 0 && strcmp(op, "gpmusic") != 0 &&
                    strcmp(op, "gpopen") != 0) {
           // silently ignore retained verbs; audio verbs fall through below
         }
-        if (strcmp(op, "gpsound") != 0 && strcmp(op, "gpplay") != 0 &&
+        if (strcmp(op, "gpsound") != 0 && strcmp(op, "gpeffect") != 0 &&
+            strcmp(op, "gpplay") != 0 &&
             strcmp(op, "gptune") != 0 && strcmp(op, "gpmusic") != 0) {
           if (!verr.empty() && first_err.empty()) first_err = verr;
           continue;                            // audio verbs share the code below
@@ -304,7 +307,8 @@ void Cocoa_gpApply(Dart_NativeArguments args) {
           eng->text()->draw_text(ElInt(c, 1), ElInt(c, 2), s,
                                  ClampByte(ElInt(c, 4)),
                                  ClampByte(ElInt(c, 5)),
-                                 ClampByte(ElInt(c, 6)));
+                                 ClampByte(ElInt(c, 6)),
+                                 cn > 7 ? (int)ElInt(c, 7) : 1);   // pixel scale
         }
       } else if (strcmp(op, "gpshader") == 0 && cn >= 2) {
         const char* body = ElStr(c, 1);
@@ -318,7 +322,10 @@ void Cocoa_gpApply(Dart_NativeArguments args) {
         if (slot < 0 || slot >= kMaxSfxSlots) verr = "gpsound: slot 0..63";
         else if (preset == NULL) verr = "gpsound: preset name needed";
         else {
-          static Lcg rng(12345);            // deterministic across a session
+          // Deterministic across a session. Static-local, but single-threaded
+          // by construction: gpApply only ever runs on the UI isolate's
+          // mutator (the pane's whole contract), so no lock.
+          static Lcg rng(12345);
           double a1 = cn > 3 ? ElDouble(c, 3) : 0.0;
           double a2 = cn > 4 ? ElDouble(c, 4) : 0.0;
           Sound snd;
@@ -334,6 +341,14 @@ void Cocoa_gpApply(Dart_NativeArguments args) {
             snd = preset_shoot(a1 > 0 ? a1 : 0.15, rng);
           } else if (strcmp(preset, "explode") == 0) {
             snd = preset_explode(a1 > 0 ? a1 : 1.0, a2 > 0 ? a2 : 0.5, rng);
+          } else if (strcmp(preset, "wah") == 0) {
+            // a1 = base Hz (280 = the saucer), a2 = detune Hz = the wah rate
+            snd = preset_wah(a1 > 0 ? a1 : 280.0, a2 > 0 ? a2 : 5.0, 0.9);
+          } else if (strcmp(preset, "hum") == 0) {
+            // The capture boss's tractor hum: the same beating trick an octave
+            // and a half down, slower — the original's AudioBoot bakes it as
+            // Wah(110, 4).
+            snd = preset_wah(a1 > 0 ? a1 : 110.0, a2 > 0 ? a2 : 4.0, 1.1);
           } else if (strcmp(preset, "powerup") == 0) {
             snd = preset_powerup(a1 > 0 ? a1 : 0.4);
           } else if (strcmp(preset, "hurt") == 0) {
@@ -355,6 +370,51 @@ void Cocoa_gpApply(Dart_NativeArguments args) {
             verr = std::string("gpsound: unknown preset ") + preset;
           }
           if (verr.empty()) eng->sfx()->define((int)slot, snd);
+        }
+      } else if (strcmp(op, "gpeffect") == 0 && cn >= 16) {
+        // The FULL synth recipe over the wire — the parameter space the
+        // eleven gpsound presets are hand-tuned points in, opened up for the
+        // sound editor (SOUND_EDITOR_PLAN.md, which pins this exact order):
+        //   ['gpeffect', slot, duration, a, d, s, r, sweepStart, sweepEnd,
+        //    noiseMix, distortion, echoCount, echoDelay, echoDecay, seed,
+        //    oscCount, (wave, freq, amp, phase, pulseWidth) * oscCount]
+        // The seed crosses too, so a recipe with noise in it renders the
+        // SAME sound every time — a saved effect is reproducible source.
+        int64_t slot = ElInt(c, 1);
+        if (slot < 0 || slot >= kMaxSfxSlots) {
+          verr = "gpeffect: slot 0..63";
+        } else {
+          double dur = ElDouble(c, 2);
+          if (dur <= 0.0) dur = 0.2;
+          if (dur > 4.0) dur = 4.0;            // echo tail fits kMaxSamples
+          Effect e(dur);
+          e.set_env(ElDouble(c, 3), ElDouble(c, 4), ElDouble(c, 5),
+                    ElDouble(c, 6));
+          e.sweep_start = ElDouble(c, 7);
+          e.sweep_end = ElDouble(c, 8);
+          e.noise_mix = ElDouble(c, 9);
+          e.distortion = ElDouble(c, 10);
+          int64_t taps = ElInt(c, 11);
+          e.echo_count = (uint32_t)(taps < 0 ? 0 : (taps > 8 ? 8 : taps));
+          e.echo_delay = ElDouble(c, 12);
+          e.echo_decay = ElDouble(c, 13);
+          int64_t osc_n = ElInt(c, 15);
+          if (osc_n < 0) osc_n = 0;
+          if (osc_n > 4) osc_n = 4;            // add_osc caps there anyway
+          for (int64_t i = 0; i < osc_n; i++) {
+            intptr_t base = 16 + (intptr_t)i * 5;
+            if (base + 4 >= cn) break;         // short list: keep what parsed
+            int64_t wf = ElInt(c, base);
+            if (wf < 0 || wf > 5) wf = 0;
+            e.add_osc((Waveform)wf, ElDouble(c, base + 1),
+                      ElDouble(c, base + 2));
+            e.oscillators.back().phase = ElDouble(c, base + 3);
+            e.oscillators.back().pulse_width = ElDouble(c, base + 4);
+          }
+          Lcg rng((uint32_t)ElInt(c, 14));
+          Sound snd = render(e, rng);
+          if (snd.samples.empty()) verr = "gpeffect: rendered no samples";
+          else eng->sfx()->define((int)slot, snd);
         }
       } else if (strcmp(op, "gpplay") == 0 && cn >= 2) {
         eng->sfx()->play((int)ElInt(c, 1));

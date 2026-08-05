@@ -1,0 +1,148 @@
+"02_nil_boolean.mst — UndefinedObject/Boolean/True/False (sprint_s06_detail.md
+ #02). True/False's ifTrue:/ifFalse:/and:/or: are the REAL-SEND fallbacks
+ for S5's inlined selectors (Pitfalls P6) — semantics must match the
+ inlined patterns exactly, incl. ifTrue: answering nil on the untaken leg."
+
+"I am the class of nil, my one instance. nil is the initial value of
+ every variable and instance variable, and the conventional answer for
+ no result. I answer true to isNil and false to notNil (all other
+ objects answer the reverse), I print as nil, and copying me answers
+ me."
+
+Object subclass: UndefinedObject [
+    isNil ^ <Boolean> [
+        ^true
+    ]
+    notNil ^ <Boolean> [
+        ^false
+    ]
+]
+
+"I am the abstract superclass of True and False, the two truth values.
+ My subclasses carry the real protocol: not, & and | (eager — the
+ argument is already evaluated), and: and or: (short-circuit — the
+ argument is a block run only when needed), the ifTrue:/ifFalse:
+ conditionals, and xor:/eqv:. The compiler inlines the common
+ conditional forms; my subclasses keep real methods with identical
+ semantics for when a Boolean is reached through a dynamic send."
+
+Object subclass: Boolean [
+]
+
+"I am the true case of Boolean; the value true is my one instance. My
+ methods answer each conditional's true leg directly: ifTrue: runs its
+ block, ifFalse: answers nil, and: evaluates its block, or: answers
+ true without looking at its argument."
+
+Boolean subclass: True [
+    not ^ <Boolean> [
+        ^false
+    ]
+    and: aBlock <[^Boolean]> ^ <Boolean> [
+        ^aBlock value
+    ]
+    or: aBlock <[^Boolean]> ^ <Boolean> [
+        ^true
+    ]
+    ifTrue: aBlock <[]> ^ <Object> [
+        ^aBlock value
+    ]
+    ifFalse: aBlock <[]> ^ <Object> [
+        ^nil
+    ]
+    ifTrue: aBlock <[]> ifFalse: cBlock <[]> ^ <Object> [
+        ^aBlock value
+    ]
+    ifFalse: aBlock <[]> ifTrue: cBlock <[]> ^ <Object> [
+        ^cBlock value
+    ]
+    & aBoolean <Boolean> ^ <Boolean> [
+        ^aBoolean
+    ]
+    "`|` is unannotated: `| arg <T> ... [` is ambiguous with an annotated
+     instance-variable list (see world/56_dict_point_set_ext.mst); the sig
+     is `aBoolean <Boolean> ^ <Boolean>`, same as & above."
+    | aBoolean [
+        ^true
+    ]
+]
+
+"I am the false case of Boolean; the value false is my one instance.
+ My methods mirror True with the legs swapped: ifTrue: answers nil,
+ ifFalse: runs its block, and: answers false without evaluating its
+ argument, or: evaluates its block."
+
+Boolean subclass: False [
+    not ^ <Boolean> [
+        ^true
+    ]
+    and: aBlock <[^Boolean]> ^ <Boolean> [
+        ^false
+    ]
+    or: aBlock <[^Boolean]> ^ <Boolean> [
+        ^aBlock value
+    ]
+    ifTrue: aBlock <[]> ^ <Object> [
+        ^nil
+    ]
+    ifFalse: aBlock <[]> ^ <Object> [
+        ^aBlock value
+    ]
+    ifTrue: aBlock <[]> ifFalse: cBlock <[]> ^ <Object> [
+        ^cBlock value
+    ]
+    ifFalse: aBlock <[]> ifTrue: cBlock <[]> ^ <Object> [
+        ^aBlock value
+    ]
+    & aBoolean <Boolean> ^ <Boolean> [
+        ^false
+    ]
+    "`|` is unannotated for the same reason as True's (parser ambiguity
+     with an ivar list); the sig is `aBoolean <Boolean> ^ <Boolean>`."
+    | aBoolean [
+        ^aBoolean
+    ]
+]
+
+nil subclass: Object [
+    = anObject <Object> ^ <Boolean> [
+        ^self == anObject
+    ]
+    ~= anObject <Object> ^ <Boolean> [
+        ^(self = anObject) not
+    ]
+    ~~ anObject <Object> ^ <Boolean> [
+        ^(self == anObject) not
+    ]
+    isNil ^ <Boolean> [
+        ^false
+    ]
+    notNil ^ <Boolean> [
+        ^true
+    ]
+    isString ^ <Boolean> [
+        ^false
+    ]
+    isSymbol ^ <Boolean> [
+        ^false
+    ]
+    isInteger ^ <Boolean> [
+        ^false
+    ]
+    isDouble ^ <Boolean> [
+        ^false
+    ]
+    "Defined HERE, beside its sibling predicates, rather than in
+     23_fraction.mst where Fraction itself lives: SmallInteger's arithmetic
+     fallbacks (06) test `aNumber isFraction`, and they run long before
+     file 23 loads (e.g. smallInt + largeInt during 07-22)."
+    isFraction ^ <Boolean> [
+        ^false
+    ]
+    isCharacter ^ <Boolean> [
+        ^false
+    ]
+    isClass ^ <Boolean> [
+        ^false
+    ]
+]

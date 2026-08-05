@@ -1,0 +1,18 @@
+"79_writestream_new.mst — MACDART: WriteStream>>new initializes its backing.
+
+ 18_writestream.mst's WriteStream keeps a `collection`/`position` pair and is
+ created with `WriteStream on: String new`, but it never defines a class-side
+ `new`. So a bare `WriteStream new` fell to the inherited basicNew with nil ivars,
+ and the first nextPut:/nextPutAll: did arithmetic on a nil position (`+` on nil).
+ A default `new` should just stream onto an empty String — the ANSI/Squeak
+ behaviour — so `anArray printOn: WriteStream new` and friends work. Loads after
+ 18 (file 79); reopen adds the missing constructor."
+
+WriteStream class >> new [ ^self on: String new ]
+
+"next: n put: anObject — write n copies of anObject (ANSI/Squeak). The one
+ WriteStream method a sweep found missing next to nextPut:/nextPutAll:."
+WriteStream >> next: anInteger put: anObject [
+    anInteger timesRepeat: [ self nextPut: anObject ].
+    ^anObject
+]

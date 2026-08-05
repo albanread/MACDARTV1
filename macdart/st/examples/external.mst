@@ -1,0 +1,26 @@
+"external.mst — top-level (external) definitions and do-it statements."
+
+"External class-side method, one-liner."
+PosixFile class >> oRdOnly [ ^0 ]
+
+"External instance method on an existing class."
+PosixFile >> isReadable [
+    ^(self flags bitAnd: 3) = 0
+]
+
+"Reopen a class to add instance-side behaviour and an instance variable."
+Posix extend [
+    | lastError |
+    describe [
+        ^'posix fd ', (fd printString)
+    ]
+]
+
+"Reopen the class side."
+Posix class extend [
+    default [ ^self new ]
+]
+
+"Bare do-it statements at top level."
+Transcript showCr: 'loading posix support'.
+Smalltalk at: #DefaultPosix put: (Posix default).

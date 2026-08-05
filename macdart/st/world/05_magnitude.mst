@@ -1,0 +1,67 @@
+"05_magnitude.mst — Magnitude/Number (sprint_s06_detail.md #05). Number>>
+ to:do: is the real-send twin of S5's inlined to:do: (Pitfall P6) — must
+ match the inlined pattern's result (the receiver) exactly."
+
+"I am the abstract superclass of objects with a linear order — numbers
+ and characters. A subclass defines < and = ; from those I derive >,
+ <=, >=, max:, min: and between:and:. Anything that answers < and =
+ gains the whole comparison protocol and can live in a
+ SortedCollection."
+
+Object subclass: Magnitude [
+    < aMagnitude <Magnitude> ^ <Boolean> [
+        self subclassResponsibility
+    ]
+    > aMagnitude <Magnitude> ^ <Boolean> [
+        ^aMagnitude < self
+    ]
+    <= aMagnitude <Magnitude> ^ <Boolean> [
+        ^(aMagnitude < self) not
+    ]
+    >= aMagnitude <Magnitude> ^ <Boolean> [
+        ^(self < aMagnitude) not
+    ]
+    max: aMagnitude <Magnitude> ^ <Magnitude> [
+        ^self < aMagnitude ifTrue: [ aMagnitude ] ifFalse: [ self ]
+    ]
+    min: aMagnitude <Magnitude> ^ <Magnitude> [
+        ^self < aMagnitude ifTrue: [ self ] ifFalse: [ aMagnitude ]
+    ]
+    between: lo <Magnitude> and: hi <Magnitude> ^ <Boolean> [
+        ^(self >= lo) and: [ self <= hi ]
+    ]
+]
+
+"I am the abstract superclass of all numbers: SmallInteger and
+ LargeInteger, Double, and Fraction. Beyond Magnitude comparison I
+ provide sign and shape (abs, negated, sign, isZero, squared,
+ reciprocal, sqrt, raisedTo:), counted loops (to:do:, to:by:do:),
+ Interval building (to:, to:by:) and Point building with @ . Mixed-mode
+ arithmetic coerces automatically: an integer combined with a Double
+ answers a Double, with a Fraction a Fraction."
+
+Magnitude subclass: Number [
+    abs ^ <Number> [
+        ^self < 0 ifTrue: [ self negated ] ifFalse: [ self ]
+    ]
+    negated ^ <Number> [
+        ^0 - self
+    ]
+    isZero ^ <Boolean> [
+        ^self = 0
+    ]
+    sign ^ <Integer> [
+        self < 0 ifTrue: [ ^-1 ].
+        self > 0 ifTrue: [ ^1 ].
+        ^0
+    ]
+    squared ^ <Number> [
+        ^self * self
+    ]
+    to: stop <Number> do: aBlock <[Number]> ^ <Self> [
+        | i |
+        i := self.
+        [ i <= stop ] whileTrue: [ aBlock value: i. i := i + 1 ].
+        ^self
+    ]
+]

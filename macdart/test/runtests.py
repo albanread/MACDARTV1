@@ -86,27 +86,40 @@ def eval_condition(cond: str) -> bool:
         return False
 
 
+def _merge_status_file(path, status):
+    """Merge one .status file's ACTIVE sections into `status` (in place)."""
+    active = True
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                active = eval_condition(line[1:-1])
+                continue
+            if not active or ":" not in line:
+                continue
+            key, outs = line.split(":", 1)
+            outcomes = {o.strip() for o in outs.split(",") if o.strip()}
+            status.setdefault(key.strip(), set()).update(outcomes)
+
+
 def load_status(suite: str):
-    """Return {test_key: set(outcomes)} merged across applicable status sections."""
+    """Return {test_key: set(outcomes)} merged across applicable status sections.
+
+    Layers our OWN test/macdart.status on top of the upstream suite's *.status
+    files: MACDART-config-specific expectations upstream only recorded for other
+    configs (see that file). Keys are suite-relative, so entries for other
+    suites simply never match.
+    """
     status = {}
     for root, _, names in os.walk(suite):
         for n in names:
-            if not n.endswith(".status"):
-                continue
-            active = True
-            with open(os.path.join(root, n), encoding="utf-8", errors="replace") as fh:
-                for line in fh:
-                    line = line.split("#", 1)[0].strip()
-                    if not line:
-                        continue
-                    if line.startswith("[") and line.endswith("]"):
-                        active = eval_condition(line[1:-1])
-                        continue
-                    if not active or ":" not in line:
-                        continue
-                    key, outs = line.split(":", 1)
-                    outcomes = {o.strip() for o in outs.split(",") if o.strip()}
-                    status.setdefault(key.strip(), set()).update(outcomes)
+            if n.endswith(".status"):
+                _merge_status_file(os.path.join(root, n), status)
+    overlay = os.path.join(HERE, "macdart.status")
+    if os.path.exists(overlay):
+        _merge_status_file(overlay, status)
     return status
 
 OUTCOMES = {
@@ -231,16 +244,22 @@ def apply_status(result, status, keys):
     return result
 
 
-def run_one_file(path, timeout, status):
+def run_one_file(path, timeout, status, suite):
     """Return list of (case_name, result) for this file (>1 for multitests)."""
     is_multi, lines, tags = analyze(path)
-    base = os.path.basename(path)[:-5]  # drop .dart
+    # Dart .status keys are SUITE-RELATIVE and keep _test, e.g.
+    # `mirrors/invocation_fuzz_test` — so a subdir'd test only matches on its
+    # relative path, not its basename. Key on the relative path first; keep the
+    # bare basename as a fallback for any status file that lives in a subdir and
+    # names tests locally.
+    rel = os.path.relpath(path, suite)[:-5]   # drop .dart, keep the subdirs
+    base = os.path.basename(path)[:-5]
     results = []
     if not is_multi:
         expect = "error" if path.endswith("_negative_test.dart") else "pass"
         rc, to = run_dart(path, timeout)
         r = classify(expect, rc, to)
-        results.append((path, apply_status(r, status, [base])))
+        results.append((path, apply_status(r, status, [rel, base])))
         return results
     for keep in [None] + sorted(tags):
         tag = keep or "none"
@@ -248,7 +267,8 @@ def run_one_file(path, timeout, status):
         rc, to = run_variant_in_tmp(path, content, timeout)
         r = classify(expectation(tags, keep), rc, to)
         results.append((f"{path}/{tag}",
-                        apply_status(r, status, [f"{base}/{tag}", base])))
+                        apply_status(r, status,
+                                     [f"{rel}/{tag}", rel, f"{base}/{tag}", base])))
     return results
 
 
@@ -281,7 +301,8 @@ def main(argv):
                ("PASS", "FAIL", "CRASH", "TIMEOUT", "XFAIL", "XCRASH", "SKIP")}
     crashes, fails = [], []
     with ThreadPoolExecutor(max_workers=args.jobs) as ex:
-        futs = {ex.submit(run_one_file, f, args.timeout, status): f for f in files}
+        futs = {ex.submit(run_one_file, f, args.timeout, status, args.suite): f
+                for f in files}
         for fut in as_completed(futs):
             for name, res in fut.result():
                 buckets[res] += 1

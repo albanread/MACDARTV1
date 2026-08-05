@@ -1,0 +1,37 @@
+"84_gamepane_buffers.mst — GamePane buffer-slot bridge (GAMEPANE_PLAN.md §5).
+
+ The indexed pane has 8 buffer slots (gp_engine.h's kNumBuffers): 0 is the
+ FRONT buffer (the one render() always displays), 1 is a conventional BACK
+ buffer, 2..7 are general asset/scratch slots. A GPU compute blitter copies
+ or composites rectangles between any two slots (mode: 0 copy, 1 transparent,
+ 2 and, 3 or, 4 xor, 5 clear). None of this was reachable from Smalltalk —
+ only cls:/point:y:color:/line:.../fill:.../disc:... (which all draw into
+ whichever slot is currently active, slot 0 by default) were wired.
+
+ This is the tool for tile-atlas reuse and scrolling multi-layer scenes:
+ pre-render a tile or a background layer ONCE into an asset slot (2..7),
+ then blitMode:...: cheap copies of it into the front buffer wherever it's
+ needed, instead of redrawing it from scratch every tick. Build that
+ pre-rendered content with activeBuffer: + fill:/disc:/pset: (stride-aware,
+ world_w_-addressed) — NOT loadBuffer:bytes:, which is a flat memcpy into
+ the buffer's start (world_w_*world_h_ bytes with no width parameter of its
+ own), so a smaller ByteArray only fills part of row 0, not a sub-rectangle
+ (confirmed live: a 16x16 tile came out as thin horizontal stripes instead
+ of a checkerboard — see 99_tiletest_scratch.mst's fix). loadBuffer: is only
+ correct for a bulk load that's exactly world_w x world_h.
+
+ scrollTo:y: pans the raster shader's read offset (world-sized buffers,
+ panned in the fragment shader — the copper-style per-scanline palette is
+ unaffected, it is screen-locked). NOTE render() always samples slot 0 —
+ there is no zero-copy hardware page-flip; 'flipping' in a back buffer
+ means drawing into slot 1 (activeBuffer: 1) then blitMode: 0 (copy) src: 1
+ dst: 0 ... to reveal it.
+
+ Loads after 80/83 (file 84); reopen adds new selectors, GamePane's own
+ corpus-ported methods are untouched."
+
+GamePane >> scrollTo: x y: y [ <stprim: stGpScroll> ]
+GamePane >> activeBuffer: slot [ <stprim: stGpActive> ]
+GamePane >> swapBuffers [ <stprim: stGpSwap> ]
+GamePane >> loadBuffer: slot bytes: aByteArray [ <stprim: stGpLoad> ]
+GamePane >> blitMode: mode src: src dst: dst sx: sx sy: sy dx: dx dy: dy w: w h: h value: v [ <stprim: stGpBlitSlots> ]

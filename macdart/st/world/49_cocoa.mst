@@ -1,0 +1,258 @@
+"49_cocoa.mst — the Cocoa bridge, C0 (docs/cocoa_bridge_design.md), MACDART
+ BINDING. The API is MACVM's; the substance is dart:cocoa's typed
+ objc_msgSend marshaller — ONE bridge under both languages (ST_PLAN.md
+ Sprint 13). An ObjcRef holds the Dart-side `Cocoa` wrapper in an ivar, so
+ retain/release policy, weak-persistent finalizers, ownership families
+ (alloc/new/copy/init results arrive already-owned) and result wrapping
+ live in exactly one place, shared with everything dartui itself draws.
+
+   | pi |
+   pi := (Cocoa classNamed: 'NSProcessInfo') send: 'processInfo'.
+   Transcript showCr: (pi sendString: 'processName').
+   pi release.
+
+ Ownership (MACDART): every wrapped result is retained by the Dart wrapper,
+ which releases when the wrapper is collected. `release` POISONS this
+ ObjcRef — later sends fail cleanly, like a terminated worker — and the
+ native reference drops at the wrapper's collection: a deliberate
+ divergence from MACVM's immediate release, in the safe direction (an
+ over-release corrupts Cocoa; a deferred one merely lingers). Use
+ `Cocoa poolDo: [...]` around allocation bursts. A caught NSException
+ surfaces as an ordinary Smalltalk error — the VM never dies. In a headless
+ host (the plain `dart` CLI) main-thread sends fail cleanly: there is no
+ run loop draining the main queue."
+"ObjcMainProxy — the C3 ergonomic face of the main-thread hop: `ref onMain`
+ answers a proxy whose every send runs the SAME Objective-C message on the
+ MAIN thread, synchronously (docs/cocoa_bridge_design.md §4 path 2 —
+ AppKit is main-thread-only). Defined before ObjcRef so `onMain` can
+ reference the global; its own body needs no forward names (sends are
+ late-bound). Only meaningful in a GUI host whose run loop drains the main
+ queue — headless, every send through it fails cleanly."
+"I am a main-thread proxy on an ObjcRef: every message sent to me runs the
+ same Objective-C message on the process main thread, synchronously, and
+ answers the result. AppKit is main-thread-only, so use me for all window
+ and view work: `window onMain makeKeyAndOrderFront: nil`. Obtain me with
+ ObjcRef>>onMain; `target` answers the underlying ObjcRef for wrapper
+ operations such as release and isValid."
+Object subclass: ObjcMainProxy [
+    | ref |
+    ObjcMainProxy class >> on: anObjcRef [
+        | p |
+        p := self basicNew.
+        p setRef: anObjcRef.
+        ^p
+    ]
+    setRef: r [
+        ref := r
+    ]
+    target [
+        "The underlying ObjcRef (for release/isValid, which are wrapper
+         operations, not sends)."
+        ^ref
+    ]
+    doesNotUnderstand: aMessage [
+        ^ref sendMain: aMessage selector asString args: aMessage arguments
+    ]
+]
+
+"STCocoa — the primitive floor of this binding: each method is a direct
+ call into a dart:cocoa helper (the <stprim:> door — the same mechanism
+ the prelude's own primitives use). Everything above it is ordinary
+ Smalltalk."
+Object subclass: STCocoa [
+    STCocoa class >> classNamed: aName [ <stprim: stObjcClassNamed> ]
+    STCocoa class >> send: h sel: s args: a [ <stprim: stObjcSend> ]
+    STCocoa class >> sendMain: h sel: s args: a [ <stprim: stObjcSendMain> ]
+    STCocoa class >> isRef: x [ <stprim: stObjcIsRef> ]
+    STCocoa class >> utf8: x [ <stprim: stObjcUTF8> ]
+    STCocoa class >> poolPush [ <stprim: stObjcPoolPush> ]
+    STCocoa class >> poolPop: p [ <stprim: stObjcPoolPop> ]
+    STCocoa class >> actionTargetTicket: t [ <stprim: stObjcActionTarget> ]
+    STCocoa class >> tableSourceTicket: t [ <stprim: stObjcTableSource> ]
+    STCocoa class >> joinRows: anArray [ <stprim: stJoinRows> ]
+]
+
+"I am a Smalltalk handle on one Objective-C object, minted only by the
+ bridge (Cocoa classNamed:, Cocoa nsString:, and the results of sends).
+ Any message I do not implement myself becomes an Objective-C send — the
+ selector text is identical in both languages, the argument and result
+ shapes are resolved from the live runtime's own @encode (a SmallInteger
+ passed where a double is declared coerces correctly), and results come
+ back as ObjcRefs, Booleans, Integers, Doubles, Strings, or small Arrays
+ of numbers for the common structs (a CGRect argument is its four Doubles
+ in an Array). Typed sends (sendString:, sendI64:, sendBool:, ...) pin the
+ return interpretation. `onMain` answers a proxy that runs every send on
+ the main thread (required for AppKit). After `release` I am poisoned and
+ further sends fail cleanly.
+
+ COLLISIONS: selectors I really implement never reach Objective-C —
+ notably `class` (escape: objcClass), `printString` (the ObjC description
+ via my printOn:), `release` (the wrapper's own), `isValid` (the poison
+ check, NOT NSTimer's -isValid), and `=`/`==`, which compare WRAPPER
+ identity — two ObjcRefs on one object are not `=`; use `isEqual:` for
+ Objective-C equality. Manual reference counting (retain/autorelease/
+ dealloc/retainCount) is refused outright: ownership belongs to the
+ bridge (wrap/release/poolDo:), never to guest code."
+Object subclass: ObjcRef [
+    | h |
+    ObjcRef class >> onHandle: aDartCocoa [
+        | r |
+        r := self basicNew.
+        r setHandle: aDartCocoa.
+        ^r
+    ]
+    setHandle: aDartCocoa [
+        h := aDartCocoa
+    ]
+    objcHandle [
+        "The Dart `Cocoa` wrapper this ref rides on (the bridge unwraps
+         ObjcRef arguments through this accessor)."
+        ^h
+    ]
+    wrapResult: x [
+        "Object results arrive as Dart wrappers — mint an ObjcRef so the
+         Smalltalk side stays in Smalltalk types; scalars pass through."
+        (STCocoa isRef: x) ifTrue: [ ^ObjcRef onHandle: x ].
+        ^x
+    ]
+
+    "── the C1 general send ──────────────────────────────────────────────
+     Arguments may be nil, true/false, Integers, Doubles, Strings (bridged
+     to a temp NSString), Arrays of numbers (struct-by-value: an NSRange is
+     two Integers, a CGPoint two Doubles, a CGRect four Doubles), or
+     ObjcRefs. MACVM pinned return shapes with a retToken; this bridge
+     resolves the shape from the method's own @encode, so the ret: variants
+     keep their signatures with the token advisory."
+    send: selName [
+        "Send an Objective-C message (no arguments)."
+        ^self wrapResult: (STCocoa send: h sel: selName args: {})
+    ]
+    send: selName with: a [
+        ^self wrapResult: (STCocoa send: h sel: selName args: { a })
+    ]
+    send: selName with: a with: b [
+        ^self wrapResult: (STCocoa send: h sel: selName args: { a. b })
+    ]
+    send: selName args: argArray [
+        ^self wrapResult: (STCocoa send: h sel: selName args: argArray)
+    ]
+    send: selName args: argArray ret: retToken [
+        ^self send: selName args: argArray
+    ]
+    sendI64: selName [ ^ STCocoa send: h sel: selName args: {} ]
+    sendBool: selName [ ^ STCocoa send: h sel: selName args: {} ]
+    sendBool: selName args: argArray [
+        ^ STCocoa send: h sel: selName args: argArray
+    ]
+    sendF64: selName [ ^ STCocoa send: h sel: selName args: {} ]
+    sendF64: selName args: argArray [
+        ^ STCocoa send: h sel: selName args: argArray
+    ]
+    sendString: selName [
+        "The result as a Smalltalk String (an NSString result is read out
+         through UTF8String)."
+        ^ STCocoa utf8: (STCocoa send: h sel: selName args: {})
+    ]
+    sendRange: selName args: argArray [
+        ^ STCocoa send: h sel: selName args: argArray
+    ]
+    sendPoint: selName [ ^ STCocoa send: h sel: selName args: {} ]
+    sendRect: selName [ ^ STCocoa send: h sel: selName args: {} ]
+
+    "── C2: doesNotUnderstand: dispatch ──────────────────────────────────
+     Any Smalltalk unary/keyword send I don't natively answer becomes the
+     Objective-C message — see the class comment's COLLISIONS note.
+
+       calendar := (Cocoa classNamed: 'NSCalendar') currentCalendar.
+       s := ((Cocoa classNamed: 'NSMutableString') alloc) init.
+       s appendString: 'hello'."
+    doesNotUnderstand: aMessage [
+        | sel |
+        sel := aMessage selector asString.
+        ((sel = 'retain') | (sel = 'autorelease') | (sel = 'dealloc')
+            | (sel = 'retainCount')) ifTrue: [
+            ^self error: 'Cocoa: manual reference counting belongs to the bridge, not guest code' ].
+        ^self primSendAuto: sel args: aMessage arguments
+    ]
+    primSendAuto: selName args: argArray [
+        ^self wrapResult: (STCocoa send: h sel: selName args: argArray)
+    ]
+    objcClass [
+        "The #class collision escape: the receiver's OBJECTIVE-C class
+         (Smalltalk `class` answers my class value, as it must)."
+        ^self send: 'class'
+    ]
+
+    "── C3: the sync main-thread hop ─────────────────────────────────────
+     AppKit is main-thread-only; these run the send ON the main thread and
+     wait. In a headless host the hop fails cleanly — there is no run loop
+     to drain the queue. Already-on-main callers run inline."
+    primSendMainAuto: selName args: argArray [
+        ^self wrapResult: (STCocoa sendMain: h sel: selName args: argArray)
+    ]
+    sendMain: selName args: argArray [
+        "One send on the main thread, shape auto-resolved like sendAuto."
+        ^self primSendMainAuto: selName args: argArray
+    ]
+    onMain [
+        "A proxy that runs EVERY send on the main thread:
+           window onMain makeKeyAndOrderFront: nil."
+        ^ObjcMainProxy on: self
+    ]
+    copy [
+        "Objective-C -copy (+1 family — the wrapper owns the result).
+         Defined EXPLICITLY so a future Object>>copy can never shadow it."
+        ^self send: 'copy'
+    ]
+    release [
+        "Poison this ref: later sends fail cleanly. The native reference
+         drops when the Dart wrapper is collected (see the class comment)."
+        h := nil
+    ]
+    isValid [
+        ^h notNil
+    ]
+    descriptionString [
+        ^ STCocoa utf8: (STCocoa send: h sel: 'description' args: {})
+    ]
+    printOn: ws [
+        ws nextPutAll: (h isNil
+            ifTrue: [ 'ObjcRef(released)' ]
+            ifFalse: [ self descriptionString ])
+    ]
+]
+
+"Cocoa poolDo: [...] — an autorelease pool around a burst of bridge work.
+ keep: answers its argument (the Dart wrapper owns the reference; nothing
+ extra to retain here) — kept for MACVM source compatibility."
+Object subclass: CocoaPool [
+    CocoaPool class >> new [ ^self basicNew ]
+    keep: anObjcRef [ ^anObjcRef ]
+]
+
+"The class-side facade: classNamed:, nsString:, and pool scoping."
+Object subclass: Cocoa [
+    Cocoa class >> classNamed: aName [
+        | c |
+        c := STCocoa classNamed: aName.
+        c isNil ifTrue: [ ^nil ].
+        ^ObjcRef onHandle: c
+    ]
+    Cocoa class >> nsString: aString [
+        "A retained NSString from a Smalltalk String."
+        ^(self classNamed: 'NSString')
+            send: 'stringWithUTF8String:' with: aString
+    ]
+    Cocoa class >> drainPool [
+        "MACVM drained its bottom pool here; this host drains per event —
+         a no-op kept for source compatibility."
+        ^self
+    ]
+    Cocoa class >> poolDo: aBlock [
+        | p |
+        p := STCocoa poolPush.
+        ^[ aBlock value ] ensure: [ STCocoa poolPop: p ]
+    ]
+    Cocoa class >> primPoolPush [ ^ STCocoa poolPush ]
+    Cocoa class >> primPoolPop: p [ ^ STCocoa poolPop: p ]
+]

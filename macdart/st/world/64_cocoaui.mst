@@ -1,0 +1,1186 @@
+"64_cocoaui.mst — CocoaUI: the Cocoa GUI's native app shell (CG2 window +
+ CG4 protocol/restart + CG5 toolbar/metrics/view-switcher + CG6 Workspace).
+ Loaded ONLY by the UI worker via `frontend::world::load_list(vm,
+ world/cocoaui.list)`, NEVER from world/world.list — so the CLI, the
+ WKWebView GUI, and the base test suite carry none of it (files 63+, the
+ conditional layer, §12.3).
+
+ The UI worker VM runs pinned to the process's MAIN thread (AppKit requires
+ it). The Rust `cocoa_gui` glue bootstraps NSApplication, boots this VM in
+ place, runs `CocoaUI startup` once (this class), then enters [NSApp run]
+ with the VM at rest — so every AppKit call below runs INLINE on main (the
+ bridge's `onMain` hop is a no-op when the caller already IS main).
+
+ CG5 layout (top to bottom, matching the WKWebView GUI's own shell): a
+ TOOLBAR strip (view-switcher buttons left, live VmMetrics readout right),
+ a CONTENT HOST that swaps its single subview per the active registered
+ view, and a small REVERSE-CHRONOLOGICAL Transcript dock at the bottom
+ (newest line first — a log to glance at, not the primary output surface;
+ CG6's Workspace Print it is that now). Every subview carries the correct
+ NSView autoresizingMask so the window is genuinely resizable (unflipped
+ AppKit coordinates: MinYMargin-flexible pins to the TOP, MaxYMargin-
+ flexible pins to the BOTTOM, both-sizable fills the middle).
+
+ The toolbar's per-button action is the C6 `macvmAction:` selector
+ (`MacvmActionTarget`, CG5): each button mints its OWN action-target ticket
+ bound to a tiny `CocoaToolbarAction` block-holder, so N buttons share ONE
+ Rust IMP with no per-button Rust code (`objc_delegate.rs`'s existing
+ ticket-routing does the rest) — the reusable mechanism this sprint exists
+ to prove.
+
+ Icons are the SAME `gui/assets/icons-mono/*.svg` files the WKWebView GUI's
+ own toolbar already ships (relative to the process cwd — the repo root,
+ matching the `MACVM_WORLD` convention), loaded as `NSImage` template images
+ so a future theme's tint color recolors them for free — no duplicate art.
+
+ ON-SCREEN status: the AppKit view construction here is the USER's on-screen
+ gate (a `MACVM_COCOA_SNAP` sequence self-verifies before that). The request
+ round-trip and (peer,corr) routing are headless-proven (embed.rs CG4
+ tests); the action dispatch is headless-proven (cocoa_delegate gate)."
+
+"I hold one block behind a native target/action control. Each toolbar
+ button or menu item mints its own action-target delegate on an instance
+ of me; when the control fires, macvmAction: runs my block. The delegate
+ registry keeps me alive — nothing else needs to hold me."
+Object subclass: CocoaToolbarAction [
+    "A block-holder so N toolbar buttons can each mint their own C6
+     action-target ticket (`MacvmDelegate actionTargetOn:`) while sharing
+     ONE Rust IMP (`macvmAction:`). Kept alive by the world-side ticket→
+     receiver registry (GC-rooted) — nothing else needs to hold it."
+    <classVars: nil>
+    | Block |
+    CocoaToolbarAction class >> on: aBlock [
+        | h | h := self new. h setBlock: aBlock. ^h
+    ]
+    setBlock: aBlock [ Block := aBlock ]
+    macvmAction: sender [ ^Block value ]
+]
+
+"I am the native GUI's application shell, running in the UI worker VM on
+ the main thread. I build the main window: a toolbar of view-switcher
+ buttons plus a live VM metrics readout, a content host whose tabs the
+ registered views fill (Workspace, the class browsers, Find, Editor,
+ Outliner, Canvas, Help, Debugger), and a newest-first Transcript dock at
+ the bottom. My Workspace evaluates the selection — or, with no selection,
+ the whole buffer — on the primary VM: Do It reports on the Transcript,
+ Print It also splices the result at the caret. I install the menus (File,
+ Source, View, Theme, Demos, Debug), the A-/A+ code-font sizing, and
+ light/dark theming. Views join me with registerViewNamed:...;
+ switchToView: swaps tabs. The primary VM runs off the main thread and is
+ reached by message; when it is restarted, environmentRestarted re-syncs
+ every view against the fresh environment."
+Object subclass: CocoaUI [
+    <classVars: Win Toolbar ContentHost Transcript TranscriptScroll ActTarget
+                TranscriptText Views ActiveView ToolbarDelegates ToolbarButtons
+                MetricLabels MemBarFill MemBarWidth Workspace WorkspaceScroll
+                WorkspaceTextDelegate TabItems TabIndexes
+                TranscriptDivider TranscriptClearBtn FontDelta
+                FontMinusBtn FontPlusBtn JitOn JitMenuItem
+                WorkspaceContainer WorkspaceBarBox WorkspaceBarButtons
+                HaltOn HaltMenuItem MetricViews MetricsHidden>
+
+    CocoaUI class >> title [ ^'MACVM' ]
+
+    "── layout constants ──"
+    CocoaUI class >> toolbarHeight [ ^44.0 ]
+    CocoaUI class >> transcriptHeight [ ^110.0 ]
+    CocoaUI class >> iconDir [ ^'gui/assets/icons-mono/' ]
+    CocoaUI class >> toolbarTexturePath [ ^'gui/assets/toolbar-texture.png' ]
+
+    "── autoresizing mask bits (NSView) ──"
+    CocoaUI class >> maskWidthSizable [ ^2 ]
+    CocoaUI class >> maskHeightSizable [ ^16 ]
+    CocoaUI class >> maskMinYMargin [ ^8 ]   "flexible space BELOW -> pins to TOP"
+    CocoaUI class >> maskMaxYMargin [ ^32 ]  "flexible space ABOVE -> pins to BOTTOM"
+    CocoaUI class >> maskMinXMargin [ ^1 ]   "flexible space LEFT -> pins to RIGHT"
+    CocoaUI class >> maskMaxXMargin [ ^4 ]   "flexible space RIGHT -> pins to LEFT (fixed width)"
+
+    CocoaUI class >> startup [
+        "Build (or rebuild) the window shell and order it front. Returns to
+         Rust with the VM at rest; Rust then calls [NSApp run]."
+        | winClass content |
+        self teardown.
+        TranscriptText := ''.
+        Views := OrderedCollection new.
+        ToolbarDelegates := OrderedCollection new.
+        ToolbarButtons := Dictionary new.
+        TabItems := OrderedCollection new.
+        TabIndexes := Dictionary new.
+        winClass := Cocoa classNamed: 'NSWindow'.
+
+        Win := ((winClass onMain alloc) onMain
+            "1100x700: the toolbar's own arithmetic sets the floor — the view
+             buttons now reach 8 + (11 * 40) = 448px and the metrics cluster
+             needs 360 (104 MEM + 4 * 64), so anything under ~824 starts with
+             the metrics scrunched under the icons. Extra width also suits the
+             4-pane browser and the debugger's stack/source split."
+            initWithContentRect: (Array with: 240.0 with: 180.0 with: 1100.0 with: 700.0)
+            styleMask: 15 backing: 2 defer: false).
+        Win onMain setReleasedWhenClosed: false.
+        Win onMain setTitle: self title.
+        Win onMain setMinSize: (Array with: 480.0 with: 320.0).
+        content := Win onMain contentView.
+        content onMain setAutoresizesSubviews: true.
+
+        self buildToolbarIn: content.
+        self buildContentHostIn: content.
+        self buildTranscriptIn: content.
+
+        self registerViewNamed: #workspace title: 'Workspace' icon: 'texteditor'
+             container: [ self workspaceContainer ]
+             onShow: [ Win onMain makeFirstResponder: Workspace ].
+        "CG7/CG8: later-loading views register themselves — resolved by name
+         so this file never depends on files after it in cocoaui.list."
+        (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc register ].
+        (Worker classNamed: #CocoaBrowser2) ifNotNil: [ :b2 | b2 register ].
+        (Worker classNamed: #CocoaFind) ifNotNil: [ :fc | fc register ].
+        (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec register ].
+        (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc register ].
+        (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv register ].
+        (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc register ].
+        (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc register ].
+        "A- / A+ font-size buttons, after every view's switcher button."
+        self buildFontButtons.
+        "Now that ToolbarButtons is complete, decide whether the metrics fit."
+        self syncMetricsVisibility.
+
+        "Forwarded primary transcript lines (§7.4) append to our Transcript view."
+        Worker onTranscriptLine: [ :t | CocoaUI appendTranscript: t ].
+
+        self installMenu.
+        self switchToView: #workspace.
+        Win onMain makeKeyAndOrderFront: nil.
+        self appendTranscript: 'CocoaUI: ready.'.
+        ^Win
+    ]
+
+    "── toolbar ──"
+    CocoaUI class >> buildToolbarIn: content [
+        | nsRect frame |
+        nsRect := Cocoa classNamed: 'NSView'.
+        frame := content onMain frame.
+        Toolbar := (nsRect onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: (frame at: 4) - self toolbarHeight
+                                  with: (frame at: 3) with: self toolbarHeight).
+        Toolbar onMain setAutoresizingMask: self maskWidthSizable + self maskMinYMargin.
+        content onMain addSubview: Toolbar.
+        self buildToolbarBackgroundIn: Toolbar.
+        self buildMetricsClusterIn: Toolbar.
+    ]
+
+    CocoaUI class >> texturePatternColor [
+        "The tiled grain as a pattern NSColor, or nil if the texture file is
+         missing. A fresh load per strip is cheap and avoids a stale handle
+         across a UI rebuild."
+        | img |
+        img := (Cocoa classNamed: 'NSImage') onMain alloc onMain
+            initWithContentsOfFile: self toolbarTexturePath.
+        img isNil ifTrue: [ ^nil ].
+        ^(Cocoa classNamed: 'NSColor') onMain colorWithPatternImage: img
+    ]
+    CocoaUI class >> addTexturedBoxFrame: rect resize: mask in: aParent [
+        "Fill `rect` in `aParent` with the grain pattern — a borderless custom
+         NSBox, plain-color fill (no CGColorRef marshalling, same safety as
+         the mem bar). Added as a subview, so whatever is added AFTER renders
+         on top of it, unchanged. Fails soft: no texture file -> nothing
+         added, `nil` returned. Answers the box (for teardown/z-order)."
+        | color box |
+        color := self texturePatternColor.
+        color isNil ifTrue: [ ^nil ].
+        box := ((Cocoa classNamed: 'NSBox') onMain alloc) onMain initWithFrame: rect.
+        box onMain setBoxType: 4.   "NSBoxCustom"
+        box onMain setBorderType: 0. "NSNoBorder"
+        box onMain setFillColor: color.
+        box onMain setAutoresizingMask: mask.
+        aParent onMain addSubview: box.
+        ^box
+    ]
+    CocoaUI class >> buildToolbarBackgroundIn: aToolbar [
+        "The grain behind the toolbar contents so the strip reads as a
+         textured surface, not a blank sheet. Called FIRST in buildToolbarIn:,
+         so every icon/metric renders on top of it, unchanged."
+        | frame |
+        frame := aToolbar onMain frame.
+        self addTexturedBoxFrame: (Array with: 0.0 with: 0.0 with: (frame at: 3) with: (frame at: 4))
+             resize: self maskWidthSizable + self maskHeightSizable
+             in: aToolbar.
+    ]
+
+    CocoaUI class >> metricCellWidth [ ^64.0 ]
+
+    CocoaUI class >> buildMetricsClusterIn: aToolbar [
+        "Five small, TIGHTLY-packed, right-anchored two-row cells — a muted
+         caption (MEM/JIT/CODE/ALLOC/GC) over its value — matching the
+         WKWebView GUI's own compact toolbar metrics cluster (same VmMetrics
+         fields/semantics; sampled off the PRIMARY by the Rust watchdog and
+         pushed here via updateMetricsMem:jit:code:alloc:gc:memPct:). The
+         whole cluster hugs the right edge (MinXMargin flexible) so it tracks
+         on resize; MEM additionally carries a small used/capacity bar — the
+         graphical touch the plain-text v1 was missing."
+        | names w x tfClass colorClass fontClass captionFont valueFont |
+        tfClass := Cocoa classNamed: 'NSTextField'.
+        colorClass := Cocoa classNamed: 'NSColor'.
+        fontClass := Cocoa classNamed: 'NSFont'.
+        captionFont := fontClass onMain systemFontOfSize: 9.0.
+        valueFont := fontClass onMain monospacedDigitSystemFontOfSize: 11.0 weight: 0.0.
+        names := #('GC' 'ALLOC' 'CODE' 'JIT' 'MEM').
+        x := (aToolbar onMain frame) at: 3.
+        MetricLabels := Dictionary new.
+        "Every metric view, for the show/hide sweep (syncMetricsVisibility)."
+        MetricViews := OrderedCollection new.
+        MetricsHidden := false.
+        names do: [ :n |
+            | caption value w |
+            "MEM's value is 'used/capacity' — the widest cell by far ('540.9K/68.0M');
+             the uniform width clipped it at the slash (seen in the CG7 snap)."
+            w := n = 'MEM' ifTrue: [ 104.0 ] ifFalse: [ self metricCellWidth ].
+            x := x - w.
+            caption := (tfClass onMain alloc) onMain
+                initWithFrame: (Array with: x with: 26.0 with: w - 8.0 with: 11.0).
+            caption onMain setEditable: false. caption onMain setBordered: false.
+            caption onMain setDrawsBackground: false. caption onMain setSelectable: false.
+            caption onMain setFont: captionFont.
+            caption onMain setTextColor: colorClass onMain secondaryLabelColor.
+            caption onMain setStringValue: n.
+            caption onMain setAutoresizingMask: self maskMinXMargin.
+            aToolbar onMain addSubview: caption.
+            MetricViews add: caption.
+
+            value := (tfClass onMain alloc) onMain
+                initWithFrame: (Array with: x with: 13.0 with: w - 8.0 with: 14.0).
+            value onMain setEditable: false. value onMain setBordered: false.
+            value onMain setDrawsBackground: false. value onMain setSelectable: false.
+            value onMain setFont: valueFont.
+            value onMain setStringValue: '—'.
+            value onMain setAutoresizingMask: self maskMinXMargin.
+            aToolbar onMain addSubview: value.
+            MetricViews add: value.
+
+            MetricLabels at: n asSymbol put: value.
+            n = 'MEM' ifTrue: [ self buildMemBarAt: x width: w - 8.0 in: aToolbar ] ].
+    ]
+
+    CocoaUI class >> buildMemBarAt: x width: aWidth in: aToolbar [
+        "A 2px used/capacity bar under the MEM value: a light track (the full
+         cell width) and a darker fill (scaled by memPct, 0-100). NSBox, not
+         a CALayer-backed NSView: `setFillColor:` takes a plain NSColor
+         object — no CGColorRef return-type marshalling risk."
+        | boxClass colorClass track fill |
+        boxClass := Cocoa classNamed: 'NSBox'.
+        colorClass := Cocoa classNamed: 'NSColor'.
+        track := (boxClass onMain alloc) onMain
+            initWithFrame: (Array with: x with: 10.0 with: aWidth with: 2.0).
+        track onMain setBoxType: 4. "NSBoxCustom"
+        track onMain setBorderType: 0. "NSNoBorder"
+        track onMain setFillColor: colorClass onMain separatorColor.
+        track onMain setAutoresizingMask: self maskMinXMargin.
+        aToolbar onMain addSubview: track.
+
+        fill := (boxClass onMain alloc) onMain
+            initWithFrame: (Array with: x with: 10.0 with: 0.0 with: 2.0).
+        fill onMain setBoxType: 4.
+        fill onMain setBorderType: 0.
+        fill onMain setFillColor: colorClass onMain controlAccentColor.
+        fill onMain setAutoresizingMask: self maskMinXMargin.
+        aToolbar onMain addSubview: fill.
+        MemBarFill := fill. MemBarWidth := aWidth.
+        MetricViews isNil ifFalse: [ MetricViews add: track; add: fill ].
+    ]
+
+    "── metrics show/hide: the cluster is right-anchored and the view-switcher
+       icons grow leftward-to-rightward, so on a narrow window the icons run
+       UNDER the metrics (the 'scrunched' look). Rather than clip, drop the
+       metrics entirely until there is room again. Re-checked on the ~4Hz
+       metrics tick, which is also how a live resize is picked up (within
+       250ms) — no window-delegate plumbing needed. ──"
+    CocoaUI class >> metricsClusterWidth [
+        "MEM (104) + the four uniform cells."
+        ^104.0 + (4 * self metricCellWidth)
+    ]
+    CocoaUI class >> metricsGap [ ^16.0 ]
+    CocoaUI class >> metricsHidden [ "true when the cluster is suppressed for width" ^MetricsHidden ]
+    CocoaUI class >> syncMetricsVisibility [
+        "Hide the whole cluster when the toolbar buttons would reach into it."
+        | want buttonsRight clusterLeft |
+        (MetricViews isNil or: [ Toolbar isNil ]) ifTrue: [ ^self ].
+        buttonsRight := 8.0 + (ToolbarButtons size * self toolbarButtonStep).
+        clusterLeft := ((Toolbar onMain frame) at: 3) - self metricsClusterWidth.
+        want := clusterLeft < (buttonsRight + self metricsGap).
+        want = MetricsHidden ifTrue: [ ^self ].
+        MetricsHidden := want.
+        MetricViews do: [ :v | v isValid ifTrue: [ v onMain setHidden: want ] ].
+    ]
+
+    CocoaUI class >> updateMetricsMem: memStr jit: jitStr code: codeStr alloc: allocStr gc: gcStr memPct: pct [
+        "Called from Rust (the primary's beat loop wakes the UI worker every
+         beat now — CG5 — so this fires ~4Hz with no new NSTimer) to refresh
+         the toolbar readout AND the MEM usage bar's fill width in place."
+        MetricLabels isNil ifTrue: [ ^self ].
+        "Doubles as the resize check (this is the only periodic tick the UI
+         has): cheap, and it only touches views when the verdict flips. When
+         hidden there is nothing to refresh, so skip the rest."
+        self syncMetricsVisibility.
+        MetricsHidden == true ifTrue: [ ^self ].
+        (MetricLabels at: #MEM ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: memStr ].
+        (MetricLabels at: #JIT ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: jitStr ].
+        (MetricLabels at: #CODE ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: codeStr ].
+        (MetricLabels at: #ALLOC ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: allocStr ].
+        (MetricLabels at: #GC ifAbsent: [ nil ]) ifNotNil: [ :tf | tf onMain setStringValue: gcStr ].
+        MemBarFill isNil ifFalse: [
+            | f |
+            f := (pct min: 100) max: 0.
+            MemBarFill onMain setFrameSize: (Array with: MemBarWidth * f / 100.0 with: 2.0) ].
+    ]
+
+    CocoaUI class >> contentHost [ ^ContentHost ]
+
+    "── content host: a TABLESS NSTabView — the Cocoa-native view switcher.
+       Each registered view is an NSTabViewItem; AppKit owns insertion,
+       removal, clipping and repaint on every switch (the manual
+       remove-subviews/add-subview swapper this replaces left stale drawing
+       behind — views 'drew over each other'). Our themed toolbar buttons and
+       the View menu ARE the tab bar; they drive selectTabViewItemAtIndex:."
+    CocoaUI class >> buildContentHostIn: content [
+        | frame |
+        frame := content onMain frame.
+        ContentHost := ((Cocoa classNamed: 'NSTabView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: self transcriptHeight
+                                  with: (frame at: 3)
+                                  with: (frame at: 4) - self toolbarHeight - self transcriptHeight).
+        ContentHost onMain setTabViewType: 6. "NSNoTabsNoBorder — chrome is ours"
+        ContentHost onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
+        content onMain addSubview: ContentHost.
+    ]
+
+    "── the view registry ──"
+    CocoaUI class >> toolbarButtonWidth [ ^36.0 ]
+    CocoaUI class >> toolbarButtonStep [ ^40.0 ]
+    CocoaUI class >> registerViewNamed: aSymbol title: aTitle icon: iconBaseName container: containerBlock onShow: onShowBlock [
+        "Add a persistent view: mint its toolbar button (icon, falling back to
+         a text title if the image fails to load — never an invisible
+         control) wired through its OWN CocoaToolbarAction/macvmAction:
+         ticket. `containerBlock` answers the view's root NSView (building
+         lazily on first show — it becomes the tab item's view, owned by the
+         NSTabView from then on); `onShowBlock` runs on every switch TO the
+         view (refresh requests, first responder).
+
+         Button width/step are sized for the ICON-ONLY case (every current
+         icon loads, so that's the case that actually renders): 92px-wide,
+         98px-apart buttons were sized for the OLD fallback text titles
+         ('Workspace', 'Outliner', ...) and left large gaps between icon
+         glyphs once every icon started loading — user report: 'the icons
+         should be placed together... without lots of space between them
+         ... crash into the metrics on smaller windows'. A fallback text
+         title still fits (clipped, not invisible) in the tighter width if
+         an icon ever fails to load — the doc's own bar ('never an
+         invisible control') doesn't require it to look good, just to
+         exist and stay clickable."
+        | btnClass imgClass img btn holder delegate x |
+        Views add: (Array with: aSymbol with: aTitle with: containerBlock with: onShowBlock).
+        btnClass := Cocoa classNamed: 'NSButton'.
+        x := 8.0 + (ToolbarButtons size * self toolbarButtonStep).
+        btn := (btnClass onMain alloc) onMain
+            initWithFrame: (Array with: x with: 6.0 with: self toolbarButtonWidth with: 32.0).
+        btn onMain setBordered: false.
+        btn onMain setTitle: aTitle.
+        imgClass := Cocoa classNamed: 'NSImage'.
+        img := (imgClass onMain alloc) onMain
+            initWithContentsOfFile: self iconDir , iconBaseName , '.svg'.
+        img isNil ifFalse: [
+            img onMain setTemplate: true.
+            btn onMain setImage: img.
+            btn onMain setImagePosition: 1. "NSImageOnly — icon loaded, hide the fallback title"
+        ].
+        "EVERY switch path goes through switchToView: — the toolbar buttons
+         previously ran the raw activate blocks, adding views ON TOP of the
+         current one (the 'views draw over each other' bug's second head;
+         only the View menu did the swap)."
+        holder := CocoaToolbarAction on: [ self switchToView: aSymbol ].
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        Toolbar onMain addSubview: btn.
+        ToolbarDelegates add: delegate.
+        ToolbarButtons at: aSymbol put: btn.
+    ]
+
+    "── code font size (the A- / A+ toolbar buttons) ──────────────────────
+     One global size DELTA applied on top of each code surface's OWN base
+     size, so the surfaces keep their relative sizing (Workspace 13, Editor/
+     Browser 12, Transcript 11) while scaling together. `fixedFontOfSize:` is
+     the single chokepoint every monospace text view builds its font through
+     — so a view built AFTER a size change picks the new size up for free,
+     and `applyFontEverywhere` re-applies to the already-built ones. Delta
+     resets to 0 on a UI-worker restart (a session preference, not persisted)."
+    CocoaUI class >> fontDelta [ ^FontDelta isNil ifTrue: [ FontDelta := 0 ] ifFalse: [ FontDelta ] ]
+    CocoaUI class >> fixedFontOfSize: base [
+        ^(Cocoa classNamed: 'NSFont') onMain
+            userFixedPitchFontOfSize: ((base + self fontDelta) max: 6)
+    ]
+    CocoaUI class >> increaseFont [ FontDelta := self fontDelta + 1 min: 16. self applyFontEverywhere ]
+    CocoaUI class >> decreaseFont [ FontDelta := self fontDelta - 1 max: -5. self applyFontEverywhere ]
+    CocoaUI class >> applyFontEverywhere [
+        "Re-set the font on every built code surface. Later-loading views
+         (CocoaBrowser/CocoaEditor) are asked by name — nil-safe if a package
+         isn't loaded; each guards its own not-yet-built view."
+        Workspace isNil ifFalse: [ Workspace onMain setFont: (self fixedFontOfSize: 13.0) ].
+        Transcript isNil ifFalse: [ Transcript onMain setFont: (self fixedFontOfSize: 11.0) ].
+        (Worker classNamed: #CocoaBrowser) ifNotNil: [ :c | c applyCodeFont ].
+        (Worker classNamed: #CocoaBrowser2) ifNotNil: [ :c | c applyCodeFont ].
+        (Worker classNamed: #CocoaEditor) ifNotNil: [ :c | c applyCodeFont ].
+    ]
+
+    "── toolbar ACTION buttons (not view switchers) ───────────────────────
+     A lighter sibling of registerViewNamed:: mint an icon button that runs
+     an arbitrary block, without registering a tab/view. Placed left-to-right
+     after the view-switcher buttons, in the same 40px step grid."
+    CocoaUI class >> mintToolbarButton: iconBase tip: aTip action: aBlock atIndex: idx [
+        | btnClass btn imgClass img holder delegate x |
+        btnClass := Cocoa classNamed: 'NSButton'.
+        x := 8.0 + (idx * self toolbarButtonStep).
+        btn := (btnClass onMain alloc) onMain
+            initWithFrame: (Array with: x with: 6.0 with: self toolbarButtonWidth with: 32.0).
+        btn onMain setBordered: false.
+        btn onMain setTitle: aTip.
+        btn onMain setToolTip: aTip.
+        imgClass := Cocoa classNamed: 'NSImage'.
+        img := (imgClass onMain alloc) onMain initWithContentsOfFile: self iconDir , iconBase , '.svg'.
+        img isNil ifFalse: [
+            img onMain setTemplate: true.
+            btn onMain setImage: img.
+            btn onMain setImagePosition: 1 ].
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        Toolbar onMain addSubview: btn.
+        ToolbarDelegates add: delegate.
+        ^btn
+    ]
+    CocoaUI class >> buildFontButtons [
+        "Two font-size buttons right after the view switchers (biggerText/
+         smallerText — the same icons-mono/ template SVGs the WKWebView
+         toolbar ships). Called once, after every view has registered its
+         button, so `ToolbarButtons size` is the count they occupy."
+        | base |
+        base := ToolbarButtons size.
+        FontMinusBtn := self mintToolbarButton: 'smallerText' tip: 'Decrease text size'
+             action: [ self decreaseFont ] atIndex: base.
+        FontPlusBtn := self mintToolbarButton: 'biggerText' tip: 'Increase text size'
+             action: [ self increaseFont ] atIndex: base + 1.
+    ]
+
+    CocoaUI class >> switchToView: aSymbol [
+        "Select the view's tab, creating its NSTabViewItem lazily on first
+         visit (the container block builds the view then). AppKit swaps the
+         item views in and out of the hierarchy itself — no manual subview
+         surgery, no stale drawing."
+        | entry idx item container |
+        entry := Views detect: [ :e | (e at: 1) == aSymbol ] ifNone: [ nil ].
+        entry isNil ifTrue: [ ^self ].
+        idx := TabIndexes at: aSymbol ifAbsent: [ nil ].
+        idx isNil ifTrue: [
+            container := (entry at: 3) value.
+            container isNil ifTrue: [ ^self ].
+            item := ((Cocoa classNamed: 'NSTabViewItem') onMain alloc) onMain
+                initWithIdentifier: nil.
+            item onMain setView: container.
+            ContentHost onMain addTabViewItem: item.
+            TabItems add: item.
+            idx := TabItems size - 1.
+            TabIndexes at: aSymbol put: idx ].
+        ContentHost onMain selectTabViewItemAtIndex: idx.
+        ActiveView := aSymbol.
+        (entry at: 4) value.
+    ]
+
+    "── the Workspace view (CG6: selection-or-everything, inline Print it) ──"
+    CocoaUI class >> workspaceBarHeight [ ^30.0 ]
+    CocoaUI class >> workspaceContainer [
+        "Answer the workspace's root view (a wrapper: grained action bar over
+         the scroll), building lazily — the tab host owns it from first show
+         onward. The bar makes Do It / Print It one-click (⌘D/⌘P still work);
+         the old preloaded explainer comment is gone — the buttons say it."
+        | tvClass frame w h barY |
+        Workspace isNil ifTrue: [
+            tvClass := Cocoa classNamed: 'NSTextView'.
+            frame := ContentHost onMain frame.
+            w := frame at: 3. h := frame at: 4.
+            barY := h - self workspaceBarHeight.
+            WorkspaceContainer := ((Cocoa classNamed: 'NSView') onMain alloc) onMain
+                initWithFrame: (Array with: 0.0 with: 0.0 with: w with: h).
+            WorkspaceContainer onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
+            WorkspaceContainer onMain setAutoresizesSubviews: true.
+            "The grained bar (the transcript/editor bars' own look) — grain
+             first, buttons on top."
+            WorkspaceBarBox := self addTexturedBoxFrame: (Array with: 0.0 with: barY with: w with: self workspaceBarHeight)
+                                    resize: self maskWidthSizable + self maskMinYMargin
+                                    in: WorkspaceContainer.
+            WorkspaceBarButtons := OrderedCollection new.
+            self workspaceBarButton: 'Do It' frame: (Array with: 4.0 with: barY + 3.0 with: 72.0 with: 24.0)
+                 action: [ self doIt ].
+            self workspaceBarButton: 'Print It' frame: (Array with: 80.0 with: barY + 3.0 with: 80.0 with: 24.0)
+                 action: [ self printIt ].
+
+            Workspace := (tvClass onMain alloc) onMain
+                initWithFrame: (Array with: 0.0 with: 0.0 with: w with: barY).
+            Workspace onMain setEditable: true.
+            Workspace onMain setAutomaticQuoteSubstitutionEnabled: false.
+            Workspace onMain setAutomaticDashSubstitutionEnabled: false.
+            Workspace onMain setAutomaticTextReplacementEnabled: false.
+            Workspace onMain setFont: (self fixedFontOfSize: 13.0).
+            "Scroll-wrapped like every other text surface: a bare NSTextView
+             draws past its frame and its stale pixels bleed through the next
+             view's transparent regions after a switch (the browser-first-open
+             bug); the scroll view clips, scrolls long content, and repaints
+             its area properly."
+            Workspace onMain setVerticallyResizable: true.
+            Workspace onMain setHorizontallyResizable: false.
+            Workspace onMain setAutoresizingMask: self maskWidthSizable.
+            (Workspace onMain textContainer) ifNotNil: [ :tc |
+                tc onMain setWidthTracksTextView: true.
+                tc release ].
+            WorkspaceScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+                initWithFrame: (Array with: 0.0 with: 0.0 with: w with: barY).
+            WorkspaceScroll onMain setHasVerticalScroller: true.
+            WorkspaceScroll onMain setAutoresizingMask: self maskWidthSizable + self maskHeightSizable.
+            WorkspaceScroll onMain setDocumentView: Workspace.
+            WorkspaceContainer onMain addSubview: WorkspaceScroll.
+            "CG8: live syntax colour, same mechanism as the browser's source
+             pane (the delegate fires for programmatic setString: too)."
+            WorkspaceTextDelegate := MacvmDelegate textDelegateOn: self.
+            Workspace onMain setDelegate: WorkspaceTextDelegate.
+            self recolorizeWorkspace.
+        ].
+        ^WorkspaceContainer
+    ]
+    CocoaUI class >> workspaceBarButton: title frame: rect action: aBlock [
+        | btn holder delegate |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setAutoresizingMask: self maskMinYMargin.
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        ToolbarDelegates add: delegate.
+        WorkspaceContainer onMain addSubview: btn.
+        WorkspaceBarButtons add: btn.
+        ^btn
+    ]
+
+    CocoaUI class >> workspace [ ^Workspace ]
+
+    "── toolbar/menu Do it / Print it (CG6: selection-aware) ──"
+    CocoaUI class >> installMenu [
+        "The app menu (⌘Q) is installed by Rust BEFORE startup (main.rs) so
+         `mainMenu` already exists here and this ADDS the Workspace submenu
+         to it, never replaces it (the CG4-review menu-clobber fix).
+
+         CG9's UI rebuild re-runs `startup` -> `installMenu` against that
+         SAME, still-live mainMenu — NSApplication's own menu bar is a
+         native object that persists across a UI-worker rebuild, unlike the
+         window/toolbar/content host, which teardown actually tears down.
+         Left unguarded, every rebuild appended a SECOND full set of
+         Workspace/View/Theme/Demos/Debug submenus on top of the first —
+         visible as duplicate entries, the stale half permanently greyed
+         out (their targets are delegates bound to the dead prior VM's own
+         MacvmDelegate registry, which fails closed on dispatch; AppKit
+         shows an item whose action can't fire as disabled).
+
+         FIRST FIX ATTEMPT (WRONG, do not repeat): track the top-level
+         items THIS method installed in a classVar, remove them next call.
+         Looked right, verifiably did nothing — a rebuild boots a WHOLE
+         FRESH UI-worker VM from source, so every Smalltalk-side classVar
+         (including that tracking list) is nil again at the top of THIS
+         very call, on every single generation, forever. Only the native
+         mainMenu object itself survives a rebuild; nothing on the
+         Smalltalk side does. FIX: read the fresh set's own fixed, known
+         titles back OFF mainMenu directly (itemWithTitle:) and remove
+         whatever's there before adding the new set — stateless from the
+         VM's own perspective by construction, so it can't go stale across
+         a rebuild the way a classVar can."
+        | app mainMenu wsItem wsMenu printItem doItem |
+        ActTarget := MacvmDelegate actionTargetOn: CocoaUI.
+        app := (Cocoa classNamed: 'NSApplication') onMain sharedApplication.
+        mainMenu := app onMain mainMenu.
+        mainMenu isNil ifTrue: [
+            mainMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+            app onMain setMainMenu: mainMenu ].
+
+        #('Workspace' 'File' 'Source' 'View' 'Theme' 'Demos' 'Debug') do: [ :title |
+            | old |
+            old := mainMenu onMain itemWithTitle: title.
+            old isNil ifFalse: [ mainMenu onMain removeItem: old ] ].
+
+        wsMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        printItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Print It' action: 'macvmPrintIt:' keyEquivalent: 'p'.
+        printItem onMain setTarget: ActTarget.
+        wsMenu onMain addItem: printItem.
+        doItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Do It' action: 'macvmDoIt:' keyEquivalent: 'd'.
+        doItem onMain setTarget: ActTarget.
+        wsMenu onMain addItem: doItem.
+
+        wsItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Workspace' action: nil keyEquivalent: ''.
+        wsItem onMain setSubmenu: wsMenu.
+        mainMenu onMain addItem: wsItem.
+
+        self installFileMenuOn: mainMenu.
+        self installSourceMenuOn: mainMenu.
+        self installViewMenuOn: mainMenu.
+        self installThemeMenuOn: mainMenu.
+        self installDemosMenuOn: mainMenu.
+        self installDebugMenuOn: mainMenu.
+    ]
+
+    "── File + Source menus (the editor's file workflow): every item first
+       fronts the Editor view (building it lazily, exactly what the View menu
+       does), then acts on it. Open…/Save As… only FLAG a host panel — the
+       modal pump runs top-level in drain_perform, never in this callback. ──"
+    CocoaUI class >> editorDo: aBlock [
+        "Front the Editor and hand its CLASS to the one-arg block — late-bound
+         by NAME (this file compiles before 68_cocoaeditor; a bareword
+         CocoaEditor here is a compile error, the Debug menu's own rule)."
+        (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec |
+            self switchToView: #editor.
+            aBlock value: ec ].
+    ]
+    CocoaUI class >> menu: aTitle on: mainMenu triples: someTriples [
+        "Build one submenu from {title. keyEquivalent. block} triples —
+         the Debug menu's own delegate wiring, factored."
+        | menu topItem |
+        menu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        someTriples do: [ :t |
+            | item holder delegate |
+            item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+                initWithTitle: (t at: 1) action: 'macvmAction:' keyEquivalent: (t at: 2).
+            holder := CocoaToolbarAction on: (t at: 3).
+            delegate := MacvmDelegate actionTargetOn: holder.
+            item onMain setTarget: delegate.
+            menu onMain addItem: item.
+            ToolbarDelegates add: delegate ].
+        topItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: aTitle action: nil keyEquivalent: ''.
+        topItem onMain setSubmenu: menu.
+        mainMenu onMain addItem: topItem.
+        ^topItem
+    ]
+    CocoaUI class >> installFileMenuOn: mainMenu [
+        | triples |
+        triples := OrderedCollection new.
+        triples add: (Array with: 'New' with: 'n' with: [ self editorDo: [ :ec | ec fileNew ] ]).
+        triples add: (Array with: 'Open…' with: 'o' with: [ self editorDo: [ :ec | ec fileOpen ] ]).
+        triples add: (Array with: 'Save' with: 's' with: [ self editorDo: [ :ec | ec fileSave ] ]).
+        triples add: (Array with: 'Save As…' with: 'S' with: [ self editorDo: [ :ec | ec fileSaveAs ] ]).
+        triples add: (Array with: 'File In' with: '' with: [ self editorDo: [ :ec | ec fileIn ] ]).
+        triples add: (Array with: 'Add to World' with: '' with: [ self editorDo: [ :ec | ec addToWorld ] ]).
+        self menu: 'File' on: mainMenu triples: triples.
+    ]
+    CocoaUI class >> installSourceMenuOn: mainMenu [
+        | triples |
+        triples := OrderedCollection new.
+        triples add: (Array with: 'Format' with: 'F' with: [ self editorDo: [ :ec | ec formatBuffer ] ]).
+        triples add: (Array with: 'Analyze' with: 'A' with: [ self editorDo: [ :ec | ec analyzeBuffer ] ]).
+        self menu: 'Source' on: mainMenu triples: triples.
+    ]
+
+    CocoaUI class >> installDemosMenuOn: mainMenu [
+        "CG10: launch a native GamePane demo on the PRIMARY (it spawns the
+         compute workers ParallelMandel needs; its frames cross to the main
+         thread's Metal pane over the worker→main protocol). Each opens the
+         game in its own window; Escape ends it."
+        | demosMenu demosItem pairs |
+        demosMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        pairs := OrderedCollection new.
+        pairs add: (Array with: 'Breakout' with: 'Breakout launch').
+        pairs add: (Array with: 'MandelZoom' with: 'MandelZoom launch').
+        pairs add: (Array with: 'Parallel Mandelbrot' with: 'ParallelMandel launch').
+        pairs add: (Array with: 'Worms' with: 'Worms launch').
+        pairs add: (Array with: 'FFT Scope' with: 'FftScope launch').
+        pairs do: [ :pair |
+            | title entry item holder delegate |
+            title := pair at: 1. entry := pair at: 2.
+            item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+                initWithTitle: title action: 'macvmAction:' keyEquivalent: ''.
+            "Launch via the host service (TOP-LEVEL on the primary), NOT a
+             nested uiDoit — the frame loop's GC roots can't survive nesting."
+            holder := CocoaToolbarAction on: [
+                ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
+                    onMain launchDemo: entry ].
+            delegate := MacvmDelegate actionTargetOn: holder.
+            item onMain setTarget: delegate.
+            demosMenu onMain addItem: item.
+            ToolbarDelegates add: delegate ].
+        demosItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Demos' action: nil keyEquivalent: ''.
+        demosItem onMain setSubmenu: demosMenu.
+        mainMenu onMain addItem: demosItem.
+        ^demosItem
+    ]
+
+    CocoaUI class >> installDebugMenuOn: mainMenu [
+        "CG9: a Debug menu to exercise the recovery machinery on-screen —
+         'Rebuild UI' (Layer 2: tears down + rebuilds the whole window set on
+         a fresh UI worker VM; the primary and its state are untouched),
+         'Restart Primary VM' (the SAME respawn-from-source a fatal doit
+         triggers automatically, on demand — the primary's whole object
+         heap is discarded and rebooted from the world source; the UI shell
+         is untouched and re-syncs onto the fresh primary automatically),
+         and 'Force Fault' (Layer 1: a deliberate bad Alien deref in a
+         callback, recovered by the C6 door to its shape default — the run
+         loop pumps on)."
+        | debugMenu debugItem pairs jitHolder jitDelegate |
+        debugMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        pairs := OrderedCollection new.
+        pairs add: (Array with: 'Break on Entry (Browser V2 selection)' with: [ self breakOnBrowserSelection: true ]).
+        pairs add: (Array with: 'Clear Break (Browser V2 selection)' with: [ self breakOnBrowserSelection: false ]).
+        pairs add: (Array with: 'Rebuild UI' with: [ self requestRebuild ]).
+        pairs add: (Array with: 'Restart Primary VM' with: [ self requestPrimaryRestart ]).
+        pairs add: (Array with: 'Force Fault (recovered)' with: [ self forceFault ]).
+        pairs do: [ :pair |
+            | title item holder delegate |
+            title := pair at: 1.
+            item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+                initWithTitle: title action: 'macvmAction:' keyEquivalent: ''.
+            holder := CocoaToolbarAction on: (pair at: 2).
+            delegate := MacvmDelegate actionTargetOn: holder.
+            item onMain setTarget: delegate.
+            debugMenu onMain addItem: item.
+            ToolbarDelegates add: delegate ].
+        "Compiler (JIT) — a checkable toggle (default ON). OFF stops the VM
+         compiling NEW methods, so anything not already compiled runs
+         interpreted; ON resumes normal tier-up. Global (all VMs); a plain
+         host-atomic flip, no VM re-entry."
+        JitOn := true.
+        JitMenuItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Compiler (JIT)' action: 'macvmAction:' keyEquivalent: ''.
+        JitMenuItem onMain setState: 1.
+        jitHolder := CocoaToolbarAction on: [ self toggleJit ].
+        jitDelegate := MacvmDelegate actionTargetOn: jitHolder.
+        JitMenuItem onMain setTarget: jitDelegate.
+        debugMenu onMain addItem: JitMenuItem.
+        ToolbarDelegates add: jitDelegate.
+
+        "Halt on Error (DBG4, default ON): a would-be-fatal error/DNU on the
+         primary opens the Debugger tab at the fault instead of printing a
+         trace and recovering. A host-atomic flip, synced onto the primary."
+        HaltOn := true.
+        HaltMenuItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Halt on Error' action: 'macvmAction:' keyEquivalent: ''.
+        HaltMenuItem onMain setState: 1.
+        jitHolder := CocoaToolbarAction on: [ self toggleHaltOnError ].
+        jitDelegate := MacvmDelegate actionTargetOn: jitHolder.
+        HaltMenuItem onMain setTarget: jitDelegate.
+        debugMenu onMain addItem: HaltMenuItem.
+        ToolbarDelegates add: jitDelegate.
+
+        debugItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Debug' action: nil keyEquivalent: ''.
+        debugItem onMain setSubmenu: debugMenu.
+        mainMenu onMain addItem: debugItem.
+        ^debugItem
+    ]
+    CocoaUI class >> toggleJit [
+        "Flip the global JIT-compile switch and reflect it in the menu checkmark."
+        JitOn := JitOn not.
+        ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
+            onMain setJitCompile: (JitOn ifTrue: [ '1' ] ifFalse: [ '0' ]).
+        JitMenuItem isNil ifFalse: [
+            JitMenuItem onMain setState: (JitOn ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+        self appendTranscript: 'compiler (JIT) ', (JitOn ifTrue: [ 'ON' ] ifFalse: [ 'OFF (interpreting new methods)' ]).
+    ]
+    CocoaUI class >> breakOnBrowserSelection: setIt [
+        "DBG4 Break on Entry: plant (or clear) a breakpoint on Browser V2's
+         currently-selected method. The host parks it; the primary pump applies
+         it on its own thread and reports on the Transcript. A halt then opens
+         the Debugger tab the next time that method is entered."
+        | b2 cls sel svc |
+        b2 := Worker classNamed: #CocoaBrowser2.
+        b2 isNil ifTrue: [ ^self appendTranscript: 'debugger: Browser V2 not loaded' ].
+        cls := b2 selectedBreakpointClass.
+        sel := b2 selectedMethodName.
+        (cls isNil or: [ sel isNil ]) ifTrue: [
+            ^self appendTranscript: 'debugger: select a method in Browser V2 first' ].
+        "Build the host service directly (this file loads before CocoaBrowser,
+         so `CocoaBrowser hostService` would be a compile error here)."
+        svc := ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init.
+        setIt
+            ifTrue: [ svc onMain setBreakpointClass: cls selector: sel ]
+            ifFalse: [ svc onMain clearBreakpointClass: cls selector: sel ].
+        self appendTranscript: 'debugger: ', (setIt ifTrue: [ 'break on ' ] ifFalse: [ 'clear break on ' ]), cls, '>>', sel.
+    ]
+    CocoaUI class >> toggleHaltOnError [
+        "Flip the DBG4 halt-on-error switch (host atomic; the primary's pump
+         reads it each beat) and reflect it in the menu checkmark."
+        HaltOn := HaltOn not.
+        ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
+            onMain setHaltOnError: (HaltOn ifTrue: [ '1' ] ifFalse: [ '0' ]).
+        HaltMenuItem isNil ifFalse: [
+            HaltMenuItem onMain setState: (HaltOn ifTrue: [ 1 ] ifFalse: [ 0 ]) ].
+        self appendTranscript: 'halt on error ', (HaltOn ifTrue: [ 'ON' ] ifFalse: [ 'OFF (errors print a trace + recover)' ]).
+    ]
+    CocoaUI class >> requestRebuild [
+        "Ask the host to rebuild the UI worker in place (serviced on the next
+         main-thread drain, never inside this callback)."
+        ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
+            onMain requestUiRebuild.
+    ]
+    CocoaUI class >> requestPrimaryRestart [
+        "Ask the host to respawn the primary VM from source (serviced on the
+         next main-thread drain, never inside this callback) — the exact
+         same watchdog path a fatal doit triggers automatically, fired on
+         demand for testing/debugging."
+        ((Cocoa classNamed: 'MacvmHostService') onMain alloc) onMain init
+            onMain requestPrimaryRestart.
+    ]
+    CocoaUI class >> forceFault [
+        "A deliberate native fault inside a C6 callback — the door recovers it
+         to the shape default (Layer 1). Requesting a rebuild first proves a
+         recovered fault can escalate to a full rebuild (Layer 2)."
+        self requestRebuild.
+        ^(Alien forAddress: 8 size: 8) byteAt: 1
+    ]
+
+    CocoaUI class >> installViewMenuOn: mainMenu [
+        "Built FROM the view registry (§ registerViewNamed:...), never hand-
+         maintained — one item per persistent view, sharing the exact
+         macvmAction: mechanism the toolbar's own buttons use (CG5)."
+        | viewMenu viewItem |
+        viewMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        Views do: [ :e |
+            | sym title item holder delegate |
+            sym := e at: 1. title := e at: 2.
+            item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+                initWithTitle: title action: 'macvmAction:' keyEquivalent: ''.
+            holder := CocoaToolbarAction on: [ self switchToView: sym ].
+            delegate := MacvmDelegate actionTargetOn: holder.
+            item onMain setTarget: delegate.
+            viewMenu onMain addItem: item.
+            ToolbarDelegates add: delegate ].
+        viewItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'View' action: nil keyEquivalent: ''.
+        viewItem onMain setSubmenu: viewMenu.
+        mainMenu onMain addItem: viewItem.
+        ^viewItem
+    ]
+
+    CocoaUI class >> installThemeMenuOn: mainMenu [
+        "Minimal theme infrastructure (CG5): an NSAppearance swap on the
+         window. The toolbar's icons are already NSImage TEMPLATE images
+         (isTemplate: true, § registerViewNamed:...), which AppKit tints
+         automatically from the effective appearance — so this alone
+         proves the icon-reuse-across-themes claim holds, with zero new
+         art. Full palette/13-theme parity with the WKWebView GUI's
+         Theme::ALL is deferred (project_gui_themes) — this is the seam."
+        | themeMenu themeItem pairs |
+        themeMenu := (Cocoa classNamed: 'NSMenu') onMain alloc onMain init.
+        pairs := OrderedCollection new.
+        pairs add: (Array with: 'System' with: #system).
+        pairs add: (Array with: 'Light' with: #light).
+        pairs add: (Array with: 'Dark' with: #dark).
+        pairs do: [ :pair |
+            | title sym item holder delegate |
+            title := pair at: 1. sym := pair at: 2.
+            item := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+                initWithTitle: title action: 'macvmAction:' keyEquivalent: ''.
+            holder := CocoaToolbarAction on: [ self applyTheme: sym ].
+            delegate := MacvmDelegate actionTargetOn: holder.
+            item onMain setTarget: delegate.
+            themeMenu onMain addItem: item.
+            ToolbarDelegates add: delegate ].
+        themeItem := ((Cocoa classNamed: 'NSMenuItem') onMain alloc) onMain
+            initWithTitle: 'Theme' action: nil keyEquivalent: ''.
+        themeItem onMain setSubmenu: themeMenu.
+        mainMenu onMain addItem: themeItem.
+        ^themeItem
+    ]
+
+    CocoaUI class >> applyTheme: aSymbol [
+        "#system reverts to following the OS appearance (setAppearance:
+         nil); #light/#dark force NSAppearanceNameAqua/DarkAqua."
+        | name appearance |
+        aSymbol == #system ifTrue: [ Win onMain setAppearance: nil. ^self ].
+        aSymbol == #light ifTrue: [ name := 'NSAppearanceNameAqua' ].
+        aSymbol == #dark ifTrue: [ name := 'NSAppearanceNameDarkAqua' ].
+        name isNil ifTrue: [ ^self ].
+        appearance := (Cocoa classNamed: 'NSAppearance') onMain
+            appearanceNamed: (Cocoa nsString: name).
+        Win onMain setAppearance: appearance.
+    ]
+
+    "── C6 action-target callbacks (dispatched synchronously on main) ──"
+    CocoaUI class >> macvmPrintIt: sender [ ^self printIt ]
+    CocoaUI class >> macvmDoIt: sender [ ^self doIt ]
+    CocoaUI class >> textDidChange: aNote [ self recolorizeWorkspace ]
+    CocoaUI class >> recolorizeWorkspace [
+        "The Workspace's recolour (CG8) — the colorizer is host-side,
+         reached via the browser's cached service handle (late-bound: 66
+         loads after this file). Called by the text delegate on keystrokes
+         AND explicitly after programmatic setString: (which posts no
+         textDidChange:)."
+        | ts bc |
+        Workspace isNil ifTrue: [ ^self ].
+        bc := Worker classNamed: #CocoaBrowser.
+        bc isNil ifTrue: [ ^self ].
+        ts := Workspace onMain textStorage.
+        ts isNil ifTrue: [ ^self ].
+        "The CHECKED variant: sends the image doesn't know paint red (the
+         editor and browser panes keep plain colorizeStorage: — they write
+         classes whose selectors don't exist yet)."
+        bc hostService onMain colorizeWorkspaceStorage: ts.
+        ts release.
+    ]
+
+    CocoaUI class >> evalTargetFor: full loc: loc len: len [
+        "PURE (headless-testable — the CG6 gate): the selection-or-everything
+         rule (WKWebView GUI's workspaceEvalTarget, ported verbatim): a
+         non-empty selection wins; an empty (collapsed) selection falls back
+         to the whole buffer. loc/len are the NSRange's 0-based location and
+         length. Answers an Array #(source insertAt)."
+        len = 0 ifTrue: [ ^Array with: full with: full size ].
+        ^Array with: (full copyFrom: loc + 1 to: loc + len) with: loc + len
+    ]
+
+    CocoaUI class >> selectionOrAll [
+        "Read the live NSTextView's selection and apply the pure rule above."
+        | range |
+        range := Workspace onMain selectedRange.
+        ^self evalTargetFor: self workspaceText loc: (range at: 1) len: (range at: 2)
+    ]
+
+    CocoaUI class >> doIt [
+        | target source |
+        target := self selectionOrAll.
+        source := target at: 1.
+        source isEmpty ifTrue: [ ^self ].
+        Worker uiDoit: source onReplyTimed: [ :result :ms |
+            CocoaUI appendTranscript: source , ' => ' , result , ' (' , ms printString , ' ms)' ].
+    ]
+
+    CocoaUI class >> printIt [
+        "Capture the insertion point NOW (at invocation) — the selection can
+         move before the async #uiReply lands (the web GUI's
+         pendingPrintInsertAt discipline, ported verbatim)."
+        | target source insertAt |
+        target := self selectionOrAll.
+        source := target at: 1.
+        insertAt := target at: 2.
+        source isEmpty ifTrue: [ ^self ].
+        Worker uiDoit: source onReplyTimed: [ :result :ms |
+            CocoaUI insertPrintResult: result at: insertAt.
+            CocoaUI appendTranscript: source , ' => ' , result , ' (' , ms printString , ' ms)' ].
+    ]
+
+    CocoaUI class >> splice: result into: full at: anInteger [
+        "PURE (headless-testable — the CG6 gate): splice ' result' into full
+         right after position anInteger, clamped into [0, full size] (the
+         captured insertion point can exceed the current text when the buffer
+         shrank between Print It and the async reply). Answers
+         #(newText caretAfter)."
+        | at text |
+        at := (anInteger min: full size) max: 0.
+        text := ' ' , result.
+        ^Array with: (full copyFrom: 1 to: at) , text , (full copyFrom: at + 1 to: full size)
+               with: at + text size
+    ]
+
+    CocoaUI class >> insertPrintResult: result at: anInteger [
+        | spliced |
+        Workspace isNil ifTrue: [ ^self ].
+        spliced := self splice: result into: self workspaceText at: anInteger.
+        Workspace onMain setString: (spliced at: 1).
+        Workspace onMain setSelectedRange: (Array with: (spliced at: 2) with: 0).
+        self recolorizeWorkspace.
+    ]
+
+    CocoaUI class >> workspaceText [
+        "The Workspace NSTextView's current text as a Smalltalk String. `string`
+         returns an NSString, which `sendString:` copies to a Smalltalk String —
+         NOT `UTF8String` (that returns a `char*`, which `sendString:` would
+         misread as an object id and crash — the CG4 SIGBUS fix)."
+        Workspace isNil ifTrue: [ ^'' ].
+        ^Workspace sendString: 'string'
+    ]
+
+    "── the transcript: a SMALL, reverse-chronological dock at the bottom ──"
+    CocoaUI class >> transcriptStripHeight [ ^22.0 ]
+
+    CocoaUI class >> buildTranscriptIn: content [
+        | tvClass frame w scrollH colorClass boxClass |
+        tvClass := Cocoa classNamed: 'NSTextView'.
+        colorClass := Cocoa classNamed: 'NSColor'.
+        boxClass := Cocoa classNamed: 'NSBox'.
+        frame := content onMain frame.
+        w := frame at: 3.
+
+        "The grain strip behind the Clear button — same texture as the
+         toolbar, so the transcript dock's control bar isn't a blank sheet
+         either. Added FIRST so the divider + Clear button render on top."
+        self addTexturedBoxFrame:
+            (Array with: 0.0 with: self transcriptHeight - self transcriptStripHeight
+                   with: w with: self transcriptStripHeight)
+            resize: self maskWidthSizable + self maskMaxYMargin
+            in: content.
+
+        "A 1px divider right at the dock's own top edge — the existing
+         NSScrollView edge alone read as 'not very visible' (user report);
+         this plus the scroll view's own line border below make the dock's
+         boundary unambiguous against the content area above it."
+        TranscriptDivider := (boxClass onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: self transcriptHeight - 1.0
+                                  with: w with: 1.0).
+        TranscriptDivider onMain setBoxType: 4. "NSBoxCustom"
+        TranscriptDivider onMain setBorderType: 0. "NSNoBorder"
+        TranscriptDivider onMain setFillColor: colorClass onMain separatorColor.
+        TranscriptDivider onMain setAutoresizingMask: self maskWidthSizable + self maskMaxYMargin.
+        content onMain addSubview: TranscriptDivider.
+
+        "A thin strip for the Clear button, just below the divider — same
+         'controls above content' shape CocoaCanvas/CocoaFind already use."
+        TranscriptClearBtn := self stripButton: 'Clear'
+            frame: (Array with: w - 54.0 with: self transcriptHeight - self transcriptStripHeight
+                          with: 48.0 with: 18.0)
+            action: [ self clearTranscript ]
+            in: content.
+        TranscriptClearBtn onMain setAutoresizingMask: self maskMinXMargin + self maskMaxYMargin.
+
+        "Scroll-wrapped: a BARE NSTextView draws past its frame when the text
+         outgrows it — long transcripts bled UP over the content view (the
+         CG7 'mess' screenshots). The scroll view clips and scrolls."
+        scrollH := self transcriptHeight - self transcriptStripHeight - 1.0.
+        TranscriptScroll := ((Cocoa classNamed: 'NSScrollView') onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: scrollH).
+        TranscriptScroll onMain setHasVerticalScroller: true.
+        "NSLineBorder — a plain scroll-view edge reads as barely-there; this
+         draws a clean 1px box around the whole log (user report: 'a more
+         distinct boundary... its not very visible yet')."
+        TranscriptScroll onMain setBorderType: 1.
+        TranscriptScroll onMain setAutoresizingMask: self maskWidthSizable + self maskMaxYMargin.
+        Transcript := (tvClass onMain alloc) onMain
+            initWithFrame: (Array with: 0.0 with: 0.0 with: w with: scrollH).
+        Transcript onMain setEditable: false.
+        Transcript onMain setFont: (self fixedFontOfSize: 11.0).
+        Transcript onMain setVerticallyResizable: true.
+        Transcript onMain setHorizontallyResizable: false.
+        Transcript onMain setAutoresizingMask: self maskWidthSizable.
+        TranscriptScroll onMain setDocumentView: Transcript.
+        content onMain addSubview: TranscriptScroll.
+    ]
+
+    "Mint a small flat button wired through the SAME CocoaToolbarAction/
+     macvmAction: ticket path registerViewNamed:... uses — CocoaCanvas/
+     CocoaFind's own stripButton:frame:action: shape, added onto aParent
+     directly (they add onto their own Container class var; CocoaUI has
+     none, so the parent is explicit) and tracked in ToolbarDelegates so
+     teardown releases it with everything else."
+    CocoaUI class >> stripButton: title frame: rect action: aBlock in: aParent [
+        | btn holder delegate |
+        btn := ((Cocoa classNamed: 'NSButton') onMain alloc) onMain initWithFrame: rect.
+        btn onMain setTitle: title.
+        btn onMain setBezelStyle: 1.
+        btn onMain setFont: ((Cocoa classNamed: 'NSFont') onMain systemFontOfSize: 10.0).
+        holder := CocoaToolbarAction on: aBlock.
+        delegate := MacvmDelegate actionTargetOn: holder.
+        btn onMain setTarget: delegate.
+        btn onMain setAction: 'macvmAction:'.
+        ToolbarDelegates isNil ifTrue: [ ToolbarDelegates := OrderedCollection new ].
+        ToolbarDelegates add: delegate.
+        aParent onMain addSubview: btn.
+        ^btn
+    ]
+
+    CocoaUI class >> appendTranscript: aString [
+        "PREPEND — newest line first (reverse chronological, CG5): a log to
+         glance at, not read top to bottom. Blast the WHOLE text each change
+         (feedback_blast_dont_patch) — never an incremental NSTextView patch.
+         Always snaps the visible scroll position back to the very top
+         afterward: newest-first ordering alone only holds until the log
+         outgrows the dock and someone (a prior manual scroll, or growth
+         itself) leaves the viewport anywhere else — a 'log to glance at'
+         must always show the latest line without the viewer scrolling for it."
+        TranscriptText isNil ifTrue: [ TranscriptText := '' ].
+        TranscriptText := aString , String lf , TranscriptText.
+        "MACDART: the shell dock only exists under CocoaUI startup; route to
+         the workspace Transcript pane (the prelude class always resolves)."
+        Transcript showCr: aString.
+    ]
+
+    CocoaUI class >> clearTranscript [
+        TranscriptText := ''.
+        Transcript isNil ifFalse: [ Transcript onMain setString: '' ].
+    ]
+
+    CocoaUI class >> environmentRestarted [
+        "The watchdog respawned the primary from source and re-synced us (§5.1).
+         Recover CLEAN (CG4 review): abandon every continuation still waiting on
+         the DEAD primary — those replies can never come — so nothing lingers or
+         leaks across restarts; then note it. The Workspace text is untouched (it
+         is local)."
+        Worker abandonPending.
+        self appendTranscript: '— environment restarted (primary respawned) —'.
+        "Snapshot views re-sync against the FRESH primary (CG7)."
+        (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc environmentRestarted ].
+        (Worker classNamed: #CocoaBrowser2) ifNotNil: [ :b2 | b2 environmentRestarted ].
+        (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec environmentRestarted ].
+        (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc environmentRestarted ].
+        (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv environmentRestarted ].
+        (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc environmentRestarted ].
+    ]
+
+    CocoaUI class >> teardown [
+        "Release the previous window's wrappers (idempotent — a rebuilt or
+         restarted UI leaks nothing)."
+        Win isNil ifFalse: [
+            Win onMain orderOut: nil.
+            (Worker classNamed: #CocoaBrowser) ifNotNil: [ :bc | bc teardown ].
+            (Worker classNamed: #CocoaBrowser2) ifNotNil: [ :b2 | b2 teardown ].
+            (Worker classNamed: #CocoaFind) ifNotNil: [ :fc | fc teardown ].
+            (Worker classNamed: #CocoaEditor) ifNotNil: [ :ec | ec teardown ].
+            (Worker classNamed: #CocoaOutliner) ifNotNil: [ :oc | oc teardown ].
+            (Worker classNamed: #CocoaCanvas) ifNotNil: [ :cv | cv teardown ].
+            (Worker classNamed: #CocoaHelp) ifNotNil: [ :hc | hc teardown ].
+            (Worker classNamed: #CocoaDebugger) ifNotNil: [ :dc | dc teardown ].
+            ActTarget isNil ifFalse: [ ActTarget isValid ifTrue: [ ActTarget release ] ].
+            ToolbarDelegates isNil ifFalse: [
+                ToolbarDelegates do: [ :d | d isValid ifTrue: [ d release ] ] ].
+            Workspace isNil ifFalse: [ Workspace isValid ifTrue: [ Workspace release ] ].
+            WorkspaceScroll isNil ifFalse: [ WorkspaceScroll isValid ifTrue: [ WorkspaceScroll release ] ].
+            WorkspaceScroll := nil.
+            WorkspaceBarButtons isNil ifFalse: [
+                WorkspaceBarButtons do: [ :b | b isValid ifTrue: [ b release ] ] ].
+            WorkspaceBarBox isNil ifFalse: [ WorkspaceBarBox isValid ifTrue: [ WorkspaceBarBox release ] ].
+            WorkspaceContainer isNil ifFalse: [ WorkspaceContainer isValid ifTrue: [ WorkspaceContainer release ] ].
+            WorkspaceBarButtons := nil. WorkspaceBarBox := nil. WorkspaceContainer := nil.
+            WorkspaceTextDelegate isNil ifFalse: [ WorkspaceTextDelegate isValid ifTrue: [ WorkspaceTextDelegate release ] ].
+            WorkspaceTextDelegate := nil.
+            Toolbar isNil ifFalse: [ Toolbar isValid ifTrue: [ Toolbar release ] ].
+            ContentHost isNil ifFalse: [ ContentHost isValid ifTrue: [ ContentHost release ] ].
+            Transcript isNil ifFalse: [ Transcript isValid ifTrue: [ Transcript release ] ].
+            TranscriptScroll isNil ifFalse: [ TranscriptScroll isValid ifTrue: [ TranscriptScroll release ] ].
+            TranscriptDivider isNil ifFalse: [ TranscriptDivider isValid ifTrue: [ TranscriptDivider release ] ].
+            TranscriptClearBtn isNil ifFalse: [ TranscriptClearBtn isValid ifTrue: [ TranscriptClearBtn release ] ].
+            TabItems isNil ifFalse: [
+                TabItems do: [ :t | t isValid ifTrue: [ t release ] ] ].
+            TabItems := nil. TabIndexes := nil.
+            Win isValid ifTrue: [ Win release ].
+            Win := nil. Workspace := nil. Toolbar := nil. ContentHost := nil.
+            Transcript := nil. TranscriptScroll := nil. ActTarget := nil. ToolbarDelegates := nil.
+            TranscriptDivider := nil. TranscriptClearBtn := nil.
+            ToolbarButtons := nil. MetricLabels := nil. Views := nil.
+            "Font buttons are subviews of Toolbar (released above) — just drop
+             the stale wrappers so a rebuilt UI re-mints them cleanly."
+            FontMinusBtn := nil. FontPlusBtn := nil.
+            MemBarFill := nil. MemBarWidth := nil ]
+    ]
+
+    CocoaUI class >> window [ ^Win ]
+    CocoaUI class >> transcriptView [ ^Transcript ]
+    "Scripting hooks (rusttcl `gui`) — drive the A-/A+ buttons for a real
+     target/action click, exactly as a user's mouse would."
+    CocoaUI class >> fontPlusButton [ ^FontPlusBtn ]
+    CocoaUI class >> fontMinusButton [ ^FontMinusBtn ]
+]

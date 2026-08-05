@@ -1,0 +1,75 @@
+"Feature test: control flow, blocks, closures, non-local return. Expected values
+ are the human-verified spec (standard Smalltalk block/control semantics)."
+STestCase subclass: TestControl [
+    tests [
+        "--- conditionals ---"
+        self check: (3 > 2 ifTrue: [ 'yes' ] ifFalse: [ 'no' ]) is: 'yes' label: 'ifTrue:ifFalse:'.
+        self check: (1 > 2 ifTrue: [ 'yes' ] ifFalse: [ 'no' ]) is: 'no' label: 'ifFalse branch'.
+        self assert: nil isNil label: 'nil isNil'.
+        self deny: 42 isNil label: '42 isNil'.
+        self assert: 42 notNil label: '42 notNil'.
+        self check: ((5 > 3) and: [ 2 < 4 ]) is: true label: 'and: both'.
+        self check: ((5 < 3) or: [ 2 < 4 ]) is: true label: 'or: short-circuit'.
+
+        "--- Boolean EQUALITY. `true = true` used to be the only one that
+             worked: it takes the identity fast path, while every other pair
+             fell through to a dispatch a Dart bool has no method for and threw
+             'Class bool has no method =' — so any code comparing a COMPUTED
+             Boolean blew up rather than answering false. ---"
+        self check: (true = true) is: true label: 'true = true'.
+        self check: (true = false) is: false label: 'true = false'.
+        self check: (false = false) is: true label: 'false = false'.
+        self check: (false = true) is: false label: 'false = true'.
+        self check: ((3 < 4) = (4 > 3)) is: true label: 'computed Booleans compare'.
+        self check: ((3 > 4) = (4 < 3)) is: true label: 'both false compare equal'.
+        self check: (true = 1) is: false label: 'true = 1'.
+        self check: (false = nil) is: false label: 'false = nil'.
+        self check: (nil = false) is: false label: 'nil = false'.
+        self check: (true ~= false) is: true label: 'true ~= false'.
+
+        "--- the nil-test family (inlined; works on a LITERAL nil too) ---"
+        self check: (nil ifNil: [ 'wasNil' ]) is: 'wasNil' label: 'nil ifNil:'.
+        self check: (5 ifNil: [ 'wasNil' ]) is: 5 label: 'non-nil ifNil: -> receiver'.
+        self check: (nil ifNotNil: [ 'x' ]) is: nil label: 'nil ifNotNil: -> nil'.
+        self check: (5 ifNotNil: [ 'notNil' ]) is: 'notNil' label: 'non-nil ifNotNil:'.
+        self check: (5 ifNotNil: [ :x | x + 1 ]) is: 6 label: 'ifNotNil: binds receiver'.
+        self check: (nil ifNil: [ 'A' ] ifNotNil: [ :x | 'B' ]) is: 'A' label: 'ifNil:ifNotNil: on nil'.
+        self check: (5 ifNil: [ 'A' ] ifNotNil: [ :x | x * 2 ]) is: 10 label: 'ifNil:ifNotNil: on value'.
+        self check: (5 ifNotNil: [ :x | x * 2 ] ifNil: [ 'A' ]) is: 10 label: 'ifNotNil:ifNil: on value'.
+        self check: (self evalOnce) is: 1 label: 'ifNil: evaluates receiver once'.
+
+        "--- loops ---"
+        self check: (self sumTo: 10) is: 55 label: 'whileTrue: sum'.
+        self check: (self countDown: 5) is: 5 label: 'timesRepeat: count'.
+        self check: (self factByTo: 6) is: 720 label: 'to:do: product'.
+        self check: (self collatzSteps: 27) is: 111 label: 'whileTrue collatz(27)'.
+        self check: (self byStep) is: 25 label: 'to:by:do: even-square sum'.
+
+        "--- blocks as values / closures ---"
+        self check: ([ :x :y | x + y ] value: 3 value: 4) is: 7 label: 'block value:value:'.
+        self check: ([ 99 ] value) is: 99 label: 'niladic block value'.
+        self check: ((self adder: 10) value: 5) is: 15 label: 'closure captures binding'.
+        self check: ([ 42 ] numArgs) is: 0 label: 'niladic block numArgs'.
+        self check: ([ :x :y | x + y ] numArgs) is: 2 label: 'dyadic block numArgs'.
+        self check: (self makeCounter) is: 3 label: 'closure mutates captured var'.
+
+        "--- non-local return through a block ---"
+        self check: (self firstEven: #(1 3 5 8 9)) is: 8 label: 'non-local return from do:'.
+        self check: (self firstEven: #(1 3 5)) is: -1 label: 'non-local return not taken'.
+
+        "--- cascades ---"
+        self check: (self cascadeBuild) is: 3 label: 'cascade ; on OrderedCollection'.
+    ]
+    sumTo: n [ | i s | i := 1. s := 0. [ i <= n ] whileTrue: [ s := s + i. i := i + 1 ]. ^s ]
+    countDown: n [ | c | c := 0. n timesRepeat: [ c := c + 1 ]. ^c ]
+    factByTo: n [ | p | p := 1. 1 to: n do: [ :i | p := p * i ]. ^p ]
+    byStep [ | s | s := 0. 1 to: 9 by: 2 do: [ :i | s := s + i ]. ^s ]
+    collatzSteps: n [ | c k | k := n. c := 0. [ k > 1 ] whileTrue: [ k even ifTrue: [ k := k // 2 ] ifFalse: [ k := 3 * k + 1 ]. c := c + 1 ]. ^c ]
+    adder: n [ ^[ :x | x + n ] ]
+    makeCounter [ | n b | n := 0. b := [ n := n + 1 ]. b value. b value. b value. ^n ]
+    firstEven: aColl [ aColl do: [ :x | x even ifTrue: [ ^x ] ]. ^-1 ]
+    cascadeBuild [ | c | c := OrderedCollection new. c add: 1; add: 2; add: 3. ^c size ]
+    | sideCalls |
+    bumpNil [ sideCalls := sideCalls + 1. ^nil ]
+    evalOnce [ sideCalls := 0. self bumpNil ifNil: [ 'n' ] ifNotNil: [ :x | x ]. ^sideCalls ]
+]
